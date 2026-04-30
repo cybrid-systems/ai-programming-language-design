@@ -1,52 +1,65 @@
-# Linux Kernel RDMA (Remote Direct Memory Access) 深度源码分析
+# RDMA — 远程直接内存访问深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`drivers/infiniband/` + `drivers/rdma/`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. RDMA 概述
-
-**RDMA** 实现**零拷贝网络**：远程机器直接读写本地内存，无需 CPU 介入，绕过内核网络栈。用于 HPC（高性能计算）和 AI 训练（GPUDirect）。
+> 基于 Linux 7.0-rc1 主线源码（`drivers/infiniband/core/cm.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. RDMA 动词
+## 0. 概述
+
+**RDMA**（Remote Direct Memory Access）允许跨网络直接访问远程内存，零拷贝、超低延迟，用于高性能计算和存储。
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 ib_device — RDMA 设备
 
 ```c
-// ibverbs — 用户空间 API
-struct ibv_pd      *pd;        // Protection Domain
-struct ibv_cq      *cq;        // Completion Queue
-struct ibv_qp      *qp;        // Queue Pair
-struct ibv_mr      *mr;        // Memory Region（注册内存）
+// drivers/infiniband/core/cm.c — cm_id
+struct cm_id {
+    struct ib_device       *device;         // RDMA 设备
+    struct ib_qp            *qp;            // 关联的 Queue Pair
+    cm_state                state;          // 连接状态
 
-// Queue Pair (QP) — RDMA 通信端点
-//  UD: Unreliable Datagram（类似 UDP）
-//  RC: Reliable Connection（类似 TCP）
-//  UC: Unreliable Connection
+    // 地址
+    __be64                  local_id;       // 本地 ID
+    __be64                  remote_id;      // 远程 ID
+
+    // 服务类型
+    enum ib_qp_type        qp_type;       // RC/UC/UD
+    union ib_gid            local_gid;      // 本地 GID
+    union ib_gid            remote_gid;     // 远程 GID
+};
+```
+
+### 1.2 ib_qp — Queue Pair
+
+```c
+// include/rdma/ib_verbs.h — ib_qp
+struct ib_qp {
+    struct ib_device       *device;         // 设备
+    struct ib_pd            *pd;            // Protection Domain
+    struct ib_cq            *send_cq;       // 发送完成队列
+    struct ib_cq            *recv_cq;       // 接收完成队列
+
+    // 状态
+    enum ib_qp_state        state;         // IB_QPS_* 状态
+    //   IB_QPS_RESET = 0
+    //   IB_QPS_INIT  = 1
+    //   IB_QPS_RTR  = 2（Ready to Receive）
+    //   IB_QPS_RTS  = 3（Ready to Send）
+    //   IB_QPS_SQD  = 4（Send Queue Drain）
+    //   IB_QPS_SQE  = 5（Send Queue Error）
+    //   IB_QPS_ERR  = 6
+};
 ```
 
 ---
 
-## 2. 核心操作
+## 2. 完整文件索引
 
-```c
-// 注册内存
-mr = ibv_reg_mr(pd, buf, size, IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-
-// 发送/接收
-ibv_post_send(qp, &sge, &wr);  // RDMA 写/发送
-ibv_post_recv(qp, &sge, &wr);  // 接收
-
-// 完成通知
-ibv_poll_cq(cq, 1, &wc);        // 轮询完成队列
-```
-
----
-
-## 3. 参考
-
-| 文件 | 内容 |
-|------|------|
-| `drivers/infiniband/core/cm.c` | Connection Manager（RDMA CM）|
-| `drivers/rdma/verbs.c` | ibverbs 核心 |
+| 文件 | 函数/结构 |
+|------|----------|
+| `drivers/infiniband/core/cm.c` | `cm_id` |
+| `include/rdma/ib_verbs.h` | `ib_qp` |
