@@ -1,128 +1,210 @@
-# Linux Kernel memcg (Memory Cgroup) 深度源码分析
+# memcg — 内存控制组深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`mm/memcontrol.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
+> 基于 Linux 7.0-rc1 主线源码（`mm/memcontrol.c` + `include/linux/memcontrol.h`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 0. 什么是 memcg？
+## 0. 概述
 
-**memcg（Memory Cgroup）** 是 cgroup v2 中**内存资源控制**子系统，允许对进程组的内存使用量施加限制。
-
-**核心能力**：
-- 设置内存上限（memory.max）
-- 内存低水位回收（memory.high）
-- 匿名页/文件页分开统计
-- 层次化记账（子 cgroup 继承父 cgroup 的限制）
+**memcg（Memory Cgroup）** 是 cgroup v1 的内存控制器，为每个 cgroup 提供独立的内存限制和统计。
 
 ---
 
 ## 1. 核心数据结构
 
+### 1.1 mem_cgroup — 控制组内存状态
+
 ```c
-// mm/memcontrol.c — mem_cgroup
+// include/linux/memcontrol.h — mem_cgroup
 struct mem_cgroup {
-    struct cgroup_subsys_state css;  // cgroup 基类
+    // cgroup 基础
+    struct cgroup_subsys_state    css;             // 基类
+    struct mem_cgroup             *parent;         // 父组
 
-    /* 层次结构 */
-    struct mem_cgroup *parent;       // 父 cgroup
-    struct list_head siblings;       // 兄弟链表
-    struct list_head children;      // 子 cgroup
+    // 使用量统计
+    atomic64_t                     memory.usage;   // 当前内存使用（字节）
+    atomic64_t                     memory.stat[NR_MEMCG_STAT]; // 详细统计
+    atomic64_t                     memory.events;   // 事件计数（OOM 等）
+    unsigned long                  memory.low;     // 下限（软限制）
+    unsigned long                  memory.high;     // 上限（触发回收）
 
-    /* 内存限制（来自 memory.max 等）*/
-    unsigned long memory_max;        // 硬限制（byte）
-    unsigned long memory_high;       // 软限制（触发异步回收）
-    unsigned long swap_max;         // swap 上限
+    // 限制
+    unsigned long                  memory.min;     // 最小保留
+    unsigned long                  memory.max;     // 硬限制
+    unsigned long                  soft_limit;     // 软限制
 
-    /* 统计计数器 */
-    atomic_long_t memory_current;   // 当前内存使用
-    atomic_long_t memory_stat[NR_MEMCG_STAT];  // 详细统计
+    // 层级 LRU
+    struct mem_cgroup_lru_state    lru;             // LRU 链表
 
-    /* 内存使用量 */
-    struct page_counter memory;      // 内存页计数器
-    struct page_counter swap;       // swap 计数器
-    struct page_counter memsw;      // memory+swap 总和
+    // socket 压力
+    unsigned long                  socket_pressure; // socket 内存压力
 
-    /* LRU 链表（用于回收）*/
-    struct list_head lru_gen_lists;  // LRU 代际链表
+    // OOM
+    struct OOM_control {
+        bool                enabled;               // OOM 是否启用
+        struct task_struct  *chosen;               // 被杀的进程
+        unsigned long       killed;               // 是否已杀
+    } oom;
+};
+```
 
-    /* OOM 处理 */
-    struct wait_queue_head oom_waitq;
-    atomic_int oom_psi_flag;
+### 1.2 memory_stat — 详细统计
+
+```c
+// mm/memcontrol.c — memory.stat
+enum mem_cgroup_stat_item {
+    MEMCG_CACHE,              // Page cache
+    MEMCG_RSS,                // Anonymous + swap cache
+    MEMCG_RSS_HUGE,           // Anonymous huge
+    MEMCG_SHMEM,              // Shared memory
+    MEMCG_FILE_MAPPED,        // File-backed
+    MEMCG_FILE_DIRTY,         // Dirty pages
+    MEMCG_FILE_WRITEBACK,     // Writeback pages
+    NR_MEMCG_STAT,
 };
 ```
 
 ---
 
-## 2. 内存限制检查
+## 2. 页面统计（page_counter）
 
 ```c
-// mm/memcontrol.c — try_charge
-bool try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask, unsigned int nr_pages)
+// include/linux/page_counter.h — page_counter
+struct page_counter {
+    atomic_long_t             usage;       // 当前使用（页数）
+    unsigned long             limit;       // 限制（页数）
+    unsigned long             soft_limit;  // 软限制
+    unsigned long             min;         // 最小保留
+    unsigned long             max;         // 硬限制
+
+    struct page_counter       *parent;     // 父 counter
+    unsigned long             failcnt;    // 触发次数
+};
+```
+
+---
+
+## 3. 收费（charge）流程
+
+### 3.1 mem_cgroup_charge — 页面收费
+
+```c
+// mm/memcontrol.c — mem_cgroup_charge
+int mem_cgroup_charge(struct page *page, struct mem_cgroup *memcg,
+                      gfp_t gfp_mask)
 {
-    // 1. 检查 memory.current 是否超过 memory.max
-    if (atomic_long_read(&memcg->memory_current) >= memcg->memory_max) {
-        // 超过硬限制，触发回收
-        ret = memcg_reclaim(memcg, gfp_mask, nr_pages);
-        if (ret != MEMCG_RECLAIM_SOME)
-            goto force;  // 回收失败
+    // 1. 找到正确的 memcg（如果是 thread，可能不是根 memcg）
+    if (!memcg)
+        memcg = get_mem_cgroup_from_mm(current->mm);
+
+    // 2. 检查限制
+    if (!page_counter_try_charge(&memcg->memory, 1, &counter)) {
+        // 超过限制 → 触发 reclaim
+        mem_cgroup_oom(memcg, gfp_mask);
+        goto force_reclaim;
     }
 
-    // 2. 如果超过 memory.high，触发异步回收
-    if (atomic_long_read(&memcg->memory_current) >= memcg->memory_high) {
-        memcg_schedule_high_work();  // 触发 memcg kworker 异步回收
-    }
+    // 3. 设置 page->mem_cgroup
+    page->mem_cgroup = memcg;
 
-    // 3. 增加引用计数
-    page_counter_charge(&memcg->memory, nr_pages);
-    return true;
+    // 4. 加入 memcg LRU
+    mem_cgroup_add_lru(page);
 
-force:
-    // 4. 硬限制触发 OOM
-    memcg_oom(memcg, gfp_mask);
-    return false;
+    return 0;
 }
 ```
 
 ---
 
-## 3. 层次化回收
+## 4. 层级合并（Hierarchical Reclaim）
 
 ```c
-// mm/memcontrol.c — memcg_reclaim
-static int memcg_reclaim(struct mem_cgroup *memcg, gfp_t gfp_mask, unsigned long nr_pages)
+// mm/memcontrol.c — mem_cgroup_oom_reclaim
+static bool mem_cgroup_oom_reclaim(struct mem_cgroup *memcg, ...)
 {
-    // 1. 从 LRU 回收
-    //    遍历 memcg 的 lru_gen_lists
-    //    回收 inactive anon / inactive file / active anon / active file
+    // 1. 计算本层 + 所有子层总使用量
+    long nr_pages = mem_cgroup_read_events(memcg, MEMCG_OOM);
 
-    // 2. 递归向上直到根
-    do {
-        lru_gen_shrink_list(memcg, nr_pages);
-        memcg = memcg->parent;
-    } while (memcg && nr_pages > 0);
+    if (mem_cgroup_exceeds_swap_limit(memcg))
+        // 如果超 swap limit，优先 reclaim swap
+        nr_pages += try_to_free_mem_cgroup_pages(memcg, nr_pages, gfp_mask);
 
-    return ret;
+    return nr_pages > 0;
 }
 ```
 
 ---
 
-## 4. PSI (Pressure Stall Information)
+## 5. OOM 处理
 
 ```c
-// PSI 追踪内存压力
-// /proc/pressure/io、/proc/pressure/memory
-// 报告：
-//   some：至少一个任务在等待内存
-//   full：所有任务都在等待内存
+// mm/memcontrol.c — mem_cgroup_oom
+static void mem_cgroup_oom(struct mem_cgroup *memcg, gfp_t mask)
+{
+    // 1. 检查是否启用 OOM
+    if (!memcg->oom.enabled)
+        return;
+
+    // 2. 设置当前任务
+    memcg->oom.chosen = current;
+
+    // 3. 发送 SIGKILL（如果无法恢复）
+    if (mask & __GFP_FS) {
+        mem_cgroup_kmem_disconnect(memcg);
+        mem_cgroup_run_oom_killer(memcg);
+    }
+}
 ```
 
 ---
 
-## 5. 参考
+## 6. 软限制（soft_limit）
 
-| 文件 | 内容 |
-|------|------|
-| `mm/memcontrol.c` | `mem_cgroup`、`try_charge`、`memcg_reclaim`、`page_counter_charge` |
-| `mm/memcontrol.h` | `struct mem_cgroup`、`memory_cgroup_subsys` |
+```c
+// mm/memcontrol.c — mem_cgroup_soft_limit_tree
+static struct mem_cgroup *mem_cgroup_soft_limit_tree(struct mem_cgroup *memcg)
+{
+    // soft_limit 树：按使用量排序
+    // 当内存压力时，从超 soft_limit 的组开始 reclaim
+    // 最先 reclaim 使用量超 soft_limit 最多的组
+}
+```
+
+---
+
+## 7. /sys/fs/cgroup/ 接口
+
+```
+/sys/fs/cgroup/memory/<cgroup>/
+├── memory.limit_in_bytes        ← 内存限制
+├── memory.soft_limit_in_bytes   ← 软限制
+├── memory.min_in_bytes         ← 最小保留
+├── memory.max_in_bytes         ← 硬限制
+├── memory.current              ← 当前使用
+├── memory.events              ← OOM 等事件数
+├── memory.stat                 ← 详细统计
+├── memory.pressure             ← 内存压力
+└── memory.swap.current         ← Swap 使用
+```
+
+---
+
+## 8. 与 cgroup v2 的区别
+
+| 特性 | cgroup v1 memcg | cgroup v2 memory |
+|------|----------------|-----------------|
+| 层级 | 每个控制器独立树 | 统一层级 |
+| 软限制 | 有 | 无（需要用户空间实现）|
+| OOM | 基于 memcg | 基于 cgroup2 |
+| 压力检测 | 有 | 有 |
+
+---
+
+## 9. 完整文件索引
+
+| 文件 | 函数/结构 |
+|------|----------|
+| `include/linux/memcontrol.h` | `struct mem_cgroup`、`enum mem_cgroup_stat_item` |
+| `include/linux/page_counter.h` | `struct page_counter` |
+| `mm/memcontrol.c` | `mem_cgroup_charge`、`mem_cgroup_oom` |

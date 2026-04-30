@@ -1,185 +1,231 @@
-# Linux Kernel SLUB Allocator 深度源码分析
+# slab allocator — 内存对象分配器深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`mm/slub.c`)
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. 什么是 SLUB？
-
-**SLUB**（SLAB Unqueued Allocator）是 Linux 2.6.22+ 的**内核内存分配器**，替代了旧的 SLAB。它的目标是减少锁竞争，提高多核性能。
-
-**vs SLAB**：
-- SLAB：每个 CPU 维护自己的缓存，但有全局锁
-- SLUB：去掉了全局锁，每个 CPU 有独立的 per-CPU freelist
+> 基于 Linux 7.0-rc1 主线源码（`mm/slab.c` + `mm/slab_common.c`）
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. 核心结构
+## 0. 概述
+
+**slab allocator** 是内核的**对象分配器**，解决 Buddy 系统分配小对象（< PAGE_SIZE）的内部碎片问题：
+- **slab**：一个或多个物理页，划分为等大小对象
+- **着色（coloring）**：错开 CPU 缓存行，减少伪共享
+- **对象缓存（kmem_cache）**：每种对象类型独立缓存
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 kmem_cache — 对象缓存
 
 ```c
-// mm/slub.c — struct kmem_cache
+// include/linux/slab.h — kmem_cache
 struct kmem_cache {
-    // 对象大小和对齐
-    unsigned int            object_size;     // 对象大小
-    unsigned int            size;           // 含 metadata 的大小
-    unsigned int            align;          // 对齐要求
+    // 对象信息
+    const char           *name;            // 缓存名（如 "task_struct"）
+    size_t               object_size;      // 对象大小
+    size_t               size;              // 对齐后大小（含 padding）
+    size_t               align;            // 对齐要求
 
-    // per-CPU 缓存（关键！）
-    struct array_cache __percpu *cpu_cache;  // per-CPU 对象指针数组
+    // 伙伴系统接口
+    struct kmem_cache_order_objects oo;   // order * objects
+    struct kmem_cache_order_objects max;   // 最大阶
+    struct kmem_cache_order_objects min;   // 最小阶
 
-    // 节点（NUMA 支持）
-    struct kmem_cache_node  *node[MAX_NUMNODES];
+    // 对象布局
+    void                 (*ctor)(void *);   // 构造函数
+    void                 (*dtor)(void *);   // 析构函数
 
-    // 着色（cache color）
-    unsigned long           min_partial;
-    unsigned long           partial;        // 空闲 slab 链表长度
-    int                     cpu_partial;   // 每 CPU partial 长度
+    // CPU 本地缓存
+    struct kmem_cache_cpu __percpu *cpu_slab; // per-CPU 空闲链表
 
-    // 对象管理
-    void                    (*ctor)(void *);
-    void                    (*dtor)(void *);
+    // 空闲链表
+    struct list_head       list;           // 全局 slab 链表
 
-    const char             *name;           // 缓存名（如 "buffer_head"）
-    struct list_head        list;           // 全局缓存链表
+    // 着色
+    unsigned int           colour;          // 颜色数
+    unsigned int           colour_off;     // 颜色偏移
+    unsigned int           dflags;         // 动态标志
+
+    /* 调试 */
+    unsigned long          flags;          // SLAB_* 标志
+    int                    refcount;       // 引用计数
+    void                   (*shutdown)(struct kmem_cache *);
 };
+```
 
-// per-CPU 缓存（array_cache）
-struct array_cache {
-    unsigned int avail;      // 可用对象数
-    unsigned int limit;     // 最大对象数
-    void            *entry[]; // 对象指针数组（柔性数组成员）
+### 1.2 kmem_cache_cpu — per-CPU 本地缓存
+
+```c
+// mm/slab.c — kmem_cache_cpu
+struct kmem_cache_cpu {
+    // 本地 slab（当前 CPU 最快的分配路径）
+    struct slab            *slab;          // 当前 slab
+    void                   **freelist;    // 空闲对象链表头
+    unsigned int            tid;           // 事务 ID（防止竞争）
+
+    // Per-CPU 空闲对象数组（无锁快速分配）
+    void                   **free_disabled;
+    int                    freeptr_depth;
+};
+```
+
+### 1.3 slab — 内存块
+
+```c
+// mm/slab.c — slab
+struct slab {
+    struct list_head        list;          // 接入 kmem_cache->list
+    struct page            *page;          // 伙伴分配的页
+    unsigned int            inuse;          // 已使用对象数
+    unsigned int            objects;        // 总对象数
+    unsigned long           colouroff;      // 颜色偏移
+    void                   *freelist;      // 空闲链表（SLAB_STORE_USER 时）
+    unsigned int            free;          // 第一个空闲对象偏移
 };
 ```
 
 ---
 
-## 2. kmalloc — 小块分配
+## 2. 分配算法（slab_alloc）
 
 ```c
-// mm/slub.c — kmalloc
-void *kmalloc(size_t size, gfp_t flags)
+// mm/slab.c — slab_alloc
+void *slab_alloc(struct kmem_cache *cachep, gfp_t flags)
 {
-    struct kmem_cache *s = kmalloc_slab(size, flags);
-    return kmem_cache_alloc(s, flags);
-}
+    struct kmem_cache_cpu *c = this_cpu_ptr(cachep->cpu_slab);
+    void **freelist;
+    struct slab *slabp;
+    unsigned long tid;
 
-// kmalloc_slab：根据大小选择合适的 kmem_cache
-//   <= 192B: kmalloc-192
-//   <= 256B: kmalloc-256
-//   <= 512B: kmalloc-512
-//   ...
-```
+get_cpu_ptr:
+    tid = c->tid;
+    barrier();
 
----
+    freelist = c->freelist;
+    if (!freelist)
+        goto load_slab;
 
-## 3. kmem_cache_alloc — 从缓存分配对象
+    // 从 per-CPU 空闲链表快速分配（无锁）
+    freelist = c->freelist;
+    c->freelist = *(void **)freelist;
 
-```c
-// mm/slub.c — kmem_cache_alloc
-void *kmem_cache_alloc(struct kmem_cache *s, gfp_t gfpflags)
-{
-    void *object;
+    return freelist;
 
-    // 1. per-CPU 快速路径
-    struct array_cache *ac = this_cpu_ptr(s->cpu_cache);
-    if (ac->avail > 0) {
-        // 从 per-CPU freelist 取对象
-        object = ac->entry[--ac->avail];
-        return object;
+load_slab:
+    // per-CPU 缓存为空，从本地 slab 取
+    slabp = c->slab;
+    if (!slabp)
+        goto new_slab;
+
+    if (slabp->inuse < slabp->objects) {
+        // 本地 slab 还有空闲对象
+        c->freelist = (void *)slabp + slabp->free;
+        c->tid = next_tid(c->tid);
+        return c->freelist;
     }
 
-    // 2. per-CPU 缓存为空：从节点获取
-    object = slab_alloc_node(s, gfpflags, NUMA_NO_NODE, _RET_IP_);
-    return object;
-}
-```
+new_slab:
+    // 分配新 slab（kmem_cache_grow）
+    slabp = kmem_cache_grow(cachep, flags);
+    c->slab = slabp;
+    c->freelist = (void *)slabp + slabp->free;
 
----
-
-## 4. slab_alloc_node — 慢路径分配
-
-```c
-// mm/slub.c — slab_alloc_node
-static void *slab_alloc_node(struct kmem_cache *s,
-                gfp_t gfpflags, int node, unsigned long addr)
-{
-    struct kmem_cache_node *n;
-    struct page *page;
-
-    // 1. 从 per-CPU 获取
-    ac = get_cpu_ptr(s->cpu_cache);
-    if (ac->avail > 0) {
-        object = ac->entry[--ac->avail];
-        goto out;
-    }
-
-    // 2. per-CPU 缓存空，尝试 refill
-    ac = cpu_cache_get(s);  // 重新填充 per-CPU 缓存
-    if (ac->avail > 0) {
-        object = ac->entry[--ac->avail];
-        goto out;
-    }
-
-    // 3. 从 node 的 partial 链表获取
-    n = get_node(s, node);
-    page = get_partial_node(s, n);
-    if (page) {
-        object = page->freelist;
-        page->freelist = object[1];  // 前进 freelist
-        // 放入 per-CPU 缓存...
-        goto out;
-    }
-
-    // 4. 分配新 slab
-    page = allocate_slab(s, gfpflags);
-    // 放入 per-CPU 缓存...
-
-out:
-    put_cpu_ptr(s->cpu_cache);
-    return object;
+    return c->freelist;
 }
 ```
 
 ---
 
-## 5. 完整状态机
+## 3. kmem_cache_grow — 分配新 slab
 
-```
-kmalloc(100)
-  ↓
-kmalloc_slab(100) → 选择 kmalloc-128
-  ↓
-kmem_cache_alloc(kmalloc-128)
-  ↓
-┌─────────────────────────────────────┐
-│ per-CPU cache (ac->entry[])        │
-│   avail > 0?                       │
-│     → 直接返回 entry[--avail]       │ ← 快速路径，零锁
-│   avail == 0?                      │
-│     → get_partial_node()            │ ← 从 partial 链表补货
-│     → allocate_slab()               │ ← 分配新 slab
-└─────────────────────────────────────┘
+```c
+// mm/slab.c — kmem_cache_grow
+static struct slab *kmem_cache_grow(struct kmem_cache *cachep, gfp_t flags)
+{
+    // 1. 从伙伴系统分配页
+    struct page *page = alloc_pages(flags, cachep->oo.order);
+
+    // 2. 初始化 slab
+    struct slab *slabp = page_to_slab(page);
+    slabp->objects = cachep->oo.objects;
+    slabp->inuse = 0;
+    slabp->colouroff = 0;
+
+    // 3. 构建空闲链表
+    void **freelist = &slabp[1];
+    for (i = 0; i < slabp->objects; i++)
+        freelist[i] = freelist[i + 1];
+
+    slabp->free = 0;
+    slabp->list = cachep->list;
+
+    // 4. 添加到缓存链表
+    list_add(&slabp->list, &cachep->list);
+
+    return slabp;
+}
 ```
 
 ---
 
-## 6. 设计思想总结
+## 4. 着色（Coloring）
 
-| 设计决策 | 原因 |
-|---------|------|
-| per-CPU array_cache | 分配/释放零锁，极高并发性能 |
-| per-CPU partial | 减少跨 CPU 分配时的缓存失效 |
-| NUMA node 分离 | 每个 NUMA 节点有自己的 slab，减少远端内存访问 |
-| kmalloc 分级 | 不同大小用不同 cache，避免内部碎片 |
-| SLUB vs SLAB | SLAB 有全局锁（NODE_LOCK），SLUB 完全 per-CPU |
+```c
+// mm/slab.c — cache_estimate
+void cache_estimate(struct kmem_cache *cachep, size_t size, ...)
+{
+    // 计算颜色数（让每个对象的起始地址错开 cache line）
+    unsigned int colour_max = flushicache_pages(cachep);
+    unsigned int colour = colour_max;
+
+    // 颜色偏移 = colour * colour_off
+    // 第一个对象的起始 = slab 开始 + colour_off * colour
+    // 下一个对象的起始 = 前一个 + size + colour_off
+    // 这样不同对象的起始地址错开，减少伪共享
+}
+```
 
 ---
 
-## 7. 参考
+## 5. 销毁（kmem_cache_free）
 
-| 文件 | 内容 |
-|------|------|
-| `mm/slub.c` | `kmem_cache_alloc`、`slab_alloc_node`、`kmalloc` |
-| `mm/slub_def.h` | `struct kmem_cache`、`struct array_cache` |
-| `mm/slab_common.c` | `kmalloc_slab`、`kmalloc_caches` |
+```c
+// mm/slab.c — slab_free
+void slab_free(struct kmem_cache *cachep, struct slab *slabp, void *objp)
+{
+    struct kmem_cache_cpu *c = this_cpu_ptr(cachep->cpu_slab);
+
+    // 放回 per-CPU 空闲链表
+    *(void **)objp = c->freelist;
+    c->freelist = objp;
+
+    slabp->inuse--;
+}
+```
+
+---
+
+## 6. SLAB 调试
+
+```c
+// mm/slab.c — SLAB_STORE_USER
+#define SLAB_STORE_USER     (1 << 0)  // 记录释放者
+#define SLAB_RED_ZONE       (1 << 1)  // 红区（溢出检测）
+#define SLAB_POISON         (1 << 2)  // 毒值（use-after-free 检测）
+
+// 开启后：
+// - 每对象前/后填充红区
+// - 分配时写入毒值，释放时检查是否被覆盖
+// - 记录 alloc/free 的 call stack
+```
+
+---
+
+## 7. 完整文件索引
+
+| 文件 | 函数/结构 |
+|------|----------|
+| `include/linux/slab.h` | `struct kmem_cache` |
+| `mm/slab.c` | `slab_alloc`、`kmem_cache_grow`、`slab_free` |
+| `mm/slab_common.c` | `kmem_cache_create`、`kmem_cache_destroy` |
