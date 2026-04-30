@@ -1,89 +1,161 @@
-# CCW / zFCP — IBM Z 系列 I/O 深度源码分析
+# 117-CCW-zFCP — IBM 大机通道深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`drivers/s390/cio/`）
+> 基于 Linux 7.0-rc1 主线源码（`drivers/s390/scsi/zfcp_*.c`）
 > 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
 ## 0. 概述
 
-IBM Z 系列（mainframe）使用与 x86 完全不同的 I/O 架构：
-- **CCW**（Channel Command Word）：通道命令字
-- **CHS**（Channel Subsystem）：通道子系统
-- **zFCP**：FCP over zSeries（光纤通道）
+**CCW（Channel Command Word）** 和 **zFCP（SCSI over Fibre Channel on IBM mainframe）** 是 IBM 大型机（s390x 架构）的 I/O 通道接口。CCW 是通道命令字，zFCP 是在 Fibre Channel 上跑 SCSI 协议。
 
 ---
 
-## 1. CCW 通道命令字
+## 1. CCW — Channel Command Word
+
+### 1.1 CCW 结构
 
 ```c
-// drivers/s390/cio/ccwdev.h — ccw1
+// arch/s390/include/asm/ccwdev.h — ccw1
 struct ccw1 {
-    __u32  cmd_code;     // 命令码（MESSAGE/READ/WRITE/...)
-    __u32  cda;          // 数据地址（虚拟/物理）
-    __u32  count;        // 传输字节数
-    __u32  flags;        // 标志
-    //   CCW_FLAG_SLI   = 0x04  // 跳过长度检查
-    //   CCW_FLAG_CC     = 0x08  // 连续命令
-    //   CCW_FLAG_SUSPEND = 0x10 // 暂停
+    u8  cmd_code;      // 命令码（IDA/READ/WRITE/SENSE 等）
+    u32 cda;           // 数据地址（Channel Data Address）
+    u8  flags;         // CCW_FLAGS_* 标志
+    u16 count;         // 传输字节数
 };
 
-// CCW 链表（Channel Program）
-struct ccw1 ccw_chain[] = {
-    { .cmd_code = 0x01, .cda = (u32)data, .count = 64, .flags = 0 },
-    { .cmd_code = 0x02, .cda = (u32)status, .count = 32, .flags = 0 },
-    { .cmd_code = 0x03, .cda = (u32)sense, .count = 24, .flags = 0 },
+// CCW 标志：
+//   CCW_FLAG_SLI   = 不要在异常时终止
+//   CCW_FLAG_CC     = 连续命令（chained CCW）
+//   CCW_FLAG_SUSPEND = 挂起当前通道程序
+```
+
+### 1.2 通道程序
+
+```c
+// CCW 通道程序 = 多个 CCW 组成的链表
+// 例如：READ + SENSE 连续执行
+struct ccw1 program[] = {
+    { .cmd_code = CCW_CMD_READ, .cda = buf, .count = 512, .flags = CCW_FLAG_CC },
+    { .cmd_code = CCW_CMD_SENSE, .cda = sense, .count = 64, .flags = 0 },
 };
 ```
 
 ---
 
-## 2. I/O 子通道
+## 2. zFCP — SCSI over Fibre Channel
+
+### 2.1 struct zfcp_adapter — 适配器
 
 ```c
-// drivers/s390/cio/device.h — subchannel
-struct subchannel {
-    // 标识
-    __u16  schid;         // 子通道 ID
-    __u8   port;          // 端口号
+// drivers/s390/scsi/zfcp_fsf.h — zfcp_adapter
+struct zfcp_adapter {
+    struct ccw_device       *ccw_device;      // CCW 设备
+    struct fsf_qtcb_bottom_port *stats;    // 统计
+
+    // 端口列表
+    struct list_head        port_list;
+    spinlock_t              port_list_lock;
+
+    // 硬件地址
+    u64                     wwpn;             // 世界-wide 端口名
+    u64                     port_id;         // FC 端口 ID
 
     // 状态
-    enum schib_config config;  // 配置状态
-
-    // I/O 请求
-    struct ccw_device *device; // 关联的 CCW 设备
-    struct irb         *irb;   // I/O 结果块
-
-    // 通道路径
-    struct chp_id      chp_mask; // 通道路径掩码
+    unsigned long           status;
+    struct work_struct      scan_ports_work;  // 端口扫描
 };
 ```
 
----
-
-## 3. zFCP — FCP over IBM Z
+### 2.2 struct zfcp_port — 端口
 
 ```c
-// drivers/s390/scsi/zfcp_fc.h — zfcp_fc_wka_port
-// zFCP = Fibre Channel Protocol over mainframe channel I/O
+// drivers/s390/scsi/zfcp_fsf.h — zfcp_port
+struct zfcp_port {
+    struct list_head        list;             // 接入 adapter
+    struct zfcp_adapter    *adapter;         // 所属适配器
 
-struct zfcp_fc_wka_port {
-    // WWPN（World Wide Port Name）
-    __be64                 wwpn;
-    // D_ID（Fabric ID）
-    __be32                 d_id;
+    u64                     wwpn;             // 端口名
+    u64                     port_id;         // FC 端口 ID
 
-    // 关联的适配器
-    struct zfcp_adapter   *adapter;
+    // LUN 列表
+    struct list_head        lun_list;
+    spinlock_t              lun_list_lock;
 };
 ```
 
 ---
 
-## 4. 完整文件索引
+## 3. FSF（Fabric Shortcut Path）
+
+### 3.1 zfcp_fsf — FSF 请求
+
+```c
+// drivers/s390/scsi/zfcp_fsf.c — zfcp_fsf_request
+// FSF 是 zFCP 和硬件之间的命令协议
+// 通过 CCW 通道程序与适配器通信
+
+struct fsf_qtcb {
+    struct fsf_byte_order   byte_order;
+    struct fsf_qtcb_header header;
+    union {
+        struct fsf_qtcb_bottom_port bottom;
+        struct fsf_qtcb_bottom_port_status status;
+    };
+};
+
+// FSF 命令：
+//   FSF_QTCB_OPEN_PORT         = 打开 FC 端口
+//   FSF_QTCB_CLOSE_PORT        = 关闭端口
+//   FSF_QTCB_SEND_ELS          = 发送 ELS（Extended Link Services）
+//   FSF_QTCB_FCP_CMND          = FCP 命令（读写 SCSI）
+```
+
+---
+
+## 4. SCSI 命令流程
+
+```
+用户：scsi_command(read LUN)
+        ↓
+Linux SCSI 中层
+        ↓
+zfcp_scsi_command()        ← zFCP 处理
+        ↓
+zfcp_fsf_fcp_cmnd()       ← 构造 FCP_CMND
+        ↓
+ccw_device_start()        ← 通过 CCW 通道发送到主机
+        ↓
+Fibre Channel 传输
+        ↓
+目标存储返回 DATA + STATUS
+        ↓
+ccw_device_intr()         ← 中断处理
+        ↓
+向上返回给 SCSI 层
+```
+
+---
+
+## 5. 完整文件索引
 
 | 文件 | 函数/结构 |
 |------|----------|
-| `drivers/s390/cio/ccwdev.h` | `struct ccw1` |
-| `drivers/s390/cio/device.h` | `struct subchannel` |
-| `drivers/s390/scsi/zfcp_fc.h` | `struct zfcp_fc_wka_port` |
+| `arch/s390/include/asm/ccwdev.h` | `struct ccw1`、`struct ccw` |
+| `drivers/s390/scsi/zfcp_fsf.h` | `struct zfcp_adapter`、`struct zfcp_port` |
+| `drivers/s390/scsi/zfcp_fsf.c` | `zfcp_fsf_fcp_cmnd`、`zfcp_fsf_request` |
+
+---
+
+## 6. 西游记类比
+
+**CCW/zFCP** 就像"天庭的专用快递通道"——
+
+> IBM 大型机（s390x）的 I/O 像专用物流通道，和普通的驿道（PCI）完全不同。CCW（Channel Command Word）就像快递包裹的标签，标注了命令类型（读/写/感知）、数据地址、长度。多个 CCW 组成一个通道程序，就像一套物流指令。zFCP 则是在光纤通道（Fibre Channel）上跑 SCSI 协议——就像用专用光纤快递公司来送 SCSI 命令。好处是：专用通道，不堵车，适合大型机那种高吞吐量的场景。
+
+---
+
+## 7. 关联文章
+
+- **PCI**（article 116）：普通服务器的 I/O 总线
+- **SCSI**（相关）：zFCP 是 SCSI 在大型机上的实现
