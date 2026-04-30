@@ -1,62 +1,79 @@
-# Linux Kernel PCI (深入) / MSI / BAR 深度源码分析
+# PCI — 外设组件互连深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`drivers/pci/` + `arch/x86/kernel/apic/apic.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. PCI 配置空间
-
-每个 PCI 设备有 256 字节配置空间，前 16 字节是**设备 ID**：
-
-```
-偏移 0x00: Vendor ID（厂商 ID）
-偏移 0x02: Device ID（设备 ID）
-偏移 0x04: Command（命令寄存器）
-偏移 0x06: Status（状态寄存器）
-偏移 0x08: Revision ID
-偏移 0x09: Class Code（类码，如 0x010802 = NVMe SSD）
-偏移 0x0C: Header Type（0 = 普通设备，1 = PCI-to-PCI 桥）
-```
+> 基于 Linux 7.0-rc1 主线源码（`drivers/pci/`）
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. BAR (Base Address Register)
+## 0. 概述
+
+**PCI/PCIe** 是连接外设的系统总线标准，PCIe 是其高速版本（串行、点对点）。
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 pci_dev — PCI 设备
 
 ```c
-// BAR 告诉操作系统设备需要多少 MMIO 地址空间
-// BAR[0]: 通常映射到 PCIe BAR 0（内存映射 I/O）
-// BAR[1]: 通常映射到 PCIe BAR 1
-// BAR[2]: 可能映射到 ROM
+// include/linux/pci.h — pci_dev
+struct pci_dev {
+    struct device           dev;           // 基类
+    struct pci_bus          *bus;          // 所属总线
+    struct pci_slot         *slot;         // 物理槽
 
-// 用户空间查看：
-// lspci -v → Memory at fbd00000 (32-bit, non-prefetchable) [size=1M]
+    // 地址
+    unsigned int           devfn;          // device（0-31） + function（0-7）
+    u16                     vendor;         // 厂商 ID
+    u16                     device;         // 设备 ID
+    u16                     subsystem_vendor; // 子系统厂商
+    u16                     subsystem_device; // 子系统设备
 
-// 操作系统分配：
-// pci_enable_device() → 检查 BAR → ioremap() 映射到虚拟地址
-// 驱动访问：readl(bar0_va + 0x04) → 读寄存器
+    // BAR（基址寄存器）
+    struct resource         resource[6];   // BAR0-BAR5
+    unsigned long           *irq;           // 中断线
+
+    // 状态
+    unsigned int            error_state;    // PCI_ERROR_* 状态
+};
 ```
 
----
-
-## 2. MSI (Message Signaled Interrupt)
-
-**MSI** 替代传统边沿中断，通过**写内存地址**触发中断，避免共享 INTA 线：
+### 1.2 pci_driver — PCI 驱动
 
 ```c
-// MSI Capability 结构：
-//   Message Address: 目标地址（通常是 LAPIC 地址）
-//   Message Data: 中断向量 + 触发模式
-
-// MSI-X: 支持更多向量（2048 个），比 MSI（32 个）更灵活
+// include/linux/pci.h — pci_driver
+struct pci_driver {
+    const char              *name;          // 驱动名
+    const struct pci_device_id *id_table;   // 支持的设备 ID 表
+    int                     (*probe)(struct pci_dev *dev, const struct pci_device_id *id);
+    void                    (*remove)(struct pci_dev *dev);
+    int                     (*suspend)(struct pci_dev *dev);
+    int                     (*resume)(struct pci_dev *dev);
+};
 ```
 
 ---
 
-## 3. 参考
+## 2. BAR 空间映射
 
-| 文件 | 内容 |
-|------|------|
-| `drivers/pci/pci.c` | `pci_enable_device`、`pci_read_config`、`pci_write_config` |
-| `drivers/pci/msi.c` | MSI/MSI-X 中断 |
-| `drivers/pci/host/msi.c` | 特定平台的 MSI |
+```c
+// drivers/pci/setup_bus.c — pci_remap_bridge_window
+static int pci_remap_bridge_window(struct pci_dev *dev, int bar)
+{
+    // 读取 BAR
+    resource_size_t base = pci_resource_start(dev, bar);
+    resource_size_t size = pci_resource_len(dev, bar);
+
+    // 映射到 CPU 地址空间
+    void __iomem *addr = ioremap(base, size);
+}
+```
+
+---
+
+## 3. 完整文件索引
+
+| 文件 | 函数/结构 |
+|------|----------|
+| `include/linux/pci.h` | `pci_dev`、`pci_driver` |
+| `drivers/pci/setup_bus.c` | `pci_remap_bridge_window` |
