@@ -7,59 +7,140 @@
 
 ## 0. 概述
 
-**UIO** 允许用户空间驱动访问硬件中断和内存，无需编写内核驱动。
+**UIO**（Userspace I/O）允许编写内核驱动的最小部分（中断处理），而将设备访问逻辑放在用户空间。
 
 ---
 
 ## 1. 核心数据结构
 
-```c
-// drivers/uio/uio.c — uio_device
-struct uio_device {
-    struct device           *dev;         // 设备
-    int                     minor;         // 次设备号
-    struct class            *class;        // 类
-    struct uio_info        *info;         // UIO 信息
-};
+### 1.1 uio_port — 端口
 
-// drivers/uio/uio.c — uio_info
-struct uio_info {
-    const char              *name;         // 设备名
-    struct uio_mem          mem[4];       // 映射的内存区域
-    struct uio_port         port[4];      // 端口区域
-    irqreturn_t (*handler)(int irq, struct uio_info *dev);
-    long                    *irq;           // IRQ 编号
-    unsigned long           irq_flags;   // 触发方式
-    const char              *version;     // 版本
-    struct device           *parent;      // 父设备
+```c
+// drivers/uio/uio.c — uio_port
+struct uio_port {
+    const char             *name;          // 端口名
+    unsigned long           start;         // 起始地址
+    int                     size;          // 大小
+    void __iomem           *map;           // 映射的 I/O 内存
+};
+```
+
+### 1.2 uio_mem — 内存区域
+
+```c
+// drivers/uio/uio.c — uio_mem
+struct uio_mem {
+    const char             *name;          // 区域名
+    unsigned long           addr;         // 用户可见的地址
+    unsigned long           size;         // 大小
+    void __iomem           *internal_addr; // 内核内部地址
+    int                     memtype;      // 类型（UIO_MEM_*
+    struct page             **pages;      // 页数组
 };
 ```
 
 ---
 
-## 2. 用户空间 API
+## 2. uio_device — UIO 设备
 
 ```c
-// 1. 打开 UIO 设备
+// drivers/uio/uio.c — uio_device
+struct uio_device {
+    struct device           dev;           // 设备
+    int                     minor;         // 次设备号
+    struct cdev             cdev;          // 字符设备
+
+    // 内存区域
+    int                     memtype;        // 类型
+    int                     num_ports;     // 端口数
+    struct uio_mem          *ports;         // 端口数组
+
+    // 中断
+    wait_queue_head_t       wait;          // 中断等待队列
+    int                     event;         // 中断事件计数
+
+    // 文件
+    struct fasync_struct   *async_queue;   // 异步通知
+};
+```
+
+---
+
+## 3. 中断处理
+
+### 3.1 uio_interrupt — 中断处理
+
+```c
+// drivers/uio/uio.c — uio_interrupt
+static irqreturn_t uio_interrupt(int irq, void *dev_id)
+{
+    struct uio_device *idev = dev_id;
+
+    // 1. 检查是否是有效中断
+    irqreturn_t ret = IRQ_NONE;
+
+    // 2. 获取用户空间的处理函数
+    //    用户程序通过 mmap 访问设备内存
+    //    用户程序 read() 阻塞，直到中断发生
+
+    // 3. 唤醒用户空间
+    ret = IRQ_HANDLED;
+    wake_up(&idev->wait);
+
+    return ret;
+}
+```
+
+### 3.2 用户空间使用
+
+```c
+// 用户空间驱动示例：
 int fd = open("/dev/uio0", O_RDWR);
 
-// 2. 获取 IRQ 信息
-read(fd, &irq_count, sizeof(irq_count));
+// 读取中断（阻塞直到中断）
+read(fd, &intr_count, sizeof(intr_count));
 
-// 3. 映射内存
-mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+// 访问设备内存
+void *mapped = mmap(0, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+volatile uint32_t *regs = mapped;
 
-// 4. 等待并处理中断
-while (1) {
-    read(fd, &event, sizeof(event));  // 阻塞直到中断
-    // 处理中断
+// 读取寄存器
+uint32_t status = regs[0];
+
+// 清除中断
+regs[1] = 0x01;
+```
+
+---
+
+## 4. mmap — 内存映射
+
+```c
+// drivers/uio/uio.c — uio_mmap
+static int uio_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    struct uio_device *idev = filp->private_data;
+    struct uio_mem *mem;
+    int mi = vma->vm_pgoff;
+
+    // 查找对应的内存区域
+    mem = &idev->ports[mi];
+
+    // 映射到用户空间
+    vma->vm_ops = &uio_vm_ops;
+    vma->vm_flags |= VM_IO;
+
+    return remap_pfn_range(vma, vma->vm_start,
+                           mem->addr >> PAGE_SHIFT,
+                           vma->vm_end - vma->vm_start,
+                           vma->vm_page_prot);
 }
 ```
 
 ---
 
-## 3. 完整文件索引
+## 5. 完整文件索引
 
 | 文件 | 函数/结构 |
 |------|----------|
-| `drivers/uio/uio.c` | `uio_device`、`uio_info` |
+| `drivers/uio/uio.c` | `struct uio_device`、`uio_interrupt`、`uio_mmap` |
