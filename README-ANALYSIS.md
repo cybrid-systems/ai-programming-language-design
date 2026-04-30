@@ -44,6 +44,7 @@
 | `14-wait-event-analysis.md` | `wait_event` 可睡眠条件等待 | `___wait_event` 宏 / `prepare_to_wait` / `WQ_FLAG_EXCLUSIVE` / `wake_up` |
 | `15-workqueue-analysis.md` | `workqueue` 异步工作队列 | `work_struct` / `worker_pool` / `delayed_work` / `WQ_UNBOUND` |
 | `16-kthread-analysis.md` | `kthread` 内核持久线程 | `kthread_run` / `kthread_should_stop` / `kthreadd_task` / park/unpark |
+| `17-get-user-pages-analysis.md` | `get_user_pages` 用户页获取 | `follow_page_mask` / `faultin_page` / `FOLL_PIN` / `gup_fast_fallback` |
 
 ---
 
@@ -220,4 +221,20 @@ kthread_should_stop(): test_bit(KTHREAD_SHOULD_STOP)
 kthread_stop(k): set_bit + wake_up + wait_for_completion(&exited)
 kthread_park/unpark: KTHREAD_SHOULD_PARK + completion 同步
 kthreadd_task (PID=2): 所有 kthread 的祖先
+```
+
+### get_user_pages
+```c
+get_user_pages(start, nr_pages, gup_flags, pages)
+  → __get_user_pages_locked(current->mm, ...)
+    → __get_user_pages(mm, start, nr_pages, gup_flags, pages, locked)
+      → do { follow_page_mask(vma, addr) → hit? → get_page/pin
+                        miss? → faultin_page() → handle_mm_fault()
+                        retry } while(nr_pages--)
+
+follow_page_mask: pgd→pud→pmd→pte 页表遍历，O(1) per page
+faultin_page: handle_mm_fault() → do_fault / do_anonymous_page
+FOLL_GET: put_page() 释放
+FOLL_PIN: unpin_user_page() 释放（DMA/RDMA 用）
+gup_fast_fallback: 架构特定快速页表遍历，不触发 fault
 ```
