@@ -1,455 +1,478 @@
-# list_head — 内核双向循环链表深度源码分析
+# 01-list_head — 双向链表深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`include/linux/list.h` + `include/linux/list_nulls.h`）
+> 基于 Linux 7.0-rc1 主线源码（`include/linux/list.h` + `include/linux/rculist.h`）
 > 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
-> 行号索引：list.h 全文 1218 行
+> 关键词：双向链表、container_of、RCU、LIST_POISON、西游记
 
 ---
 
 ## 0. 概述
 
-`list_head` 是 Linux 内核最核心的数据结构，**几乎所有内核子系统都依赖它**（调度器、文件系统、网络、设备驱动、内存管理等）。它的设计哲学：
-
-- **侵入式**：链表的 `list_head` 直接嵌入到数据结构内部，而非外部包装
-- **双向循环**：`prev` 和 `next` 形成双向环，不存在 NULL 尾
-- **O(1) 插入删除**：给定节点，不需要遍历即可操作
-- **类型安全**：通过 `container_of` 在编译期完成类型推导
+**list_head** 是 Linux 内核最核心的数据结构之一，采用**双向循环链表**设计，所有节点结构都要内嵌 `struct list_head`。其精妙之处在于 `container_of` 宏——通过链表节点逆向找到父结构体。
 
 ---
 
-## 1. 数据结构定义
+## 1. 核心数据结构
 
-### 1.1 list_head — 双向循环链表节点
+### 1.1 struct list_head — 链表节点
 
 ```c
-// include/linux/list.h — 核心结构
+// include/linux/list.h:35 — 链表节点定义
 struct list_head {
-    struct list_head *next;  // 指向下一个节点
-    struct list_head *prev; // 指向上一个节点
+    struct list_head  *next;   // 指向下一个节点
+    struct list_head  *prev;   // 指向上一个节点
 };
 ```
 
-**设计要点**：
-- 两个指针组成双向链表，`prev` 和 `next` 初始化时指向自身（空链表）
-- **无数据域**：纯粹的链表结构，数据存在包含 `list_head` 的外层结构中
-- **侵入式**：外层结构内部嵌入 `list_head`，而非外围包装
-
-### 1.2 container_of — 从成员找到容器
+**两种初始化方式：**
 
 ```c
-// include/linux/container_of.h
-#define container_of(ptr, type, member) ({                      \
-    void *__mptr = (void *)(ptr);                               \
-    static_assert(__same_type(*(ptr), ((type *)0)->member) ||   \
-                  __same_type(*(ptr), void),                    \
-                  "pointer type mismatch in container_of()");     \
-    ((type *)(__mptr - offsetof(type, member))); })
-```
+// 方式一：静态初始化（编译时）
+struct list_head my_list = LIST_HEAD_INIT(my_list);
+// 展开为：
+//   struct list_head my_list = { &my_list, &my_list }; // 指向自己 = 空链表
 
-**机制**（以 `struct task_struct` 为例）：
-```
-假设：
-  struct task_struct {
-      struct list_head tasks;  // offset = 0x100
-      char name[32];          // 其他字段...
-  };
-
-  ptr = &some_task->tasks (地址 = 0x1000)
-
-计算：
-  container_of(ptr, struct task_struct, tasks)
-  = (struct task_struct *)(0x1000 - 0x100)
-  = 0xF00  ← 回到 task_struct 起始地址
-```
-
-### 1.3 list_entry — container_of 的别名
-
-```c
-// include/linux/list.h
-#define list_entry(ptr, type, member) \
-    container_of(ptr, type, member)
-```
-
----
-
-## 2. 初始化
-
-### 2.1 LIST_HEAD — 声明并初始化空链表
-
-```c
-// include/linux/list.h
-#define LIST_HEAD_INIT(name) { &(name), &(name) }
-
-#define LIST_HEAD(name) \
-    struct list_head name = LIST_HEAD_INIT(name)
-```
-
-**效果**：
-```c
+// 方式二：宏初始化
 LIST_HEAD(my_list);
-// 等价于：
-struct list_head my_list = { &my_list, &my_list };
-// prev = &my_list, next = &my_list（自环）
+// 效果同上，但更简洁
 ```
 
-### 2.2 INIT_LIST_HEAD — 运行时初始化
+**内存布局：**
+
+```
+struct list_head 节点：
+  [prev指针 | next指针]
+    8字节(64位) | 8字节(64位)
+    = 16字节
+
+注意：prev 和 next 指向类型是 struct list_head*，不是具体结构！
+```
+
+### 1.2 链表类型分类
 
 ```c
-// include/linux/list.h
-static inline void INIT_LIST_HEAD(struct list_head *list)
-{
-    WRITE_ONCE(list->next, list);
-    WRITE_ONCE(list->prev, list);
-}
-```
+// list_head 作为"哨兵"（头节点），不携带数据
+struct list_head {
+    struct list_head *next;  // 指向第一个真实数据节点
+    struct list_head *prev;  // 指向最后一个真实数据节点（形成循环）
+};
 
-**为什么用 `WRITE_ONCE`？**
-- 防止编译器将写操作与后续读操作重排序
-- 配合 `list_empty()` 的 `READ_ONCE`，形成**发布-订阅**内存屏障语义
-- 在启用 `CONFIG_LIST_HARDENED` 时额外保护
+// 使用时，将 list_head 作为成员嵌入到真实数据结构中：
+struct task_struct {
+    struct list_head  tasks;   // 所有进程串成链表
+    struct list_head  children; // 子进程链表
+    struct list_head  sibling;  // 加入兄弟链表
+    // ...
+};
+```
 
 ---
 
-## 3. 插入操作
+## 2. 核心操作函数
 
-### 3.1 __list_add — 内部插入
+### 2.1 list_add — 头部插入
 
 ```c
-// include/linux/list.h:151-162
+// include/linux/list.h:32
 static inline void __list_add(struct list_head *new,
-              struct list_head *prev,
-              struct list_head *next)
+                              struct list_head *prev,
+                              struct list_head *next)
 {
     if (!__list_add_valid(new, prev, next))
         return;
 
-    next->prev = new;          // [1] next 的 prev 指向 new
-    new->next = next;          // [2] new 的 next 指向 next
-    new->prev = prev;          // [3] new 的 prev 指向 prev
-    WRITE_ONCE(prev->next, new); // [4] prev 的 next 指向 new（写屏障）
+    next->prev = new;
+    new->next = next;
+    new->prev = prev;
+    WRITE_ONCE(prev->next, new);
 }
 ```
 
-**图示**：
-```
-插入前：  prev ←→ next
-           ↑
-         new
+**图解 list_add(new, head, head->next)：**
 
-插入后：  prev ←→ new ←→ next
+```
+插入前（空链表示意）：
+  head ──→ [A] ──→ [B] ──→ head
+  ↑_____________________________↓（循环）
+
+插入 new 到 head 后面：
+  head ──→ [new] ──→ [A] ──→ [B] ──→ head
+          ↑_____________________________↓
 ```
 
-### 3.2 list_add — 头部插入（栈）
+### 2.2 list_add_tail — 尾部插入
 
 ```c
-// include/linux/list.h:170-178
-// 在 head 之后插入，等价于栈的 push
-static inline void list_add(struct list_head *new, struct list_head *head)
-{
-    __list_add(new, head, head->next);
-}
-```
-
-**效果**：最新元素在链表头部
-
-### 3.3 list_add_tail — 尾部插入（队列）
-
-```c
-// include/linux/list.h:191-199
-// 在 head->prev 之前插入，等价于队列的 enqueue
+// include/linux/list.h:43
 static inline void list_add_tail(struct list_head *new, struct list_head *head)
 {
     __list_add(new, head->prev, head);
 }
+// 等价于：插入到 head->prev 之后（即 head 之前）
+// 循环链表尾插 = 插入到 head 前面
 ```
 
-**效果**：最新元素在链表尾部
-
----
-
-## 4. 删除操作
-
-### 4.1 __list_del — 内部删除
+### 2.3 list_del — 删除节点
 
 ```c
-// include/linux/list.h:207-213
+// include/linux/list.h:207
 static inline void __list_del(struct list_head *prev, struct list_head *next)
 {
-    next->prev = prev;            // prev 的 next 跳过自己
-    WRITE_ONCE(prev->next, next); // next 的 prev 也跳过自己
+    next->prev = prev;
+    WRITE_ONCE(prev->next, next);
 }
-```
 
-**图示**：
-```
-删除前：  prev ←→ entry ←→ next
-删除后：  prev ←→ next（entry 被隔离）
-```
-
-### 4.2 list_del — 删除并置毒
-
-```c
-// include/linux/list.h:228-233
+// 对外接口：list_del
 static inline void list_del(struct list_head *entry)
 {
-    __list_del_entry(entry);
-    entry->next = LIST_POISON1;   // 0x100 + sizeof(struct list_head)
-    entry->prev = LIST_POISON2;   // 0x200 + sizeof(struct list_head)
+    __list_del(entry->prev, entry->next);
+    entry->next = LIST_POISON1;  // 0x00100100
+    entry->prev = LIST_POISON2;  // 0x00200200
 }
+
+// LIST_POISON1 和 LIST_POISON2 是故意设为无效指针地址
+// 如果错误访问已删除节点，立即触发 page fault（调试用）
 ```
 
-**毒值的作用**：
-- 如果错误访问已删除的节点，立刻触发段错误（而非静默崩溃）
-- `LIST_POISON1 = ((void *)0x100 + sizeof(struct list_head))`
-- `LIST_POISON2 = ((void *)0x200 + sizeof(struct list_head))`
-
-### 4.3 list_del_init — 删除并重新初始化
+### 2.4 list_replace — 替换节点
 
 ```c
-// include/linux/list.h:264-267
-static inline void list_del_init(struct list_head *entry)
+// include/linux/list.h:226
+static inline void list_replace(struct list_head *old,
+                               struct list_head *new)
 {
-    __list_del_entry(entry);
-    INIT_LIST_HEAD(entry);  // 让 entry 成为一个新链表的表头
+    new->next = old->next;
+    new->next->prev = new;
+    new->prev = old->prev;
+    new->prev->next = new;
 }
 ```
 
----
-
-## 5. 遍历操作
-
-### 5.1 list_for_each — 正向遍历
+### 2.5 list_move / list_move_tail
 
 ```c
-// include/linux/list.h:451-457
-#define list_for_each(pos, head) \
-    for (pos = (head)->next; pos != (head); pos = pos->next)
-```
-
-**注意**：遍历过程中**不能 `list_del(pos)`**，会导致未定义行为
-
-### 5.2 list_for_each_safe — 安全遍历（可删除）
-
-```c
-// include/linux/list.h:469-475
-#define list_for_each_safe(pos, n, head) \
-    struct list_head *n; \
-    for (pos = (head)->next, n = pos->next; pos != (head); \
-         pos = n, n = pos->next)
-```
-
-**用法**：
-```c
-struct list_head *pos, *n;
-list_for_each_safe(pos, n, &my_list) {
-    list_del(pos);           // 安全删除
-    kfree(list_entry(pos, struct my_struct, member));
-}
-```
-
-### 5.3 list_for_each_entry — 遍历外层结构
-
-```c
-// include/linux/list.h:557-563
-#define list_for_each_entry(pos, head, member)               \
-    for (pos = list_entry((head)->next, typeof(*pos), member); \
-         &pos->member != (head);                             \
-         pos = list_entry(pos->member.next, typeof(*pos), member))
-```
-
-**完整示例**：
-```c
-struct task_struct {
-    struct list_head tasks;  // 嵌入到 task_struct
-    char name[32];
-};
-
-LIST_HEAD(task_list);
-
-struct task_struct *task;
-list_for_each_entry(task, &task_list, tasks) {
-    printk("%s\n", task->name);
-}
-```
-
----
-
-## 6. 移动和拼接
-
-### 6.1 list_move — 从一个链表移到另一个链表的头部
-
-```c
-// include/linux/list.h:301-306
+// include/linux/list.h:263
 static inline void list_move(struct list_head *list, struct list_head *head)
 {
-    __list_del_entry(list);
+    __list_del(list->prev, list->next);
     list_add(list, head);
 }
-```
 
-### 6.2 list_move_tail — 从一个链表移到另一个链表的尾部
-
-```c
-// include/linux/list.h:320-325
-static inline void list_move_tail(struct list_head *list, struct list_head *head)
+static inline void list_move_tail(struct list_head *list,
+                                  struct list_head *head)
 {
-    __list_del_entry(list);
+    __list_del(list->prev, list->next);
     list_add_tail(list, head);
 }
 ```
 
-### 6.3 list_splice — 合并两个链表
+### 2.6 list_is_first / list_is_last
 
 ```c
-// include/linux/list.h:530-533
-static inline void list_splice(struct list_head *list, struct list_head *head)
+// include/linux/list.h:289
+static inline int list_is_first(const struct list_head *list,
+                                const struct list_head *head)
 {
-    if (!list_empty(list))
-        list_splice_tail_init(list, head);
+    return list->prev == head;
+}
+
+static inline int list_is_last(const struct list_head *list,
+                                const struct list_head *head)
+{
+    return list->next == head;
+}
+```
+
+### 2.7 list_empty — 链表判空
+
+```c
+// include/linux/list.h:284
+static inline int list_empty(const struct list_head *head)
+{
+    return READ_ONCE(head->next) == head;
+}
+// 注意：使用 READ_ONCE 是为了防止 CPU 乱序执行导致的误判
+```
+
+### 2.8 list_rotate_left — 旋转链表
+
+```c
+// include/linux/list.h:271
+static inline void list_rotate_left(struct list_head *head)
+{
+    struct list_head *first;
+
+    if (!list_empty(head)) {
+        first = head->next;
+        __list_del(first->prev, first->next);
+        list_add_tail(first, head);
+    }
 }
 ```
 
 ---
 
-## 7. hlist — 单向链表变体（哈希表桶头）
+## 3. 遍历宏
 
-### 7.1 为什么要 hlist？
-
-`list_head` 的问题：**每个桶头都占用两个指针**（16 字节 on 64-bit）。如果系统中有一万个 `list_head` 桶头，就是 160KB 开销。
-
-**hlist** 用单向链表 + 哑节点实现桶头，只需要**一个指针**（8 字节 on 64-bit）：
+### 3.1 list_for_each — 正向遍历
 
 ```c
-// include/linux/list_nulls.h
-struct hlist_nulls_head {
-    struct hlist_nulls_node *first;  // 一个指针
-};
+// include/linux/list.h:311
+#define list_for_each(pos, head) \
+    for (pos = (head)->next; pos != (head); pos = pos->next)
+// 语义：for (pos = head->next; pos != head; pos = pos->next)
 
-struct hlist_nulls_node {
-    struct hlist_nulls_node *next, **pprev;  // next + pprev（双指针）
-};
+// 缺陷：pos 是 struct list_head*，不是具体数据
+//       每次迭代需要用 container_of 转换
 ```
 
-### 7.2 nulls marker — 替代 NULL
-
-hlist 用 **nulls marker** 替代 NULL 标识链表结尾：
+### 3.2 list_for_each_entry — 直接遍历数据节点
 
 ```c
-#define NULLS_MARKER(value) (1UL | (((long)value) << 1))
-// 最低位 = 1 表示 nulls 标记
-// 高位存具体值（用于调试/统计）
-```
+// include/linux/list.h:328
+#define list_for_each_entry(pos, head, member) \
+    for (pos = list_entry((head)->next, typeof(*pos), member); \
+         &pos->member != (head); \
+         pos = list_entry(pos->member.next, typeof(*pos), member))
 
-### 7.3 hlist 遍历
-
-```c
-#define hlist_for_each(pos, head) \
-    for (pos = (head)->first; \
-         (!is_a_nulls(pos) && pos); \
-         pos = pos->next)
-```
-
----
-
-## 8. 内存序与并发安全
-
-### 8.1 为什么需要内存屏障？
-
-```c
-// list_del 的等价操作
-next->prev = prev;          // [A] 写
-WRITE_ONCE(prev->next, next); // [B] 写（带屏障）
-
-// 如果 CPU B 在 [A] 之前读取了 next，
-// 可能看到过期数据（prev 的旧值）
-```
-
-`WRITE_ONCE` + `READ_ONCE` 组合：
-- 防止编译器重排序
-- 在 DEC Alpha 等弱序 CPU 上，防止 CPU 重排序
-- 确保 **发布-订阅** 语义：写端 publish 后，读端一定能看到
-
-### 8.2 list_empty_careful — 并发安全的空判断
-
-```c
-// include/linux/list.h:393-396
-static inline int list_empty_careful(const struct list_head *head)
-{
-    struct list_head *next = smp_load_acquire(&head->next);
-    return list_is_head(next, head) && (next == READ_ONCE(head->prev));
+// 示例：遍历所有进程
+struct task_struct *task;
+list_for_each_entry(task, &init_task.tasks, tasks) {
+    printk("%s\n", task->comm);
 }
+// 自动将 list_head* 转换为 task_struct*
 ```
 
-`smp_load_acquire`：确保 `next` 读取之前，所有之前的写操作都对读者可见。
+### 3.3 list_for_each_entry_reverse — 反向遍历
+
+```c
+// include/linux/list.h:346
+#define list_for_each_entry_reverse(pos, head, member) \
+    for (pos = list_entry((head)->prev, typeof(*pos), member); \
+         &pos->member != (head); \
+         pos = list_entry(pos->member.prev, typeof(*pos), member))
+```
+
+### 3.4 list_for_each_safe — 安全遍历（删除时用）
+
+```c
+// include/linux/list.h:317
+#define list_for_each_safe(pos, n, head) \
+    for (pos = (head)->next, n = pos->next; pos != (head); \
+         pos = n, n = pos->next)
+// n 是下一个节点的备份，允许安全删除当前 pos
+```
+
+### 3.5 list_for_each_entry_safe — 安全遍历数据节点
+
+```c
+// include/linux/list.h:372
+#define list_for_each_entry_safe(pos, n, head, member) \
+    for (pos = list_entry((head)->next, typeof(*pos), member), \
+         n = list_entry(pos->member.next, typeof(*pos), member); \
+         &pos->member != (head); \
+         pos = n, n = list_entry(n->member.next, typeof(*pos), member))
+```
 
 ---
 
-## 9. 实际内核使用案例
+## 4. container_of — 链表节点到父结构体的转换
 
-### 9.1 进程调度器中的使用
+### 4.1 原理
 
 ```c
-// include/linux/sched.h — task_struct
+// include/linux/container_of.h:14
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(void *)(ptr) - offsetof(type, member)))
+
+// offsetof：计算 member 在 type 中的偏移量
+// ptr - offset = 父结构体的起始地址
+```
+
+### 4.2 list_entry — container_of 的别名
+
+```c
+// include/linux/list.h:23
+#define list_entry(ptr, type, member) \
+    container_of(ptr, type, member)
+// list_entry = container_of，功能完全相同
+```
+
+### 4.3 图解
+
+```
 struct task_struct {
-    struct list_head    tasks;     // 全局调度链表
-    struct list_head    run_list;  // 运行队列链表
-    struct list_head    children;  // 子进程链表
-    struct list_head    sibling;   // 兄弟进程链表
+    char name[20];     // offset 0
+    int  pid;         // offset 20
+    struct list_head tasks; // offset 24 (假设)
 };
-```
 
-### 9.2 设备驱动中的使用
+假设 &task->tasks = 0x1000a8
+offsetof(task_struct, tasks) = 24
+则 task 的起始地址 = 0x1000a8 - 24 = 0x100090
 
-```c
-// include/linux/device.h — struct device
-struct device {
-    struct list_head    node;         // 设备链表
-    struct list_head    children;     // 子设备链表
-    struct device       *parent;      // 父设备
-};
-```
-
-### 9.3 workqueue 中的使用
-
-```c
-// include/linux/workqueue.h — struct work_struct
-struct work_struct {
-    atomic_long_t        data;
-    struct list_head    entry;   // 接入 workqueue 链表
-    work_func_t         func;    // 回调函数
-};
+验证：
+task->tasks.next 访问的地址 = 0x100090 + 24 = 0x1000a8 ✓
 ```
 
 ---
 
-## 10. 设计决策总结
+## 5. RCU 遍历（读写分离）
 
-| 决策 | 原因 |
-|------|------|
-| 侵入式（嵌入而非包装）| 外层结构直接包含链表节点，内存局部性更好 |
-| 双向循环（无 NULL 尾）| 消除边界检查，代码更简洁高效 |
-| container_of 而非 offsetof | 编译期类型检查，更安全 |
-| WRITE_ONCE/READ_ONCE | 支持弱序 CPU（Alpha）和并发场景 |
-| LIST_POISON | use-after-free 立即崩溃而非静默错误 |
-| hlist 单指针桶头 | 减少哈希表桶头的内存开销（16→8 字节）|
+### 5.1 list_for_each_entry_rcu
+
+```c
+// include/linux/rculist.h:38
+#define list_for_each_entry_rcu(pos, head, member...) \
+    for (pos = list_entry(rcu_dereference_raw((head)->next), \
+                typeof(*pos), member); \
+         list_entry_is_head(pos, head, member) || \
+         ({ rcu_lock_trace(pos, head); 0; }); \
+         pos = list_entry(rcu_dereference_raw(pos->member.next), \
+                  typeof(*pos), member))
+```
+
+### 5.2 list_splice_rcu — RCU 安全拼接
+
+```c
+// include/linux/rculist.h:179
+static inline void list_splice_rcu(struct list_head *list,
+                                   struct list_head *head,
+                                   bool (*cond)(const struct list_head *))
+{
+    if (cond && !cond(list))
+        return;
+
+    if (!list_empty(list)) {
+        struct list_head *first = list->next;
+        struct list_head *last = list->prev;
+        struct list_head *at = head->next;
+
+        first->prev = head;
+        WRITE_ONCE(head->next, first);
+        last->next = at;
+        at->prev = last;
+    }
+}
+```
 
 ---
 
-## 11. 完整文件索引
+## 6. Linux 内核使用案例
 
-| 文件路径 | 关键行号 | 内容 |
-|---------|---------|------|
-| `include/linux/list.h` | 28-35 | `LIST_HEAD_INIT` / `LIST_HEAD` 定义 |
-| `include/linux/list.h` | 38-42 | `INIT_LIST_HEAD` 实现 |
-| `include/linux/list.h` | 151-162 | `__list_add` 内部插入 |
-| `include/linux/list.h` | 165-177 | `list_add` 栈插入 |
-| `include/linux/list.h` | 180-198 | `list_add_tail` 队列插入 |
-| `include/linux/list.h` | 207-213 | `__list_del` 内部删除 |
-| `include/linux/list.h` | 228-233 | `list_del` 含毒值删除 |
-| `include/linux/list.h` | 264-267 | `list_del_init` |
-| `include/linux/list.h` | 301-306 | `list_move` |
-| `include/linux/list.h` | 451-457 | `list_for_each` |
-| `include/linux/list.h` | 469-475 | `list_for_each_safe` |
-| `include/linux/list.h` | 557-563 | `list_for_each_entry` |
-| `include/linux/container_of.h` | 18-27 | `container_of` 定义 |
-| `include/linux/list_nulls.h` | 全文 | `hlist_nulls` 单向链表变体 |
+### 6.1 进程链表
+
+```c
+// kernel/fork.c — copy_process
+// 每个进程的 task_struct.tasks 将所有进程串成链表
+
+struct task_struct *task;
+list_for_each_entry(task, &init_task.tasks, tasks) {
+    // 遍历系统中的所有进程
+}
+
+// 链表头 init_task 是 swapper 进程（PID 0）
+// init_task.tasks 是系统进程链表的入口
+```
+
+### 6.2 VFS inode链表
+
+```c
+// include/linux/fs.h — inode
+struct inode {
+    struct list_head  i_list;    // inode 链表（inod_hashtable）
+    struct list_head  i_sb_list; // 超级块链表
+    struct hlist_node i_hash;   // hash 链表节点
+    // ...
+};
+// 磁盘缓存中的 inode 通过 i_list 链接
+```
+
+### 6.3 模块链表
+
+```c
+// kernel/module/main.c — module
+struct module {
+    enum module_state state;     // MODULE_STATE_LIVE / MODULE_STATE_COMING / GOING
+    struct list_head  list;     // 所有模块的链表
+    char              name[MODULE_NAME_LEN];
+    // ...
+};
+
+// 全局模块链表：
+static LIST_HEAD(modules);
+// 通过 list_for_each_entry(mod, &modules, list) 遍历所有模块
+```
+
+---
+
+## 7. 设计决策总结
+
+| 设计决策 | 原因 |
+|---------|------|
+| 双向循环链表 | O(1) 插入/删除，头尾操作等价 |
+| 循环结构 | 无需特殊处理空链表 |
+| list_head 嵌入数据内 | 通用链表节点，可挂任意结构 |
+| container_of | 无需维护独立节点结构，节省内存 |
+| LIST_POISON | 删除后访问触发 page fault，快速发现 bug |
+| WRITE_ONCE/READ_ONCE | 防止 CPU 乱序执行导致的数据竞争 |
+| RCU 变体 | 读写可以真正并行（读不加锁） |
+
+---
+
+## 8. 内存布局图
+
+```
+循环链表完整结构：
+
+  head（哨兵节点）
+    │
+    ├──prev─┐
+    │       │
+    │      [A] ──prev──→ [A]的prev ──→ ... ──→ [Z]的prev
+    │       │                                     │
+    │       ↓                                     ↓
+    │      [A] ←─next── [A]的next ──→ ... ──→ [Z] ──next──┘
+    │                                                   │
+    └───────────────────────────────────────────────────┘
+    
+注意：prev 指向链表中前一个节点的 next 指针的地址（不是节点本身）
+     next 指向链表中后一个节点的 prev 指针的地址（不是节点本身）
+```
+
+---
+
+## 9. 完整文件索引
+
+| 文件 | 行号 | 内容 |
+|------|------|------|
+| `include/linux/list.h` | 35 | `struct list_head` 定义 |
+| `include/linux/list.h` | 32 | `__list_add` |
+| `include/linux/list.h` | 43 | `list_add_tail` |
+| `include/linux/list.h` | 207 | `__list_del` |
+| `include/linux/list.h` | 213 | `list_del` |
+| `include/linux/list.h` | 226 | `list_replace` |
+| `include/linux/list.h` | 263 | `list_move` |
+| `include/linux/list.h` | 284 | `list_empty` |
+| `include/linux/list.h` | 289 | `list_is_first/last` |
+| `include/linux/list.h` | 311 | `list_for_each` |
+| `include/linux/list.h` | 328 | `list_for_each_entry` |
+| `include/linux/container_of.h` | 14 | `container_of` |
+| `include/linux/rculist.h` | 38 | `list_for_each_entry_rcu` |
+| `include/linux/list.h` | 23 | `list_entry` |
+
+---
+
+## 10. 西游记类比
+
+**list_head** 就像"取经路上妖怪的报名簿"——
+
+> 唐僧（head 哨兵）走在最前面，八戒（节点 A）、悟空（节点 B）、沙僧（节点 C）依次跟在后面。八戒的"prev"指向唐僧，"next"指向悟空；悟空的"prev"指向八戒的 name 字段所在位置（container_of 魔法），"next"指向沙僧……最后沙僧的"next"又指向唐僧，形成一个循环。只要知道其中任何一个妖怪在报名簿上的位置（`struct list_head*`），就能反推出这个妖怪是谁（`container_of`）。这比每次点名时从队伍头开始数要快得多——O(1) 定位。
+
+---
+
+## 11. 关联文章
+
+- **hlist**（article 02）：适用于 hash table 的单向链表变体
+- **RCU**（article 26）：list_for_each_entry_rcu 的读写分离并发机制
+- **container_of**（本文）：所有链表逆向推导父结构的数学基础
