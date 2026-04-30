@@ -1,4 +1,4 @@
-# completion — 内核完成量深度源码分析
+# 11-completion — 一次性完成信号量深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码（`include/linux/completion.h` + `kernel/sched/completion.c`）
 > 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
@@ -7,62 +7,110 @@
 
 ## 0. 概述
 
-**completion** 是内核的**一次性同步机制**，用于一个线程等待另一个线程完成某个操作：
-- `wait_for_completion()`：阻塞等待
-- `complete()` / `complete_all()`：唤醒等待者
-- 与信号量的区别：**completion 默认阻塞，信号量默认非阻塞**
+**completion** 是 Linux 内核的"一次性同步原语"：一个线程等待另一个线程完成某个操作（一次性，不可重用）。典型场景：线程退出同步（kthread_stop）、设备驱动请求-完成。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 completion — 完成量
+### 1.1 struct completion — 完成结构
 
 ```c
-// include/linux/completion.h — struct completion
+// include/linux/completion.h:26 — completion
 struct completion {
-    unsigned int                    done;  // 完成计数
-    struct swait_queue_head        wait;  // 等待队列
+    unsigned int            done;      // 完成计数（0=未完成，>0=已完成）
+    wait_queue_head_t       wait;     // 等待队列
 };
-```
 
-**`done` 字段含义**：
-| 值 | 含义 |
-|----|------|
-| 0 | 未完成，初始化状态 |
-| 1 | 一次完成（`complete()`） |
-| >1 | 多次 `complete()` |
-| UINT_MAX | `complete_all()`，永久完成 |
+// 初始化宏：
+#define DECLARE_COMPLETION(name) \
+    struct completion name = { .done = 0, .wait = __WAIT_QUEUE_HEAD_INITIALIZER(name.wait) }
 
----
-
-## 2. 初始化
-
-### 2.1 DECLARE_COMPLETION — 静态声明
-
-```c
-// include/linux/completion.h
-#define DECLARE_COMPLETION(work) \
-    struct completion work = COMPLETION_INITIALIZER(work)
-
-#define COMPLETION_INITIALIZER(work) \
-    { 0, __SWAIT_QUEUE_HEAD_INITIALIZER((work).wait) }
-```
-
-### 2.2 init_completion — 运行时初始化
-
-```c
-// include/linux/completion.h
+// 动态初始化：
 static inline void init_completion(struct completion *x)
 {
-    x->done = 0;                       // 计数器归零
-    init_swait_queue_head(&x->wait);   // 初始化等待队列
+    x->done = 0;
+    init_waitqueue_head(&x->wait);
 }
 ```
 
 ---
 
-## 3. complete — 唤醒一个等待者
+## 2. wait_for_completion — 等待完成
+
+### 2.1 wait_for_completion
+
+```c
+// kernel/sched/completion.c — wait_for_completion
+void wait_for_completion(struct completion *x)
+{
+    // 快速路径：done > 0 时直接返回（自旋）
+    do {
+        if (x->done > 0)
+            return;
+        wait_for_common(x, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE);
+    } while (!x->done);
+}
+```
+
+### 2.2 wait_for_common — 通用等待
+
+```c
+// kernel/sched/completion.c — wait_for_common
+static long wait_for_common(struct completion *x, unsigned long timeout, int state)
+{
+    struct wait_queue_entry wait;
+
+    // 1. 快速路径：done > 0 直接返回
+    if (x->done > 0)
+        return timeout;
+
+    // 2. 加入等待队列
+    init_wait_entry(&wait, current);
+
+    for (;;) {
+        if (x->done > 0)
+            break;  // 已完成，退出
+
+        if (signal_pending_state(state, current))
+            break;  // 被信号打断
+
+        // 让出 CPU
+        timeout = schedule_timeout(timeout);
+        if (!timeout)
+            break;  // 超时
+    }
+
+    finish_wait(&x->wait, &wait);
+    return timeout;
+}
+```
+
+### 2.3 wait_for_completion_timeout — 超时版本
+
+```c
+// include/linux/completion.h — wait_for_completion_timeout
+static inline unsigned long wait_for_completion_timeout(struct completion *x, unsigned long timeout)
+{
+    return wait_for_common(x, timeout, TASK_UNINTERRUPTIBLE);
+}
+```
+
+### 2.4 wait_for_completion_interruptible — 可中断版本
+
+```c
+// include/linux/completion.h — wait_for_completion_interruptible
+static inline long wait_for_completion_interruptible_timeout(struct completion *x, unsigned long timeout)
+{
+    return wait_for_common(x, timeout, TASK_INTERRUPTIBLE);
+}
+```
+
+---
+
+## 3. complete — 发送完成信号
+
+### 3.1 complete — 单次完成
 
 ```c
 // kernel/sched/completion.c — complete
@@ -72,17 +120,17 @@ void complete(struct completion *x)
 
     raw_spin_lock_irqsave(&x->wait.lock, flags);
 
-    if (x->done != UINT_MAX)          // 如果不是 complete_all
-        x->done++;                     // done++（解锁一个等待者）
-    swake_up_locked(&x->wait, 1);     // 唤醒一个等待者
+    // 增加 done 计数
+    x->done++;
+
+    // 唤醒所有等待者
+    wake_up_all_no_lock(&x->wait);
 
     raw_spin_unlock_irqrestore(&x->wait.lock, flags);
 }
 ```
 
----
-
-## 4. complete_all — 唤醒所有等待者
+### 3.2 complete_all — 标记永久完成
 
 ```c
 // kernel/sched/completion.c — complete_all
@@ -92,89 +140,154 @@ void complete_all(struct completion *x)
 
     raw_spin_lock_irqsave(&x->wait.lock, flags);
 
-    x->done = UINT_MAX;               // 永久设置为最大值
-    swake_up_all_locked(&x->wait);    // 唤醒所有等待者
+    // done = UINT_MAX 表示永久完成
+    // 后续任何 wait_for_completion 都立即返回
+    x->done = UINT_MAX;
+
+    // 唤醒所有等待者
+    wake_up_all_no_lock(&x->wait);
 
     raw_spin_unlock_irqrestore(&x->wait.lock, flags);
 }
 ```
 
-**重要**：使用 `complete_all()` 后，必须调用 `reinit_completion()` 才能重用：
+---
+
+## 4. reinit_completion — 重新初始化
 
 ```c
+// include/linux/completion.h:47 — reinit_completion
 static inline void reinit_completion(struct completion *x)
 {
-    x->done = 0;                      // 重置计数器
+    x->done = 0;  // 重置计数器（不能用 complete_all）
 }
 ```
 
 ---
 
-## 5. wait_for_completion — 等待
+## 5. 流程图
 
-### 5.1 do_wait_for_common
-
-```c
-// kernel/sched/completion.c — do_wait_for_common
-static inline long __sched
-do_wait_for_common(struct completion *x,
-           long (*action)(long), long timeout, int state)
-{
-    if (!x->done) {
-        DECLARE_SWAITQUEUE(wait);      // 声明等待队列条目
-
-        do {
-            if (signal_pending_state(state, current))
-                return -ERESTARTSYS;
-
-            __prepare_to_swait(&x->wait, &wait);  // 加入等待队列
-            __set_current_state(state);           // 设置进程状态
-            raw_spin_unlock_irq(&x->wait.lock);   // 解锁
-            timeout = action(timeout);             // 调度（睡眠）
-        } while (!x->done && timeout > 0);
-
-        raw_spin_lock_irq(&x->wait.lock);
-        __finish_swait(&x->wait, &wait);        // 从队列移除
-    }
-
-    return timeout ?: -ETIME;
-}
 ```
+线程 A（等待者）：
+  init_completion(&done);
+  wait_for_completion(&done);
+  ↓
+  (睡眠在 wait_queue)
+  ↓
+  被 wake_up 唤醒
+  ↓
+  检查 done > 0
+  ↓
+  继续执行
 
-### 5.2 wait_for_completion — 主接口
 
-```c
-// include/linux/completion.h
-void wait_for_completion(struct completion *);
+线程 B（完成者）：
+  ... 做完了 ...
+  complete(&done);   // done++
+  ↓
+  wake_up_all(&done->wait)
+  ↓
+  唤醒所有等待者
 ```
 
 ---
 
-## 6. 典型使用模式
+## 6. completion vs semaphore 对比
+
+| 特性 | completion | semaphore |
+|------|-----------|-----------|
+| 语义 | 一次性完成 | 计数资源 |
+| done 计数 | 单调递增 | 可增可减 |
+| 等待者唤醒 | 全部（complete）| 由计数决定 |
+| 重置 | reinit_completion | V 操作 |
+| 典型用途 | 线程退出、请求完成 | 资源计数 |
+
+---
+
+## 7. 内核实际使用案例
+
+### 7.1 kthread_stop
 
 ```c
-// 线程 A（等待者）：
-DECLARE_COMPLETION(done);
-
-void thread_a(void)
+// kernel/kthread.c — kthread_stop
+int kthread_stop(struct task_struct *k)
 {
-    wait_for_completion(&done);         // 阻塞等待
-    // 继续执行
+    struct completion done;
+
+    // 1. 初始化 completion
+    init_completion(&done);
+    k->exit_completion = &done;
+
+    // 2. 设置停止标志
+    k->should_stop = 1;
+
+    // 3. 唤醒线程（如果正在睡眠）
+    wake_up_process(k);
+
+    // 4. 等待线程退出
+    wait_for_completion(&done);  // 线程调用 complete() 时唤醒
+
+    return 0;
 }
 
-// 线程 B（完成者）：
-void thread_b(void)
+// kthread 线程函数结束时：
+void __noreturn kthread_exit(long result)
 {
-    // ... 做工作 ...
-    complete(&done);                    // 唤醒 A
+    complete(k->exit_completion);  // 唤醒 kthread_stop
+    do_exit(result);
+}
+```
+
+### 7.2 device driver 请求-完成
+
+```c
+// 驱动发起异步请求：
+init_completion(&dev->done);
+queue_request(dev->req);
+wait_for_completion_timeout(&dev->done, HZ);  // 最多等 1 秒
+
+// 中断处理程序：
+irq_handler() {
+    complete(&dev->done);  // 请求完成，唤醒等待者
 }
 ```
 
 ---
 
-## 7. 完整文件索引
+## 8. 设计决策总结
 
-| 文件 | 函数 |
-|------|------|
-| `include/linux/completion.h` | `struct completion`、`DECLARE_COMPLETION`、`init_completion` |
-| `kernel/sched/completion.c` | `complete`、`complete_all`、`do_wait_for_common` |
+| 设计决策 | 原因 |
+|---------|------|
+| done 计数器 | 支持多次 complete（每个 complete 唤醒一次）|
+| complete_all 设置 UINT_MAX | 永久标记，避免遗漏 |
+| swait 队列 | 比完整 wait_queue 更轻量（用于短时等待）|
+| 自旋快速路径 | done > 0 时无需调度，零开销 |
+
+---
+
+## 9. 完整文件索引
+
+| 文件 | 函数/结构 | 行 |
+|------|----------|-----|
+| `include/linux/completion.h` | `struct completion` | 26 |
+| `include/linux/completion.h` | `init_completion` | 24 |
+| `include/linux/completion.h` | `DECLARE_COMPLETION` | 52 |
+| `kernel/sched/completion.c` | `wait_for_completion` | 函数 |
+| `kernel/sched/completion.c` | `wait_for_common` | 函数 |
+| `kernel/sched/completion.c` | `complete` | 函数 |
+| `kernel/sched/completion.c` | `complete_all` | 函数 |
+
+---
+
+## 10. 西游记类比
+
+**completion** 就像"取经队伍的任务完成表"——
+
+> 唐僧（等待者）发起一个任务（比如"悟空去找水"），在任务表上登记（init_completion）。悟空去执行任务，悟空走了之后（schedule），唐僧就在旁边等着（wait_for_completion）。等悟空找到水回来，在任务表上打勾（complete），然后叫醒唐僧（wake_up_all）。唐僧检查任务完成了，就继续取经。如果唐僧用的是 complete_all（永久完成），那这个任务表就被永久封存了，以后任何人都不用再做了。
+
+---
+
+## 11. 关联文章
+
+- **wait_queue**（article 07）：completion 底层使用 wait_queue
+- **kthread**（article 14）：kthread_stop 使用 completion 同步
