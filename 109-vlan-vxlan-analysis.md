@@ -1,73 +1,99 @@
-# Linux Kernel VLAN / VXLAN 深度源码分析
+# VLAN / VXLAN — 虚拟网络深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`drivers/net/vlan/` + `drivers/net/vxlan/`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. VLAN (802.1Q)
-
-**VLAN** 在以太网帧头插入 4 字节 VLAN tag（TPID + TCI），实现**虚拟局域网**隔离。
-
-```
-以太网头：  [DA][SA][Type][Data][CRC]
-VLAN帧：    [DA][SA][0x8100][VLAN_ID][Type][Data][CRC]
-```
+> 基于 Linux 7.0-rc1 主线源码（`drivers/net/vlan/` + `drivers/net/vxlan.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. VLAN 结构
+## 0. 概述
+
+**VLAN**（802.1Q）和 **VXLAN** 是网络虚拟化技术：
+- **VLAN**：在二层隔离（12 位 VID）
+- **VXLAN**：在三层封装（24 位 VNI），用于虚拟机/容器隔离
+
+---
+
+## 1. VLAN（802.1Q）
+
+### 1.1 vlan_hdr — VLAN 头
 
 ```c
-// drivers/net/vlan/dev.c — vlan_dev_priv
+// include/linux/if_vlan.h — vlan_hdr
+struct vlan_hdr {
+    __be16              tpid;           // 0x8100（ETH_P_8021Q）
+    __be16              tci;           // Tag Control Information
+    //   bits 0-11: VID（12 位）
+    //   bits 12-14: PCP（优先级）
+    //   bit 15: CFI（规范格式）
+};
+```
+
+### 1.2 vlan_dev — VLAN 设备
+
+```c
+// drivers/net/vlan/vlan_dev.c — vlan_dev
 struct vlan_dev_priv {
-    unsigned int             vlan_id;       // VLAN ID (0-4095)
-    unsigned int             vlan_proto;    // VLAN_PROTO_8021Q / 802.1AD
-    struct net_device       *real_dev;     // 下层设备（eth0）
-    struct vlan_pcpu_stats  *vlan_pcpu_stats; // 每 CPU 统计
+    unsigned int        vlan_id;        // VLAN ID（0-4095）
+    unsigned long       flags;          // VLAN_* 标志
+    struct net_device   *real_dev;       // 下层设备
+    __be16             vlan_proto;      // ETH_P_8021Q
 };
 ```
 
 ---
 
-## 2. VXLAN — 隧道
+## 2. VXLAN
 
-**VXLAN** 在 UDP（端口 4789）上封装二层，实现**跨主机的虚拟机网络**。
+### 2.1 vxlan_config — VXLAN 配置
 
 ```c
-// drivers/net/vxlan/vxlan.h — vxlan_config
+// drivers/net/vxlan.c — vxlan_config
 struct vxlan_config {
-    __u32              vni;              // VXLAN Network Identifier
-    __u32              remote_ip;        // 远程 VTEP IP
-    __u32              local_ip;        // 本地 VTEP IP
-    __u16              dst_port;        // UDP 目标端口（4789）
-    __u8               ttl;
-    __u8               tos;
-    struct vxlan_sock  *vsock;          // 绑定的 UDP socket
+    unsigned int        vni;            // VXLAN Network Identifier（24 位）
+    unsigned int        remote_ip;      // 目的 IP（UDP 封装的远程）
+    unsigned int        local_ip;       // 源 IP
+
+    // 端口
+    unsigned short     dst_port;       // 目的 UDP 端口（4789）
+    unsigned short     src_port_min;   // 源端口范围
+    unsigned short     src_port_max;
+
+    // 选项
+    unsigned int        df;            // Do not Fragment
+    __u8                tos;           // Type of Service
+    __u8                ttl;           // Time to Live
 };
 ```
 
+### 2.2 vxlan_xmit — 发送
+
+```c
+// drivers/net/vxlan.c — vxlan_xmit
+static void vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+    struct vxlan_config *conf = netdev_priv(dev);
+    struct vxlanhdr *vh;
+
+    // 1. 添加 VXLAN 头
+    vh = (struct vxlanhdr *)skb_push(skb, sizeof(*vh));
+    vh->vx_flags = VXLAN_FLAGS;          // I bit = 1（VNI 有效）
+    vh->vx_vni = conf->vni << 8;        // VNI（24 位）
+
+    // 2. UDP 封装
+    struct udphdr *uh = udp_hdr(skb);
+    uh->dest = conf->dst_port;          // 4789
+
+    // 3. IP 封装
+    //    将 skb 发送到 remote_ip
+}
+```
+
 ---
 
-## 3. VXLAN 封装
+## 3. 完整文件索引
 
-```
-原始帧:  [ETH_HDR][IP_HDR][Payload]
-          ↓
-VXLAN 封装：
-          [ETH_HDR][IP_HDR][UDP_HDR][VXLAN_HDR][ETH_HDR][Payload]
-                                              [VNI][0]
-
-VTEP（VXLAN Tunnel End Point）：
-  - 封装：VM → eth0 → vxlan0 → 封装 → 物理网络
-  - 解封装：物理网络 → vxlan0 → 解封装 → VM
-```
-
----
-
-## 4. 参考
-
-| 文件 | 内容 |
-|------|------|
-| `drivers/net/vlan/dev.c` | VLAN 设备实现 |
-| `drivers/net/vxlan/vxlan.c` | VXLAN 封装/解封装 |
+| 文件 | 函数/结构 |
+|------|----------|
+| `drivers/net/vlan/vlan_dev.c` | `vlan_dev_priv` |
+| `drivers/net/vxlan.c` | `vxlan_config`、`vxlan_xmit` |
+| `include/linux/if_vlan.h` | `vlan_hdr` |

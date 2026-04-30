@@ -1,82 +1,132 @@
-# Linux Kernel Bridge (网桥) 深度源码分析
+# bridge — 网桥设备深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`net/bridge/`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. 网桥概述
-
-**bridge** 是 Linux 的二层交换机实现，将多个网络接口（ eth0、veth0、tap0）加入同一个广播域，所有接口收到广播帧，仅目标 MAC 的帧从对应接口发出。
+> 基于 Linux 7.0-rc1 主线源码（`net/bridge/br_device.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. 核心结构
+## 0. 概述
+
+**bridge**（网桥）是二层交换机设备，连接多个网段，通过 MAC 学习进行转发。
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 net_bridge — 网桥
 
 ```c
 // net/bridge/br_private.h — net_bridge
 struct net_bridge {
-    struct list_head           port_list;      // 所有网桥端口
-    struct net_device          *dev;            // 网桥自身设备
-    struct br_fdb_entry        *hash[BR_HASH_SIZE];  // MAC 地址表
-    spinlock_t                 hash_lock;
-    struct timer_list           forward_delay_timer;
-    struct timer_list           hello_timer;
-    struct timer_list           age_timer;
-    struct bridge_mst_state    *mst;           // MSTP（多生成树）
-};
+    // 设备
+    struct net_device       *dev;           // 网桥设备
+    struct net               *net;           // 网络命名空间
 
-// net/bridge/br_private.h — net_bridge_port
-struct net_bridge_port {
-    struct net_bridge           *br;            // 所属网桥
-    struct net_device           *dev;           // 底层设备
-    unsigned long               flags;          // BR_STATE_* 状态
-    int                         path_cost;      // 路径成本
-    u8                          designated_root; // 生成树根桥
-    struct fdb_entry            *fdb_entries;   // 端口 MAC 表
-    struct rcu_head             rcu;
+    // 端口
+    struct list_head        port_list;        // 端口链表
+    unsigned int            ports_count;       // 端口数
+
+    // MAC 表
+    struct br_fdb_hash      fdb_hash;         // MAC 地址哈希表
+    unsigned long           bridge_ageing_time; // MAC 条目老化时间
+
+    // STP（生成树协议）
+    int                     stp_enabled;      // 是否启用 STP
+    unsigned char           bridge_id;        // 桥 ID
+    unsigned char           root_id;          // 根桥 ID
 };
 ```
 
----
-
-## 2. MAC 学习流程
-
-```
-收到帧 → 检查 src MAC →
-  if 不在 hash[MAC]: 
-      添加 (MAC, port) 到 hash
-  else:
-      更新 age_timer（超时删除）
-
-转发决策：
-  if dst MAC 是广播/多播:
-      洪泛所有端口（除接收端口）
-  elif dst MAC 在 hash:
-      只从对应端口发出
-  else:
-      洪泛所有端口（未知单播）
-```
-
----
-
-## 3. STP (生成树协议)
+### 1.2 net_bridge_port — 网桥端口
 
 ```c
-// 网桥ID = (priority << 48) | MAC
-// 选举根桥：ID 最小的成为根桥
-// 每个非根桥选举一个根端口（到根桥cost最小）
-// 每个段选举一个指定端口（发送最佳 BPDU）
-// 阻塞非指定端口
+// net/bridge/br_private.h — net_bridge_port
+struct net_bridge_port {
+    struct net_bridge       *br;              // 所属网桥
+    struct net_device       *dev;             // 底层设备
+    unsigned int            port_no;           // 端口号
+
+    // 状态
+    unsigned char           state;            // PORT_STATE_*
+    //   PORT_STATE_DISABLED   = 0
+    //   PORT_STATE_BLOCKING    = 1
+    //   PORT_STATE_LEARNING    = 2
+    //   PORT_STATE_FORWARDING  = 3
+
+    // MAC 学习
+    unsigned long           designated_age;
+
+    // STP
+    unsigned char           path_cost;         // 路径成本
+    unsigned char           priority;         // 优先级
+};
 ```
 
 ---
 
-## 4. 参考
+## 2. MAC 学习
 
-| 文件 | 内容 |
-|------|------|
-| `net/bridge/br_forward.c` | 转发逻辑 |
-| `net/bridge/br_stp.c` | STP 生成树 |
-| `net/bridge/br_fdb.c` | MAC 地址学习 |
-| `net/bridge/br_private.h` | `struct net_bridge`、`struct net_bridge_port` |
+### 2.1 br_fdb_insert — 学习 MAC
+
+```c
+// net/bridge/br_fdb.c — br_fdb_insert
+void br_fdb_insert(struct net_bridge *br, struct net_bridge_port *port,
+                  const unsigned char *addr, unsigned int vid)
+{
+    struct hlist_node *p;
+
+    // 1. 查找或创建 MAC 条目
+    struct net_bridge_fdb_entry *fdb = br_fdb_find(br, addr, vid);
+
+    if (fdb) {
+        // 2. 更新已有条目
+        fdb->port = port;
+        fdb->updated = jiffies;
+    } else {
+        // 3. 新增条目
+        br_fdb_add(br, port, addr, vid);
+    }
+}
+```
+
+---
+
+## 3. 转发流程
+
+```c
+// net/bridge/br_forward.c — br_handle_frame
+int br_handle_frame(struct sk_buff *skb)
+{
+    struct net_bridge_port *p = br_port_get(skb->dev);
+    unsigned char *dest = eth_hdr(skb)->h_dest;
+
+    // 1. 如果是混杂模式，直接转发
+    if (p->state == PORT_STATE_FORWARDING) {
+        if (is_multicast_ether_addr(dest)) {
+            // 组播：泛洪到所有端口（除了源）
+            br_flood_forward(skb, p);
+        } else {
+            // 单播：查找 MAC 表
+            struct net_bridge_fdb_entry *fdb = br_fdb_find(br, dest, 0);
+
+            if (fdb && fdb->port != p) {
+                // 直接转发到目标端口
+                br_forward(fdb->port, skb);
+            } else {
+                // 未知：泛洪
+                br_flood_forward(skb, p);
+            }
+        }
+    }
+}
+```
+
+---
+
+## 4. 完整文件索引
+
+| 文件 | 函数/结构 |
+|------|----------|
+| `net/bridge/br_private.h` | `net_bridge`、`net_bridge_port` |
+| `net/bridge/br_fdb.c` | `br_fdb_insert`、`br_fdb_find` |
+| `net/bridge/br_forward.c` | `br_handle_frame` |

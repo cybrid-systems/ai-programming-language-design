@@ -1,67 +1,68 @@
-# Linux Kernel veth (虚拟以太网对) 深度源码分析
+# veth — 虚拟以太网设备对深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`drivers/net/veth.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. veth 概述
-
-**veth** 是成对出现的虚拟以太网设备，一端发送的数据直接到达另一端，常用于：
-- 连接两个 network namespace
-- 连接容器到主机网桥
+> 基于 Linux 7.0-rc1 主线源码（`drivers/net/veth.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. 核心结构
+## 0. 概述
+
+**veth**（Virtual Ethernet）是成对出现的虚拟网络设备，数据从一端发出直接到另一端。用于命名空间连接。
+
+---
+
+## 1. veth 设备对
 
 ```c
 // drivers/net/veth.c — veth_priv
 struct veth_priv {
-    struct net      *remote_net;   // 对方 netns
-    struct net_device *peer;       // 配对设备
-    struct napi_struct *napi;     // NAPI 轮询
-    atomic_t         dropped;       // 丢弃计数
-    struct list_head  delayed;     // 延迟队列
-    struct bpf_prog *xdp_prog;    // XDP 程序
+    struct net_device __rcu *peer;   // 对端设备
+    atomic64_t             drop_count; // 丢弃计数
 };
 ```
 
 ---
 
-## 2. 数据包流程
-
-```
-veth0 (namespace A)                        veth1 (namespace B)
-    │                                              │
-    │ transmit:                                    │
-    │   dev_hard_start_xmit()                     │
-    │   → xmit path:                               │
-    │     skb->dev = peer (veth1)                 │
-    │     netif_rx(skb)  ← 直接进入 peer 的接收队列 │
-    │                                              │
-    │                                     receive: │
-    │                                     netif_rx(skb) →
-    │                                     eth_type_trans(skb, peer) →
-    │                                     peer->netdev_ops->ndo_rx()
-```
-
----
-
-## 3. 创建
+## 2. 转发流程
 
 ```c
-// ip link add veth0 type veth peer name veth1
-// → veth_newlink() → alloc_netdev(sizeof(priv), "veth%d", NET_NAME_UNKNOWN, veth_setup)
-// → register_netdevice(veth0)
-// → register_netdevice(veth1)
-// → priv->peer = peer; peer->priv = veth0
+// drivers/net/veth.c — veth_xmit
+static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+    struct veth_priv *priv = netdev_priv(dev);
+    struct net_device *peer;
+
+    // 1. 获取对端
+    peer = rcu_dereference(priv->peer);
+    if (!peer)
+        return TX_DROP;
+
+    // 2. 发送skb 到对端
+    //    不需要实际的物理传输，直接转发
+    dev_forward_skb(peer, skb);
+
+    return TX_OK;
+}
 ```
 
 ---
 
-## 4. 参考
+## 3. 创建 veth 对
 
-| 文件 | 内容 |
-|------|------|
-| `drivers/net/veth.c` | `veth_xmit`、`veth_newlink` |
+```c
+// drivers/net/veth.c — veth_newlink
+static int veth_newlink(struct net *src_net, struct net_device *dev,
+                        struct nlattr **tb, struct nlattr **data, ...)
+{
+    // 创建两个配对设备
+    // veth0 <-> veth1
+}
+```
+
+---
+
+## 4. 完整文件索引
+
+| 文件 | 函数/结构 |
+|------|----------|
+| `drivers/net/veth.c` | `veth_priv`、`veth_xmit` |

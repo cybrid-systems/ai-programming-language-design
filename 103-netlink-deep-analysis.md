@@ -1,83 +1,130 @@
-# Linux Kernel Netlink (深入) 深度源码分析
+# netlink — 通用 netlink 协议深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`net/netlink/af_netlink.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. netlink 概述
-
-**netlink** 是内核与用户空间的双向通信机制，比 `ioctl` 更灵活，支持：
-- 异步消息（内核主动推送）
-- 多播（一对多）
-- 同步请求/响应
+> 基于 Linux 7.0-rc1 主线源码（`net/netlink/af_netlink.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. 协议族
+## 0. 概述
+
+**netlink** 是内核与用户空间的双向通信机制，用于配置网络接口、路由表、firewalld、udev 等。
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 netlink_sock — netlink 套接字
 
 ```c
-// include/uapi/linux/netlink.h — netlink families
-NETLINK_ROUTE         = 0  // 路由（rtnetlink）
-NETLINK_AUDIT         = 12 // 审计
-NETLINK_NETFILTER     = 12 // conntrack
-NETLINK_KOBJECT_UEVENT = 15 // uevent
-NETLINK_RDMA          = 20 // RDMA
-```
+// net/netlink/af_netlink.c — netlink_sock
+struct netlink_sock {
+    struct sock           sk;           // 基类
+    u32                   pid;         // 端口 ID（用户空间的进程/线程 ID）
+    unsigned int          groups;       // 多播组掩码
+    unsigned long         flags;        // NL_SOCK_* 标志
 
----
+    // 接收队列
+    struct sk_buff_head   rcv_queue;   // 接收消息队列
+    unsigned int          max_recv_queue_len; // 最大队列长度
 
-## 2. 核心结构
-
-```c
-// net/netlink/af_netlink.c — nlmsghdr
-struct nlmsghdr {
-    __u32         nlmsg_len;     // 消息总长度（含 header）
-    __u16         nlmsg_type;    // 消息类型（NLMSG_*）
-    __u16         nlmsg_flags;   // 标志
-    __u32         nlmsg_seq;     // 序列号
-    __u32         nlmsg_pid;     // 发送者 PID
-};
-
-// net/netlink/af_netlink.c — sock
-struct sock {
-    struct socket         *sk_socket;    // 底层 socket
-    struct nlmsghdr       *rcv_buf;      // 接收缓冲
-    struct {
-        spinlock_t        lock;
-        struct sk_buff    *skb_head;
-        struct sk_buff    *skb_tail;
-    } sk_receive_queue;                  // 接收队列
+    // 回调
     void                  (*netlink_rcv)(struct sk_buff *skb);
-    int                   (*netlink_send)(struct sock *ssk, struct sk_buff *skb);
 };
 ```
 
----
-
-## 3. 用户空间使用
+### 1.2 nlmsghdr — netlink 消息头
 
 ```c
-// 创建 netlink 套接字
-int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
-
-// 绑定（指定 pid 和 multicast groups）
-struct sockaddr_nl addr = {
-    .nl_family = AF_NETLINK,
-    .nl_pid = getpid(),           // 通常 0 表示自动分配
-    .nl_groups = RTMGRP_LINK | RTMGRP_IPV4_ROUTE,
+// include/uapi/linux/netlink.h — nlmsghdr
+struct nlmsghdr {
+    __u32               nlmsg_len;    // 消息长度（header + data）
+    __u16               nlmsg_type;    // 消息类型（RTM_* / AUDIT_* 等）
+    __u16               nlmsg_flags;   // NLM_F_* 标志
+    __u32               nlmsg_seq;     // 序列号
+    __u32               nlmsg_pid;    // 发送者 PID
 };
-bind(fd, (struct sockaddr *)&addr, sizeof(addr));
-
-// 接收消息
-recvmsg(fd, &msg, 0);
 ```
 
 ---
 
-## 4. 参考
+## 2. bind — 绑定
 
-| 文件 | 内容 |
-|------|------|
-| `net/netlink/af_netlink.c` | `netlink_send`、`netlink_rcv` |
-| `include/uapi/linux/netlink.h` | `struct nlmsghdr` |
+```c
+// net/netlink/af_netlink.c — netlink_bind
+static int netlink_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
+{
+    struct netlink_sock *nlk = nlk_sk(sock->sk);
+    struct netlink_table *tb;
+    u32 portid = addr->nl_family == AF_NETLINK ? addr->nl_groups : current->pid;
+
+    // 1. 获取端口 ID
+    nlk->pid = portid;
+
+    // 2. 加入 hash 表
+    nlk_hash_add(nlk, tb);
+
+    // 3. 如果是多播组，注册
+    if (addr->nl_groups)
+        nlk->groups = addr->nl_groups;
+}
+```
+
+---
+
+## 3. sendmsg / recvmsg
+
+```c
+// net/netlink/af_netlink.c — netlink_sendmsg
+static int netlink_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+{
+    struct netlink_sock *nlk = nlk_sk(sock->sk);
+    struct nlmsghdr *hdr;
+
+    // 1. 构建 netlink 头
+    hdr = nlmsg_put(msg, nlk->pid, nlk->seq, msg->msg_flags, len - NLMSG_HDRLEN);
+
+    // 2. 复制数据
+    memcpy(NLMSG_DATA(hdr), msg->msg_iov->iov_base, len - NLMSG_HDRLEN);
+
+    // 3. 发送（如果是多播，发送给组内所有成员）
+    if (nlh->nlmsg_flags & NLM_F_MULTICAST)
+        nlmsg_multicast(nlk->pid, hdr);
+
+    return len;
+}
+```
+
+---
+
+## 4. rtnetlink — 路由 netlink
+
+```c
+// net/core/rtnetlink.c — rtnl_newlink
+static int rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh, ...)
+{
+    struct ifinfomsg *ifm;
+    struct net_device *dev;
+
+    // 1. 解析 ifinfomsg
+    ifm = nlmsg_data(nlh);
+
+    // 2. 创建或获取设备
+    if (ifm->ifi_index)
+        dev = __dev_get_by_index(ifm->ifi_index);
+    else
+        dev = alloc_netdev(...);
+
+    // 3. 设置设备属性
+    dev_set_mac_address(dev, nla_data(tb[IFLA_ADDRESS]));
+}
+```
+
+---
+
+## 5. 完整文件索引
+
+| 文件 | 函数/结构 |
+|------|----------|
+| `net/netlink/af_netlink.c` | `netlink_sock`、`netlink_bind`、`netlink_sendmsg` |
+| `include/uapi/linux/netlink.h` | `nlmsghdr` |
+| `net/core/rtnetlink.c` | `rtnl_newlink` |
