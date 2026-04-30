@@ -1,4 +1,4 @@
-# blk-mq — 块设备多队列深度源码分析
+# 21-blk-mq — 块设备多队列深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码（`block/blk-mq.c`）
 > 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
@@ -7,225 +7,219 @@
 
 ## 0. 概述
 
-**blk-mq（Block Multi-Queue）** 是 Linux 3.13+ 引入的块设备 I/O 框架，专为**多核 CPU + SSD/NVMe** 设计：
-- 每个 CPU 一个**软件队列**（soft queue）
-- 每个硬件队列一个**硬件队列**（hard queue）
-- 消除锁竞争，最大化并发
+**blk-mq（Block Multi-Queue）** 是 Linux 3.13 引入的块设备新框架，为 SSD/NVMe 等高速设备设计。每个 CPU 有独立的软中断队列（soft queue），消除锁竞争。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 blk_mq_hw_queue — 硬件队列
+### 1.1 blk_mq_hw_queues — 硬件队列
+
+```c
+// block/blk-mq.h — blk_mq_hw_queues
+struct blk_mq_hw_queues {
+    struct blk_mq_hw_queue  **queues;  // per-CPU 硬件队列
+};
+```
+
+### 1.2 blk_mq_hw_queue — 硬件队列
 
 ```c
 // block/blk-mq.h — blk_mq_hw_queue
 struct blk_mq_hw_queue {
-    spinlock_t          lock;           // 保护队列
-    struct list_head    dispatch;       // 待分发的请求链表
-    unsigned long       state;          // HCTX_STATE_* 状态
+    spinlock_t              lock;      // 保护请求队列
+    struct list_head        dispatch;   // 待分发的请求链表
+    unsigned long           state;      // BLK_MQ_F_TAG_QUEUE_SHARED 等
 
-    /* 请求 */
-    struct blk_mq_tags   *tags;         // 标签（请求描述符）
-    struct blk_mq_tags   *sched_tags;   // 调度器标签（如果使用 MQ scheduler）
+    // 请求队列
+    struct blk_mq_ctx       *queue_ctx; // per-CPU 软中断上下文
+    struct request          *fq;        // 请求铁轨（I/O scheduler）
 
-    /* CPU 映射 */
-    struct blk_mq_ctx   **ctxs;        // 指向每个 CPU 的 soft queue
-    unsigned int         nr_ctx;         // ctx 数量
+    // 硬件
+    void                   *driver_data; // 驱动私有数据
+    struct blk_mq_tags     *tags;      // 请求标签
 };
 ```
 
-### 1.2 blk_mq_ctx — 软件队列（per-CPU）
+### 1.3 struct request — I/O 请求
 
 ```c
-// block/blk-mq.h — blk_mq_ctx
-struct blk_mq_ctx {
-    unsigned int        cpu;              // CPU 编号
-    spinlock_t          lock;             // 保护本 CPU 的请求
-    struct list_head    rq_lists[HCTX_MAX_QUEUES]; // 每种类型的请求链表
-    // HCTX_TYPE_DEFAULT = 0（普通请求）
-    // HCTX_TYPE_READ = 1（读请求）
-    // HCTX_TYPE_POLL = 2（polled I/O）
-};
-```
-
-### 1.3 blk_mq_tag_set — 标签集
-
-```c
-// block/blk-mq.h — blk_mq_tag_set
-struct blk_mq_tag_set {
-    const struct blk_mq_ops *ops;         // 硬件操作函数表
-    unsigned int        nr_hw_queues;     // 硬件队列数
-    unsigned int        queue_depth;       // 每队列请求深度
-    unsigned int        reserved_tags;     // 保留标签数
-    unsigned int        cmd_size;         // 每请求私有数据大小
-
-    /* 分配 */
-    struct blk_mq_tags  *tags[MAX_QUEUE_DEPTH]; // 标签数组
-    struct blk_mq_tags  *shared_tags;     // 共享标签
-
-    unsigned int        nr_maps;          // 映射数量（HCTX_MAX_QUEUES）
-    struct blk_mq_queue_map queue_map[HCTX_MAX_QUEUES]; // CPU→HW 队列映射
-};
-```
-
-### 1.4 request — I/O 请求
-
-```c
-// include/linux/blkdev.h — request
+// block/blk-mq.h — request
 struct request {
     struct request_queue   *q;           // 所属队列
-    struct blk_mq_hw_queue *mq_hctx;   // 硬件队列
-    unsigned int        cmd_flags;       // REQ_OP_* | REQ_* 标志
-    sector_t            __sector;       // 起始扇区
-    unsigned long       nr_sectors;     // 扇区数
-    struct bio          *bio;           // 关联的 bio
+    struct blk_mq_hw_queue *mq_hctx;     // 硬件队列
 
-    /* 标签（用于在硬件队列中标识请求）*/
-    unsigned int        tag;            // 请求标签
-    unsigned int        internal_tag;   // 内部标签
+    // 请求标识
+    unsigned int           cmd_flags;      // REQ_* 标志
+    unsigned int           tag;            // 标签（ blk_mq_tags 中的索引）
 
-    struct list_head    queuelist;      // 链表（用于调度）
-    struct list_head    mq_list;        // 接入软队列的链表
+    // 扇区
+    sector_t              sector;          // 起始扇区
+    unsigned long         nr_sectors;     // 扇区数
+
+    // bio
+    struct bio            *bio;          // 关联的 bio
+    struct io_context     *ioprio;
+
+    // 队列
+    struct list_head       queuelist;     // 接入软件队列的链表
 };
 ```
 
 ---
 
-## 2. 提交请求流程
+## 2. 软队列与硬队列
 
-### 2.1 blk_mq_submit_request
+```
+blk-mq 分层：
 
-```c
-// block/blk-mq.c — blk_mq_submit_request
-void blk_mq_submit_request(struct request *rq, bool no_mq)
-{
-    struct blk_mq_ctx *ctx = rq->mq_ctx;
-    struct blk_mq_hw_queue *hctx = rq->mq_hctx;
-
-    // 1. 如果有调度器，先尝试调度
-    if (q->elevator)
-        blk_mq_sched_insert_request(rq, ...);
-    else
-        blk_mq_insert_requests(hctx, ctx, list, 0);
-
-    // 2. 尝试直接 dispatch
-    if (!no_mq)
-        blk_mq_try_issue_list_directly(hctx, &rq);
-}
+用户进程
+      ↓ submit_bio
+软件层（per-CPU）：
+  CPU0 → blk_mq_ctx[0]  ──┐
+  CPU1 → blk_mq_ctx[1]  ──┼── 每个 CPU 有自己的软队列
+  ...                       ──┘
+      ↓ dispatch
+硬件层（per-HW）：
+  HW Queue 0 ──→ NVMe SSD（多队列）
+  HW Queue 1 ──→ ...
 ```
 
-### 2.2 blk_mq_insert_requests — 插入软队列
+---
+
+## 3. 提交请求
+
+### 3.1 blk_mq_submit_bio — 提交 bio
 
 ```c
-// block/blk-mq.c — blk_mq_insert_requests
-void blk_mq_insert_requests(struct blk_mq_hw_queue *hctx, struct blk_mq_ctx *ctx, ...)
+// block/blk-mq.c — blk_mq_submit_bio
+void blk_mq_submit_bio(struct bio *bio)
 {
+    struct request_queue *q = bio->bi_bdev->bd_disk->queue;
+    struct blk_mq_hw_queue *hctx;
+    struct blk_mq_ctx *ctx;
+
+    // 1. 找到 per-CPU 软队列
+    ctx = blk_mq_get_cpu_ctx(q);
+
+    // 2. 分配 request
+    struct request *rq = blk_mq_alloc_request(q, bio, ...);
+    rq->bio = bio;
+
+    // 3. 加入 per-CPU 软队列
     spin_lock(&ctx->lock);
-
-    // 将请求链表加入 ctx 的 rq_lists
-    list_splice_tail(list, &ctx->rq_lists[hctx->type]);
-
+    list_add_tail(&rq->queuelist, &ctx->rq_list);
     spin_unlock(&ctx->lock);
+
+    // 4. 如果需要，触发软中断
+    if (blk_mq_need_unplug(q))
+        blk_mq_trigger_unplug(q);
 }
 ```
 
 ---
 
-## 3. Dispatch 流程
+## 4. 软中断处理
 
-### 3.1 blk_mq_do_dispatch — 从软队列取出请求
+### 4.1 blk_mq_run_softirq — 运行软中断
 
 ```c
-// block/blk-mq.c — blk_mq_do_dispatch
-static void blk_mq_do_dispatch(struct blk_mq_hw_queue *hctx)
+// block/blk-mq.c — blk_mq_run_softirq
+void blk_mq_run_softirq(void *data)
 {
-    LIST_HEAD(list);
+    struct blk_mq_ctx *ctx = data;
+    struct request_queue *q = ctx->q;
 
-    // 遍历每个 CPU 的软队列
-    for (i = 0; i < hctx->nr_ctx; i++) {
-        ctx = hctx->ctxs[i];
+    // 遍历 per-CPU 队列
+    while (!list_empty(&ctx->rq_list)) {
+        struct request *rq;
 
         spin_lock(&ctx->lock);
-        list_splice_init(&ctx->rq_lists[hctx->type], &list);
+        rq = list_first_entry(&ctx->rq_list, struct request, queuelist);
+        list_del_init(&rq->queuelist);
         spin_unlock(&ctx->lock);
 
         // 分发到硬件队列
-        list_for_each_entry(rq, &list, queuelist)
-            blk_mq_try_issue_directly(hctx, rq, false);
+        blk_mq_dispatch_rq(rq);
     }
 }
 ```
 
-### 3.2 blk_mq_try_issue_directly — 直接发送到硬件
+### 4.2 blk_mq_dispatch_rq — 分发请求
 
 ```c
-// block/blk-mq.c — blk_mq_try_issue_directly
-static blk_status_t blk_mq_try_issue_directly(struct blk_mq_hw_queue *hctx,
-                         struct request *rq, ...)
+// block/blk-mq.c — blk_mq_dispatch_rq
+static int blk_mq_dispatch_rq(struct request *rq)
 {
-    // 1. 尝试获取硬件队列
-    if (!blk_mq_get_driver_tag(hctx, rq, NULL))
-        return BLK_STS_RESOURCE;
+    struct blk_mq_hw_queue *hctx = rq->mq_hctx;
 
-    // 2. 调用驱动的 queue_rq
-    ret = hctx->tags->ops->queue_rq(hctx, rq);
+    // 加锁
+    spin_lock(&hctx->lock);
 
-    if (ret != BLK_STS_OK)
-        blk_mq_put_driver_tag(hctx, rq);
+    // 加入硬件队列的 dispatch 链表
+    list_add_tail(&rq->queuelist, &hctx->dispatch);
 
-    return ret;
+    // 标记队列需要处理
+    blk_mq_hw_queues_mark_pending(hctx);
+
+    spin_unlock(&hctx->lock);
+
+    // 触发硬件队列的完成中断
+    blk_mq_trigger_complete(hctx);
+
+    return 0;
 }
 ```
 
 ---
 
-## 4. 硬件操作函数表
+## 5. 硬件队列处理
 
 ```c
-// include/linux/blk-mq.h — blk_mq_ops
-struct blk_mq_ops {
-    // 队列请求
-    blk_status_t (*queue_rq)(struct blk_mq_hw_queue *, struct request *);
+// NVMe 驱动（drivers/nvme/host/pci.c）
+// 硬件队列的中断处理：
+nvme_irq(irq, *data):
+    // 1. 读取完成队列（CQ）
+    nvme_complete_cqes(nvmeq, ...);
 
-    // 命令提交
-    blk_status_t (*submit_bio)(struct bio *);
+    // 2. 清理已完成请求
+    blk_mq_free_request(req);
 
-    // 映射队列
-    int (*map_queues)(struct blk_mq_tag_set *set);
-
-    // 空闲回调
-    void (*timeout)(struct request *);
-
-    // 优先级
-    int (*poll)(struct blk_mq_hw_queue *, struct io_comp_batch *);
-
-    // 完成
-    void (*complete)(struct request *);
-};
+    // 3. 如果 CQ 不满，触发新的提交
+    nvme_submit_sqes(nvmeq);
 ```
 
 ---
 
-## 5. 多队列映射
+## 6. 与传统 IO Scheduler 的对比
 
-```
-CPU 0 ─┐
-CPU 1 ─┼─► Hardware Queue 0 ──► SSD/NVMe
-CPU 2 ─┤
-CPU 3 ─┘
-
-映射策略（blk_mq_map_queues）：
-  - 轮询：将 CPU 均匀分配到硬件队列
-  - 掩码：CPU 亲和性掩码
-```
+| 特性 | blk-mq（无 scheduler）| 传统（cfq/mq-deadline）|
+|------|---------------------|----------------------|
+| 队列数 | 数千（per-CPU+per-HW）| 少量（全局）|
+| 锁竞争 | 低（每队列独立锁）| 高（全局锁）|
+| SSD 友好 | ✓（多队列匹配 SSD 内部并行）| ✗ |
+| HDD 友好 | 一般 | ✓（全局调度优化寻道）|
 
 ---
 
-## 6. 完整文件索引
+## 7. 完整文件索引
 
 | 文件 | 函数/结构 |
 |------|----------|
-| `block/blk-mq.c` | `blk_mq_submit_request`、`blk_mq_do_dispatch` |
-| `block/blk-mq.h` | `struct blk_mq_hw_queue`、`struct blk_mq_ctx` |
-| `include/linux/blk-mq.h` | `struct blk_mq_ops`、`struct request` |
+| `block/blk-mq.h` | `struct blk_mq_hw_queue`、`struct request` |
+| `block/blk-mq.c` | `blk_mq_submit_bio`、`blk_mq_run_softirq`、`blk_mq_dispatch_rq` |
+
+---
+
+## 8. 西游记类比
+
+**blk-mq** 就像"取经路上的多驿站快递系统"——
+
+> 以前的快递是统一一个中转站（单队列 + 全局锁），所有货物都挤在一起，锁竞争严重。blk-mq 就像每个大城市都有自己独立的快递站（per-CPU soft queue），每个驿站（hardware queue）也有自己的发货通道。货物从最近的驿站发出（bio → request），快递员（softirq）定期从 per-CPU 站点取货，送到对应的硬件队列（NVMe 的内部多队列）。这样即使某个驿站繁忙，其他驿站也不受影响，真正实现了并发。
+
+---
+
+## 9. 关联文章
+
+- **IO scheduler**（相关）：mq-deadline、bfq 等为 blk-mq 设计的调度器
+- **block layer**（相关）：bio → request 转换
