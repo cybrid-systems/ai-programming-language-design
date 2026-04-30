@@ -1,176 +1,165 @@
-# Linux Kernel ALSA (Advanced Linux Sound Architecture) 深度源码分析
+# ALSA — 高级 Linux 声音架构深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`sound/core/`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
+> 基于 Linux 7.0-rc1 主线源码（`sound/core/` + `sound/core/pcm_native.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 0. ALSA 概述
+## 0. 概述
 
-**ALSA** 是 Linux 音频子系统，提供：
-- PCM（Pulse Code Modulation）音频流
-- Mixer（混音器）控制
-- MIDI（Musical Instrument Digital Interface）
-- 用户空间库（libasound）
+**ALSA** 是 Linux 的声音子系统，提供 PCM（脉冲编码调制）音频接口。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 snd_card — 声卡
+### 1.1 snd_pcm — PCM 设备
 
 ```c
-// sound/core/init.c — snd_card
-struct snd_card {
-    int             number;              // 声卡编号
-    char            id[16];              // 标识符
-    char            driver[16];           // 驱动名
-    struct device   *dev;                 // 设备
-    struct snd_info_entry *proc_root;     // /proc/asound/ 入口
-    struct list_head    devices;          // 此声卡的设备链表
-    struct snd_pcm *pcm;                 // PCM 设备
-    struct snd_ctl *ctl;                 // 控制设备
-};
-```
-
-### 1.2 snd_pcm — PCM 设备
-
-```c
-// sound/core/pcm.c — snd_pcm
+// sound/core/pcm_native.c — snd_pcm
 struct snd_pcm {
-    struct snd_card   *card;             // 所属声卡
-    struct list_head  list;              // PCM 链表
-    int               device;             // 设备号
-    unsigned int      info_flags;         // SNDRV_PCM_INFO_* 标志
-    struct snd_pcm_ops *ops;             // 操作函数表
-    struct snd_pcm_str streams[2];       // playback + capture
+    // 设备信息
+    struct device           *dev;           // 设备
+    struct snd_card         *card;          // 声卡
+    char                    *id;            // ID
+    char                    *name;          // 名称
+
+    // 流
+    struct snd_pcm_str      streams[2];     // 0=PLAYBACK, 1=CAPTURE
+    // streams[PLAYBACK].substream → PCM 播放流
 };
 
-// snd_pcm_str — PCM 流（播放或录音）
-struct snd_pcm_str {
-    int               stream;              // SNDRV_PCM_STREAM_PLAYBACK/CAPTURE
-    struct snd_pcm_substream *substream; // 子流（多个应用可同时打开）
-};
-```
-
-### 1.3 snd_pcm_substream — 子流
-
-```c
 // sound/core/pcm_native.c — snd_pcm_substream
 struct snd_pcm_substream {
-    struct snd_pcm     *pcm;              // PCM 设备
-    int                stream;             // 播放或录音
-    struct file        *file;             // 关联的用户空间文件
-    void               *private_data;      // 驱动私有数据
-    struct snd_pcm_runtime *runtime;     // 运行时配置
-    size_t             buffer_bytes_max;   // 最大缓冲区大小
-    struct snd_dma_buffer self_buffer;    // DMA 缓冲区
+    struct snd_pcm          *pcm;            // 所属 PCM
+    struct device           *device;       // 设备
+    struct snd_pcm_runtime  *runtime;      // 运行时状态
+    int                     stream;          // PLAYBACK or CAPTURE
+
+    // 操作函数表
+    const struct snd_pcm_ops *ops;         // 操作函数
+    const struct snd_pcm_lib_ops *lib_ops; // 库操作
+
+    // DMA
+    struct snd_dma_buffer   dma_buffer;     // DMA 缓冲区
+    unsigned int            dma_max;       // 最大 DMA 大小
 };
 ```
 
-### 1.4 snd_pcm_runtime — 运行时
+### 1.2 snd_pcm_runtime — 运行时状态
 
 ```c
-// include/sound/pcm.h — snd_pcm_runtime
+// sound/core/pcm_native.c — snd_pcm_runtime
 struct snd_pcm_runtime {
-    __u64             boundary;            // 缓冲区边界（ wrap point）
-    unsigned int      buffer_size;         // 缓冲区大小（帧数）
-    unsigned int      period_size;         // 周期大小（帧数）
-    unsigned int      sample_bits;         // 采样位数（8/16/24/32）
-    unsigned int      channels;            // 声道数（1=单声，2=立体声）
-    unsigned int      rate;               // 采样率（44100/48000 Hz）
-    snd_pcm_format_t  format;               // 格式（S16_LE/S32_LE 等）
-    __u64             appl_ptr;            // 应用指针（已消费位置）
-    __u64             hw_ptr;              // 硬件指针（已生产位置）
-    struct snd_pcm_access_t  *access;      // 访问模式（MMAP/INTERLEAVED等）
-    struct snd_pcm_substream *trigger_master; // 触发主设备
+    // 格式
+    unsigned int            channels;       // 声道数
+    unsigned int            rate;           // 采样率
+    snd_pcm_format_t       format;         // 格式（16-bit LE 等）
+    unsigned int            sample_bits;    // 采样位数
+    unsigned int            frame_bits;     // 每帧位数
+
+    // DMA
+    snd_pcm_uframes_t      buffer_size;    // 缓冲区大小（帧）
+    snd_pcm_uframes_t       period_size;   // 周期大小（帧）
+    snd_pcm_uframes_t       avail_min;     // 最小可用
+    snd_pcm_uframes_t       start_threshold; // 开始阈值
+    snd_pcm_uframes_t       stop_threshold;  // 停止阈值
+
+    // 指针
+    snd_pcm_uframes_t      hw_ptr_base;    // 硬件指针基础
+    snd_pcm_uframes_t      hw_ptr_interrupt; // 中断指针
+    snd_pcm_uframes_t      sw_ptr;         // 软件指针
+
+    // 状态
+    unsigned int            state;         // PCM 状态
+    //   SNDRV_PCM_STATE_OPEN
+    //   SNDRV_PCM_STATE_PREPARED
+    //   SNDRV_PCM_STATE_RUNNING
+    //   SNDRV_PCM_STATE_XRUN
+    //   SNDRV_PCM_STATE_SUSPENDED
 };
 ```
 
 ---
 
-## 2. PCM 操作流程
+## 2. 播放流程
 
-### 2.1 open
-
-```c
-// sound/core/pcm_native.c — snd_pcm_open
-static int snd_pcm_open(struct file *file, struct snd_pcm *pcm, int stream)
-{
-    // 1. 分配 substream
-    struct snd_pcm_substream *ss = kzalloc(sizeof(*ss), GFP_KERNEL);
-
-    // 2. 关联到 PCM 流
-    ss->pcm = pcm;
-    ss->stream = stream;
-
-    // 3. 调用驱动初始化
-    substream->ops->open(substream);
-
-    file->private_data = substream;
-}
-```
-
-### 2.2 writei / readi — 音频数据传输
+### 2.1 snd_pcm_writei — 播放音频
 
 ```c
 // sound/core/pcm_native.c — snd_pcm_writei
-static snd_pcm_sframes_t snd_pcm_writei(struct snd_pcm_substream *substream,
-                   const void __user *buffer, snd_pcm_uframes_t size)
+static ssize_t snd_pcm_writei(struct file *file, const char *buf, size_t size, loff_t *offset)
 {
-    // 1. 计算可用空间
-    avail = snd_pcm_avail_update(substream);
+    struct snd_pcm_substream *substream = pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
+    struct snd_pcm_runtime *runtime = substream->runtime;
 
-    // 2. 如果可用空间不足，等待（阻塞模式）
-    while (avail < size) {
-        if (wait_for_avail(substream, &avail) < 0)
-            return -EAGAIN;
-    }
+    // 1. 检查状态
+    if (runtime->state != SNDRV_PCM_STATE_PREPARED &&
+        runtime->state != SNDRV_PCM_STATE_RUNNING)
+        return -EBADFD;
 
-    // 3. DMA 传输（驱动实现）
-    //    substream->ops->copy_user(substream, buffer, size);
-    //    或 substream->ops->page(substream) 返回物理页供 DMA
+    // 2. 复制数据到 DMA 缓冲区
+    frames = size / (runtime->channels * (runtime->sample_bits / 8));
+    frames = copy_from_user(runtime->dma_area + offset, buf, frames);
 
-    // 4. 更新应用指针
-    runtime->appl_ptr += size;
+    // 3. 启动 DMA（如果需要）
+    if (runtime->state == SNDRV_PCM_STATE_PREPARED)
+        snd_pcm_start(substream);
 
-    return size;
+    return frames;
 }
 ```
 
 ---
 
-## 3. 中断与 DMA
+## 3. ioctl 命令
 
 ```c
-// DMA 完成后触发中断：
-// → snd_pcm_period_elapsed(ss)  // 周期结束
-// → wake_up(&runtime->sleep)   // 唤醒等待数据的应用
-// → kill_fasync()               // 发送 SIGIO（如果使用 async）
+// sound/core/pcm_native.c — snd_pcm_lib_ioctl
+long snd_pcm_lib_ioctl(struct file *file, unsigned int cmd, void *arg)
+{
+    struct snd_pcm_substream *substream = pcm->streams[0].substream;
 
-// ALSA DMA 环形缓冲区：
-// [period 0][period 1][period 2][period 3]
-// 每个 period 触发一次中断 → 用户空间读取一个 period
+    switch (cmd) {
+    case SNDRV_PCM_IOCTL_HW_PARAMS:
+        // 设置硬件参数（采样率、格式、声道数）
+        return snd_pcm_hw_params(substream, arg);
+
+    case SNDRV_PCM_IOCTL_PREPARE:
+        // 准备设备
+        return snd_pcm_prepare(substream, NULL);
+
+    case SNDRV_PCM_IOCTL_START:
+        return snd_pcm_start(substream);
+
+    case SNDRV_PCM_IOCTL_LINK:
+        // 链接多个流同步
+        return 0;
+
+    case SNDRV_PCM_IOCTL_RESUME:
+        return snd_pcm_resume(substream);
+    }
+}
 ```
 
 ---
 
-## 4. 环形缓冲区管理
+## 4. ALSA 设备节点
 
 ```
-硬件指针 (hw_ptr)：DMA 已经写到哪（生产端）
-应用指针 (appl_ptr)：用户空间已经消费到哪（消费端）
-
-可用空间 = buffer_size - (hw_ptr - appl_ptr) mod boundary
+/dev/snd/
+├── controlC0           ← 控制设备（混音器）
+├── pcmC0D0p           ← PCM 播放设备（卡0，设备0，播放）
+├── pcmC0D0c           ← PCM 录音设备（卡0，设备0，录音）
+├── seq               ← 音序器
+└── timer             ← 定时器
 ```
 
 ---
 
-## 5. 参考
+## 5. 完整文件索引
 
-| 文件 | 内容 |
-|------|------|
-| `sound/core/init.c` | `snd_card` 创建 |
-| `sound/core/pcm.c` | PCM 核心结构 |
-| `sound/core/pcm_native.c` | `snd_pcm_open`、`snd_pcm_writei` |
-| `include/sound/pcm.h` | `struct snd_pcm_runtime` |
+| 文件 | 函数/结构 |
+|------|----------|
+| `sound/core/pcm_native.c` | `snd_pcm_substream`、`snd_pcm_runtime`、`snd_pcm_writei` |
+| `sound/core/pcm_lib.c` | PCM 库函数 |
