@@ -1,197 +1,165 @@
-# netfilter — 包过滤框架深度源码分析
+# 28-netfilter — 包过滤框架深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`net/netfilter/core.c` + `net/ipv4/netfilter/iptable_filter.c`）
+> 基于 Linux 7.0-rc1 主线源码（`net/netfilter/core.c`）
 > 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
 ## 0. 概述
 
-**netfilter** 是 Linux 内核的**数据包过滤框架**，通过 HOOK 点在协议栈各处截获数据包进行过滤/NAT/记录。
+**netfilter** 是 Linux 的数据包过滤框架，在协议栈的关键 HOOK 点插入处理逻辑，实现防火墙（iptables/nftables）、NAT、连接跟踪等功能。
 
 ---
 
-## 1. HOOK 点（Netfilter Hooks）
-
-### 1.1 IPv4 HOOK 点
+## 1. HOOK 点
 
 ```
-prerouting  ───► FORWARD ───► postrouting
-     │                          ▲
-     ▼                          │
-  INPUT                       OUTPUT
-     │                          ▲
-     ▼                          │
- LOCAL PROCESS                 │
+数据包在协议栈中的 HOOK：
+
+   入站                                    出站
+    │                                      ▲
+    ▼                                      │
+   PREROUTING (路由前)                     │
+    │                                      │
+   [NF_INET_LOCAL_IN] ──────────────────────┤
+    │                                      │
+   FORWARD (路由后转发)                     │
+    │                                      │
+   POSTROUTING (路由后)                    │
+    │                                      │
+   [NF_INET_LOCAL_OUT] ←───────────────────┘
+
+HOOK 优先级（数字小 = 先执行）：
+  NF_IP_PRE_ROUTING  = 0  (PREROUTING)
+  NF_IP_LOCAL_IN    = 1  (LOCAL_IN)
+  NF_IP_FORWARD     = 2  (FORWARD)
+  NF_IP_LOCAL_OUT   = 3  (LOCAL_OUT)
+  NF_IP_POST_ROUTING = 4 (POSTROUTING)
 ```
 
-| HOOK | 位置 | 用途 |
-|------|------|------|
-| NF_INET_PRE_ROUTING | 收到包最早位置 | DNAT、raw 表 |
-| NF_INET_LOCAL_IN | 转发给本地进程 | INPUT 过滤 |
-| NF_INET_FORWARD | 转发到其他主机 | FORWARD 过滤 |
-| NF_INET_LOCAL_OUT | 本地发出包 | OUTPUT 过滤、SNAT |
-| NF_INET_POST_ROUTING | 发出前最后位置 | SNAT、mangle |
+---
 
-### 1.2 HOOK 注册
+## 2. nf_hook_ops — HOOK 操作
 
 ```c
 // include/linux/netfilter.h — nf_hook_ops
 struct nf_hook_ops {
-    struct list_head        list;            // 链表
-    nf_hookfn              *hook;            // 回调函数
-    pf_type                pf;               // 协议族（PF_INET 等）
-    unsigned int           hooknum;           // HOOK 点编号
-    int                    priority;         // 优先级（越小越先）
+    nf_hookfn          *hook;      // 处理函数
+    void               *priv;      // 私有数据
+    u_int8_t           pf;          // 协议族（PF_INET 等）
+    unsigned int       hooknum;     // HOOK 点（NF_INET_*）
+    int                 priority;   // 优先级（小的先调用）
 };
 ```
 
 ---
 
-## 2. 核心数据结构
-
-### 2.1 nf_hook_entry — HOOK 条目
+## 3. nf_hookfn — 处理函数
 
 ```c
-// net/netfilter/core.c — nf_hook_entry
-struct nf_hook_entry {
-    nf_hookfn          *hook;        // 过滤函数
-    void              *priv;        // 私有数据
+// include/linux/netfilter.h — nf_hookfn
+typedef unsigned int nf_hookfn(void *priv,
+                              struct sk_buff *skb,
+                              const struct nf_hook_state *state);
+
+enum nf_hook_ops_type {
+    NF_HOOK_NOLOG   = 0,
+    NF_HOOK_BPF      = 1,
+    NF_HOOK_NORMAL   = 2,
+    NF_HOOK_DEV_BPF  = 3,
 };
 
-struct nf_hook_info {
-    struct nf_hook_entry *hooks[NF_MAX_HOOKS]; // 每协议族每点一个
-};
-```
-
-### 2.2 net — 网络命名空间
-
-```c
-// include/net/net_namespace.h — net
-struct net {
-    // netfilter 规则
-    struct netns nf  *nf;          // netfilter 命名空间
-    // ...
-};
+// 返回值：
+//   NF_DROP     = 丢弃包
+//   NF_ACCEPT   = 接受包，继续处理
+//   NF_STOLEN   = 吞噬包（HOOK 处理完，不再处理）
+//   NF_QUEUE    = 排队到用户空间（nfqueue）
+//   NF_REPEAT   = 重新调用本 HOOK
 ```
 
 ---
 
-## 3. 数据包处理流程
-
-### 3.1 nf_hook_slow — 遍历 HOOK 链
+## 4. nf_hook_slow — 执行 HOOK 链
 
 ```c
 // net/netfilter/core.c — nf_hook_slow
-static unsigned int nf_hook_slow(struct net *net, struct sk_buff *skb,
-                 const struct nf_hook_state *state)
+unsigned int nf_hook_slow(u_int8_t pf, unsigned int hook,
+                          struct sk_buff *skb, struct net_device *indev,
+                          struct net_device *outdev,
+                          const struct net_device *const *hook_list)
 {
-    struct nf_hook_entries *hooks;
+    struct list_head *head;
+    struct nf_hook_entry *hook_entry;
     unsigned int verdict;
-    struct nf_hook_entry *hook;
-    void *priv;
 
-    // 获取 HOOK 链
-    hooks = rcu_dereference(net->nf.hooks[state->pf][state->hooknum]);
-    if (!hooks)
-        return NF_ACCEPT;
-
-    // 遍历每个 HOOK
-    for (i = 0; i < hooks->num; i++) {
-        verdict = hooks->hooks[i].hook(hooks->hooks[i].priv, skb, state);
+    // 遍历 HOOK 链表
+    head = &hook_list[hook];
+    list_for_each_entry_rcu(hook_entry, head, list) {
+        verdict = hook_entry->hook(hook_entry->priv, skb, state);
         if (verdict != NF_ACCEPT)
-            return verdict;
+            return verdict;  // 丢弃或其他
     }
 
     return NF_ACCEPT;
 }
 ```
 
-### 3.2 返回值
+---
+
+## 5. iptables 规则表
+
+```
+iptables 表链结构：
+
+filter 表（包过滤）：
+  INPUT   → NF_INET_LOCAL_IN
+  OUTPUT  → NF_INET_LOCAL_OUT
+  FORWARD → NF_INET_FORWARD
+
+nat 表（地址转换）：
+  PREROUTING  → NF_IP_PRE_ROUTING  (DNAT)
+  OUTPUT      → NF_IP_LOCAL_OUT    (LOCAL DNAT)
+  POSTROUTING → NF_IP_POST_ROUTING (SNAT)
+```
+
+---
+
+## 6. 连接跟踪（conntrack）
 
 ```c
-// include/uapi/linux/netfilter.h
-enum nf_inet_hooks {
-    NF_HOOK_REJECT = -1,           // 拒绝
-    NF_HOOK_DROP = -2,             // 丢弃
-    NF_HOOK_BPF = -3,             // BPF 决定
-    NF_HOOK_NF_DEV_1 = -5,         // 厂商自定义
-    NF_ACCEPT = 1,                 // 接受
-    NF_DROP = 1,                   // 丢弃
-    NF_QUEUE = 2,                   // 放入队列（nft queues）
+// net/netfilter/nf_conntrack_core.c — nf_conntrack_in
+// 每个连接在 HOOK 中被跟踪：
+//   NEW → ESTABLISHED → RELATED → ...
+
+struct nf_conntrack_tuple {
+    union nf_inet_addr src;  // 源地址
+    union nf_inet_addr dst;  // 目标地址
+    __be16              src_port;  // 源端口
+    __be16              dst_port;  // 目标端口
+    u8                 protonum;   // TCP/UDP/ICMP
 };
 ```
 
 ---
 
-## 4. iptables 表链结构
-
-```
-raw ─────► mangle ─────► nat ─────► filter
- (钩子)    (修改)     (地址)    (过滤)
-   │
-   ▼
-PREROUTING / OUTPUT
-```
-
-### 4.1 ipt_table — 表
-
-```c
-// net/ipv4/netfilter/iptable_filter.c — ipt_table
-static struct xt_table filter_table = {
-    .name       = "filter",
-    .valid_hooks = FILTER_VALID_HOOKS,
-    .hook       = filter_hook,           // HOOK 函数
-    .owner      = THIS_MODULE,
-    .me         = "iptable_filter",
-};
-```
-
-### 4.2 filter_hook — filter 表处理
-
-```c
-static unsigned int filter_hook(void *priv, struct sk_buff *skb,
-                   const struct nf_hook_state *state)
-{
-    // INPUT/FORWARD/OUTPUT 三个点的分发
-    switch (state->hook) {
-    case NF_INET_LOCAL_IN:
-        return ipt_do_table(skb, state->hook, &info->chains[0]);
-    case NF_INET_FORWARD:
-        return ipt_do_table(skb, state->hook, &info->chains[1]);
-    case NF_INET_LOCAL_OUT:
-        return ipt_do_table(skb, state->hook, &info->chains[2]);
-    }
-    return NF_ACCEPT;
-}
-```
-
----
-
-## 5. nftables — 替代 iptables
-
-**nftables**（Linux 3.13+）是新一代包过滤框架：
-- 更简单的语法
-- 内核 JIT 编译规则
-- 原生支持 set/map
-- 替代 iptables/ip6tables/ebtables
-
-```c
-// 用户空间规则：
-table inet filter {
-    chain input {
-        tcp dport 22 accept
-        ip saddr 192.168.1.0/24 drop
-    }
-}
-```
-
----
-
-## 6. 完整文件索引
+## 7. 完整文件索引
 
 | 文件 | 函数/结构 |
 |------|----------|
-| `include/linux/netfilter.h` | `struct nf_hook_ops`、`NF_HOOK_*` |
-| `net/netfilter/core.c` | `nf_hook_slow`、`nf_register_net_hook` |
-| `net/ipv4/netfilter/iptable_filter.c` | `filter_hook`、`ipt_do_table` |
+| `include/linux/netfilter.h` | `struct nf_hook_ops`、`nf_hookfn` |
+| `net/netfilter/core.c` | `nf_hook_slow` |
+
+---
+
+## 8. 西游记类比
+
+**netfilter** 就像"取经路上的关卡检查站"——
+
+> 数据包经过各个关卡（HOOK 点）时，每个关卡（nf_hook_ops）按优先级顺序检查。iptables 规则就像每个关卡的操作手册（规则表），按顺序从上到下匹配。第一条匹配的规则决定数据包命运（NF_DROP 丢弃，NF_ACCEPT 放行）。如果所有关卡都放行，包就继续旅行（进入协议栈）。
+
+---
+
+## 9. 关联文章
+
+- **conntrack**（网络部分）：连接跟踪增强 netfilter
+- **netfilter**（article 63）：nf_conntrack 模块

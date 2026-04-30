@@ -1,4 +1,4 @@
-# cgroup v2 — 控制组统一层级深度源码分析
+# 27-cgroup_v2 — Cgroup v2 统一层级深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码（`kernel/cgroup/cgroup.c`）
 > 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
@@ -7,135 +7,135 @@
 
 ## 0. 概述
 
-**cgroup v2** 是 Linux 4.5+ 引入的统一控制组，与 v1 的区别：
-- **单一树**：所有控制器在同一树中
-- **强制继承**：子 cgroup 继承父 cgroup 的控制器
-- **线程模式**：支持线程级别的 cgroup
+**cgroup v2（统一层级）** 是 Linux 控制组的最新版本，所有控制器在同一树中管理资源，替代了 v1 的多树模型。
 
 ---
 
-## 1. 核心数据结构
+## 1. cgroup v1 vs v2 对比
 
-### 1.1 cgroup — cgroup 描述符
+```
+cgroup v1（多树）：
+  /sys/fs/cgroup/
+    cpu/           ← cpu 控制器子树
+    memory/        ← memory 控制器子树（独立）
+    blkio/         ← blkio 控制器子树（独立）
+  问题：不同控制器的资源分配无法协调
+
+cgroup v2（统一树）：
+  /sys/fs/cgroup/
+    user/          ← 所有控制器在同一树
+      alice/       ← alice 的 cpu + memory + io 统一管理
+      bob/         ← bob 的资源独立
+```
+
+---
+
+## 2. 核心数据结构
+
+### 2.1 cgroup_root — v2 根
 
 ```c
-// kernel/cgroup/cgroup.h — cgroup
+// kernel/cgroup/cgroup.c — cgroup_root
+struct cgroup_root {
+    struct cgroup        *cgrp;           // 根 cgroup
+    unsigned long         subsys_mask;    // 启用的控制器掩码
+    char                  name[CGROUP_NAMELEN]; // "cgroup2fs"
+};
+```
+
+### 2.2 cgroup — 控制组
+
+```c
+// kernel/cgroup/cgroup.c — cgroup
 struct cgroup {
-    // ID 和名称
-    struct cgroup_id        id;             // 全局唯一 ID
-    const char              *name;           // cgroup 名称
-    struct cgroup          *parent;         // 父 cgroup
-    struct list_head        children;        // 子 cgroup 链表
+    // 层级
+    struct cgroup          *parent;        // 父 cgroup
+    struct cgroup         *self;          // 指向自己的 cgroup_self
+    struct cgroup_fs_context *ctx;        // 创建上下文
 
-    // 子系统状态
-    struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT]; // 各控制器状态
-    unsigned long           subtree_control;  // 启用的控制器
-    unsigned long           subtree_ss_mask;   // 显式启用的控制器
+    // 子树控制
+    unsigned long           subtree_control;  // 子树控制器掩码
+    unsigned long           child_subtree_control; // 子孙可用的控制器
 
-    // 资源限制
-    struct cgroup_files     *cftypes;       // cgroupfs 文件类型
-    struct cgroup_fs_context *ctx;          // cgroupfs 上下文
+    // 控制器
+    struct cgroup           *child;         // 第一个子 cgroup
+    struct cgroup          *last_child;    // 最后一个子 cgroup
+    struct cgroup          *children;       // 子 cgroup 链表
 
-    // 线程模式
-    enum cgroup_thread_tag  thread_tag;      // 线程标签
-    struct cgroup           *dom_cgrp;       // 域 cgroup（线程模式）
-    struct list_head        threaded_cpusets; // 线程 cgroup 链表
-
-    // 统计
-    struct cgroup_base_stat base_cst;       // 基础统计
-};
-```
-
-### 1.2 cgroup_subsys_state — 子系统状态
-
-```c
-// kernel/cgroup/cgroup.h — cgroup_subsys_state
-struct cgroup_subsys_state {
-    struct cgroup           *cgroup;          // 所属 cgroup
-    struct cgroup_subsys   *ss;              // 控制器
-    unsigned long           flags;            // CSS_* 标志
-
-    // 层级统计
-    struct css_refcount     refcnt;         // 引用计数
-
-    // 各控制器特定
-    union {
-        struct cgroup_cpu    cpu;       // CPU 控制器
-        struct cgroup_memory  memory;     // 内存控制器
-        // ...
-    };
-};
-```
-
-### 1.3 cgroup_controller — 控制器
-
-```c
-// kernel/cgroup/cgroup.h — cgroup_controller
-struct cgroup_controller {
-    struct cgroup_subsys   *ss;          // 控制器
-    unsigned long           cftypes;       // 文件类型
-    struct cgroup          *cgrp;         // 所属 cgroup
+    // 资源
+    struct cgroup_resources  resources;      // 资源状态
 };
 ```
 
 ---
 
-## 2. cgroup 文件系统接口
+## 3. 子树控制
 
-### 2.1 cgroupfs 文件
-
-```
-/sys/fs/cgroup/
-├── cgroup.controllers      ← 可用控制器列表
-├── cgroup.max.depth        ← 最大深度
-├── cgroup.stat             ← 统计
-├── cgroup.subtree_control  ← 子 cgroup 启用的控制器
-├── cgroup.procs            ← 进程列表
-├── cpu.pressure            ← CPU 压力
-├── memory.pressure         ← 内存压力
-├── io.pressure             ← I/O 压力
-└── <cgroup>/
-```
-
-### 2.2 资源限制
+### 3.1 subtree_control
 
 ```c
-// CPU 限制
-cpu.max = "100000 1000000"     // 10% CPU
-cpu.weight = 100               // 权重（权重比例）
+// 开启子树的 cpu 控制器：
+echo +cpu > /sys/fs/cgroup/user/cgroup.subtree_control
 
-// 内存限制
-memory.max = 1073741824       // 1GB
-memory.high = 805306368        // 高水位线（触发回收）
-memory.low = 268435456         // 低水位线（触发预回收）
+// 效果：user 下的所有子 cgroup 共享 user 的 cpu 资源
+// 子 cgroup 不能单独管理 cpu（由 user 统一管理）
+```
 
-// I/O 限制
-io.max = "8:0 rbps=104857600"  // 100MB/s
-io.weight = 100                 // 权重
+### 3.2 资源分配示例
+
+```
+/sys/fs/cgroup/user/alice/
+  subtree_control = cpu,memory,io
+  └─ alice/       ← 使用 cpu + memory + io（从 user 继承）
+      └─ alice/app1/ ← 子 cgroup，共享 alice 的资源
 ```
 
 ---
 
-## 3. 线程模式（Threaded Cgroup）
+## 4. 线程模式（Threaded Mode）
 
 ```c
-// cgroup v2 线程模式允许进程中的线程属于不同子 cgroup
-// 子 cgroup 的线程被标记为 threaded
-// 父 cgroup 被称为 domain cgroup
+// 线程模式允许同一进程树的线程在不同 cgroup：
+echo threaded > /sys/fs/cgroup/user/alice/cgroup.type
 
-dom_cgrp                    ← 域 cgroup
-├── threaded_cpusets[]     ← 线程 cgroup
-│   ├── t1                 ← 线程 cgroup（共享父的资源控制）
-│   └── t2
-└── processes              ← 进程
+// 线程模式下，线程可以在同属一个 cgroup 的不同子 cgroup 之间移动
 ```
 
 ---
 
-## 4. 完整文件索引
+## 5. 内存控制器
+
+### 5.1 memory.max — 内存限制
+
+```c
+// 写入限制：
+echo 1G > /sys/fs/cgroup/user/alice/memory.max
+
+// 读取当前使用：
+cat /sys/fs/cgroup/user/alice/memory.current
+
+// 如果超过限制：
+//   进程被移到 memory.repriority 或触发 OOM
+```
+
+---
+
+## 6. 完整文件索引
 
 | 文件 | 函数/结构 |
 |------|----------|
-| `kernel/cgroup/cgroup.h` | `struct cgroup`、`struct cgroup_subsys_state` |
-| `kernel/cgroup/cgroup.c` | `cgroup_create`、`cgroup_apply_control` |
-| `kernel/cgroup/cgroup-v2.c` | cgroup v2 特定实现 |
+| `kernel/cgroup/cgroup.c` | `struct cgroup_root`、`struct cgroup` |
+
+---
+
+## 7. 西游记类比
+
+**cgroup v2** 就像"天庭的资源管理局"——
+
+> 以前每个部门（v1 多树）独立管理自己的资源，玉帝（root）要协调跨部门资源分配很麻烦。cgroup v2 统一树就像把所有部门合并成一个大的资源管理局（统一层级），每个子部门（子 cgroup）在父部门的统一领导下分配资源。如果 user 下有 alice 和 bob 两个徒弟，他们共享 user 的 cpu 和 memory，但各自内部可以再细分。这就是 subtree_control 的意义——父部门统一管理，子部门按需分配。
+
+---
+
+## 8. 关联文章
+
+- **cgroup v1**（article 94）：v1 的多树模型
