@@ -1,269 +1,224 @@
-# Linux Kernel mutex 可睡眠互斥锁 — 深度源码分析
+# mutex — 内核互斥锁深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码（`include/linux/mutex.h` + `include/linux/mutex_types.h` + `kernel/locking/mutex.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-> 更新：整合 2026-04-21 学习笔记
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 0. 什么是 mutex？
+## 0. 概述
 
-**mutex** 是内核最常用的**可睡眠互斥锁**：
-- 一次只能一个任务持有
-- 持有者才能解锁（不可跨线程/跨进程）
-- 不可递归加锁
-- 支持 TASK_INTERRUPTIBLE / TASK_KILLABLE 等待模式
-- 可选优先级继承（CONFIG_RT_MUTEXES）
+**mutex** 是内核最简单的互斥锁，语义：
+- **同一时刻只有一个持有者**
+- **只有持有者才能解锁**
+- **不允许递归**
+- **不允许在中断上下文使用**
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 `struct mutex`（非 RT）
+### 1.1 mutex — 互斥锁
 
 ```c
-// include/linux/mutex_types.h — 非 PREEMPT_RT 配置
+// include/linux/mutex_types.h — mutex (非 RT)
 context_lock_struct(mutex) {
-    atomic_long_t       owner;          // 低位存 owner task_struct*，高位存标志
-    raw_spinlock_t      wait_lock;      // 保护 wait_list
+    atomic_long_t       owner;         // 持有者（task_struct* + 标志）
+    raw_spinlock_t     wait_lock;     // 保护等待链表
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
-    struct optimistic_spin_queue osq;  // MCS 自旋锁（减少 cacheline 竞争）
+    struct optimistic_spin_queue osq;   // MCS 自旋锁（optimistic spinning）
 #endif
-    struct mutex_waiter *first_waiter __guarded_by(&wait_lock);  // 等待链表头
+    struct mutex_waiter *first_waiter; // 等待者链表头
 #ifdef CONFIG_DEBUG_MUTEXES
-    void               *magic;           // 调试：魔数
+    void               *magic;        // 调试：魔数
 #endif
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
-    struct lockdep_map  dep_map;       // 死锁检测
+    struct lockdep_map  dep_map;        // 调试：锁依赖图
 #endif
 };
-
-// 静态初始化
-#define DEFINE_MUTEX(mutexname) \
-    struct mutex mutexname = __MUTEX_INITIALIZER(mutexname)
-
-#define __MUTEX_INITIALIZER(mutexname)                \
-    {                                               \
-        .owner = ATOMIC_LONG_INIT(0),               \
-        .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(...),\
-        .wait_list = LIST_HEAD_INIT(mutexname.wait_list) \
-    }
 ```
 
 ### 1.2 owner 字段编码
 
 ```c
-// kernel/locking/mutex.c — owner 编码规则
-// 低位用于标记：
-//   bit 0 = 1 → MUTEX_FLAG_PICKUP（锁被拾取，正在交接）
-//   bit 0 = 0 → 正常状态，剩余位存 task_struct* 地址
+// kernel/locking/mutex.h — owner 编码
+// owner = task_struct* + MUTEX_FLAGS（低 3 位）
 
-static inline struct task_struct *__owner_task(unsigned long owner)
-{
-    return (struct task_struct *)(owner & ~MUTEX_FLAGS);
-}
+struct task_struct *owner = (struct task_struct *)(owner_raw & ~MUTEX_FLAGS);
+unsigned long flags = owner_raw & MUTEX_FLAGS;
 
-#define MUTEX_FLAGS 0x01
-
-// 判断是否已锁定
-static inline bool __mutex_locked(struct mutex *lock)
-{
-    return atomic_long_read(&lock->owner) != 0;
-}
+// MUTEX_FLAGS 定义：
+#define MUTEX_FLAG_WAITERS  0x01  // 有等待者（解锁时需要 wakeup）
+#define MUTEX_FLAG_HANDOFF  0x02  // 互斥模式
+#define MUTEX_FLAG_PICKUP   0x04  // 快速拾取
 ```
+
+**owner == 0**：锁空闲
 
 ---
 
-## 2. 快速路径 vs 慢路径
+## 2. fastpath — 快速路径（乐观自旋）
 
-```
-mutex_lock() 路径：
-
-1. __mutex_trylock_fast() — 乐观自旋
-   atomic_long_try_cmpxchg_acquire(&lock->owner, &zero, curr)
-   → 如果 owner == 0（未锁定），原子地设置为 current → 加锁成功！
-   → O(1)，无需睡眠
-
-2. __mutex_lock_slowpath() — 慢路径（抢锁失败）
-   1. spin_lock(wait_lock)
-   2. 检查是否已解锁（其他 CPU 刚释放）→ 快速路径
-   3. add_wait_queue() 加入 wait_list
-   4. 设置状态为 TASK_UNINTERRUPTIBLE
-   5. spin_unlock(wait_lock)
-   6. schedule() — 睡眠让出 CPU
-```
-
-```
-mutex_unlock() 路径：
-
-1. __mutex_unlock_fast() — 快速路径
-   atomic_long_try_cmpxchg_release(&lock->owner, &curr, 0)
-   → 如果 current 是持有者，原子地设置为 0 → 解锁成功！
-   → O(1)
-
-2. __mutex_unlock_slowpath() — 慢路径（有等待者）
-   1. spin_lock(wait_lock)
-   2. 如果有等待者：
-        ww_mutex → 调用 handoff 交接
-        普通 mutex → 唤醒 first_waiter
-   3. spin_unlock(wait_lock)
-```
-
----
-
-## 3. 乐观自旋（CONFIG_MUTEX_SPIN_ON_OWNER）
+### 2.1 __mutex_trylock_fast — O(1) 获取
 
 ```c
-// kernel/locking/mutex.c — mutex_spin_on_owner
-static int mutex_spin_on_owner(struct mutex *lock,
-                               struct mutex_waiter *waiter)
+// kernel/locking/mutex.c
+static inline bool __mutex_trylock_fast(struct mutex *lock)
 {
-    // 如果锁持有者在运行 → 继续自旋等待
-    // 如果锁持有者不运行（睡眠、迁移）→ 退出自旋，睡眠
+    unsigned long owner = atomic_long_read(&lock->owner);
+
+    // 如果 owner == 0（空闲），尝试原子交换
+    if (owner)  // 非零 = 已被持有
+        return false;
+
+    return atomic_long_try_cmpxchg_acquire(&lock->owner, &owner, (long)current) != 0;
+}
+```
+
+**原理**：
+- 使用 `try_cmpxchg` 原子指令
+- 如果 `lock->owner == 0`，设置为 `current`
+- 成功 → 获取锁；失败 → 走慢路径
+
+### 2.2 osq — MCS 自旋锁
+
+**MCS（Michael-Scott）队列锁**：解决自旋锁的缓存一致性（cache bouncing）问题。
+
+```
+传统自旋：所有自旋线程竞争同一个变量 → 缓存行 ping-pong
+MCS 自旋：每个线程在自己本地变量上自旋 → 只需一次写入
+```
+
+```
+lock = &osq->queue
+node = get_local_node()
+
+// 加入队列
+node->next = NULL
+prev = atomic_xchg(lock, node)  // 原子替换，返回旧值
+if (prev)
+    prev->next = node           // 前驱指向自己
+
+// 自旋等待
+while (node->locked == 0)       // 本地变量，自旋
+    cpu_relax();
+
+// 锁持有者 unlock 时设置 node->locked = 1
+```
+
+---
+
+## 3. slowpath — 慢路径（阻塞）
+
+### 3.1 __mutex_lock_slowpath
+
+```c
+// kernel/locking/mutex.c
+__mutex_lock_slowpath(lock)
+{
+    // 1. 加入等待队列
+    mutex_waiter = alloc_mutex_waiter();
+    mutex_waiter->task = current;
+
+    spin_lock(&lock->wait_lock);
+    // 插入到等待者链表（按 FIFO 顺序）
+    if (lock->first_waiter == NULL)
+        lock->first_waiter = mutex_waiter;
+    else
+        list_add_tail(&mutex_waiter->list, &lock->first_waiter->list);
+
+    // 2. 设置 MUTEX_FLAG_WAITERS（告诉 unlock 需要 wakeup）
+    atomic_long_or(MUTEX_FLAG_WAITERS, &lock->owner);
+
+    // 3. 尝试乐观自旋（如果在等待队列）
+    if (can_spin_on_owner(lock))
+        optimistic_spin(lock);
+
+    // 4. 阻塞等待
     for (;;) {
-        if (!owner || !osq_locked(&lock->osq))
+        set_current_state(TASK_UNINTERRUPTIBLE);
+        if (__mutex_trylock(lock))
             break;
-        cpu_relax();
+        schedule();
+    }
+    __set_current_state(TASK_RUNNING);
+
+    // 5. 从等待队列移除
+    spin_lock(&lock->wait_lock);
+    list_del(&mutex_waiter->list);
+    spin_unlock(&lock->wait_lock);
+}
+```
+
+---
+
+## 4. unlock — 解锁
+
+### 4.1 mutex_unlock
+
+```c
+// kernel/locking/mutex.c
+void __mutex_unlock(struct mutex *lock)
+{
+    // 1. 如果没有等待者，直接释放
+    if (atomic_long_read(&lock->owner) & MUTEX_FLAG_WAITERS) {
+        // 有等待者，走慢路径
+        __mutex_unlock_slowpath(lock);
+    } else {
+        // 快速释放
+        atomic_long_set(&lock->owner, 0);
     }
 }
 ```
 
-**为什么乐观自旋有效**：
-- 锁的持有时间通常很短（几个指令）
-- 自旋等待比上下文切换便宜（schedule() 开销约 10-50μs）
-- 自旋期间锁可能已释放，无需睡眠
-
----
-
-## 4. wait_list 与 FIFO 唤醒
+### 4.2 __mutex_unlock_slowpath
 
 ```c
-// kernel/locking/mutex.c — 添加等待者
-static void __mutex_add_waiter(struct mutex *lock,
-                                struct mutex_waiter *waiter)
+// kernel/locking/mutex.c
+__mutex_unlock_slowpath()
 {
-    struct mutex_waiter *first_waiter = mutex_waiter_last(lock);
-    list_add_tail(&waiter->node, &lock->wait_list);
-    if (!first_waiter)  // 第一个等待者
-        lock->owner = (unsigned long)(waiter->task | MUTEX_FLAG_WAITERS);
-}
+    // 1. 获取第一个等待者
+    waiter = lock->first_waiter;
 
-// 唤醒等待者（FIFO，不是优先级）
-static void __mutex_unlock_slowpath(struct mutex *lock)
-{
-    // 取出 wait_list 第一个等待者
-    waiter = list_first_entry(&lock->wait_list, struct mutex_waiter, node);
-    wake_up_process(waiter->task);  // 唤醒
+    // 2. 清除 MUTEX_FLAG_WAITERS
+    atomic_long_andnot(MUTEX_FLAG_WAITERS, &lock->owner);
+
+    // 3. 设置 HANDOFF（将锁交给等待者）
+    atomic_long_or(MUTEX_FLAG_HANDOFF, &lock->owner);
+
+    // 4. 唤醒等待者
+    wake_up_process(waiter->task);
 }
 ```
 
 ---
 
-## 5. ww_mutex（ Wound-Wait 死锁避免）
+## 5. 状态转换图
 
-```c
-// 内核还支持 ww_mutex，用于多锁同时获取场景（如文件系统）
-// Wound-Wait 协议：
-//   - 事务 A 等锁，事务 B 持有 → A 等待
-//   - 事务 A 持锁，事务 B 要获取 → B 被 wounded（释放已有锁）
-//   - 避免循环等待死锁
-
-struct ww_mutex {
-    struct mutex base;
-    // ...
-};
+```
+锁空闲: owner = 0
+    ↓
+try_cmpxchg(current) 成功
+    ↓
+持有中: owner = current | 0
+    ↓
+有线程等待: owner |= MUTEX_FLAG_WAITERS
+    ↓
+解锁时检测到 WAITERS
+    ↓
+owner |= MUTEX_FLAG_HANDOFF
+    ↓
+wake_up_process(等待者)
+    ↓
+新持有者: owner = new_task | 0
 ```
 
 ---
 
-## 6. API 总览
+## 6. 完整文件索引
 
-```c
-// 加锁
-void mutex_lock(struct mutex *lock);                          // 不可中断
-int mutex_lock_interruptible(struct mutex *lock);             // 可被信号中断
-int mutex_lock_killable(struct mutex *lock);                 // 可被 kill 信号中断
-void mutex_lock_nested(struct mutex *lock, unsigned subclass); // 分层锁
-bool mutex_trylock(struct mutex *lock);                      // 非阻塞尝试
-
-// 解锁
-void mutex_unlock(struct mutex *lock);
-
-// 查询
-bool mutex_is_locked(struct mutex *lock);                    // 是否已锁定
-bool mutex_trylock(struct mutex *lock);                      // 尝试加锁
-```
-
----
-
-## 7. 真实内核使用案例
-
-### 7.1 inode 锁（`fs/inode.c`）
-
-```c
-// 每个 inode 有 i_mutex
-struct inode {
-    // ...
-    struct mutex i_mutex;  // inode 操作锁
-};
-
-// 使用
-mutex_lock(&inode->i_mutex);
-// 修改 inode
-mutex_unlock(&inode->i_mutex);
-```
-
-### 7.2 模块加载（`kernel/module.c`）
-
-```c
-// 模块列表操作
-static DEFINE_MUTEX(module_mutex);  // 保护模块链表
-
-mutex_lock(&module_mutex);
-list_add_rcu(&mod->list, &modules);
-mutex_unlock(&module_mutex);
-```
-
-### 7.3 内存管理（`mm/mmap.c`）
-
-```c
-// mmap_sem（部分已迁移到 mmap_lock）
-static DEFINE_MUTEX(mm->mmap_lock);
-```
-
----
-
-## 8. vs spinlock
-
-| 特性 | spinlock | **mutex** |
-|------|---------|-----------|
-| 上下文 | 中断、原子、NMI | **进程上下文** |
-| 睡眠 | **不允许** | 允许（schedule） |
-| 持有时间 | 极短（几个指令） | 任意长度 |
-| 递归 | 不允许 | 不允许 |
-| 优先级继承 | 无 | **支持（CONFIG_RT_MUTEXES）** |
-| 中断上下文 | ✅ | ❌ |
-| 死锁检测（lockdep）| ✅ | **✅** |
-
----
-
-## 9. 设计思想总结
-
-| 设计决策 | 原因 |
-|---------|------|
-| owner 原子变量 + wait_lock | 快速路径无锁（cmpxchg），争用时用自旋锁 |
-| MCS osq | 减少多 CPU cacheline 竞争（每个 CPU 有自己的 MCS 节点）|
-| wait_list FIFO | 先到先服务（公平），避免饥饿 |
-| spin_on_owner | 锁持有时间通常很短，自旋比睡眠/唤醒便宜 |
-| RT-MUTEX 支持 | 优先级继承解决优先级反转问题 |
-
----
-
-## 10. 参考
-
-| 文件 | 内容 |
+| 文件 | 函数 |
 |------|------|
-| `include/linux/mutex.h` | API 声明、宏定义 |
-| `include/linux/mutex_types.h` | mutex 结构体（RT / non-RT） |
-| `include/linux/kref.h` | kref 引用计数 |
-| `kernel/locking/mutex.c` | 快速路径（trylock/unlock）、慢路径实现 |
+| `include/linux/mutex_types.h` | `struct mutex` |
+| `include/linux/mutex.h` | `__MUTEX_INITIALIZER`、`DEFINE_MUTEX` |
+| `kernel/locking/mutex.h` | owner 编码、`__mutex_owner` |
+| `kernel/locking/mutex.c` | `__mutex_trylock_fast`、`__mutex_lock_slowpath`、`__mutex_unlock_slowpath` |

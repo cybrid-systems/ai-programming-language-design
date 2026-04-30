@@ -1,488 +1,426 @@
-# Linux Kernel rbtree 红黑树 — 深度源码分析
+# rbtree — 内核红黑树深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`lib/rbtree.c` + `include/linux/rbtree.h` + `include/linux/rbtree_augmented.h`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-> 更新：整合 2026-04-16 学习笔记
-
----
-
-## 0. 为什么需要红黑树？
-
-**链表的问题**：O(n) 查找，有序场景下退化成线性扫描。
-
-**红黑树的核心价值**：O(log n) 插入/删除/查找，同时保证**近似平衡**（最多 2 倍路径长度），无需像 AVL 树那样频繁旋转。
-
-**内核使用量**（Linux 7.0 源码）：
-```
-grep -rn "rb_insert_color\|rb_erase" --include="*.c" | wc -l  →  698 处
-```
+> 基于 Linux 7.0-rc1 主线源码（`include/linux/rbtree.h` + `include/linux/rbtree_types.h` + `lib/rbtree.c`）
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 行号索引：rbtree.h 全文、rbtree.c 全文
 
 ---
 
-## 1. 核心数据结构
+## 0. 概述
 
-### 1.1 `rb_node` — 节点（含颜色压缩）
+**红黑树（R-B Tree）** 是 Linux 内核最核心的搜索树结构，用于：
+- **调度器**：CFS 用红黑树管理 vruntime
+- **内存管理**：vm_area_struct 按地址组织
+- **文件系统**：dentry 缓存、ext4 inode extent
+- **网络**：路由表（fib）、neighbour 表
+- **设备驱动**：GPIO 引脚、PCI BAR
+
+**核心保证**：O(log n) 查找/插入/删除，且**不需要额外平衡操作**（不像 AVL 树）。
+
+---
+
+## 1. 红黑树性质
+
+根据 Wikipedia 和内核注释：
+
+```
+1) 节点非红即黑
+2) 根节点为黑
+3) 所有叶子（NIL/NULL）为黑
+4) 红节点的两个子节点都为黑（不能有连续红节点）
+5) 从根到所有叶子路径上的黑节点数相同（黑高）
+```
+
+**O(log n) 证明**：
+- 性质 4 限制了红节点不能连续 → 最长路径 ≤ 2 × 最短路径
+- 性质 5 保证所有路径黑高相同 → 最短路径 ≥ log₂(n+1)
+- 综合：最长路径 ≤ 2 × log₂(n+1) = O(log n)
+
+---
+
+## 2. 核心数据结构
+
+### 2.1 rb_node — 红黑树节点
 
 ```c
 // include/linux/rbtree_types.h
 struct rb_node {
-    unsigned long  __rb_parent_color;  // 低 1 位存颜色，其余位存 parent 指针
-    struct rb_node *rb_right;          // 右子树
-    struct rb_node *rb_left;           // 左子树
-} __attribute__((aligned(sizeof(long))));  // 按 long 对齐，保证指针低位可用
+    unsigned long  __rb_parent_color;  // 父指针 + 颜色（合并存储）
+    struct rb_node *rb_right;         // 右子树
+    struct rb_node *rb_left;          // 左子树
+} __attribute__((aligned(sizeof(long))));
+    // 对齐到 sizeof(long) — 确保指针低位可用于存颜色
 ```
 
-**颜色压缩设计**（`include/linux/rbtree_augmented.h:171-182`）：
+**`__rb_parent_color` 编码**：
 
-```c
-#define RB_RED       0
-#define RB_BLACK     1
+```
+64-bit 系统（8 字节指针）：
+  低 2 位存颜色（00=红，01=黑）
+  高 62 位存父节点指针（地址对齐到 4 字节，所以最低 2 位肯定为 0）
 
-// 从 __rb_parent_color 中提取 parent 指针（清除低 2 位）
-#define __rb_parent(pc)    ((struct rb_node *)(pc & ~3))
+提取父指针：
+  #define rb_parent(r) ((struct rb_node *)((r)->__rb_parent_color & ~3))
 
-// 从 __rb_parent_color 中提取颜色（取最低 1 位）
-#define __rb_color(pc)     ((pc) & 1)
-
-// parent 指针和颜色共用了同一个存储空间：
-//  parent 地址必然是 4 或 8 字节对齐 → 二进制最后 2 位为 00
-//  低 1 位存颜色 → color 要么是 RB_RED(0) 要么是 RB_BLACK(1)
-//  存储时：(__rb_parent_color) = parent_address + color
-//  提取时：parent = __rb_parent_color & ~3，color = __rb_parent_color & 1
+提取颜色：
+  #define __rb_color(pc) ((pc) & 1)
+  #define RB_BLACK 1
+  #define RB_RED   0
 ```
 
-**为什么 `aligned(sizeof(long))`**：在 64 位系统上 `sizeof(long) = 8`，`rb_node` 按 8 字节对齐后，其地址最低 3 位必为 0，所以可以用其中 1 位存颜色而不损失地址空间。
-
-### 1.2 `rb_root` — 树根
+### 2.2 rb_root — 树的根
 
 ```c
 // include/linux/rbtree_types.h
 struct rb_root {
-    struct rb_node *rb_node;  // 指向根节点，空树为 NULL
+    struct rb_node *rb_node;  // 根节点，NULL 表示空树
 };
 
-#define RB_ROOT (struct rb_root) { NULL, }  // 空树常量
+#define RB_ROOT (struct rb_root) { NULL }
 ```
 
-### 1.3 `rb_root_cached` — 带最左节点缓存
+### 2.3 rb_root_cached — 缓存最左节点
 
 ```c
 // include/linux/rbtree_types.h
 struct rb_root_cached {
-    struct rb_root rb_root;
-    struct rb_node *rb_leftmost;  // 缓存树中最左（最小）节点 → O(1) 找最小
+    struct rb_root  rb_root;   // 红黑树根
+    struct rb_node *rb_leftmost; // 最左（最小）节点缓存 → O(1) 找最小
 };
 
 #define RB_ROOT_CACHED (struct rb_root_cached) { {NULL, }, NULL }
 ```
 
+**为什么要缓存最左节点？**
+- 很多场景要找最小值（如调度器的 vruntime 最小任务）
+- `rb_first()` 需要从根一直向左下走，O(log n)
+- 缓存 `rb_leftmost` 后，`rb_first_cached()` = O(1)
+
 ---
 
-## 2. 红黑树的 5 大性质
+## 3. rb_node 链接操作
+
+### 3.1 rb_link_node — 插入节点（未着色/平衡）
 
 ```c
-// lib/rbtree.c — 注释原文
-/*
- * red-black trees properties:
- *
- *  1) A node is either red or black
- *  2) The root is black
- *  3) All leaves (NULL) are black
- *  4) Both children of every red node are black  // 不允许两个红节点连续
- *  5) Every simple path from root to leaves contains the same number
- *     of black nodes.                            // 每条路径黑高相同
- */
-```
-
-**性质 4 + 5 → O(log n) 保证**：
-
-```
-从根到任一叶的路径长度 ≤ 2 × 其他路径长度
-
-设黑高 = B（每条路径的黑节点数相同）
-最短路径：全黑 → 长度 ≤ B
-最长路径：黑-红-黑-红-... → 长度 ≤ 2B
-
-因此最长路径 = O(log n)，查找再差也是 2×最优
-```
-
----
-
-## 3. 内存布局图
-
-```
-红黑树节点布局：
-
-struct rb_node {
-    unsigned long  __rb_parent_color;  // parent_pointer + color_bit
-    struct rb_node *rb_right;          // 右子树
-    struct rb_node *rb_left;           // 左子树
-}
-
-示例树（key: 8 根黑、11 红、6 黑、13 红）：
-
-              8(B)                         颜色 = (__rb_parent_color & 1)
-             /    \                        parent = __rb_parent_color & ~3
-           6(B)    13(R)
-                  /   \
-               11(R)   15(B)
-
-__rb_parent_color 存储示例（假设 8 的地址 = 0x1000）：
-  8.__rb_parent_color = 0x1000 + 1 = 0x1001  (地址 + RB_BLACK)
-  验证：parent = 0x1001 & ~3 = 0x1000 ✓
-        color  = 0x1001 & 1 = 1 = RB_BLACK ✓
-```
-
----
-
-## 4. 旋转操作（图解）
-
-旋转是红黑树保持平衡的核心操作，不改变中序遍历顺序，只改变树的形状。
-
-### 4.1 左旋（以 P 为轴心）
-
-```
-左旋 (rotate left at P)：
-
-      P                    R
-     / \                  / \
-    PL  R      →        P   RR
-       / \             / \
-      RL  RR          PL  RL
-
-步骤（P 的右子 R 变成 P 的父）：
-1. R 的左子 RL 变成 P 的右子
-2. P 变成 R 的左子
-3. R 变成新的子树根
-```
-
-### 4.2 右旋（以 P 为轴心）
-
-```
-右旋 (rotate right at P)：
-
-      P                    L
-     / \                  / \
-    L   PR      →       LL   P
-   / \                       / \
-  LL  LR                   LR  PR
-
-步骤（P 的左子 L 变成 P 的父）：
-1. L 的右子 LR 变成 P 的左子
-2. P 变成 L 的右子
-3. L 变成新的子树根
-```
-
----
-
-## 5. 插入操作（`__rb_insert`）
-
-### 5.1 标准二叉搜索树插入
-
-```c
-// include/linux/rbtree.h:92 — 将 node 链接到树中（不含平衡）
-static inline void rb_link_node(struct rb_node *node,
-                                struct rb_node *parent,
-                                struct rb_node **rb_link)
+// include/linux/rbtree.h
+static inline void rb_link_node(struct rb_node *node, struct rb_node *parent,
+                struct rb_node **rb_link)
 {
-    node->__rb_parent_color = (unsigned long)parent;  // 只存 parent，颜色=0（红）
-    node->rb_left = node->rb_right = NULL;
-    *rb_link = node;  // parent->left/right = node
+    node->__rb_parent_color = (unsigned long)parent;  // [1] 设置父指针（默认红色）
+    node->rb_left = node->rb_right = NULL;           // [2] 左右子设为 NULL
+
+    *rb_link = node;                                   // [3] parent->{left/right} = node
 }
 ```
 
-新插入节点**默认红色**，然后调用 `rb_insert_color()` 做平衡修复。
+**参数**：
+- `parent`：新节点的父节点
+- `rb_link`：指向父节点的左或右指针的地址（即 `&parent->rb_left` 或 `&parent->rb_right`）
 
-### 5.2 平衡修复（3 种情况）
+### 3.2 rb_link_node_rcu — RCU 版本
 
-**Case 1：叔叔节点是红色**
+```c
+// include/linux/rbtree.h
+static inline void rb_link_node_rcu(struct rb_node *node, struct rb_node *parent,
+                    struct rb_node **rb_link)
+{
+    node->__rb_parent_color = (unsigned long)parent;
+    node->rb_left = node->rb_right = NULL;
 
-```
-插入 n（红），父 p（红），叔 u（红）→ 颜色翻转
-
-  G(B)                  G(R)
- /    \                /    \
-p(R)   u(R)    →     p(B)   u(B)
- |
-n(R)
-
-修复：p 和 u 变黑，G 变红（如果 G 是根则保持黑）
-递归：node = G（可能违反情况 4，继续向上修复）
-```
-
-**Case 2：叔叔节点是黑色 + node 是右子（左旋 parent）**
-
-```
-      G(B)                   G(B)
-     /    \                /    \
-   p(R)    u(B)    →    n(R)    u(B)
-     \                  /
-      n(R)            p(R)
-
-修复：左旋 parent → 变成 Case 3
-```
-
-**Case 3：叔叔节点是黑色 + node 是左子（右旋 G）**
-
-```
-      G(B)                   p(B)
-     /    \                /    \
-   p(R)    u(B)    →    n(R)    G(R)
-   /                            /  \
- n(R)                          u(B)  u(B)
-
-修复：右旋 G，颜色交换（p 变黑，G 变红）
-完成！不需要继续向上递归
+    rcu_assign_pointer(*rb_link, node);  // RCU 安全赋值
+}
 ```
 
 ---
 
-## 6. 删除操作（`____rb_erase_color`）
+## 4. 着色操作
 
-删除比插入复杂，因为需要处理**双重黑**（black height 不平衡）问题。
+### 4.1 颜色相关宏
 
-**核心思路**：通过旋转和颜色调整，把双重黑向上推，直到根节点或可以消除。
+```c
+// lib/rbtree.c
+#define __rb_parent(pc)   ((struct rb_node *)(pc & ~3UL))
+#define __rb_color(pc)    ((pc) & 1UL)
+#define __rb_set_parent_color(rb, parent, color) \
+    (((rb)->__rb_parent_color = (unsigned long)(parent) | (color)))
 
-### 6.1 删除节点的 3 种情况
+// 着色操作
+#define rb_set_parent_color(rb, parent, color) \
+    __rb_set_parent_color(rb, parent, color)
 
+#define rb_set_black(rb)  do { (rb)->__rb_parent_color |= RB_BLACK; } while(0)
+#define rb_is_red(rb)     (!rb_is_black(rb))
+#define rb_is_black(rb)   ((rb)->__rb_parent_color & RB_BLACK)
 ```
-1. 被删节点无子节点 → 直接删除，调整父节点
-2. 被删节点只有一棵子树 → 用子树节点替换被删节点
-3. 被删节点有两棵子树 → 找后继节点（rb_next）替换，然后转情况 1 或 2
+
+---
+
+## 5. 插入与再平衡（核心算法）
+
+### 5.1 __rb_insert — 插入主循环
+
+```c
+// lib/rbtree.c — 完整插入再平衡算法
+// 伪代码（配合内核注释）：
+
+__rb_insert(node, root):
+    parent = node.__rb_parent_color & ~3  // 父节点
+    gparent = parent.__rb_parent_color & ~3  // 祖父节点
+
+    while (true):
+        if parent == NULL:
+            // Case 1: 插入根节点 → 染黑，完成
+            node 染黑
+            break
+
+        if parent 是黑色:
+            // Case 2: 父节点为黑，插入红节点不违反性质 4
+            break
+
+        // 父节点为红（违反性质 4），需要修复
+        gparent = rb_red_parent(parent)  // 祖父（必然存在，因为父为红）
+
+        if parent == gparent.rb_left:
+            uncle = gparent.rb_right
+
+            if uncle 存在且为红色:
+                // Case 1: Uncle 为红
+                // → 父、叔染黑，祖父染红
+                // → node = gparent，继续向上检查
+                continue
+
+            if node == parent.rb_right:
+                // Case 2: Node 是右子 → 左旋 parent
+                // → 变成 Case 3
+                rotate_left(parent)
+                swap(node, parent)
+
+            // Case 3: Node 是左子 → 右旋 gparent
+            // → 父染黑，祖父染红
+            rotate_right(gparent)
+
+        else:  // parent == gparent.rb_right，对称处理
+            ...
 ```
 
-### 6.2 双黑修复（4 种情况）
+### 5.2 旋转操作详解
 
+**左旋（rotate_left）**：
 ```
-设被删节点的兄弟节点 = S，父节点 = P
-
-Case 1：S 是红色 → 左/右旋 P，S 变黑，P 变红 → 变成 Case 2/3/4
-
-Case 2：S 是黑色，两个子节点都是黑色
-  → S 变红，P 变黑（或双重黑上传）
-
-Case 3：S 是黑色，兄的远端子是红色，近端子是黑色
-  → 旋转 S → 变成 Case 4
-
-Case 4：S 是黑色，兄的远端子是红色
-  → 旋转 P，远端红变黑，完成！树已平衡
+旋转前：                旋转后：
+    g                    p
+   / \                 / \
+  p   U    ←左旋→     n   g
+ / \                     / \
+n   ?                     ?   U
 ```
+
+**右旋（rotate_right）**：
+```
+旋转前：                旋转后：
+    g                    p
+   / \                 / \
+  U   p      ←右旋→   g   n
+     / \               / \
+    ?   n               U   ?
+```
+
+### 5.3 三种情况图解
+
+**Case 1 — Uncle 为红（颜色翻转）**：
+```
+       [g=B]                [g=R]
+      /      \            /      \
+  [p=R]      [u=R]  →  [p=B]    [u=B]
+     ↓                    ↓
+   [n=R]              [n=R]
+```
+处理后：g 变红，p、u 变黑，node = g（向上继续检查）
+
+**Case 2 — Node 为右子（左旋变 Case 3）**：
+```
+       [g=B]                [g=B]
+      /      \            /      \
+  [p=R]      [u=B]  →  [n=R]    [u=B]
+       \                    ↑
+      [n=R]              变左子
+```
+
+**Case 3 — Node 为左子（右旋）**：
+```
+       [g=B]                [p=B]
+      /      \            /      \
+  [p=R]      [u=B]  →  [n=R]    [g=R]
+     ↓                            ↓
+   [n=R]                        [u=B]
+```
+
+---
+
+## 6. 删除操作
+
+### 6.1 rb_erase — 删除并再平衡
+
+```c
+// lib/rbtree.c
+void rb_erase(struct rb_node *node, struct rb_root *root)
+{
+    struct rb_node *rebalance;
+    struct rb_node *child;
+
+    // 1. 处理最多两个子节点的情况
+    if (node->rb_left && node->rb_right)
+        // 有两个子节点：找后继替换，然后删除后继（最多一个子节点）
+        goto two_children;
+
+    child = node->rb_right ?: node->rb_left;  // C 语法：右存在用右，否则用左
+
+    if (child):
+        // 替换 node
+        __rb_replace(node, child, root)
+        rebalance = child
+    else:
+        rebalance = NULL
+
+two_children:
+    // 删除 node，child 替代其位置
+    // rebalance 节点可能需要再平衡
+
+    if (rebalance):
+        __rb_erase(rebalance, root)
+}
+```
+
+### 6.2 删除再平衡关键路径
+
+删除红色节点：**不需要再平衡**（不影响黑高）
+
+删除黑色节点：**需要修复**，因为经过它的路径黑高减少 1
 
 ---
 
 ## 7. 遍历操作
 
-### 7.1 最小 / 最大
+### 7.1 rb_first / rb_last — 最值
 
 ```c
-// include/linux/rbtree.h:55 — 最左节点（最小 key）
+// include/linux/rbtree.h
 static inline struct rb_node *rb_first(const struct rb_root *root)
 {
     struct rb_node *n;
+
     n = root->rb_node;
-    if (!n) return NULL;
-    while (n->rb_left)
+    if (!n)
+        return NULL;
+
+    while (n->rb_left)   // 一直向左下走
         n = n->rb_left;
+
     return n;
 }
+```
 
-// 最右节点（最大 key）
-static inline struct rb_node *rb_last(const struct rb_root *root)
+### 7.2 rb_next / rb_prev — 中序后继/前驱
+
+```c
+// lib/rbtree.c
+struct rb_node *rb_next(const struct rb_node *node)
 {
-    struct rb_node *n;
-    n = root->rb_node;
-    if (!n) return NULL;
-    while (n->rb_right)
-        n = n->rb_right;
-    return n;
+    if (node->rb_right) {
+        // 有右子树：后继是最右子树的最小（最左）
+        node = node->rb_right;
+        while (node->rb_left)
+            node = node->rb_left;
+        return node;
+    }
+
+    // 无右子树：向上找第一个"自己是左子"的祖先
+    while (node->rb_parent && node == node->rb_parent->rb_right)
+        node = node->rb_parent;
+
+    return node->rb_parent;
 }
 ```
 
-### 7.2 后继 / 前驱
+### 7.3 rb_first_cached — O(1) 版本
 
 ```c
-// lib/rbtree.c:480 — rb_next
-extern struct rb_node *rb_next(const struct rb_node *);
-extern struct rb_node *rb_prev(const struct rb_node *);
+// include/linux/rbtree.h
+#define rb_first_cached(root) (root)->rb_leftmost
+// 直接返回缓存的最小节点，O(1)
 ```
-
-`rb_next`：右子树不为空 → 右子树最左；否则向上找到第一个它是左子的祖先。
 
 ---
 
-## 8. 增强版红黑树：`rb_root_cached` + `rb_root_augmented`
+## 8. 实际内核使用案例
 
-### 8.1 `rb_root_cached` — 最左节点缓存
-
-```c
-// 适用场景：频繁 rb_first()（找最小）操作
-struct rb_root_cached {
-    struct rb_root rb_root;
-    struct rb_node *rb_leftmost;  // O(1) 获取最小节点
-};
-```
-
-### 8.2 `rb_augment_callbacks` — 旋转时维护额外数据
+### 8.1 CFS 调度器（vmlinux_tracing_state）
 
 ```c
-// include/linux/rbtree_augmented.h
-struct rb_augment_callbacks {
-    void (*propagate)(struct rb_node *node, struct rb_node *stop);  // 向上传播更新
-    void (*copy)(struct rb_node *old, struct rb_node *new);          // 节点替换时复制
-    void (*rotate)(struct rb_node *old, struct rb_node *new);       // 旋转后更新
-};
-```
-
-**为什么需要 augment**：
-- CFS 调度器需要维护 `min_vruntime`
-- 旋转后子树的 `min_vruntime` 可能变化
-- augment 回调在每次旋转后自动更新这些派生数据
-
----
-
-## 9. 真实内核使用案例
-
-### 9.1 CFS 调度器（`kernel/sched/fair.c`）
-
-```c
-// include/linux/sched.h:575 — 调度实体
-struct sched_entity {
-    struct load_weight      load;
-    struct rb_node           run_node;    // 接入 CFS 红黑树
-    u64                      deadline;
-    u64                      min_vruntime;
-    u64                      vruntime;    // 虚拟运行时间，红黑树的 key
-    ...
-};
-
-// CFS 调度队列（关键结构）
+// kernel/sched/fair.c — vruntime 红黑树
 struct cfs_rq {
-    struct rb_root_cached    tasks_timeline;  // 按 vruntime 有序的红黑树
-    // 树最左节点 = 当前运行实体（最小 vruntime）
+    struct rb_root_cached   tasks_timeline;
+    // tasks_timeline.rb_root = 红黑树根
+    // tasks_timeline.rb_leftmost = vruntime 最小的任务
 };
 
-// 取最小 vruntime 的实体（O(1)）
-static inline struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
-{
-    return rb_entry_safe(cfs_rq->tasks_timeline.rb_leftmost,
-                          struct sched_entity, run_node);
-}
-
-// 实体插入时用 vruntime 作为 key
-// 内核保证 vruntim 越小越先调度 → 完全公平调度
+// 取最左节点（最小 vruntime）
+struct sched_entity *se = rb_entry(
+    rb_first_cached(&cfs_rq->tasks_timeline),
+    struct sched_entity, run_node
+);
 ```
 
-**CFS 红黑树工作原理**：
-- key = `vruntime`
-- 每次调度选最左节点（最小 vruntime）
-- 被调度后 vruntime 增加，重新插入树
-- 完全公平：通过 vruntime 增长速率实现
-
-### 9.2 虚拟内存区域（`mm/mmap.c`）
+### 8.2 vm_area_struct（虚拟内存区域）
 
 ```c
-// include/linux/mm_types.h:705 — VMA 节点
-struct vm_area_struct {
-    struct rb_node       vm_rb;     // 按 start addr 有序的红黑树
-    unsigned long        vm_start;
-    unsigned long        vm_end;
-    struct anon_vma_name *anon_name;
-    ...
-};
-
-// 全局 VMA 树
+// mm/mmap.c — VMA 红黑树
 struct mm_struct {
-    struct rb_root       mm_mt;     // 所有 VMA 按地址有序
-    ...
+    struct rb_root  mm_rb;        // VMA 红黑树
+    struct vm_area_struct *mmap; // 链表（额外组织）
 };
 
-// 查找包含 addr 的 VMA：O(log n) 红黑树查找
-// 合并相邻 VMA：利用树的中序遍历性质
+// 查找覆盖 addr 的 VMA
+struct vm_area_struct *vma = vma_lookup(mm, addr);
 ```
 
-### 9.3 hrtimer 高精度定时器
+### 8.3 ext4 extent 树
 
 ```c
-// kernel/time/hrtimer.c
-struct hrtimer {
-    struct rb_node          node;   // 按到期时间有序
-    ktime_t                expires; // 到期时间（key）
-    ...
+// fs/ext4/inode.c — extent 树
+struct ext4_extent {
+    struct rb_node    rb_node;   // 嵌入到 extent 树
+    __u32           ee_block;   // 起始块号（排序 key）
+    __u16           ee_len;     // 长度
+    __u16           ee_start_hi; // 物理块号高 16 位
+    __u32           ee_start_lo; // 物理块号低 32 位
 };
 ```
 
 ---
 
-## 10. 算法复杂度分析
+## 9. 设计决策总结
 
-| 操作 | 时间复杂度 | 说明 |
-|------|----------|------|
-| `rb_link_node` | O(1) | 直接链接，无平衡 |
-| `rb_insert_color` | O(log n) | 最多 3 次旋转 |
-| `rb_erase` | O(log n) | 最多 3 次旋转 |
-| `rb_first` | O(1)（缓存）/ O(log n) | `rb_root_cached` 时 O(1) |
-| `rb_next` / `rb_prev` | O(log n) | 树高 |
-| 查找 | O(log n) | 二叉搜索 |
-| `rb_root_cached` 维护 | O(1) | 插入/删除时更新最左缓存 |
-
----
-
-## 11. vs 其他数据结构
-
-| 特性 | 链表 | 跳转表 | 哈希表 | **红黑树** |
-|------|------|--------|--------|-----------|
-| 查找 | O(n) | O(log n) | O(1) 均摊 | **O(log n)** |
-| 有序遍历 | ✅ | ✅ | ❌ | **✅** |
-| 范围查询 | O(n) | O(log n) | ❌ | **O(log n + k)** |
-| 插入/删除 | O(1) | O(log n) | O(1) | **O(log n)** |
-| 内存开销 | 最低 | 高 | 高 | **中等（3 指针+颜色）** |
-| 典型场景 | 短列表 | 替代树 | 字典 | **有序映射、CFS、vma** |
-
----
-
-## 12. 设计思想总结
-
-| 设计决策 | 原因 |
-|---------|------|
-| `__rb_parent_color` 合并存储 | 省 8 字节（一个指针的宽度），内核极度内存敏感 |
-| `aligned(sizeof(long))` | 确保指针低 2 位为 0，可用 1 位存颜色 |
-| 增强版回调 `rb_augment` | 旋转后自动维护派生数据（如 min_vruntime），用户无感知 |
-| `rb_root_cached` 最左缓存 | CFS 等高频取最小场景，O(1) 而非 O(log n) |
-| 空树 = `rb_node = NULL` | 不需要哨兵节点 |
-
----
-
-## 13. 参考
-
-| 文件 | 内容 |
+| 决策 | 原因 |
 |------|------|
-| `lib/rbtree.c` | 旋转、插入、删除完整实现（~300 行） |
-| `include/linux/rbtree.h` | 头文件宏、遍历函数 |
-| `include/linux/rbtree_types.h` | `rb_node` / `rb_root` / `rb_root_cached` 定义 |
-| `include/linux/rbtree_augmented.h` | 增强版红黑树（旋转回调） |
-| `include/linux/sched.h:575` | `sched_entity`（CFS 使用） |
-| `include/linux/mm_types.h:705` | `vm_area_struct`（vma 使用） |
-| `kernel/sched/fair.c` | CFS 红黑树具体使用（`tasks_timeline`） |
+| `__rb_parent_color` 合并存储 | 节省一个指针的存储空间（指针对齐时低位无用）|
+| `aligned(sizeof(long))` | 确保指针低位可用于存颜色 |
+| `rb_leftmost` 缓存 | 大多数场景需要找最小，O(1) > O(log n) |
+| 迭代而非递归 | 内核不能栈溢出，递归插入/删除深度 O(log n) 可接受 |
+| 着色标记在 parent_color 低位 | 无需额外字段，指针操作天然原子 |
 
 ---
 
-## 附录：doom-lsp 分析记录
+## 10. 完整文件索引
 
-```
-lib/rbtree.c — 54 symbols：
-  rb_set_black, rb_red_parent, __rb_rotate_set_parents
-  __rb_insert @ 84
-  ____rb_erase_color @ 226
-  rb_insert_color @ 434, rb_erase @ 440
-  rb_next @ 480, rb_prev @ 539
-  rb_replace_node @ 541, rb_replace_node_rcu @ 558
-  rb_left_deepest_node @ 580
-
-include/linux/rbtree.h — 29 symbols：
-  rb_insert_color @ 44, rb_erase @ 45
-  rb_next @ 49, rb_prev @ 50
-  rb_first @ 55, rb_last @ 70
-  rb_link_node @ 92
-  rb_add_cached @ 197, rb_erase_cached @ 151
-  rb_find_add_cached @ 313, rb_find @ 419
-```
+| 文件路径 | 关键行 | 内容 |
+|---------|-------|------|
+| `include/linux/rbtree_types.h` | 全文 | `rb_node`、`rb_root`、`rb_root_cached` |
+| `include/linux/rbtree.h` | `rb_link_node` | 链接节点 |
+| `include/linux/rbtree.h` | `rb_first`、`rb_last` | 最值查找 |
+| `include/linux/rbtree.h` | `rb_first_cached` | O(1) 最左节点 |
+| `lib/rbtree.c` | `__rb_insert` | 插入+再平衡 |
+| `lib/rbtree.c` | `rb_erase` | 删除+再平衡 |
+| `lib/rbtree.c` | `rb_next`、`rb_prev` | 中序遍历 |
+| `lib/rbtree.c` | 注释 | 红黑树 5 性质详解 |
