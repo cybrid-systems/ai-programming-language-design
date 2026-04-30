@@ -1,125 +1,163 @@
-# Linux Kernel kworker / migration / ksoftirqd 深度源码分析
+# kworker — 内核工作线程深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`kernel/sched/core.c` + `kernel/workqueue.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
+> 基于 Linux 7.0-rc1 主线源码（`kernel/workqueue.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
 ## 0. 概述
 
-Linux 内核有多个**专用内核线程**，负责系统级工作：
-- `kworker`：处理 workqueue 中的 work
-- `migration`：在 CPU 热插拔时迁移任务
-- `ksoftirqd`：处理软中断
-- `rcuop`：RCU 回调释放
+**kworker** 是内核工作队列（workqueue）的线程池，处理 `struct work_struct` 回调。分为：
+- **bound**：绑定到特定 CPU 的 kworker
+- **unbound**：可在任何 CPU 运行的 kworker（一般使用这个）
 
 ---
 
-## 1. kworker — workqueue 执行者
+## 1. 核心数据结构
+
+### 1.1 worker — 工作线程
+
+```c
+// kernel/workqueue.c — worker
+struct worker {
+    // 基础
+    struct worker           *next;         // 链表
+    struct work_struct      *current_pwq;  // 当前执行的 work_struct
+
+    // 线程
+    struct task_struct      *task;         // 线程描述符
+    struct workqueue_struct *wq;          // 所属工作队列
+    struct pool             *pool;         // 所属内存池
+
+    // 状态
+    unsigned long           flags;         // WORKER_* 标志
+    int                     id;            // 线程 ID
+
+    // 管理
+    struct list_head        entry;         // 接入 idle/active 链表
+    struct list_head        scheduled;      // 等待执行的 work 链表
+};
+```
+
+### 1.2 workqueue_struct — 工作队列
+
+```c
+// kernel/workqueue.c — workqueue_struct
+struct workqueue_struct {
+    const char              *name;         // "events" "kblockd" 等
+    unsigned long           flags;         // WQ_* 标志
+
+    // CPU 绑定
+    struct workqueue_attrs  *attrs;        // 属性（是否 unbound）
+    bool                    unbound;       // true = unbound workqueue
+
+    // 内存池（per-CPU）
+    struct pool             *pool;         // unbound 时使用共享池
+
+    // Per-CPU 池（bound 时）
+    struct cpu_workqueue_struct  *cpu_pwqs; // per-CPU 工作队列
+};
+```
+
+### 1.3 work_struct — 工作项
+
+```c
+// include/linux/workqueue.h — work_struct
+struct work_struct {
+    atomic_long_t           data;          // 编码：指针 + pending 位
+    struct list_head        entry;         // 接入链表
+    work_func_t             func;          // 处理函数（回调）
+};
+
+typedef void (*work_func_t)(struct work_struct *work);
+```
+
+### 1.4 data 编码
+
+```c
+// include/linux/workqueue.h
+// data 编码：
+//   WORK_STRUCT_PENDING_BIT = 0 (1=待执行)
+//   WORK_STRUCT_LINKED_BIT  = 1 (1=链接到其他 work)
+//   WORK_STRUCT_COLOR_SHIFT = 2
+
+#define work_data_bits(work) ((unsigned long *)(&(work)->data))
+
+static inline void set_work_pwq(struct work_struct *work, void *pwq, unsigned long bits)
+{
+    work->data = (unsigned long)pwq | bits;
+}
+
+static inline void *get_work_pwq(struct work_struct *work)
+{
+    return (void *)(work->data & WORK_STRUCT_WQ_DATA_MASK);
+}
+```
+
+---
+
+## 2. worker_thread — 工作线程主循环
 
 ```c
 // kernel/workqueue.c — worker_thread
-static int worker_thread(void *arg)
+static int worker_thread(void *data)
 {
-    struct worker_pool *pool = arg;
+    struct worker *worker = data;
+    struct work_struct *work;
 
     while (!kthread_should_stop()) {
         // 1. 等待 work
-        if (!pool->nr_running)
-            schedule();
-
-        // 2. 获取 work
-        struct work_struct *work = list_first_entry(&pool->worklist,
-                               struct work_struct, entry);
-        list_del(&work->entry);
-
-        // 3. 执行
-        work->func(work);
-
-        // 4. 循环
-    }
-}
-
-// 每个 CPU 至少有一个 per-CPU kworker：
-// kworker/0:0 — system_wq
-// kworker/0:1 — system_highpri_wq
-// kworker/1:0 — CPU-1 的 kworker
-```
-
----
-
-## 2. migration — CPU 热插拔迁移
-
-```c
-// kernel/sched/core.c — migration_call
-static int migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
-{
-    int cpu = (unsigned long)hcpu;
-
-    switch (action) {
-    case CPU_UP_PREPARE:
-    case CPU_UP_PREPARE_FROZEN:
-        // 创建 migration 线程
-        t = kthread_create(migration_thread, (void *)(long)cpu,
-                  "migration/%d", cpu);
-        kthread_bind(t, cpu);
-        break;
-
-    case CPU_ONLINE:
-    case CPU_ONLINE_FROZEN:
-        wake_up_process(t);
-        break;
-
-    case CPU_DOWN_PREPARE:
-    case CPU_DOWN_PREPARE_FROZEN:
-        kthread_stop(t);  // 停止 migration 线程
-        break;
-    }
-}
-
-// kernel/sched/core.c — migration_thread
-static int migration_thread(void *arg)
-{
-    int cpu = (long)arg;
-
-    set_current_state(TASK_INTERRUPTIBLE);
-    while (!kthread_should_stop()) {
-        struct rq *rq = cpu_rq(cpu);
-
-        // 迁移 runqueue 上的任务
-        // pull_task(rq, busiest_rq);
-        // push_task(rq, idle_rq);
-
         schedule();
+        cond_resched();
+
+        // 2. 获取待执行的 work
+        work = drain_workqueue(worker->pool);
+        if (!work)
+            continue;
+
+        // 3. 执行 work->func
+        worker->current_pwq = get_work_pwq(work);
+        work->func(work);
+        worker->current_pwq = NULL;
     }
+
+    return 0;
 }
 ```
 
 ---
 
-## 3. ksoftirqd — 软中断处理线程
+## 3. queue_work — 提交 work
 
 ```c
-// kernel/softirq.c — smp_run_ksoftirqd
-static void run_ksoftirqd(unsigned int cpu)
+// kernel/workqueue.c — queue_work
+bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
 {
-    // 每 CPU 一个 ksoftirqd 线程
-    // 处理 pending softirq
+    struct worker_pool *pool = get_work_pool(work);
+    struct worker *worker;
+    bool ret;
 
-    local_softirq_pending();
-    if (local_softirq_pending()) {
-        // 在此线程中处理，而非 irq_exit()
-        do_softirq();
-    }
+    // 1. 检查是否已在队列中
+    if (test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
+        return false;
+
+    // 2. 加入 pool 的 pending 链表
+    spin_lock(&pool->lock);
+    list_add_tail(&work->entry, &pool->pending);
+    spin_unlock(&pool->lock);
+
+    // 3. 唤醒 worker
+    wake_up_worker(pool);
+
+    return true;
 }
 ```
 
 ---
 
-## 4. 参考
+## 4. 完整文件索引
 
-| 文件 | 内容 |
-|------|------|
-| `kernel/workqueue.c` | `worker_thread`、`create_worker` |
-| `kernel/sched/core.c` | `migration_call`、`migration_thread` |
-| `kernel/softirq.c` | `run_ksoftirqd` |
+| 文件 | 函数/结构 |
+|------|----------|
+| `kernel/workqueue.c` | `struct worker`、`worker_thread`、`queue_work` |
+| `include/linux/workqueue.h` | `struct work_struct`、`work_func_t` |

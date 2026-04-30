@@ -1,186 +1,199 @@
-# Linux Kernel Scheduler Domains 与 Load Balancing 深度源码分析
+# scheduler domains — 多核负载均衡深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`kernel/sched/topology.c` + `kernel/sched/fair.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-
----
-
-## 0. 什么是 Scheduler Domains？
-
-**Scheduler Domains** 是 Linux 多核调度器的**层次化负载均衡**机制，按 CPU 亲和性分层（同一核心→同簇→同节点→跨节点），在每层独立进行负载均衡。
+> 基于 Linux 7.0-rc1 主线源码（`kernel/sched/topology.c` + `kernel/sched/deadline.c`)
+> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
 
 ---
 
-## 1. sched_domain 层次结构
+## 0. 概述
+
+**Scheduler Domains** 将 CPU 分组为层级域，实现多级负载均衡：
+- **SCHED_SOFTIRQ**：触发负载均衡
+- **SD_SHARE_PKG_RESOURCES**：共享缓存/Memory bandwidth
+- **SD_SHARE_CPU_GROUPS**：共享 CPU 包
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 sched_domain — 调度域
 
 ```c
-// include/linux/sched/sd_flags.h — sched_domain
+// include/linux/sched/topology.h — sched_domain
 struct sched_domain {
-    /* 层次结构 */
-    struct sched_domain *parent;    // 父域（更大范围）
-    struct sched_domain *child;   // 子域（更小范围）
+    // 层级信息
+    int                     span_top;       // 域内 CPU 数
+    unsigned long           span[1];        // 域内 CPU 掩码（bitmask）
 
-    /* 覆盖的 CPU 集合 */
-    struct cpumask __rcu *span;  // 此域覆盖的 CPU
+    // 父/子域
+    struct sched_domain     *parent;        // 上一级（更大的域）
+    struct sched_domain     *child;         // 下一级（更小的域）
 
-    /* 负载均衡组 */
-    struct sched_group *groups;    // 此域的调度组链表
+    // 分组信息
+    struct sched_domain_shared *shared;     // 域间共享资源
+    struct sched_group      *groups;        // 域内 CPU 组
 
-    /* 平衡间隔 */
-    unsigned long       interval;    // 平衡间隔（jiffies）
-    unsigned long       last_balance;
-    unsigned long       balance_interval;
+    // 负载信息
+    unsigned long           lb_count[SD_BALANCE_EXEC]; // 平衡次数
+    unsigned long           lb_flags[SD_BALANCE_EXEC];   // 平衡标志
+    unsigned long           last_balance;   // 上次平衡时间
+    unsigned int            balance_exec;   // 本次平衡执行耗时
 
-    /* 标志 */
-    int                 level;        // 域层级（SD_INIT）
-    enum sched_domain_level {
-        SD_LV_NONE = 0,
-        SD_LV_SIBLING,      // 兄弟核
-        SD_LV_MC,           // 核心内（包含 LLC）
-        SD_LV_CPU,          // 包（同一 socket）
-        SD_LV_NUMA,        // NUMA
-        SD_LV_ALLNODES,    // 所有节点
-        SD_LV_SYSTEM,      // 系统级
-    };
+    // 域配置（SD_* 标志）
+    unsigned int            flags;          // SD_* 标志
+    int                     level;          // 层级（0=最近）
 
-    /* 平衡函数 */
-    int (*balance)(struct rq *this_rq, struct rq_cpu *cpu);
-    int (*负荷阈值);
+    // 触发频率
+    unsigned int            min_interval;   // 最小平衡间隔
+    unsigned int            max_interval;   // 最大平衡间隔
+    unsigned int            busy_factor;    // 繁忙因子（跳过繁忙组的平衡）
+
+    // 名称（调试用）
+    const char              *name;          // "SMT" "MC" "DIE" "NODE"
 };
+```
 
-// sched_group — 调度组（可一起调度的 CPU 集合）
+### 1.2 sched_group — CPU 组
+
+```c
+// include/linux/sched/topology.h — sched_group
 struct sched_group {
-    struct sched_group *next;      // 组链表
-    struct sched_domain *sd;      // 所属域
-    unsigned long       cpu_mask; // 组内 CPU 位掩码
-    unsigned long       capacity;  // 组容量
-    unsigned long       capacity_orig;
-    unsigned int        idle_cpus;
+    struct sched_domain     *sd;            // 所属域
+    unsigned long           cpumask;        // 组内 CPU 掩码
+    unsigned long           capacity;       // 组容量（容量 = CPU数 * 调度实体）
+    unsigned long           capacity_orig;   // 原始容量
+    unsigned int            group_weight;   // 组内"权重"
+    unsigned int            nr_running;     // 组内运行任务数
+
+    // 统计
+    struct sched_avg        avg;            // 组平均负载
+
+    // 下一个组（形成循环）
+    struct sched_group      *next;          // 同级下一个组
+};
+```
+
+### 1.3 sched_domain_shared — 域间共享
+
+```c
+// include/linux/sched/topology.h — sched_domain_shared
+struct sched_domain_shared {
+    // 共享资源
+    atomic_t                nr_busy_cpus;   // 域内繁忙 CPU 数
+    unsigned long           has_blocked;    // 有阻塞任务的标志
+    unsigned long           imbalance;      // 不平衡程度
+    struct callback_head    *rcu;           // RCU 回调
+
+    // 共享状态
+    unsigned long           topology_hetero_level; // 异构层级
 };
 ```
 
 ---
 
-## 2. 层次图
+## 2. 负载均衡触发
 
-```
-系统调度域（SD_LV_SYSTEM）：
-  span = all CPUs
-  │
-  ├─ NUMA 域（SD_LV_NUMA）：
-  │    span = 同一 NUMA 节点内的所有 CPU
-  │    │
-  │    └─ CPU 包域（SD_LV_CPU）：
-  │         span = 同一 socket/PKG 内的所有 CPU
-  │         │
-  │         └─ MC/核心域（SD_LV_MC）：
-  │              span = 同一物理核心内的逻辑 CPU（SMT）
-  │              │
-  │              └─ 兄弟核（SD_LV_SIBLING）：
-  │                   span = SMT 线程对（如 CPU0+CPU4）
-```
-
----
-
-## 3. load_balance — 核心均衡
+### 2.1 load_balance — 主动均衡
 
 ```c
 // kernel/sched/fair.c — load_balance
-static int load_balance(int this_rq, int this_cpu, struct rq_flags *rf)
+static int load_balance(int cpu, struct rq *rq,
+                        struct sched_domain *sd, enum cpu_idle_type idle)
 {
-    // 1. 找到最繁忙的调度组
-    struct sched_group *busiest = find_busiest_group(this_rq, this_cpu);
+    struct sched_group *group;
+    unsigned long leader_mismatch;
+    unsigned long load;
+    int pulled = 0;
 
-    // 2. 如果 busiest->group_weight <= 1，跳过
-    if (!busiest || busiest->group_weight <= 1)
-        return 0;
+    // 1. 计算本地 CPU 当前负载
+    load = rq->nr_running * SCHED_CAPACITY_SCALE;
 
-    // 3. 获取 busiest 的 runqueue
-    struct rq *busiest_rq = busiest->rq;
+    // 2. 找到最繁忙的组
+    busiest = find_busiest_group(cpu, sd, &idle, &load, &imbalance);
 
-    // 4. 从 busiest_rq 迁移任务到 this_rq
-    do {
-        unsigned long imm = 0, tot = 0;
+    if (!imbalance)
+        return 0;  // 已经平衡
 
-        // 计算需要迁移的任务数
-        // nr_migrate = (busiest_rq->cfs.h_nr_running - this_rq->cfs.h_nr_running) / 2
-        nr_migrate = (busiest_rq->cfs.h_nr_running -
-                      this_rq->cfs.h_nr_running) / 2;
+    // 3. 从 busiest 组迁移任务
+    pulled = move_tasks(rq, cpu, busiest, &imbalance, sd);
 
-        // 5. 锁定 busiest_rq
-        double_lock_balance(this_rq, busiest_rq);
+    // 4. 更新统计
+    sd->balance_exec += local_clock() - start_time;
 
-        // 6. 迁移任务
-        move_tasks(this_rq, this_cpu, busiest_rq, this_cpu,
-                   imm, tot, &pinned);
-
-        // 7. 更新统计
-        update_blocked_averages(this_rq);
-
-    } while (busiest_rq->cfs.h_nr_running > this_rq->cfs.h_nr_running + 8);
-
-    return 1;
+    return pulled;
 }
 ```
 
----
-
-## 4. find_busiest_group — 找最繁忙组
+### 2.2 find_busiest_group — 找最繁忙的组
 
 ```c
 // kernel/sched/fair.c — find_busiest_group
-static struct sched_group *find_busiest_group(struct rq *this_rq, int this_cpu)
+static struct sched_group *find_busiest_group(int cpu, struct sched_domain *sd, ...)
 {
-    // 1. 遍历调度域层级
-    for_each_domain(this_cpu, sd) {
-        // 2. 计算每个组的负载
-        for_each_sg(sd->groups, sg, i) {
-            load = sg->group_weight;  // 或乘以 avg_load
+    struct sched_domain_shared *sds = sd->shared;
 
-            if (load > busiest_load) {
-                busiest = sg;
-                busiest_load = load;
-            }
-        }
-
-        // 3. 如果 busiest 负载不超过阈值，停止向更高层遍历
-        if (busiest_load < sd->imbalance_pct * sg->capacity / 100)
-            break;
+    // 1. 计算每个组的负载
+    //    group_load = 组的 nr_running * 组的 capacity
+    for_each_cpu(cpu, group->cpumask) {
+        load = cpu_rq(cpu)->nr_running;
+        total += load * cpu_capacity(cpu);
     }
 
-    return busiest;
+    // 2. 找到超过阈值的组
+    //    如果 busiest组的负载 > 本组的负载 * 1.25（SF_PICK）
+    //    → 返回 busiest 组
+
+    // 3. 否则返回平衡的组
+    return sd->groups;
 }
 ```
 
 ---
 
-## 5. nohz_idle_balance — 非交互核心
+## 3. 不平衡阈值（imbalance）
 
 ```c
-// 当 CPU 进入 idle（nohz）时：
-// 1. nohz.next_balance 记录下次需要平衡的时间
-// 2. 离开 idle 时调用 nohz_idle_balance()
-// 3. 一次性处理所有之前积压的负载均衡
+// kernel/sched/fair.c — calculate_imbalance
+static unsigned long calculate_imbalance(struct sched_domain *sd, ...)
+{
+    unsigned long busiest_load, busiest_capacity;
+    unsigned long this_load, this_capacity;
+
+    // 计算不平衡量
+    // imbalance = (busiest_load / busiest_capacity) - (this_load / this_capacity)
+    // 如果 > 小于 sd->imbalance_pct（默认 25%），不需要移动
+
+    if (busiest_load > this_load * sd->imbalance_pct / 100)
+        return busiest_load - this_load;
+
+    return 0;
+}
 ```
 
 ---
 
-## 6. 设计思想总结
+## 4. idle 平衡类型
 
-| 设计决策 | 原因 |
-|---------|------|
-| 分层均衡 | 同 SMT 核优先均衡，减少跨核延迟 |
-| SD_LV_MC → NUMA 层级 | 优先在低延迟层级均衡 |
-| busiest_load / capacity 比较 | 考虑 CPU 容量（异构系统）|
-| imbalance_pct 阈值 | 避免过度均衡 |
-| double_lock_balance | 迁移时同时锁住两个 rq |
+```c
+// include/linux/sched/idle.h — enum cpu_idle_type
+enum cpu_idle_type {
+    CPU_IDLE,         // idle 线程（无任务）
+    CPU_NOT_IDLE,     // 非 idle（正常负载）
+    CPU_NEWLY_IDLE,   // 刚刚进入 idle（有任务要迁移）
+    CPU_MAX_IDLE_TYPE // 边界
+};
+
+// 平衡频率：
+// CPU_IDLE → 慢（避免频繁唤醒）
+// CPU_NEWLY_IDLE → 快（尽快迁移，避免浪费）
+```
 
 ---
 
-## 7. 参考
+## 5. 完整文件索引
 
-| 文件 | 内容 |
-|------|------|
-| `kernel/sched/topology.c` | `sched_domain`、`sched_group`、`build_sched_domains` |
-| `kernel/sched/fair.c` | `load_balance`、`find_busiest_group`、`move_tasks` |
-| `include/linux/sched/sd_flags.h` | `SD_LV_*` 层级定义 |
+| 文件 | 函数/结构 |
+|------|----------|
+| `include/linux/sched/topology.h` | `struct sched_domain`、`struct sched_group` |
+| `kernel/sched/topology.c` | `sched_init_numa`、`build_sched_domains` |
+| `kernel/sched/fair.c` | `load_balance`、`find_busiest_group` |
