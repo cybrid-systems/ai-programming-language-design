@@ -1,199 +1,176 @@
-# 18-copy_page_range — fork 时页面复制深度源码分析
+# 18-copy_page_range — 页表复制深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`mm/memory.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**copy_page_range** 在 `fork()` 时复制父进程的 VMA 区域到子进程。核心是 **COW（Copy-On-Write）**：fork 后父子共享物理页，只读保护，直到一方写入时才真正复制。
+**copy_page_range** 是 `fork()` 系统调用的核心内存操作。当 Linux 创建一个子进程时，需要复制父进程的页表——让子进程看到相同的内存视图，但通过 **写时复制（COW, Copy-on-Write）** 机制，物理页框本身并不立即复制。
+
+COW 的核心思想：**父进程和子进程共享同一份物理内存，但标记为只读。当任意一方尝试写入时，触发缺页异常，此时才复制物理页。**
+
+doom-lsp 确认 `mm/memory.c` 包含 copy_page_range 及其相关函数。
 
 ---
 
-## 1. COW 机制
-
-```
-fork() 后：
-  父/子共享同一物理页（只读）
-  ↓
-任一方写入：
-  触发 page fault（write fault）
-  ↓
-内核分配新页，复制内容（do_wp_page）
-  ↓
-写入方获得自己的私有副本
-```
-
----
-
-## 2. copy_page_range — 复制 VMA
+## 1. 核心函数：copy_page_range
 
 ```c
-// mm/memory.c — copy_page_range
-int copy_page_range(struct mm_struct *dst, struct mm_struct *src,
-                   struct vm_area_struct *vma)
-{
-    // 1. hugetlb 特殊处理
-    if (is_vm_hugetlb(vma))
-        return copy_hugetlb_page_range(dst, src, vma);
+int copy_page_range(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+                    struct vm_area_struct *vma)
+```
 
-    // 2. 共享映射：直接复制（不 COW）
-    if (vma->vm_flags & VM_SHARED)
-        return copy_pte_range(dst, src, vma);
-
-    // 3. 可写区域：正常复制（可能触发 COW）
-    if (vma->vm_flags & VM_WRITE)
-        return copy_pte_range(dst, src, vma);
-
-    // 4. 只读区域：共享物理页（COW 保护）
-    return copy_pte_range(dst, src, vma);
-}
+```
+copy_page_range(dst_mm, src_mm, vma)
+  │
+  ├─ 遍历 src_mm 中 VMA 覆盖的所有页表
+  │
+  ├─ 对每级页表：
+  │    ├─ PGD → P4D → PUD → PMD → PTE
+  │
+  ├─ 对每个 PTE（页表项）：
+  │    │
+  │    ├─ [匿名页] copy_pte_range → copy_one_pte
+  │    │    ├─ 复制 PTE 到子进程的页表
+  │    │    ├─ 父进程 PTE 标记为只读
+  │    │    ├─ struct page->_mapcount 增加
+  │    │    └─ 设置 pte_wrprotect（清除写权限）
+  │    │
+  │    ├─ [文件映射页] copy_pte_range
+  │    │    ├─ 增加 page cache 的引用计数
+  │    │    ├─ 复制 PTE
+  │    │    └─ 如果 MAP_PRIVATE → 同样写保护
+  │    │
+  │    └─ [交换页] copy_pte_range
+  │         └─ 增加交换计数，复制交换 entry
+  │
+  └─ return 0（成功）
 ```
 
 ---
 
-## 3. copy_pte_range — 复制页表项
+## 2. 写时复制（COW）触发
 
-```c
-// mm/memory.c — copy_pte_range
-static int copy_pte_range(struct mm_struct *dst, struct mm_struct *src,
-                         struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-                         unsigned long addr, unsigned long end)
-{
-    // 逐 PTE 复制
-    for (; addr < end; addr += PAGE_SIZE) {
-        pte_t *src_pte, *dst_pte;
-        pte_t pte;
+子进程创建后，所有可写页面都被标记为只读。当父或子首次写入时：
 
-        // 1. 获取源 PTE
-        src_pte = get_locked_pte(src, addr, &src_ptl);
-        pte = *src_pte;
-
-        // 2. 获取/分配目标 PTE
-        dst_pte = get_locked_pte(dst, addr, &dst_ptl);
-
-        // 3. 复制 PTE
-        copy_pte(src, dst, dst_pte, src_pte, addr, page);
-    }
-}
+```
+写入操作 → CPU 触发页错误（page fault）
+  │
+  └─ handle_mm_fault(vma, addr, FAULT_FLAG_WRITE)
+       │
+       ├─ 检查 VMA 权限（VM_WRITE 是否设置）
+       │
+       ├─ handle_pte_fault(vmf)
+       │    │
+       │    ├─ 如果 PTE 不存在 → do_anonymous_page() 或 do_fault()
+       │    │
+       │    └─ 如果 PTE 存在但写保护 → do_wp_page()
+       │         │
+       │         └─ do_wp_page(vmf)
+       │              │
+       │              ├─ 检查引用计数（_mapcount）
+       │              │
+       │              ├─ 如果只有一个人引用：
+       │              │    └─ 直接修改 PTE 权限为可写（取消 COW）
+       │              │
+       │              ├─ 如果多个人引用：
+       │              │    ├─ alloc_page_vma() → 分配新物理页
+       │              │    ├─ copy_user_highpage() → 复制内容
+       │              │    ├─ 修改 PTE 指向新页（可写）
+       │              │    └─ 原页引用计数减一
 ```
 
 ---
 
-## 4. copy_pte — 复制单个 PTE
+## 3. 关键细节
+
+### 3.1 引用计数检查
 
 ```c
-// mm/memory.c — copy_pte
-static inline void copy_pte(struct mm_struct *dst, struct mm_struct *src,
-                pte_t *dst_pte, pte_t *src_pte,
-                unsigned long addr, struct page *page)
-{
-    pte_t pte = *src_pte;
-
-    // 获取物理页
-    page = pte_page(pte);
-
-    // 增加页引用
-    get_page(page);
-
-    // 如果源 PTE 可写：
-    if (pte_write(pte)) {
-        // 设置为只读（R/W 位清除）
-        pte = pte_wrprotect(pte);
-        // 清除脏位
-        pte = pte_mkclean(pte);
-    }
-
-    // 父子共享同一物理页
-    set_pte_at(dst, addr, dst_pte, pte);
-
-    // 两个进程的 PTE 现在都指向同一个物理页，且都是只读
-}
-```
-
----
-
-## 5. do_wp_page — 写时复制（Write Fault）
-
-```c
-// mm/memory.c — do_wp_page
-static vm_fault_t do_wp_page(struct vm_fault *vmf)
-{
-    struct page *page = vmf->page;
-    struct page *new_page;
-
-    // 1. 获取当前 PTE
-    pte_t pte = *vmf->pte;
-
-    // 2. 如果是匿名页且只有一个用户（当前进程）：
-    if (PageAnon(page) && page_mapcount(page) == 1) {
-        // 只有一个用户（当前进程），直接改为可写
-        pte = pte_mkyoung(pte);    // 标记年轻
-        pte = pte_mkwrite(pte);    // 标记可写
-        set_pte_at(vmf->vma->vm_mm, vmf->address, vmf->pte, pte);
-        update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
-        return VM_FAULT_WRITE;
-    }
-
-    // 3. 否则（多个共享者 或 文件映射）：分配新页，复制
-    new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
-    copy_page(new_page, page);
-
-    // 4. 设置新页为可写
-    pte = mk_pte(new_page, vmf->vma->vm_page_prot);
+// mm/memory.c — do_wp_page 中的优化
+if (page_mapcount(old_page) == 1) {
+    // 只有这个进程在使用该页
+    // 直接取消写保护即可，不需要复制
     pte = pte_mkwrite(pte);
     set_pte_at(vmf->vma->vm_mm, vmf->address, vmf->pte, pte);
-
-    // 5. 释放旧页的引用
-    put_page(page);
-
-    return VM_FAULT_WRITE;
+    return;
 }
 ```
 
----
+如果引用计数为 1（只有当前进程），就不需要复制——直接改为可写即可。
 
-## 6. 流程图
+### 3.2 透明大页（THP）的 COW
 
-```
-fork():
-  copy_page_range()
-    copy_pte_range()
-      copy_pte()
-        pte_wrprotect()  // 设置只读
-        set_pte_at()       // 父子共享同一物理页
+对于透明大页，copy_page_range 调用 `copy_huge_pmd`：
 
-进程A 写入 addr：
-  → do_page_fault()
-    → do_wp_page()
-      → 如果只有一个用户：直接改为可写
-      → 如果多个用户：分配新页，复制内容
-
-进程A 现在有了自己的物理页副本！
+```c
+int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+                  pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
+                  struct vm_area_struct *vma)
 ```
 
----
-
-## 7. 完整文件索引
-
-| 文件 | 函数/结构 |
-|------|----------|
-| `mm/memory.c` | `copy_page_range`、`copy_pte_range`、`copy_pte` |
-| `mm/memory.c` | `do_wp_page` |
+透明大页的 COW 需要复制整个 2MB 大页（512个 4KB 页），而不是逐 PTE 处理。
 
 ---
 
-## 8. 西游记类比
+## 4. 数据流全景
 
-**COW** 就像"取经队伍复制营房"——
+```
+fork()
+  │
+  ├─ dup_mm()   ← 复制 mm_struct
+  │    │
+  │    ├─ allocate_mm()         ← 分配新 mm_struct
+  │    │
+  │    ├─ dup_mmap()            ← 复制所有 VMA
+  │    │    │
+  │    │    └─ 对每个 VMA：
+  │    │         └─ copy_page_range(dst_mm, src_mm, vma)
+  │    │              │
+  │    │              └─ 遍历 VMA 中所有页表
+  │    │                   └─ 每个 PTE 设置写保护
+  │    │
+  │    └─ mm->mmap 建立完毕
 
-> 悟空（父进程）fork 出一个分身（子进程）。营房（物理页）不是立即复制一份，而是两个队伍共住一个营房，门口贴上"只读"标签（pte_wrprotect）。如果悟空的分身只是看营房（读），不用真的复制，节省空间。如果分身想装修营房（写），土地神（do_wp_page）会来：先看看营房里住了几家人（page_mapcount）。如果只有分身一家，就直接把"只读"牌子换成"可读写"（pte_mkwrite）。如果还有其他人（多用户），就要重新分配一个新营房，把原来的内容复制过去，分身住新营房。这就是 Copy-On-Write——只有在真正需要写的时候才复制。
+父进程写入：
+  → 缺页 → do_wp_page() → 复制页 → 继续
+
+子进程写入：
+  → 缺页 → do_wp_page() → 复制页 → 继续
+```
 
 ---
 
-## 9. 关联文章
+## 5. 设计决策总结
 
-- **vm_area_struct**（article 16）：VMA 的 COW 标志
-- **page_allocator**（article 17）：COW 时分配新页
-- **VFS**（article 19）：fork 时通过 copy_page_range 复制文件映射
+| 决策 | 原因 |
+|------|------|
+| 写时复制（COW） | 避免 fork 后立即复制大量物理页 |
+| 引用计数==1 优化 | 如果只有自己引用，免去复制 |
+| 逐 VMA 处理 | 根据 VMA 类型（匿名/文件）采取不同策略 |
+| THP 的 pmd 级别复制 | 大页的 COW 以 2MB 为单位 |
+
+---
+
+## 6. 源码文件索引
+
+| 文件 | 关键符号 | 行 |
+|------|---------|-----|
+| `mm/memory.c` | `copy_page_range` | 页表复制 |
+| `mm/memory.c` | `do_wp_page` | 写时复制缺页处理 |
+| `mm/memory.c` | `copy_pte_range` | PTE 级别复制 |
+| `mm/huge_memory.c` | `copy_huge_pmd` | THP 复制 |
+
+---
+
+## 7. 关联文章
+
+- **VMA**（article 16）：copy_page_range 遍历 VMA 地址范围的页表
+- **page_allocator**（article 17）：COW 触发时，从 buddy 分配新页
+- **THP**（article 40）：透明大页的 COW 行为不同
+
+---
+
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*

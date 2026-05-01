@@ -1,284 +1,220 @@
-# 16-vm_area_struct / mmap — 虚拟内存区域深度源码分析
+# 16-vm_area_struct — 虚拟内存区域深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`include/linux/mm_types.h` + `mm/mmap.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**vm_area_struct（VMA）** 是进程虚拟地址空间的连续区间，每个 mmap 映射的区域对应一个 VMA。通过红黑树（O(log n)）和链表（顺序遍历）双重索引。
+**vm_area_struct（VMA）** 描述进程虚拟地址空间中的一个连续区域。每个进程的地址空间由若干 VMA 组成——代码段、堆、栈、mmap 区域等各对应一个 VMA。
+
+VMA 是内存管理中最重要的数据结构之一，它连接了**虚拟地址**和**物理内存**之间的映射关系。
+
+doom-lsp 确认 `include/linux/mm_types.h` 定义 VMA 相关结构，`mm/mmap.c` 和 `mm/memory.c` 实现 VMA 操作，共包含约 800+ 个符号。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 struct vm_area_struct — VMA
+### 1.1 struct vm_area_struct
 
 ```c
-// include/linux/mm_types.h — vm_area_struct
 struct vm_area_struct {
-    // 归属
-    struct mm_struct           *vm_mm;         // 所属进程（所有 VMA 共用同一个 mm_struct）
-    unsigned long             vm_start;          // 起始地址（含）
-    unsigned long             vm_end;           // 结束地址（不含）
-    struct vm_area_struct    *vm_next;         // 按地址排序的链表（线性列表）
-
-    // 红黑树节点
-    struct rb_node            vm_rb;            // 接入 mm_rb 红黑树的节点
-
-    // 权限与标志
-    pgprot_t                 vm_page_prot;      // 页保护（PAGE_READ/PAGE_WRITE）
-    unsigned long            vm_flags;          // VM_READ/VM_WRITE/VM_SHARED/...
-
-    // 文件映射
-    struct {
-        struct file          *vm_file;        // 映射的文件（如果有）
-        unsigned long        vm_pgoff;        // 文件内页偏移
-    } shared;
-
-    // 匿名映射
-    struct anon_vma           *anon_vma;        // 匿名映射的 anon_vma
-    struct list_head          anon_vma_chain;   // 匿名 VMA 链表
-
-    // 操作函数表
-    const struct vm_operations_struct *vm_ops; // VMA 操作函数表
-
-    // 私有数据
-    unsigned long             vm_private_data;    // 驱动私有数据
+    unsigned long          vm_start;      // 起始虚拟地址
+    unsigned long          vm_end;        // 结束虚拟地址（不含）
+    
+    struct vm_area_struct *vm_next;       // 进程 VMA 链表中的下一个
+    struct vm_area_struct *vm_prev;       // 上一个
+    
+    struct rb_node         vm_rb;         // 红黑树节点（快速查找）
+    
+    unsigned long          vm_flags;      // 权限标志 (VM_READ/WRITE/EXEC/SHARED)
+    
+    struct file           *vm_file;       // 映射的文件（文件映射）
+    unsigned long          vm_pgoff;      // 文件内偏移（页为单位）
+    
+    const struct vm_operations_struct *vm_ops; // VMA 操作回调
+    
+    struct anon_vma       *anon_vma;      // 匿名映射的反向映射
+    
+    struct mm_struct      *vm_mm;         // 所属的 mm_struct
+    unsigned long          vm_page_prot;  // 页表权限（从 vm_flags 转换而来）
+    ...
 };
 ```
 
----
+### 1.2 VMA 的组织方式
 
-## 2. vm_flags — 关键标志
+每个 VMA 通过两种结构被索引：
 
-```c
-// include/linux/mm.h — vm_flags
-#define VM_READ          0x00000001  // 可读
-#define VM_WRITE         0x00000002  // 可写
-#define VM_EXEC          0x00000004  // 可执行
-#define VM_SHARED        0x00000008  // 共享映射（MAP_SHARED）
-#define VM_MAYREAD       0x00000010  // 可设置读
-#define VM_MAYWRITE      0x00000020  // 可设置写
-#define VM_MAYEXEC       0x00000040  // 可设置执行
-#define VM_GROWSDOWN     0x00000100  // 向下扩展（栈）
-#define VM_PFNMAP        0x00000400  // PFN 映射（设备内存）
-#define VM_MIXEDMAP      0x00010000  // 混合映射（PFN + 页）
-#define VM_LOCKED        0x00000020  // 已锁定（mlock）
-#define VM_DONTCOPY      0x00020000  // fork 时不复制
-#define VM_ACCOUNT       0x00040000  // 已记账
-#define VM_NORESERVE     0x00000001  // 不预留
+```
+mm_struct 中的 VMA 组织：
+  ┌─────────────────────────┐
+  │ mm->mmap (链表)         │──→ VMA1 → VMA2 → VMA3 → ...  ← 线性遍历
+  │                         │
+  │ mm->mm_rb (红黑树根)    │──→ [VMA1] [VMA2] [VMA3] ...  ← O(log n) 查找
+  │                         │
+  │ mm->map_count           │──  VMA 总数
+  └─────────────────────────┘
 ```
 
----
-
-## 3. mm_struct — 进程内存描述符
-
-```c
-// include/linux/mm_types.h — mm_struct（相关字段）
-struct mm_struct {
-    // VMA 集合
-    struct vm_area_struct   *mmap;            // VMA 链表头
-    struct rb_root          mm_rb;           // VMA 红黑树根
-
-    // 地址空间
-    unsigned long           start_code, end_code;  // 代码段
-    unsigned long           start_data, end_data;  // 数据段
-    unsigned long           start_brk, brk;        // 堆
-    unsigned long           start_stack;             // 栈起始
-
-    // 统计
-    unsigned long           total_vm;               // 总映射页数
-    unsigned long           hiwater_vm;            // 峰值 VM
-
-    // 页表
-    pgd_t                 *pgd;                  // 页表全局目录
-};
-```
+链表用于遍历所有 VMA，红黑树用于按地址快速查找。
 
 ---
 
-## 4. find_vma — 查找 VMA
+## 2. 关键操作
 
-### 4.1 find_vma — 红黑树查找
+### 2.1 find_vma（按地址查找 VMA）
 
 ```c
-// mm/mmap.c — find_vma
 struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
-{
-    struct rb_node *rb = mm->mm_rb.rb_node;
-    struct vm_area_struct *vma = NULL;
-
-    // 二分查找：
-    // - 如果 addr < vma->vm_start → 左子树
-    // - 如果 addr >= vma->vm_end → 右子树
-    // - 否则命中
-    while (rb) {
-        vma = rb_entry(rb, struct vm_area_struct, vm_rb);
-
-        if (addr < vma->vm_start)
-            rb = rb->rb_left;
-        else if (addr >= vma->vm_end)
-            rb = rb->rb_right;
-        else {
-            // 命中：addr 在 [vm_start, vm_end) 内
-            return vma;
-        }
-    }
-
-    return NULL;  // 找不到
-}
-
-// 时间复杂度：O(log n)，n = VMA 数量
 ```
 
-### 4.2 vma_rb_insert — 插入 VMA 到红黑树
+```
+find_vma(mm, addr)
+  │
+  ├─ 从 mm->mm_rb 红黑树中查找
+  │    └─ 返回第一个 vm_end > addr 的 VMA
+  │
+  └─ 如果没有找到 → 返回 NULL
+```
+
+这是最常用的 VMA 查找函数——缺页处理、权限检查等都需要通过它获知某个地址属于哪个 VMA。
+
+### 2.2 mmap 系统调用流程
+
+```
+sys_mmap(addr, length, prot, flags, fd, offset)
+  │
+  ├─ 检查权限/参数
+  │
+  ├─ do_mmap(file, addr, len, prot, flags, ...)
+  │    │
+  │    ├─ 查找空闲地址区间
+  │    │    └─ 使用 unmapped_area() / unmapped_area_topdown()
+  │    │
+  │    ├─ 分配新的 VMA
+  │    │    └─ kmem_cache_alloc(vm_area_cachep)
+  │    │
+  │    ├─ 设置 vm_start, vm_end, vm_flags, vm_file, vm_pgoff
+  │    │
+  │    ├─ 插入到 mm->mmap 链表和 mm->mm_rb 红黑树
+  │    │    └─ vma_link(mm, vma)
+  │    │
+  │    ├─ 处理文件映射
+  │    │    └─ file->f_op->mmap(file, vma)  ← 文件系统回调
+  │    │
+  │    └─ 返回映射后的起始地址
+```
+
+### 2.3 do_munmap（解除映射）
+
+```
+do_munmap(mm, addr, len)
+  │
+  ├─ find_vma_links(mm, addr, &vma, &prev, &rb_link, &rb_parent)
+  │    └─ 找到受影响的 VMA
+  │
+  ├─ split_vma()                          ← 如果需要部分解除
+  │    └─ 将 VMA 在 addr/addr+len 处分裂
+  │
+  ├─ unmap_region()                       ← 解除页表映射
+  │    └─ zap_page_range() → 清除 PTE
+  │
+  └─ remove_vma_list()                   ← 删除 VMA 结构
+```
+
+---
+
+## 3. VMA 的 vm_operations_struct
 
 ```c
-// mm/mmap.c — vma_rb_insert
-void vma_rb_insert(struct vm_area_struct *vma, struct rb_root *root)
-{
-    struct rb_node **rb = &root->rb_node;
-    struct rb_node *parent = NULL;
-    struct vm_area_struct *tmp;
-
-    // 找到插入位置
-    while (*rb) {
-        tmp = rb_entry(*rb, struct vm_area_struct, vm_rb);
-        parent = *rb;
-
-        if (vma->vm_end <= tmp->vm_start)
-            rb = &(*rb)->rb_left;
-        else if (vma->vm_start >= tmp->vm_end)
-            rb = &(*rb)->rb_right;
-        else
-            BUG();  // 与已有 VMA 冲突
-    }
-
-    rb_link_node(&vma->vm_rb, parent, rb);
-    rb_insert_color(&vma->vm_rb, root);
-}
+struct vm_operations_struct {
+    void (*open)(struct vm_area_struct *vma);          // VMA 被复制时
+    void (*close)(struct vm_area_struct *vma);         // VMA 被删除时
+    vm_fault_t (*fault)(struct vm_fault *vmf);         // 缺页处理
+    vm_fault_t (*huge_fault)(struct vm_fault *vmf);    // 透明大页缺页
+    void (*map_pages)(struct vm_fault *vmf, pgoff_t start, pgoff_t end);
+    unsigned long (*pagesize)(struct vm_area_struct *vma);
+    ...
+};
 ```
+
+最重要的是 `fault` 回调——当 VMA 区域内发生缺页时，这个函数负责填充物理页。
 
 ---
 
-## 5. mmap — 创建映射
-
-### 5.1 sys_mmap_pgoff — 系统调用
+## 4. VMA 权限标志（vm_flags）
 
 ```c
-// mm/mmap.c — sys_mmap_pgoff
-unsigned long sys_mmap_pgoff(unsigned long addr, unsigned long len,
-                              unsigned long prot, unsigned long flags,
-                              unsigned long fd, unsigned long pgoff)
-{
-    // 1. 验证参数（对齐、限制）
-    if (offset_in_page(len))  // len 必须页对齐
-        return -EINVAL;
-
-    // 2. 调用 vm_mmap_pgoff
-    return vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
-}
-```
-
-### 5.2 vm_mmap_pgoff — 核心映射
-
-```c
-// mm/mmap.c — vm_mmap_pgoff
-unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
-                             unsigned long len, unsigned long prot,
-                             unsigned long flags, unsigned long pgoff)
-{
-    struct vm_area_struct *vma;
-
-    // 1. 分配 VMA
-    vma = kmem_cache_zalloc(vm_area_allocator, GFP_KERNEL);
-    if (!vma)
-        return -ENOMEM;
-
-    // 2. 初始化
-    vma->vm_start = addr;
-    vma->vm_end = addr + len;
-    vma->vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags);
-    vma->vm_file = get_file(file);  // 增加文件引用
-    vma->vm_pgoff = pgoff;
-    vma->vm_ops = NULL;
-
-    // 3. 插入 mm_rb 红黑树
-    vma_rb_insert(vma, &mm->mm_rb);
-
-    // 4. 插入 mmap 链表
-    list_add_tail(&vma->vm_next, &mm->mmap);
-
-    // 5. 如果是文件映射，调用文件驱动的 mmap
-    if (file && file->f_op->mmap)
-        file->f_op->mmap(file, vma);
-
-    return addr;
-}
+#define VM_READ      0x00000001    // 可读
+#define VM_WRITE     0x00000002    // 可写
+#define VM_EXEC      0x00000004    // 可执行
+#define VM_SHARED    0x00000008    // 共享映射（MAP_SHARED）
+#define VM_MAYREAD   0x00000010    // 将来可能可读
+#define VM_MAYWRITE  0x00000020    // 将来可能可写
+#define VM_MAYEXEC   0x00000040    // 将来可能可执行
+#define VM_GROWSDOWN 0x00000100    // 向下增长（栈）
+#define VM_PFNMAP    0x00000400    // 纯 PFN 映射（无 struct page）
+#define VM_DENYWRITE 0x00000800    // 禁止文件写入
+...
 ```
 
 ---
 
-## 6. VMA 合并
+## 5. 数据类型流
 
-### 6.1 vma_merge — 相邻 VMA 合并
+```
+进程 A 的用户空间：
+  ┌──────────────────────┐  0x7fff00000000  (栈)
+  │ VMA: [stack]         │  RW
+  ├──────────────────────┤  0x7f0000000000
+  │ VMA: [libc.so]       │  R-X  (文件映射)
+  ├──────────────────────┤
+  │ VMA: [heap]           │  RW   (匿名映射)
+  ├──────────────────────┤
+  │ VMA: [data]           │  RW   (文件映射)
+  ├──────────────────────┤
+  │ VMA: [text]           │  R-X  (文件映射)
+  └──────────────────────┘  0x400000
 
-```c
-// mm/mmap.c — vma_merge
-// 相邻的同属性 VMA 会自动合并：
-//   [0x1000, 0x2000) + [0x2000, 0x3000) → [0x1000, 0x3000)
-//   条件：vm_end == next->vm_start && flags 相同
-
-// 可以合并的情况：
-//   匿名映射 + 相同 anon_vma
-//   文件映射 + 相同 file + 相邻偏移
+mmap = 创建新 VMA
+munmap = 删除 VMA
+缺页 → 根据 VMA 填充物理页
+fork → 复制所有 VMA（copy_page_range）
 ```
 
 ---
 
-## 7. 内存布局图
+## 6. 设计决策总结
 
-```
-进程虚拟地址空间布局：
-
-0x0000000000400000  ← 代码段 start_code
-...                  ← 代码段
-0x0000000000600000  ← 数据段 end_data
-                    ← BSS
-0x00007ffffffde000  ← 堆 start_brk（向上增长）→ brk
-                    ← mmap 区域（匿名或文件映射）
-0x00007ffffffff000  ← 最高用户地址
-                    ← 栈 start_stack（向下增长）
-```
+| 决策 | 原因 |
+|------|------|
+| 链表 + 红黑树双组织 | 遍历快且查找快 |
+| 区间 [start, end) | 半开区间便于计算长度 |
+| vm_operations_struct | 文件系统和匿名映射可以定制缺页行为 |
+| vm_flags 位掩码 | 快速检查权限 |
+| vm_file + vm_pgoff | 统一文件映射和匿名映射 |
 
 ---
 
-## 8. 完整文件索引
+## 7. 源码文件索引
 
-| 文件 | 函数/结构 | 行 |
-|------|----------|-----|
-| `include/linux/mm_types.h` | `struct vm_area_struct` | VMA 定义 |
-| `include/linux/mm_types.h` | `struct mm_struct`（VMA 部分）| mm_struct 定义 |
-| `include/linux/mm.h` | `VM_READ` 等标志 | 0x00000001 等 |
-| `mm/mmap.c` | `sys_mmap_pgoff` | 系统调用 |
-| `mm/mmap.c` | `find_vma` | 红黑树查找 |
-| `mm/mmap.c` | `vma_rb_insert` | 红黑树插入 |
-| `mm/mmap.c` | `vma_merge` | VMA 合并 |
+| 文件 | 关键符号 | 行 |
+|------|---------|-----|
+| `include/linux/mm_types.h` | `struct vm_area_struct` | 定义 |
+| `mm/mmap.c` | `find_vma` / `do_mmap` / `do_munmap` | VMA 操作 |
+| `mm/memory.c` | `handle_mm_fault` | 缺页入口 |
 
 ---
 
-## 9. 西游记类比
+## 8. 关联文章
 
-**vm_area_struct** 就像"取经路上的驿站地图"——
-
-> 唐朝的疆域（进程地址空间）被分成很多驿站（VMA），每个驿站有明确的管辖范围（vm_start 到 vm_end）。地图用两套索引：一本是按顺序排列的驿路本（mmap 链表），一本是按地理位置分的山川图（mm_rb 红黑树）。要找某个地址属于哪个驿站，红黑树二分查找（find_vma）比翻驿路本快得多。相邻的驿站如果是同一家客栈（相同属性），会自动合并成一个大驿站（vma_merge），这样地图更简洁。
+- **page_allocator**（article 17）：VMA 缺页时从 buddy 获取页面
+- **page_cache**（article 20）：文件映射 VMA 的缺页由 page cache 填充
+- **mmap**（article 79）：mmap 系统调用详解
 
 ---
 
-## 10. 关联文章
-
-- **page_allocator**（article 17）：VMA 的物理页分配
-- **copy_page_range**（article 18）：fork 时的 COW
-- **mlock**（article 39）：VM_LOCKED 标志
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*

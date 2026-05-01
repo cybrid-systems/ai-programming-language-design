@@ -1,299 +1,243 @@
 # 20-page_cache — 页缓存深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`mm/filemap.c` + `include/linux/fs.h`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**page_cache** 是 Linux 内核的磁盘文件缓存：将磁盘块缓存在内存页中，加速文件读写。核心是 **address_space**（文件到页的映射），使用 **XArray** 存储页帧。
+**页缓存（page cache）** 是 Linux 内核中文件系统性能的核心。它将磁盘上的文件数据缓存在物理内存中，避免每次读写都触发磁盘 I/O。
+
+page cache 的本质：**通过 `address_space` 将文件偏移量（索引）映射到物理内存页（`struct page*`）**。文件 read 优先从 page cache 中查找，只有未命中时才从磁盘读取。
+
+doom-lsp 确认 `include/linux/pagemap.h` 和 `mm/filemap.c` 是 page cache 的核心实现，共包含 500+ 个符号。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 struct address_space — 地址空间
+### 1.1 struct address_space——page cache 的核心
 
 ```c
-// include/linux/fs.h — address_space
 struct address_space {
-    struct inode           *host;              // 关联的 inode
-    struct xarray          i_pages;            // 页缓存（XArray）
-    //   索引 = 文件内页偏移（page_index）
-    //   值 = struct page*
+    struct inode            *host;        // 所属的 inode
+    struct xarray           i_pages;      // 页缓存的核心：页的 XArray 索引
+    struct rb_root_cached   i_mmap;       // 共享映射的 VMA 红黑树
+    unsigned long           nrpages;      // 缓存页总数
 
-    // 写回
-    struct radix_tree_root  i_pages;             // XArray 替代了 radix_tree
-    struct writeback_control *i_wb;           // 写回控制
-    spinlock_t              i_size_lock;       // 保护 i_size
+    struct address_space_operations *a_ops; // 页面操作回调
 
-    // 统计
-    atomic_t                truncate_count;      // 截断计数
-    unsigned long           nrpages;            // 缓存页数
+    unsigned long           flags;        // AS_* 标志
+
+    spinlock_t              i_pages_lock; // 保护 i_pages
+    ...
 };
 ```
 
-### 1.2 struct page — 页帧
+`i_pages` 是 page cache 的核心——一个 XArray，以文件页偏移为索引，存储 `struct page*`。
+
+### 1.2 struct address_space_operations
 
 ```c
-// include/linux/mm_types.h — page（缓存相关字段）
-struct page {
-    // 缓存状态
-    struct {
-        struct address_space *mapping;   // 所属 address_space（NULL = 匿名页）
-        pgoff_t            index;         // 在文件内的页偏移
-    };
-
-    // 状态标志
-    unsigned long          flags;         // PG_locked / PG_uptodate / ...
-
-    // LRU（最近最少使用）链表
-    struct list_head        lru;           // 接入 inode 或 swap 的 LRU
-
-    // 页引用
-    atomic_t                _refcount;     // 引用计数
+struct address_space_operations {
+    int (*writepage)(struct page *page, struct writeback_control *wbc);
+    int (*readpage)(struct file *file, struct page *page);
+    int (*writepages)(struct address_space *, struct writeback_control *);
+    int (*readahead)(struct readahead_control *);
+    int (*write_begin)(struct file *, struct address_space *, ...);
+    int (*write_end)(struct file *, struct address_space *, ...);
+    void (*invalidatepage)(struct page *, unsigned int, unsigned int);
+    int (*releasepage)(struct page *, gfp_t);
+    ...
 };
 ```
 
----
-
-## 2. 页缓存查找
-
-### 2.1 find_get_entry — 查找页
-
-```c
-// mm/filemap.c — find_get_entry
-struct page *find_get_entry(struct address_space *mapping, pgoff_t index)
-{
-    // 1. 从 XArray 查找
-    struct page *page;
-    page = xa_load(&mapping->i_pages, index);
-
-    if (page && !IS_ERR(page)) {
-        // 增加页引用
-        get_page(page);
-        return page;
-    }
-
-    return NULL;  // 未缓存
-}
-```
-
-### 2.2 find_get_entries — 批量查找
-
-```c
-// mm/filemap.c — find_get_entries
-unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
-                          unsigned int nr_entries, struct page **entries)
-{
-    // 从 XArray 批量查找
-    // 返回指向 nr_entries 个页的指针数组
-    return find_get_entries(mapping, start, nr_entries, entries);
-}
-```
+每个文件系统实现这些回调来支持 page cache。
 
 ---
 
-## 3. 页缓存插入
+## 2. 读路径
 
-### 3.1 add_to_page_cache — 添加页到缓存
+### 2.1 filemap_read——通用文件读取
 
-```c
-// mm/filemap.c — add_to_page_cache
-int add_to_page_cache(struct page *page, struct address_space *mapping,
-                      pgoff_t index, gfp_t gfp)
-{
-    int error;
-
-    // 1. 设置 page 的 mapping 和 index
-    page->mapping = mapping;
-    page->index = index;
-
-    // 2. 加入 XArray
-    error = xa_insert(&mapping->i_pages, index, page, gfp);
-    if (error)
-        goto err;
-
-    // 3. 更新统计
-    mapping->nrpages++;
-
-    return 0;
-
-err:
-    page->mapping = NULL;
-    return error;
-}
+```
+filemap_read(file, iov_iter, bytes)
+  │
+  ├─ 循环读取：
+  │    │
+  │    ├─ 获取要读取的页范围（start, end）
+  │    │
+  │    ├─ [命中] find_get_page(mapping, index)
+  │    │    │
+  │    │    ├─ xa_load(&mapping->i_pages, index) ← XArray 查找
+  │    │    │
+  │    │    ├─ 如果找到 → page_cache_get() → 增加引用
+  │    │    └─ 如果未命中 → goto 缺页
+  │    │
+  │    ├─ [缺页] page_cache_sync_readahead()
+  │    │    │
+  │    │    ├─ 触发预读（readahead）
+  │    │    │
+  │    │    └─ a_ops->readpage(file, page) ← 文件系统从磁盘读
+  │    │
+  │    ├─ [复制] copy_page_to_iter(page, offset, bytes, iter)
+  │    │    └─ 将页内容复制到用户空间缓冲区
+  │    │
+  │    ├─ mark_page_accessed(page)           ← 标记访问（影响 LRU）
+  │    │
+  │    └─ 继续读取下一页，直到 bytes 读完
 ```
 
 ---
 
-## 4. read_cache_page — 读取一页
+## 3. 写路径
 
-### 4.1 read_cache_page — 读文件页
+### 3.1 通用文件写入（带缓写的 write-back）
 
-```c
-// mm/filemap.c — read_cache_page
-struct page *read_cache_page(struct address_space *mapping,
-                            pgoff_t index,
-                            int (*filler)(void *, struct page *),
-                            void *data)
-{
-    struct page *page;
-
-    // 1. 查找缓存
-    page = find_get_entry(mapping, index);
-    if (page)
-        return page;
-
-    // 2. 分配新页
-    page = page_cache_alloc(mapping);
-    if (!page)
-        return ERR_PTR(-ENOMEM);
-
-    // 3. 从磁盘读取
-    error = filler(data, page);
-    if (error)
-        goto err;
-
-    // 4. 加入缓存
-    error = add_to_page_cache(page, mapping, index, GFP_KERNEL);
-    if (error)
-        goto err;
-
-    return page;
-
-err:
-    put_page(page);
-    return ERR_PTR(error);
-}
+```
+filemap_write(file, iov_iter, bytes)
+  │
+  ├─ [写入缓存] iomap_write_iter / generic_perform_write
+  │    │
+  │    ├─ grab_cache_page_write_begin(mapping, index)
+  │    │    │
+  │    │    ├─ 在 page cache 中查找或创建页
+  │    │    │    └─ pagecache_get_page(mapping, index, FGP_LOCK|FGP_WRITE|FGP_CREAT)
+  │    │    │         └─ __page_cache_alloc(gfp) → 分配新页
+  │    │    │         └─ add_to_page_cache_lru(page, mapping, index) → 加入 XArray + LRU
+  │    │    │
+  │    │    └─ return locked page
+  │    │
+  │    ├─ a_ops->write_begin(file, mapping, pos, len, &page, &fsdata)
+  │    │    └─ 文件系统准备写入（如 ext4 预留块）
+  │    │
+  │    ├─ iov_iter_copy_from_user_atomic(page, iov_iter, offset, copied)
+  │    │    └─ 从用户空间复制数据到页缓存
+  │    │
+  │    ├─ a_ops->write_end(file, mapping, pos, len, copied, page, fsdata)
+  │    │    └─ 文件系统处理脏页
+  │    │
+  │    └─ page_cache_release(page)           ← 释放临时引用
+  │
+  └─ [回写] 脏页在稍后由 writeback 机制写入磁盘
+       └─ bdi_writeback → wb_workfn → writeback_sb_inodes
+            └─ a_ops->writepage(page, wbc)    ← 文件系统写回磁盘
 ```
 
 ---
 
-## 5. 写回机制
+## 4. 预读（Read Ahead）
 
-### 5.1 filemap_fdatawrite — 写回脏页
+预读是 page cache 性能的关键优化——检测顺序读取模式，提前加载后续页面：
 
-```c
-// mm/filemap.c — filemap_fdatawrite
-int filemap_fdatawrite(struct address_space *mapping)
-{
-    // 遍历所有脏页，写回到磁盘
-    // 使用 i_pages 的 XArray 迭代
-
-    return xa_for_each_range(&mapping->i_pages, index, page) {
-        if (PageDirty(page))
-            writepage(page, wbc, NULL);
-    }
-}
 ```
-
-### 5.2 writepage — 单页写回
-
-```c
-// mm/filemap.c — writepage
-int writepage(struct page *page, struct writeback_control *wbc, void *data)
-{
-    struct address_space *mapping = page->mapping;
-    struct inode *inode = mapping->host;
-
-    // 调用文件系统的写回函数
-    if (mapping->a_ops->writepage)
-        return mapping->a_ops->writepage(page, wbc);
-
-    // 否则调用通用写回
-    return mapping->f_op->fsync(page, wbc);
-}
+顺序读取检测：
+  │
+  ├─ file->f_ra (struct file_ra_state) 记录读模式
+  │    ├─ start        ← 当前预读起始
+  │    ├─ size         ← 预读窗口大小
+  │    ├─ async_size   ← 异步预读触发阈值
+  │    └─ prev_pos     ← 上次读取位置
+  │
+  ├─ 当前请求:
+  │    └─ 如果 prev_pos + 1 == 当前页 → 顺序读
+  │
+  ├─ 触发预读:
+  │    └─ page_cache_sync_readahead(mapping, ra, filp, index, req_count)
+  │         ├─ ondemand_readahead(ra, mapping, filp, index, req_count)
+  │         │    ├─ 顺序检测：
+  │         │    │    └─ try_context_readahead() → 检查是否顺序
+  │         │    │
+  │         │    ├─ 初始读（首次）→ 先读 4KB（1 页）
+  │         │    ├─ 顺序读模式 → 窗口加倍（2, 4, 8, 16... 直到上限）
+  │         │    └─ 随机读 → 不预读
+  │         │
+  │         └─ ra_submit(ra, mapping, filp)
+  │              └─ __do_page_cache_readahead()
+  │                   ├─ 分配 n 页
+  │                   ├─ add_to_page_cache_lru()
+  │                   └─ a_ops->readpage() 批量提交
 ```
 
 ---
 
-## 6. 内存布局图
+## 5. 回写（Writeback）
+
+脏页不会立即写入磁盘，而是通过 writeback 机制异步回写：
 
 ```
-文件读写 page_cache 流程：
+脏页产生：
+  write_end() 标记页面为脏
+  └─ set_page_dirty(page)
+       └─ __set_page_dirty_nobuffers()
+            └─ xa_lock_irqsave(&mapping->i_pages_lock)
+            └─ __xa_set_mark(&mapping->i_pages, index, PAGECACHE_TAG_DIRTY)
+            └─ xa_unlock_irqrestore(...)
 
-用户读文件 /foo/bar.dat (内容在磁盘)：
-
-  1. find_get_entry(i_pages, page_index=0)
-       ↓
-     XArray lookup → NULL（未缓存）
-       ↓
-  2. read_cache_page()
-       ↓
-     alloc_page() → 分配 struct page
-       ↓
-  3. filesystem.readpage() → 从磁盘读入
-       ↓
-  4. add_to_page_cache(page)
-       ↓
-     XArray insert: i_pages[0] = page
-       ↓
-  5. 返回 page 给用户
-
-后续读同一页：
-  find_get_entry() → XArray lookup → 直接返回
-  ↑ 零磁盘 I/O
+writeback 触发：
+  ┌─────────────────────────────────────┐
+  │ 定时器（dirty_expire_interval）      │→ 唤醒 flusher 线程
+  │ 脏页比例超限（dirty_background_ratio）│→ 唤醒 flusher 线程
+  │ 直接 reclaim 遇到脏页               │→ 同步回写
+  └─────────────────────────────────────┘
 ```
 
 ---
 
-## 7. LRU 缓存淘汰
+## 6. 数据类型流
 
-### 7.1 inode 会话的 LRU
+```
+读文件：
+  read(fd, buf, 4096)
+    → filemap_read()
+      → find_get_page(mapping, index)    ← XArray 查找索引页
+        → 命中: copy_page_to_iter()
+        → 未命中: a_ops->readpage(page)  ← 磁盘 I/O
+          → mark_page_accessed()         ← LRU 管理
 
-```c
-// mm/filemap.c — inode_add_lru
-// page_cache 的 LRU 由 inode 的 LRU 间接管理
-// inode 结构中有 page 链表
-// 当内存压力时，kswapd 扫描 LRU，释放页帧
+写文件：
+  write(fd, buf, 4096)
+    → generic_perform_write()
+      → grab_cache_page_write_begin()     ← 分配/获取页
+      → iov_iter_copy_from_user_atomic()  ← 复制数据
+      → a_ops->write_end()               ← 标记脏页
+    → 稍后回写:
+      → a_ops->writepage()               ← 写入磁盘
 ```
 
 ---
 
-## 8. XArray 应用
+## 7. 设计决策总结
 
-```c
-// 页缓存的 XArray 操作：
-
-// 插入：
-xa_insert(&mapping->i_pages, index, page, GFP_KERNEL);
-
-// 查找：
-page = xa_load(&mapping->i_pages, index);
-
-// 删除：
-xa_erase(&mapping->i_pages, index);
-
-// 迭代：
-xa_for_each(&mapping->i_pages, index, page) {
-    // 处理每一页
-}
-```
+| 决策 | 原因 |
+|------|------|
+| XArray 索引页缓存 | O(log n) 查找，支持标记系统 |
+| write-back（延迟写） | 合并多次小写入，减少磁盘 I/O |
+| 预读（readahead） | 隐藏磁盘延迟，提升顺序读性能 |
+| 脏页标记（XA_MARK_0） | 快速查找需要回写的页 |
+| LRU 管理 | 内存压力下回收最近最少使用的页 |
 
 ---
 
-## 9. 完整文件索引
+## 8. 源码文件索引
 
-| 文件 | 函数/结构 |
-|------|----------|
-| `mm/filemap.c` | `find_get_entry`、`read_cache_page`、`add_to_page_cache` |
-| `mm/filemap.c` | `filemap_fdatawrite`、`writepage` |
-| `include/linux/fs.h` | `struct address_space` |
-
----
-
-## 10. 西游记类比
-
-**page_cache** 就像"取经队伍的地图缓存"——
-
-> 唐僧去西天取经，每到一个地方（文件系统），都要翻当地的地图（文件）。地图太大，不可能每次都从藏经阁（磁盘）里拿，所以当地土地神会把常用地图缓存起来（页缓存）。如果地图在缓存里（find_get_entry → XArray lookup），直接用；如果没有，就从藏经阁借一份（read_cache_page → filesystem.readpage），然后放在当地保管（add_to_page_cache）。如果地图被涂改过（脏页），就定期归还给藏经阁（writepage）。藏经阁（磁盘）很大，但翻地图很慢；土地神的桌子（内存）小，但翻得快——这就是页缓存的意义。
+| 文件 | 关键符号 | 行 |
+|------|---------|-----|
+| `include/linux/pagemap.h` | 页缓存 API | 声明 |
+| `include/linux/fs.h` | `struct address_space` | 核心结构 |
+| `mm/filemap.c` | `filemap_read` / `filemap_write` | 读写入口 |
+| `mm/filemap.c` | `find_get_page` / `pagecache_get_page` | 查找/获取页 |
+| `mm/readahead.c` | `ondemand_readahead` | 预读算法 |
 
 ---
 
-## 11. 关联文章
+## 9. 关联文章
 
-- **VFS**（article 19）：address_space 是 inode 的成员
-- **XArray**（article 04）：address_space.i_pages 使用 XArray
-- **page_allocator**（article 17）：页帧是 Buddy System 分配的
+- **VFS**（article 19）：VFS 的读写操作通过 page cache 实现
+- **XArray**（article 04）：page cache 使用 XArray 作为底层存储
+- **writeback**（article 159）：脏页回写机制
+
+---
+
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
