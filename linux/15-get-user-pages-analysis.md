@@ -1,4 +1,4 @@
-# 15-get_user_pages — 用户空间内存锁定深度源码分析
+# 15-get_user_pages — 用户空间内存锁��深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -7,192 +7,117 @@
 
 ## 0. 概述
 
-**get_user_pages（GUP）** 是 Linux 内核中允许内核代码**锁定用户空间内存页**并直接访问的机制。它解决了两个核心需求：
-1. **DMA 传输**：用户空间缓冲区必须物理连续 / 页对齐才能给 DMA 控制器用
-2. **内核直接访问**：IOCTL/SYSCALL 中需要长时间在用户缓冲区上操作
+**get_user_pages（GUP）** 是内核锁定用户空间内存页并直接访问的机制。它解决两个需求：
+1. **DMA 传输**：用户空间缓冲区必须有物理地址才能在 DMA 中使用
+2. **内核直接访问**：IOCTL/SYSCALL 中需长时间操作用户缓冲区（如 RDMA、GPU）
 
-GUP 返回一个 `struct page**` 数组，同时将页面锁定在内存中（不能被换出）。调用者使用完毕后通过 `put_page()` 释放。
+GUP 的核心操作：锁定用户页 → 返回 `struct page**` → 内核/DMA 直接使用 → 完成后释放。
 
-doom-lsp 确认 `mm/gup.c` 包含约 950+ 个符号，是 Linux 内存管理中最关键也最容易出错的接口之一。
+doom-lsp 确认 `mm/gup.c` 包含约 950+ 个符号，是内存管理中最要紧的接口之一。
 
 ---
 
-## 1. 核心函数
+## 1. 核心 API
 
-### 1.1 get_user_pages（经典函数）
+### 1.1 get_user_pages vs pin_user_pages
 
 ```c
+// 传统版本
 long get_user_pages(unsigned long start, unsigned long nr_pages,
                     unsigned int gup_flags, struct page **pages,
                     struct vm_area_struct **vmas);
-```
 
-参数：
-- `start`：用户空间起始虚拟地址
-- `nr_pages`：需要锁定的页数
-- `gup_flags`：FOLL_* 标志
-- `pages`：输出参数，返回的 page 指针数组
-- `vmas`：可选，返回 VMA 信息
-
-### 1.2 pin_user_pages（新一代）
-
-```c
+// 新版本（Linux 5.6+，推荐）
 long pin_user_pages(unsigned long start, unsigned long nr_pages,
                     unsigned int gup_flags, struct page **pages);
 ```
 
-从 Linux 5.6 开始，`pin_user_pages` 取代了 `get_user_pages`。它增加了对 **dma-pinned pages** 的跟踪，解决了长期页锁定与 THP 碎片整理的冲突。
+`pin_user_pages` 解决了长期 DMA 缓冲区与透明大页碎片整理的冲突问题，通过 `FOLL_PIN` 标记页面的"已钉选"状态。
 
 ---
 
-## 2. 核心流程
+## 2. 核心操作流程
 
 ```
 pin_user_pages(start, nr_pages, FOLL_WRITE, pages)
   │
   ├─ internal_get_user_pages_fast(start, nr_pages, gup_flags, pages)
   │    │
-  │    ├─ [快速路径] 锁定页表并遍历
-  │    │    └─ walk_page_range() 遍历用户页表
-  │    │    └─ 对每个有效的 PTE：
-  │    │         ├─ 获取 struct page
-  │    │         ├─ try_grab_page(page, flags)  ← 增加引用+标记
-  │    │         │    └─ page_ref_inc(page)      引用计数+1
-  │    │         │    └─ 设置 FOLL_PIN 标识
-  │    │         └─ 存到 pages[] 数组
+  │    ├─ [快速路径] gup_fast_permitted()
+  │    │    └─ 锁定 RCU，遍历页表
+  │    │    └─ follow_page_mask(vma, addr, flags) → page*
+  │    │    └─ 如果页表项有效 → try_grab_page(page, flags)
+  │    │         └─ page_ref_inc(page)
+  │    │         └─ 设置 FOLL_PIN 标识（区分 get_page vs pin）
   │    │
-  │    └─ [慢速路径] 处理缺页等异常
-  │         └─ faultin_page()                    ← 触发缺页处理
-  │         └─ handle_mm_fault()                 ← 分配物理页
-  │         └─ 重试 GUP 操作
-  │
-  └─ return 已获取的页数
-```
-
-### 2.1 快速路径 vs 慢速路径
-
-```
-快速路径：
-  ┌─────────────────────────────────┐
-  │ 页表已存在                      │
-  │ lock mmap_sem (读)              │
-  │ follow_pte() → 获取 page*      │
-  │ unlock mmap_sem                  │
-  └─────────────────────────────────┘
-
-慢速路径（缺页）：
-  ┌─────────────────────────────────┐
-  │ 页表不存在（未映射/被换出）      │
-  │ lock mmap_sem (写)               │
-  │ handle_mm_fault() → 分配页框    │
-  │ unlock mmap_sem                  │
-  │ 返回 GUP 重试                    │
-  └─────────────────────────────────┘
+  │    ├─ [慢速路径] __get_user_pages()
+  │    │    └─ lock mmap_lock（读锁）
+  │    │    └─ find_vma(mm, start)
+  │    │    └─ follow_page_mask() → 如果缺页：
+  │    │         └─ handle_mm_fault(vma, addr, flags) → 分配物理页
+  │    │         └─ 重新 follow 获取 page
+  │    │    └─ unlock mmap_lock
+  │    │
+  │    └─ return 已获取的页数
 ```
 
 ---
 
-## 3. FOLL 标志族
+## 3. FOLL 标志
 
 | 标志 | 含义 | 使用场景 |
 |------|------|---------|
-| `FOLL_WRITE` | 需要写权限 | DMA 从内存读取 |
-| `FOLL_GET` | 获取引用（get_page） | 标准 GUP |
+| `FOLL_WRITE` | 需要写权限 | DMA 读内存（设备写入）|
+| `FOLL_GET` | 获取引用（get_page）| 标准 GUP |
 | `FOLL_PIN` | 使用 pin_user_pages 语义 | 长期锁定 |
 | `FOLL_LONGTERM` | 长期持有页面 | 设备驱动程序 |
-| `FOLL_FORCE` | 强制访问（即使只读映射）| ptrace / 调试 |
+| `FOLL_FORCE` | 强制访问 | ptrace / 调试 |
 | `FOLL_NOWAIT` | 不等待缺页 | 原子上下文 |
 | `FOLL_HWPOISON` | 允许获取损坏页 | 内存故障处理 |
-| `FOLL_PCI_P2PDMA` | PCI P2P DMA 支持 | NVMe 等 |
 
 ---
 
-## 4. 与页表的关系
-
-GUP 的本质是**将用户空间页表解析为 `struct page*`，同时确保这些页不会被释放**。
+## 4. 与 page allocator 的关系
 
 ```
-用户虚拟地址空间：
-  VA: 0x7f1234560000
-  │
-  ├─ 页表遍历（软件）：
-  │    PGD → P4D → PUD → PMD → PTE
-  │
-  ├─ 每级页表项指向物理页框
-  │
-  └─ 最终 PTE 包含：
-       ├─ 物理页框号 (PFN)
-       ├─ 权限位 (R/W/X)
-       └─ 状态位 (Present/Dirty/Accessed)
+GUP 本质：
+  用户空间 VA → 页表遍历 → PFN（物理页框号）
+  → struct page* → page_ref_inc（防止释放）
 
-GUP 读取 PTE → PFN → struct page → page_ref_inc → pages[]
+内核/DMA 使用：
+  直接读写 page->virtual（或 page_to_phys 给 DMA）
+
+完成后释放：
+  unpin_user_page(page)     ← 减少引用计数
+  → 如果引用降为 0 → 放回 buddy 系统
 ```
 
 ---
 
-## 5. pin_user_pages 与 DMA 的关系
-
-pin_user_pages 引入了 `FOLL_PIN` 和 `FOLL_LONGTERM` 两个关键概念：
-
-```
-get_user_pages（旧）：
-  page->_refcount + 1
-  → 页可以被文件系统迁移/整理
-  → 与 THP 碎片整理冲突
-
-pin_user_pages（新）：
-  page->_refcount + 1
-  page->_mapcount（FOLL_PIN 跟踪位）
-  → 页被标记为 "dma-pinned"
-  → 碎片整理可以避开这些页
-  → 解决了长期 DMA 缓冲区的碎片问题
-```
-
----
-
-## 6. 释放路径
-
-```c
-void unpin_user_page(struct page *page)
-{
-    // 减少引用
-    if (PageDmaPinned(page))
-        __unpin_device_page(page);
-    else
-        put_page(page);
-}
-```
-
----
-
-## 7. 设计决策总结
+## 5. 设计决策总结
 
 | 决策 | 原因 |
 |------|------|
-| 快速/慢速路径分离 | 绝大多数情况页表已存在 |
-| pin_user_pages + FOLL_PIN | 解决长期锁定与 THP 碎片整理冲突 |
+| 快速/慢速路径分离 | 大多数情况页表已存在（快速路径）|
+| pin_user_pages + FOLL_PIN | 解决长期锁定与 THP 碎片冲突 |
 | page_ref_inc | 防止页面被回收 |
-| 不复制页内容 | 共享物理内存（零拷贝） |
-| vmas 参数可选 | 大部分调用者只需要 page 数组 |
+| 不复制页内容 | 共享物理内存（零拷贝）|
 
 ---
 
-## 8. 源码文件索引
+## 6. 源码文件索引
 
-| 文件 | 关键符号 | 行 |
-|------|---------|-----|
-| `mm/gup.c` | `internal_get_user_pages_fast` | 快速路径 |
-| `mm/gup.c` | `faultin_page` | 缺页处理 |
-| `mm/gup.c` | `pin_user_pages` | 入口 |
-| `include/linux/mm.h` | `FOLL_*` 标志 | 定义 |
+| 文件 | 关键符号 |
+|------|---------|
+| `mm/gup.c` | `pin_user_pages` / `get_user_pages` / `__get_user_pages` |
+| `include/linux/mm.h` | `FOLL_*` 标志定义 |
 
 ---
 
-## 9. 关联文章
+## 7. 关联文章
 
-- **page_allocator**（article 17）：GUP 获取的页面来自 page allocator
+- **page_allocator**（article 17）：GUP 获得的物理页来自 buddy 系统
 - **VMA**（article 16）：GUP 通过 VMA 检查权限
-- **DMA**（article 203）：DMA 传输使用 GUP 固定缓冲区
 
 ---
 
