@@ -1,12 +1,10 @@
-# 34-fanotify-deep — 深度源码分析
+# 34-fanotify-deep — Fanotify 深度分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+## 0. 概述
+fanotify 的通知组和权限决策实现。
 
----
+## 1. permission event
+fanotify 支持在文件访问前询问用户空间的决策守护进程。
 
-fanotify 深入：mark 管理（inode/mount/sb 类型）、group 通知队列管理。
-
----
-
-*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01*
+## 2. 关联文章
+- **32-fanotify**: fanotify 基础
