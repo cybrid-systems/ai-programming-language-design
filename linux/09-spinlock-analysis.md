@@ -1,266 +1,236 @@
 # 09-spinlock — 自旋锁深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`include/linux/spinlock.h` + `kernel/locking/spinlock.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**spinlock** 是最轻量的锁：自旋等待（忙等），适用于临界区很短、不能睡眠的场景（如中断处理）。
+**自旋锁（spinlock）** 是 Linux 内核中最底层的锁机制。与 mutex 不同，自旋锁在获取失败时会**原地自旋转**（busy-wait），不会睡眠。这使得自旋锁可以在中断上下文和进程上下文使用，但临界区必须极短。
+
+spinlock 的发展经历了三代演变：
+1. **原始 ticket spinlock** — 公平但 cache line bouncing 严重
+2. **MCS queued spinlock** — 减少 cache 竞争（x86 默认）
+3. **Generic qspinlock** — 架构无关的队列自旋锁
+
+本文分析的是当前 64 位架构默认使用的 **qspinlock（queued spinlock）**。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 raw_spinlock_t — 自旋锁
+### 1.1 struct spinlock——用户接口
 
 ```c
-// include/linux/spinlock_types.h — raw_spinlock_t
-typedef struct {
-    arch_spinlock_t        lock;   // 架构相关的锁
-} raw_spinlock_t;
+// include/linux/spinlock_types.h
+typedef struct spinlock {
+    union {
+        struct raw_spinlock rlock;    // 底层实现
+    };
+} spinlock_t;
 
-// x86 的实现：
-// include/asm-generic/qspinlock.h — arch_spinlock_t
-typedef struct {
-    u32 slock;   // 0 = 未锁，1 = 已锁
+typedef struct raw_spinlock {
+    arch_spinlock_t raw_lock;         // 架构特定实现
+} raw_spinlock_t;
+```
+
+### 1.2 arch_spinlock_t——qspinlock（`include/asm-generic/qspinlock_types.h`）
+
+```c
+typedef struct qspinlock {
+    union {
+        atomic_t val;                 // 32 位原子值
+
+        struct {
+            u16    locked;            // bit 0: 锁持有者
+            u16    pending;           // 等待获取锁的任务数
+        };
+    };
 } arch_spinlock_t;
 ```
 
-### 1.2 spinlock_t — 自旋锁（可睡眠变体）
+`val` 的编码方式：
 
-```c
-// include/linux/spinlock_types.h — spinlock_t
-#ifdef CONFIG_PREEMPT_RT
-// RT 内核：spinlock 变成 sleepable 锁
-typedef struct {
-    raw_spinlock_t        raw_lock;
-    // ...
-} spinlock_t;
-#else
-// 普通内核：spinlock = raw_spinlock
-typedef raw_spinlock_t spinlock_t;
-#endif
+```
+  bit  0    = locked  (1 = 锁被持有)
+  bit  1    = pending (1 = 有等待者正在试图获取)
+  bit 2-7   = index   (在 MCS 数组中的索引)
+  bit 8-31  = tail    (MCS 队列尾部)
 ```
 
 ---
 
-## 2. x86 TSO 模型下的实现
+## 2. 快速路径（无竞争）
 
-### 2.1 arch_spin_lock — 加锁
+### 2.1 spin_lock（`include/linux/spinlock.h:363`）
 
 ```c
-// include/asm-generic/qspinlock.h — arch_spin_lock
-static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
+static __always_inline void spin_lock(spinlock_t *lock)
 {
-    // x86 TSO（Total Store Order）模型下：
-    // 所有 store 按程序顺序执行
-    // 所有 load 可以 reorder
-
-    // 方式一：test-and-set
-    // while (atomic_xchg(&lock->slock, 1) == 1)
-    //     cpu_relax();
-
-    // 方式二：更优化的 queued spinlock（MCS 的变体）
-    // 减少 cacheline bounce
-}
-
-static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
-{
-    int val = 1;
-
-    // TSO：x86 保证 lock 前缀的指令不会 reorder
-    // 所以下面的代码在 x86 上是正确的
-    asm volatile(
-        "1: lock xaddl %0, %1\n"   // xaddl = atomic exchange + add
-        "   testl %0, %0\n"         // 检查旧值
-        "   jz 3f\n"                // 如果是 0（原值），说明锁空闲，跳到 3
-        "2: pause\n"               // cpu_relax 的 x86 实现：降低功耗、提高调度
-        "   cmpl %2, %1\n"         // 检查锁是否释放（load 当前值）
-        "   je 1b\n"               // 如果已释放，重试
-        "   jmp 2b\n"              // 继续自旋
-        "3:\n"
-        : "+r"(val), "+m"(lock->slock)
-        : "i"(0)
-        : "memory", "cc");
+    raw_spin_lock(&lock->rlock);
 }
 ```
 
-### 2.2 xaddl 指令详解
+`raw_spin_lock` 最终调用架构特定的快速路径：
 
 ```c
-// lock xaddl %0, %1 的语义：
-//   temp = *lock;    // 原子读取
-//   *lock = temp + val; // 原子写入
-//   %0 = temp;         // 输出：返回原值
-
-// 所以：
-//   lock xaddl $1, %slock
-//   如果原值 = 0（空闲），返回 0
-//   如果原值 = 1（已锁），返回 1
-//   同时 slock = 1（已被锁定）
-
-// 自旋逻辑：
-//   如果返回 0 → 锁空闲 → 成功
-//   如果返回 1 → 锁被持有 → 继续自旋
-```
-
-### 2.3 pause 指令
-
-```c
-// cpu_relax() 在 x86 上的实现：
-// 实际上是 "pause" 指令
-// pause 的作用：
-//   1. 降低 CPU 功耗
-//   2. 提示 CPU 这是一个自旋锁场景
-//   3. 减少 memory order 冲突（pause 会清空 store buffer 的部分）
-//   4. 让超线程（Hyperthread）的资源更多分配给对等线程
-```
-
----
-
-## 3. 解锁
-
-### 3.1 arch_spin_unlock
-
-```c
-// include/asm-generic/qspinlock.h — arch_spin_unlock
-static __always_inline void arch_spin_unlock(arch_spinlock_t *lock)
+// qspinlock 快速路径
+static __always_inline void queued_spin_lock(struct qspinlock *lock)
 {
-    // 简单：直接写 0
-    // x86 TSO 下不需要 memory barrier
-    // 因为所有之前的 store 都已经按顺序执行
-    // 但完整代码会有 barrier
-    __release(lock);
-    lock->slock = 0;
+    u32 val = atomic_read(&lock->val);
+
+    // 快速路径：锁空闲时直接尝试获取
+    if (likely(val == 0)) {                    // val == 0 = 空闲
+        if (atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))
+            return;                            // 获取成功！一条 CAS 搞定
+    }
+
+    // 慢速路径：有竞争
+    queued_spin_lock_slowpath(lock, val);
 }
+```
 
-// __release 展开为：
-//   asm volatile("" : : "i"(lock) : "memory")
-// 告诉编译器：在这一点之前的所有内存访问都不能 reorder 到之后
-// 实际上是 compiler barrier + aarch64 的 explicit barrier
+**快速路径只有一条 CAS 指令**——在无竞争场景下效率极高。
+
+---
+
+## 3. 慢速路径（qspinlock_slowpath）
+
+当锁已被持有时，`queued_spin_lock_slowpath` 负责管理等待者。它是自旋锁的核心：
+
+```
+queued_spin_lock_slowpath(lock, val)
+  │
+  ├─ [Phase 1] Pending 位争取
+  │    └─ 如果只有 locked=1，没有 pending，没有队列
+  │         └─ 尝试设置 pending=1
+  │         └─ 成功 → 等待 locked 清零 → 获取锁
+  │
+  ├─ [Phase 2] 加入 MCS 队列
+  │    └─ 在 MCS 数组中分配一个节点
+  │    └─ 通过 CAS 将自己链接到队列尾部
+  │    └─ 在本地 MCS 节点上自旋（无 cache line 竞争）
+  │
+  ├─ [Phase 3] 排队自旋
+  │    └─ 读取前驱节点的 next 指针
+  │    └─ 前驱释放后，自己的节点被置为 locked
+  │
+  └─ [Phase 4] 获取锁
+       └─ 从 MCS 队列头部获取锁
+       └─ 设置 locked=1
 ```
 
 ---
 
-## 4. 读写自旋锁
-
-### 4.1 rwlock_t — 读写锁
+## 4. 解锁路径
 
 ```c
-// include/linux/rwlock.h — rwlock_t
-typedef struct {
-    arch_rwlock_t        lock;   // 0 = 未锁，正数 = 读锁计数
-} rwlock_t;
-
-// x86 实现：
-typedef struct {
-    int lock;   // bit[31] = 写锁标记，bit[30:0] = 读锁计数
-} arch_rwlock_t;
-
-// 读锁：atomic_inc(&lock->lock)  （加到计数上）
-// 写锁：atomic_xchg(&lock->lock, -1)（设为 -1 表示写锁）
+static __always_inline void queued_spin_unlock(struct qspinlock *lock)
+{
+    smp_store_release(&lock->locked, 0);  // 清零 locked 位
+}
 ```
+
+一次 release store 即可完成。如果队列中有等待者，MCS 机制会自动将锁传递给下一个节点。
 
 ---
 
-## 5. spin_lock_irqsave — 禁用中断的加锁
+## 5. spin_lock_irqsave
 
 ```c
-// include/linux/spinlock.h — spin_lock_irqsave
-#define spin_lock_irqsave(lock, flags) \
-do { \
-    flags = 0; \
-    spin_lock(lock); \
-} while (0)
+static __always_inline unsigned long spin_lock_irqsave(spinlock_t *lock)
+{
+    unsigned long flags;
 
-// 实际实现：
-//   1. 保存当前中断状态（FLAGS）
-//   2. 禁用本地中断（CLI）
-//   3. 获取锁
+    local_irq_save(flags);     // 关闭本地中断
+    raw_spin_lock(&lock->rlock);
 
-// 解锁时：
-#define spin_unlock_irqrestore(lock, flags) \
-do { \
-    spin_unlock(lock); \
-    local_irq_restore(flags); \
-} while (0)
+    return flags;              // flags 在 spin_unlock_irqrestore 中使用
+}
+```
 
-// 必须用 irqsave/irqrestore，不能用 irq_disable/enable
-// 因为其他代码可能已经开了中断
+关闭中断+获取锁——防止中断处理程序和进程上下文之间的死锁。解锁时用 `spin_unlock_irqrestore` 恢复中断状态。
+
+---
+
+## 6. 关键 API 族
+
+| API | 中断状态 | 适用场景 |
+|-----|---------|---------|
+| `spin_lock` / `spin_unlock` | 不影响 | 进程上下文，无中断竞争 |
+| `spin_lock_irq` / `spin_unlock_irq` | 关开中断 | 知道中断之前是开的 |
+| `spin_lock_irqsave` / `spin_unlock_irqrestore` | 保存/恢复 | 不知道中断状态 |
+| `spin_lock_bh` / `spin_unlock_bh` | 关开 softirq | 防止 softirq 竞争 |
+
+---
+
+## 7. 数据类型流
+
+```
+lock-free fastpath:
+  spin_lock(lock)
+    └─ CAS(lock->val, 0, _Q_LOCKED_VAL)    ← 一条指令
+    └─ memory barrier (acquire)
+
+lock-contended slowpath:
+  spin_lock(lock)
+    └─ CAS(lock->val, owner, pending+tail)  ← 加入 MCS 队列
+    └─ while (my_node->locked == 0)         ← 本地自旋
+    │      cpu_relax()
+    └─ 获取锁
+
+unlock:
+  spin_unlock(lock)
+    └─ smp_store_release(&lock->locked, 0)   ← release 语义
+    └─ MCS 队列中下一个节点被唤醒
 ```
 
 ---
 
-## 6. 内存屏障（Memory Barrier）
+## 8. MCS vs Ticket 对比
 
-### 6.1 为什么需要 barrier
+| 特性 | Ticket spinlock | MCS qspinlock |
+|------|----------------|---------------|
+| 公平性 | ✅ FIFO | ✅ FIFO |
+| cache bouncing | ❌ 全局变量 | ✅ 本地节点 |
+| 空间开销 | 低 | 中（MCS 数组）|
+| 64 位支持 | 差 | 好 |
 
-```
-x86 TSO 模型：
-
-CPU0:           CPU1:
-store x=1       load y
-store y=1       ???
-
-如果 CPU0 先执行 store x，后执行 store y：
-x86 TSO 保证：store 到 y 不会越过 store 到 x
-
-但是，如果 CPU0 和 CPU1 之间有锁：
-CPU0:           CPU1:
-spin_lock       spin_lock
-store x=1       load y    ← 这里能看到 x=1
-store y=1
-spin_unlock     spin_unlock
-
-spin_lock/unlock 提供了隐含的 barrier：
-- 进入锁之前的 store 不能 reorder 到锁之后
-- 锁之后的 load 不能 reorder 到锁之前
-```
+每个 CPU 在 MCS 数组中有预分配的本地节点，自旋在自己的节点上，不会触发全局 cache line 失效。
 
 ---
 
-## 7. 与 mutex 的对比
+## 9. 设计决策总结
 
-| 特性 | spinlock | mutex |
-|------|----------|-------|
-| 自旋等待 | ✓ | ✗（睡眠）|
-| 持有时睡眠 | ✗ | ✓ |
-| 中断上下文 | ✓ | ✗ |
-| 临界区时长 | 极短（us级）| 较长（可ms级）|
-| 优先级继承 | 无 | 有（PI-mutex）|
-
----
-
-## 8. 内核使用案例
-
-### 8.1 中断处理
-
-```c
-// 软中断（softirq）
-spin_lock(&irq_desc->lock);  // 保护中断描述符
-// 处理...
-spin_unlock(&irq_desc->lock);
-```
-
-### 8.2 定时器
-
-```c
-// 内核数据结构中的自旋锁
-struct timer_list {
-    spinlock_t      lock;
-    // ...
-};
-```
+| 决策 | 原因 |
+|------|------|
+| 快速路径 CAS | 无竞争时 O(1) |
+| MCS 队列 | 避免 cache line bouncing |
+| pending 位 | 减少不必要队列操作 |
+| smp_store_release 解锁 | 保证 memory ordering |
+| local_irq_save | 防止中断上下文死锁 |
 
 ---
 
-## 9. 完整文件索引
+## 10. 源码文件索引
 
-| 文件 | 函数/结构 |
-|------|----------|
-| `include/linux/spinlock_types.h` | `raw_spinlock_t`、`spinlock_t` |
-| `include/asm-generic/qspinlock.h` | `arch_spin_lock`、`arch_spin_unlock` |
-| `include/linux/spinlock.h` | `spin_lock_irqsave` |
-| `kernel/locking/spinlock.c` | spinlock 核心实现 |
+| 文件 | 关键符号 | 行 |
+|------|---------|-----|
+| `include/linux/spinlock.h` | `spin_lock` 宏族 | ~363 |
+| `include/linux/spinlock_types.h` | `struct spinlock` | |
+| `include/asm-generic/qspinlock.h` | `queued_spin_lock` | |
+| `include/asm-generic/qspinlock_types.h` | `struct qspinlock` | |
+| `kernel/locking/qspinlock.c` | `queued_spin_lock_slowpath` | |
+
+---
+
+## 11. 关联文章
+
+- **mutex**（article 08）：另一种锁，允许持有者睡眠
+- **rwsem**（article 10）：读写信号量，使用类似的自旋锁思路
+- **MCS lock**：自旋锁的底层契约
+
+---
+
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
