@@ -446,3 +446,13 @@ cat /sys/kernel/debug/tracing/trace_pipe
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 25. 参考
+
+- mm/oom_kill.c — OOM Killer 完整实现
+- Documentation/admin-guide/sysctl/vm.rst — sysctl 参数
+- /proc/[pid]/oom_score — 查看进程 OOM 分数
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
