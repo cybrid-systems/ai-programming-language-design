@@ -432,3 +432,29 @@ echo 200M > /sys/fs/cgroup/myapp/memory.high
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 29. 带 memcg 的调试
+
+```bash
+# 查看进程所属 memcg
+cat /proc/<pid>/cgroup
+
+# 查看 memcg 内的所有进程
+cat /sys/fs/cgroup/<group>/cgroup.procs
+
+# 查看 memcg 内存压力
+cat /sys/fs/cgroup/<group>/memory.pressure
+# some avg10=2.34 avg60=1.56 avg300=0.78
+# full avg10=1.23 avg60=0.89 avg300=0.45
+
+# some: 部分进程在等待内存
+# full: 所有进程都在等待内存
+```
+
+## 30. 总结
+
+memcg 是 Linux 内存资源隔离的基础。每个 cgroup 维护独立的内存计数器和限制，通过 try_charge 路径在页面分配时执行层级计费检查。超出上限时触发回收或 OOM，memory.min/low 提供保护机制。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
