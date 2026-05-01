@@ -6,7 +6,9 @@
 
 ## 0. 概述
 
-**mlock（内存锁定）** 将进程的虚拟页面锁定在物理内存中，防止被换出（swap）。关键应用：实时系统（避免缺页延迟）、加密应用（防止密钥被换出）。
+**mlock** 将进程的虚拟页锁定在物理内存中，防止被换出（swap out）。用于实时应用（避免缺页延迟）和安全敏感应用（防止密钥等敏感数据被换出到磁盘）。
+
+**doom-lsp 确认**：`mm/mlock.c` 核心实现。
 
 ---
 
@@ -14,12 +16,16 @@
 
 ```c
 #include <sys/mman.h>
-int mlock(const void *addr, size_t len);       // 锁定区间
-int munlock(const void *addr, size_t len);     // 解锁
-int mlockall(int flags);                       // 锁定全部
-int munlockall(void);                          // 解锁全部
 
-// flags: MCL_CURRENT（锁定当前）, MCL_FUTURE（锁定未来页）
+int mlock(const void *addr, size_t len);    // 锁定区间
+int munlock(const void *addr, size_t len);  // 解锁
+int mlockall(int flags);                    // 锁定全部
+int munlockall(void);                       // 解锁全部
+
+// mlockall flags:
+// MCL_CURRENT: 锁定当前所有页
+// MCL_FUTURE:  锁定未来所有页
+// MCL_ONFAULT: 仅在缺页时锁定
 ```
 
 ---
@@ -29,39 +35,61 @@ int munlockall(void);                          // 解锁全部
 ```
 mlock(addr, len)
   └─ do_mlock(start, len, VM_LOCKED)
-       ├─ 遍历 VMA，设置 VM_LOCKED 标志
        └─ __mm_populate(start, len, 0)
-            └─ populate_vma_page_range(vma, start, end, NULL)
-                 → 对区间内所有页面调用 get_user_pages
-                 → 强制缺页 → 页面进入物理内存
-                 → 页面被标记为 unevictable（不可回收）
+            └─ populate_vma_range(vma, start, end)
+                 → 遍历区间内所有 VMA
+                 → 对每个未映射页调用 get_user_pages → 强制缺页
+                 → 设置 VM_LOCKED 标志
+                 → 页面被标记为 unevictable
 ```
 
 ---
 
 ## 3. RLIMIT_MEMLOCK
 
-RLIMIT_MEMLOCK 限制非 root 进程可锁定的内存总量：
-
 ```bash
-ulimit -l 65536   # 限制 64MB
+# 查看限制
+ulimit -l       # 通常 64KB（非 root）
+
+# root 可锁定大量内存
+# 内核启动参数：mlock=yes 允许非 root 锁定更多
 ```
 
 ---
 
-## 4. 源码文件索引
+## 4. unevictable 链表
 
-| 文件 | 内容 |
-|------|------|
-| mm/mlock.c | mlock 核心 |
-| include/linux/mman.h | 标志定义 |
+被 mlock 锁定的页面被放入 unevictable LRU 链表，页面回收代码会跳过此链表：
+
+```c
+// mm/vmscan.c
+static unsigned long shrink_inactive_list(...)
+{
+    // 处理 LRU 链表
+    // unevictable 链表的页面不会被回收
+}
+
+// mm/mlock.c
+void mlock_vma_page(struct page *page)
+{
+    // 将页面从 active/inactive LRU 移到 unevictable LRU
+    lru_cache_add(page, LRU_UNEVICTABLE);
+}
+```
 
 ---
 
-## 5. 关联文章
+## 5. 源码文件索引
+
+| 文件 | 内容 |
+|------|------|
+| mm/mlock.c | 实现 |
+| include/linux/mman.h | 标志 |
+
+---
+
+## 6. 关联文章
 
 - **188-mlock**: mlock 深度分析
 
 ---
-
-*分析工具：doom-lsp*
