@@ -554,3 +554,5 @@ static struct kmem_cache *rmap_item_cache;
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
 KSM 是 Linux 内核内存去重机制。通过 ksmd 内核线程扫描并合并虚拟化场景中重复的匿名页面，显著降低内存占用。稳定树/不稳定树双树结构实现高效查找。
+
+ksmd 线程优先级为 NICE 5，每轮扫描 pages_to_scan 个页面后休眠 sleep_millisecs 毫秒。通过 sysfs 接口动态调整扫描参数。
