@@ -406,58 +406,50 @@ stable_node_dups    # 稳定树重复
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## 23. ksm_scan_kthread 创建
 
-ksmd 内核线程在内核初始化时创建：
 
-```c
-// mm/ksm.c — ksm_init()
-static int __init ksm_init(void)
-{
-    // 创建 ksmd 内核线程
-    ksm_thread = kthread_run(ksm_scan_thread, NULL, "ksmd");
-    if (IS_ERR(ksm_thread))
-        return PTR_ERR(ksm_thread);
 
-    // 设置低优先级（nice=5）
-    set_user_nice(ksm_thread, 5);
 
-    return 0;
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+ksmd 线程的优先级为 NICE 5（低优先级），确保不影响交互式进程的性能。扫描间隔和每轮扫描页数可通过 sysfs 调整以适应不同的工作负载。
+
+## 25. 参考
+
+```bash
+# KSM 完整配置项
+/sys/kernel/mm/ksm/
+├── pages_to_scan
+├── sleep_millisecs
+├── run
+├── pages_shared
+├── pages_sharing
+├── pages_unshared
+├── pages_volatile
+├── full_scans
+├── stable_node_chains
+├── stable_node_dups
+├── merge_across_nodes
+├── max_page_sharing
+└── use_zero_pages
 ```
 
-## 24. KSM 总结
+## 26. 关联文章
 
-KSM 通过 ksmd 内核线程合并相同内容的页。两个红黑树管理合并状态，稳定树保存已合并页面，不稳定树保存候选页面。ksm_max_page_sharing 限制共享者数量，use_zero_pages 优化零页。在虚拟化场景可节省 50%+ 内存。
+- **42-oom-killer**: OOM Killer
+- **39-mlock**: 内存锁定
 
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-
-The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
-
-ksmd 线程的优先级为 NICE 5（低优先级），确保不影响交互式进程的性能。扫描间隔和每轮扫描页数可通过 sysfs 调整以适应不同的工作负载。
