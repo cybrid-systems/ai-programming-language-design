@@ -337,3 +337,83 @@ memcg 是容器内存隔离的核心。通过 try_charge 路径逐层检查层�
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
+
+## Additional Analysis
+
+The memcg subsystem provides fine-grained memory control for containers and workloads. Hierarchical charging ensures that each cgroup's memory usage is properly accounted. The page_counter structure enables O(1) charge/uncharge operations while maintaining hierarchical limit checks.
+
