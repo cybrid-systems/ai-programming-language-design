@@ -426,3 +426,23 @@ cat /sys/kernel/debug/tracing/trace_pipe
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 24. OOM 内存统计字段
+
+```c
+// OOM 触发时打印的内存统计
+// active_anon:        活跃匿名页（进程堆栈）
+// inactive_anon:      非活跃匿名页（可回收）
+// active_file:        活跃文件页（page cache）
+// inactive_file:      非活跃文件页（可回收）
+// unevictable:        锁定页（mlock）
+// slab_reclaimable:   可回收 slab（inode/dentry 缓存）
+// slab_unreclaimable: 不可回收 slab
+//
+// 当 inactive_file 和 slab_reclaimable 较大时
+// 说明系统有大量可回收内存，OOM 可能由内存分配策略导致
+```
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
