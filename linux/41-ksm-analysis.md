@@ -481,3 +481,28 @@ KSM 通过 ksmd 内核线程合并相同内容页面。稳定树/不稳定树双
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 30. KSM 页面生命周期
+
+```
+匿名页面 → 首次扫描：加入不稳定树
+         → 再次扫描：校验和比较
+         → 内容不变：尝试合并
+         → 合并成功：移入稳定树
+         → COW 写入：生成新页面
+```
+
+## 31. KSM 调试
+
+```bash
+# 查看 ksmd 状态
+ps aux | grep ksmd
+cat /proc/$(pgrep ksmd)/stat
+
+# 查看 KSM 节省趋势
+watch -n1 cat /sys/kernel/mm/ksm/pages_sharing
+```
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
