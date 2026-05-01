@@ -473,3 +473,4 @@ memcg 通过 page_counter 结构实现 O(1) 的计费和层级检查。页面分
 memcg 的 memory.stat 提供了内存使用的详细分类。通过监控 anon/file/slab 等字段的比例，可以判断内存压力来源和回收效率。
 memcg 的层级结构支持嵌套 cgroup。子 cgroup 的 memory.max 不能超过父 cgroup 的剩余配额。系统根 cgroup（根 memcg）没有上限限制，但受全局物理内存限制。
 memcg 是 Linux 容器技术的核心组件之一。它提供了页面级的内存隔离能力，配合 CPU cgroup 和 IO cgroup 实现完整的资源隔离。Docker、Kubernetes 等容器平台都依赖 memcg。
+memory.high 和 memory.max 的区别在于超限行为。high 触发异步回收行为，进程可继续运行。max 触发同步回收和 OOM，分配进程阻塞。合理配置两者可在缓存利用率和响应延迟间取得平衡。
