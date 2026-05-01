@@ -4,8 +4,6 @@
 > 工具：doom-lsp（clangd LSP）+ 原始源码对照
 > 关键词：eventpoll、epitem、ep_poll_callback、ep_ptable_queue_proc、LT/ET、红黑树
 
----
-
 ## 0. epoll 概述与历史
 
 **epoll** 是 Linux 2.6+ 引入的 I/O 多路复用机制，解决了 `select`/`poll` 的 O(n) 扫描问题。核心设计：
@@ -26,8 +24,6 @@ epoll:
   FD 就绪:    回调 → 加入 rdllist O(1)
   epoll_wait: 仅复制 rdllist     O(k) k=就绪数
 ```
-
----
 
 ## 1. 核心数据结构（逐字段解析）
 
@@ -137,8 +133,6 @@ struct epoll_filefd {
 };
 ```
 
----
-
 ## 2. epoll_create / epoll_create1
 
 ```c
@@ -173,8 +167,6 @@ static int do_epoll_create(int flags)
     return fd;
 }
 ```
-
----
 
 ## 3. epoll_ctl — 核心：插入/修改/删除 FD
 
@@ -250,8 +242,6 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 }
 ```
 
----
-
 ## 4. ep_ptable_queue_proc — epoll 高效的核心
 
 这是 epoll 区别于 select/poll 的**关键机制**：
@@ -293,8 +283,6 @@ static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 - `select/poll` 在每次调用时**重新设置**等待队列，每次都要遍历
 - `epoll` 通过回调机制，仅在 `epoll_ctl(ADD)` 时设置一次，之后 FD 就绪时**主动回调**，无需遍历
 
----
-
 ## 5. ep_poll_callback — FD 就绪时的回调
 
 ```c
@@ -323,8 +311,6 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
     return 1;
 }
 ```
-
----
 
 ## 6. epoll_wait — 等待就绪事件
 
@@ -356,8 +342,6 @@ static int do_epoll_wait(int epfd, struct epoll_event __user *events,
 }
 ```
 
----
-
 ## 7. LT（水平触发）vs ET（边缘触发）
 
 ```c
@@ -374,8 +358,6 @@ static int do_epoll_wait(int epfd, struct epoll_event __user *events,
 //   ET: 边缘触发需要设置 EPOLLONESHOT，之后需要 epoll_ctl(MOD) 重新激活
 ```
 
----
-
 ## 8. 设计决策总结
 
 | 设计决策 | 原因 |
@@ -385,8 +367,6 @@ static int do_epoll_wait(int epfd, struct epoll_event __user *events,
 | 两层链表（rdllist + ovflist）| 避免边调用回调边遍历链表的数据竞争 |
 | 自旋锁 + mutex 双锁 | 读多写少场景，读用锁，写用原子操作 |
 | refcount 引用计数 | 防止 close(fd) 时释放正在使用的 epitem |
-
----
 
 ## 9. 参考
 
@@ -399,3 +379,126 @@ static int do_epoll_wait(int epfd, struct epoll_event __user *events,
 | `fs/eventpoll.c` | `do_epoll_wait` | 5250 |
 | `fs/eventpoll.c` | `ep_rbtree_insert` | 红黑树工具 |
 | `include/linux/eventpoll.h` | `struct epoll_event` | 用户空间接口 |
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+

@@ -1,291 +1,199 @@
-# 15-get_user_pages / follow_page — 用户页获取深度源码分析
+# 15-get_user_pages — 用户空间内存锁定深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`mm/gup.c` + `mm/memory.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**get_user_pages** 将用户空间虚拟地址转换为物理页帧（struct page*），用于 DMA 缓冲（设备直接访问内存）、驱动访问用户缓冲区、GPU 共享内存等。
+**get_user_pages（GUP）** 是 Linux 内核中允许内核代码**锁定用户空间内存页**并直接访问的机制。它解决了两个核心需求：
+1. **DMA 传输**：用户空间缓冲区必须物理连续 / 页对齐才能给 DMA 控制器用
+2. **内核直接访问**：IOCTL/SYSCALL 中需要长时间在用户缓冲区上操作
+
+GUP 返回一个 `struct page**` 数组，同时将页面锁定在内存中（不能被换出）。调用者使用完毕后通过 `put_page()` 释放。
+
+doom-lsp 确认 `mm/gup.c` 包含约 950+ 个符号，是 Linux 内存管理中最关键也最容易出错的接口之一。
 
 ---
 
-## 1. 核心 API
+## 1. 核心函数
 
-### 1.1 get_user_pages — 获取用户页
+### 1.1 get_user_pages（经典函数）
 
 ```c
-// mm/gup.c — get_user_pages
 long get_user_pages(unsigned long start, unsigned long nr_pages,
-                   unsigned int gup_flags, struct page **pages,
-                   struct vm_area_struct **vmas)
+                    unsigned int gup_flags, struct page **pages,
+                    struct vm_area_struct **vmas);
+```
+
+参数：
+- `start`：用户空间起始虚拟地址
+- `nr_pages`：需要锁定的页数
+- `gup_flags`：FOLL_* 标志
+- `pages`：输出参数，返回的 page 指针数组
+- `vmas`：可选，返回 VMA 信息
+
+### 1.2 pin_user_pages（新一代）
+
+```c
+long pin_user_pages(unsigned long start, unsigned long nr_pages,
+                    unsigned int gup_flags, struct page **pages);
+```
+
+从 Linux 5.6 开始，`pin_user_pages` 取代了 `get_user_pages`。它增加了对 **dma-pinned pages** 的跟踪，解决了长期页锁定与 THP 碎片整理的冲突。
+
+---
+
+## 2. 核心流程
+
+```
+pin_user_pages(start, nr_pages, FOLL_WRITE, pages)
+  │
+  ├─ internal_get_user_pages_fast(start, nr_pages, gup_flags, pages)
+  │    │
+  │    ├─ [快速路径] 锁定页表并遍历
+  │    │    └─ walk_page_range() 遍历用户页表
+  │    │    └─ 对每个有效的 PTE：
+  │    │         ├─ 获取 struct page
+  │    │         ├─ try_grab_page(page, flags)  ← 增加引用+标记
+  │    │         │    └─ page_ref_inc(page)      引用计数+1
+  │    │         │    └─ 设置 FOLL_PIN 标识
+  │    │         └─ 存到 pages[] 数组
+  │    │
+  │    └─ [慢速路径] 处理缺页等异常
+  │         └─ faultin_page()                    ← 触发缺页处理
+  │         └─ handle_mm_fault()                 ← 分配物理页
+  │         └─ 重试 GUP 操作
+  │
+  └─ return 已获取的页数
+```
+
+### 2.1 快速路径 vs 慢速路径
+
+```
+快速路径：
+  ┌─────────────────────────────────┐
+  │ 页表已存在                      │
+  │ lock mmap_sem (读)              │
+  │ follow_pte() → 获取 page*      │
+  │ unlock mmap_sem                  │
+  └─────────────────────────────────┘
+
+慢速路径（缺页）：
+  ┌─────────────────────────────────┐
+  │ 页表不存在（未映射/被换出）      │
+  │ lock mmap_sem (写)               │
+  │ handle_mm_fault() → 分配页框    │
+  │ unlock mmap_sem                  │
+  │ 返回 GUP 重试                    │
+  └─────────────────────────────────┘
+```
+
+---
+
+## 3. FOLL 标志族
+
+| 标志 | 含义 | 使用场景 |
+|------|------|---------|
+| `FOLL_WRITE` | 需要写权限 | DMA 从内存读取 |
+| `FOLL_GET` | 获取引用（get_page） | 标准 GUP |
+| `FOLL_PIN` | 使用 pin_user_pages 语义 | 长期锁定 |
+| `FOLL_LONGTERM` | 长期持有页面 | 设备驱动程序 |
+| `FOLL_FORCE` | 强制访问（即使只读映射）| ptrace / 调试 |
+| `FOLL_NOWAIT` | 不等待缺页 | 原子上下文 |
+| `FOLL_HWPOISON` | 允许获取损坏页 | 内存故障处理 |
+| `FOLL_PCI_P2PDMA` | PCI P2P DMA 支持 | NVMe 等 |
+
+---
+
+## 4. 与页表的关系
+
+GUP 的本质是**将用户空间页表解析为 `struct page*`，同时确保这些页不会被释放**。
+
+```
+用户虚拟地址空间：
+  VA: 0x7f1234560000
+  │
+  ├─ 页表遍历（软件）：
+  │    PGD → P4D → PUD → PMD → PTE
+  │
+  ├─ 每级页表项指向物理页框
+  │
+  └─ 最终 PTE 包含：
+       ├─ 物理页框号 (PFN)
+       ├─ 权限位 (R/W/X)
+       └─ 状态位 (Present/Dirty/Accessed)
+
+GUP 读取 PTE → PFN → struct page → page_ref_inc → pages[]
+```
+
+---
+
+## 5. pin_user_pages 与 DMA 的关系
+
+pin_user_pages 引入了 `FOLL_PIN` 和 `FOLL_LONGTERM` 两个关键概念：
+
+```
+get_user_pages（旧）：
+  page->_refcount + 1
+  → 页可以被文件系统迁移/整理
+  → 与 THP 碎片整理冲突
+
+pin_user_pages（新）：
+  page->_refcount + 1
+  page->_mapcount（FOLL_PIN 跟踪位）
+  → 页被标记为 "dma-pinned"
+  → 碎片整理可以避开这些页
+  → 解决了长期 DMA 缓冲区的碎片问题
+```
+
+---
+
+## 6. 释放路径
+
+```c
+void unpin_user_page(struct page *page)
 {
-    long ret;
-    struct vm_area_struct *vma;
-
-    // 1. 遍历每个页
-    for (i = 0; i < nr_pages; i++) {
-        ret = get_user_pages_page(vma, start + i * PAGE_SIZE, gup_flags, &page);
-        if (ret < 0)
-            goto out;
-        pages[i] = page;
-    }
-
-out:
-    return ret > 0 ? i : ret;
+    // 减少引用
+    if (PageDmaPinned(page))
+        __unpin_device_page(page);
+    else
+        put_page(page);
 }
-
-// gup_flags：
-//   FOLL_GET      = 0x01   // 增加页引用（get_page）
-//   FOLL_PIN      = 0x02   // 页被固定（不能被换出，用于 DMA）
-//   FOLL_TOUCH    = 0x04   // 访问页（触发 page fault）
-//   FOLL_WRITE    = 0x08   // 可写（触发 COW）
-//   FOLL_FORCE    = 0x10   // 强制获取（即使没有访问权限）
-```
-
-### 1.2 get_user_pages_page — 获取单个页
-
-```c
-// mm/gup.c — get_user_pages_page
-static long get_user_pages_page(struct vm_area_struct *vma,
-                                 unsigned long address,
-                                 unsigned int gup_flags,
-                                 struct page **page)
-{
-    struct page *page;
-    unsigned int flags = gup_flags;
-
-retry:
-    // 1. 尝试快速路径：follow_page
-    page = follow_page(vma, address, flags);
-
-    if (!page) {
-        // 2. 快速路径失败，进入 slowpath（处理 page fault）
-        if (foll_flags & FOLL_WRITE)
-            flags |= FOLL_WRITE;
-
-        ret = faultin_page(vma, address, &flags, foll_flags & FOLL_WRITE);
-        if (ret < 0)
-            goto out;
-
-        goto retry;  // 重试
-    }
-
-out:
-    return ret;
-}
-```
-
----
-
-## 2. follow_page — 跟随页表
-
-### 2.1 follow_page
-
-```c
-// mm/memory.c — follow_page
-struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
-                         unsigned int flags)
-{
-    pte_t *ptep, pte;
-    spinlock_t *ptl;
-
-    // 1. 获取 PTE
-    ptep = get_locked_pte(vma->vm_mm, address, &ptl);  // 查找或创建页表
-    if (!ptep)
-        return NULL;
-
-    pte = *ptep;
-
-    // 2. 检查 PTE 有效性
-    if (!pte_present(pte)) {
-        pte_unmap(ptep);
-        return NULL;  // 页不在内存（ swapped out 或未分配）
-    }
-
-    // 3. 检查权限
-    if ((flags & FOLL_WRITE) && !pte_write(pte))
-        return NULL;  // 没有写权限
-
-    if ((flags & FOLL_FORCE) && (flags & FOLL_WRITE))
-        // FOLL_FORCE 绕过某些权限检查
-
-    // 4. 获取物理页
-    if (pte_devmap(pte))
-        return pte_to_page(pte);  // 设备映射页
-
-    if (pte_young(pte))
-        ptep_test_and_set_young(pte);  // 标记已访问
-
-    // 5. 增加页引用
-    if (flags & FOLL_GET)
-        get_page(pte_to_page(pte));
-
-    pte_unmap_unlock(ptep, ptl);
-    return pte_to_page(pte);
-}
-```
-
----
-
-## 3. 缺页处理（faultin_page）
-
-### 3.1 faultin_page — 处理缺页
-
-```c
-// mm/gup.c — faultin_page
-static int faultin_page(struct vm_area_struct *vma, unsigned long address,
-                        unsigned int *flags, bool write)
-{
-    struct vm_fault vmf = {
-        .vma = vma,
-        .address = address,
-        .flags = 0,
-        .pmc = NULL,
-    };
-
-    // 设置标志
-    if (write)
-        vmf.flags |= FAULT_FLAG_WRITE;
-
-    if (*flags & FOLL_GET)
-        vmf.flags |= FAULT_FLAG_KILLABLE;
-
-    // 调用 VMA 的 fault 处理函数
-    // → handle_mm_fault() → do_page_fault()
-    return handle_mm_fault(vma, address, vmf.flags);
-}
-```
-
----
-
-## 4. FOLL_PIN vs FOLL_GET
-
-### 4.1 区别
-
-```
-FOLL_GET: 普通的页引用增加
-  - 页可以被换出（虽然引用计数 > 0）
-  - 适合短期借用
-  - 需要 put_page() 释放
-
-FOLL_PIN: 页被固定（pinned）
-  - 页绝对不能被换出或移动
-  - 用于设备 DMA（设备只能访问物理地址）
-  - 需要 unpin_user_pages() 释放
-  - 引用计数会标记为"pinned"
-```
-
-### 4.2 页固定计数
-
-```c
-// mm/gup.c — 被固定的页有特殊的引用计数
-// FOLL_PIN 使用 page->_refcount 的额外位
-
-// page 引用计数编码：
-//   bit[0] = Pinned flag
-//   bit[1..] = 实际引用计数
-// 或者使用额外的 atomic_t：_total_pinned_count
-```
-
-### 4.3 put_page vs unpin_user_pages
-
-```c
-// FOLL_GET 用完后：
-put_page(page);
-
-// FOLL_PIN 用完后：
-unpin_user_pages(page, npages);
-//   减少固定计数
-//   如果固定计数归零，允许页被换出
-```
-
----
-
-## 5. DMA 映射场景
-
-### 5.1 典型 DMA 缓冲区使用
-
-```c
-// 驱动获取 DMA 缓冲区：
-struct page **pages = alloc_pages(...);
-void *buf = page_address(pages[0]);
-
-// 映射到用户空间（假设用户已 mmap）：
-get_user_pages(start, npages, FOLL_PIN | FOLL_WRITE, pages, NULL);
-
-// DMA 设备访问物理地址：
-dma_addr = page_to_phys(pages[0]);
-// 或者 virt_to_page(buf)
-
-// 完成后 unpin：
-unpin_user_pages(pages, npages);
-```
-
-### 5.2 GPU 内存共享
-
-```c
-// GPU 驱动（如 i915, amdgpu）：
-//   用户空间分配一块 GPU memory
-//   驱动通过 get_user_pages(FOLL_PIN) 固定这些页
-//   将物理页列表传递给 GPU 硬件
-//   GPU 直接访问这些物理页
-```
-
----
-
-## 6. 内存布局图
-
-```
-get_user_pages(start, npages=3) 流程：
-
-用户虚拟地址空间
-  start ─────┬─── page[0] → pte[0] → 页帧 0
-             │
-  start+PAGE_SIZE ─┬── page[1] → pte[1] → 页帧 1
-             │
-  start+2*PAGE_SIZE ─┬── page[2] → pte[2] → 页帧 2
-
-返回：
-  pages[0] = &page[帧0]
-  pages[1] = &page[帧1]
-  pages[2] = &page[帧2]
 ```
 
 ---
 
 ## 7. 设计决策总结
 
-| 设计决策 | 原因 |
-|---------|------|
-| FOLL_PIN vs FOLL_GET | PIN 用于 DMA，GET 用于临时借用 |
-| follow_page 快速路径 | 无缺页时零 fault 开销 |
-| faultin_page slowpath | 处理 demand paging / COW |
-| page_to_phys | DMA 设备需要物理地址 |
+| 决策 | 原因 |
+|------|------|
+| 快速/慢速路径分离 | 绝大多数情况页表已存在 |
+| pin_user_pages + FOLL_PIN | 解决长期锁定与 THP 碎片整理冲突 |
+| page_ref_inc | 防止页面被回收 |
+| 不复制页内容 | 共享物理内存（零拷贝） |
+| vmas 参数可选 | 大部分调用者只需要 page 数组 |
 
 ---
 
-## 8. 完整文件索引
+## 8. 源码文件索引
 
-| 文件 | 函数/结构 |
-|------|----------|
-| `mm/gup.c` | `get_user_pages`、`get_user_pages_page`、`faultin_page` |
-| `mm/memory.c` | `follow_page` |
-| `include/linux/mm.h` | `FOLL_GET`、`FOLL_PIN` 等标志 |
-
----
-
-## 9. 西游记类比
-
-**get_user_pages** 就像"取经路上借仙丹"——
-
-> 悟空要从太上老君那里借一堆仙丹（物理页）。他先检查自己有没有仙丹本子上登记（follow_page）。如果没有，就去找老君签字批准（faultin_page → handle_mm_fault）。太上老君批准后，仙丹就正式借到手了（page）。如果是要拿去炼丹炉（DMA），悟空就把仙丹"固定"在原地（FOLL_PIN），这样炼丹的时候仙丹不会跑掉（不会被换出）。如果是普通用，用完就还回去（put_page）就行了。
+| 文件 | 关键符号 | 行 |
+|------|---------|-----|
+| `mm/gup.c` | `internal_get_user_pages_fast` | 快速路径 |
+| `mm/gup.c` | `faultin_page` | 缺页处理 |
+| `mm/gup.c` | `pin_user_pages` | 入口 |
+| `include/linux/mm.h` | `FOLL_*` 标志 | 定义 |
 
 ---
 
-## 10. 关联文章
+## 9. 关联文章
 
-- **vm_area_struct**（article 16）：VMA 的页保护属性
-- **page_allocator**（article 17）：物理页分配
-- **DMA**（设备驱动部分）：get_user_pages 用于 DMA 映射
+- **page_allocator**（article 17）：GUP 获取的页面来自 page allocator
+- **VMA**（article 16）：GUP 通过 VMA 检查权限
+- **DMA**（article 203）：DMA 传输使用 GUP 固定缓冲区
+
+---
+
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
