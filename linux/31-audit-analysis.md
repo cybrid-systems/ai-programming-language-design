@@ -265,67 +265,256 @@ type=PATH msg=audit(...):
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## Additional Audit Analysis
+## 14. 过滤引擎详解
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+```c
+// kernel/auditfilter.c — 规则过滤
+int audit_filter(int msgtype, enum audit_state *state)
+{
+    struct audit_entry *e;
+    int ret = 1;
+
+    list_for_each_entry_rcu(e, &audit_filter_list[AUDIT_FILTER_EXIT], list) {
+        if (audit_filter_match(e, current)) {
+            switch (e->rule.action) {
+            case AUDIT_NEVER:
+                return 0;   // 不记录
+            case AUDIT_ALWAYS:
+                ret = 1;    // 记录
+            }
+        }
+    }
+    return ret;
+}
+```
+
+## 15. 审计事件类型
+
+| 类型 | 代码 | 说明 |
+|------|------|------|
+| AUDIT_SYSCALL | 1300 | 系统调用 |
+| AUDIT_PATH | 1302 | 路径名 |
+| AUDIT_EXECVE | 1309 | execve 参数 |
+| AUDIT_USER_START | 1320 | 用户登录 |
+| AUDIT_AVC | 1400 | SELinux 决策 |
+| AUDIT_MAC_POLICY_LOAD | 1403 | SELinux 策略加载 |
+
+## 16. 性能调优
+
+```bash
+# 增大缓冲区减少丢失
+auditctl -b 8192
+
+# 速率限制
+auditctl -r 5000
+
+# 排除噪声事件
+auditctl -a exclude,always -F msgtype=USER_START
+auditctl -a exclude,always -F msgtype=CRED_DISP
+
+# 监控关键操作
+auditctl -a always,exit -S execve -S open -S openat -S creat
+auditctl -w /etc/passwd -p wa -k identity
+auditctl -w /etc/shadow -p wa -k identity
+```
+
+## 17. 调试命令
+
+```bash
+auditctl -s              # 查看状态
+auditctl -l              # 列出规则
+ausearch -m SYSCALL      # 搜索系统调用事件
+ausearch -k mykey        # 按 key 搜索
+aureport --summary       # 摘要报告
+aureport -x              # 可执行文件统计
+```
+
+## 18. 常见问题
+
+- auditd 无法启动: 检查 auditd.conf
+- 日志丢失: 增大 -b 缓冲区
+- 性能下降: 使用排除规则减少日志量
+- 规则过多: 合并同类规则
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 19. 审计上下文释放
+
+```c
+// kernel/auditsc.c
+static void audit_free_context(struct audit_context *context)
+{
+    struct audit_names *n;
+
+    // 释放关联的路径名
+    for (i = 0; i < context->name_count; i++) {
+        n = &context->names[i];
+        if (n->name)
+            kfree(n->name);  // 释放路径名
+    }
+
+    // 释放 socket 地址
+    if (context->sockaddr)
+        kfree(context->sockaddr);
+
+    kfree(context);  // 释放上下文本身
+}
+```
+
+## 20. per-CPU 缓冲区缓存
+
+```c
+// kernel/audit.c — per-CPU 缓存减少分配
+static DEFINE_PER_CPU(struct audit_buffer *, audit_buffer_cpu);
+
+struct audit_buffer *audit_log_start(struct audit_context *ctx, ...)
+{
+    struct audit_buffer *ab;
+
+    // 尝试从 per-CPU 缓存获取
+    ab = this_cpu_read(audit_buffer_cpu);
+    if (ab) {
+        this_cpu_write(audit_buffer_cpu, NULL);
+        return ab;
+    }
+
+    // 分配新的
+    ab = kmalloc(sizeof(*ab), gfp_mask);
+    if (!ab) return NULL;
+
+    ab->skb = alloc_skb(AUDIT_BUFSIZ, gfp_mask);
+    ab->ctx = ctx;
+    return ab;
+}
+```
+
+## 21. 审计日志轮转
+
+```bash
+# /etc/audit/auditd.conf
+max_log_file = 8           # 8MB
+max_log_file_action = ROTATE
+num_logs = 5               # 保留 5 个历史文件
+space_left_action = SYSLOG  # 磁盘空间不足时
+disk_full_action = SUSPEND  # 磁盘满时暂停
+```
+
+## 22. auditctl 规则格式
+
+```bash
+# 基本格式
+auditctl -a <list>,<action> <options>
+
+# list: task, exit, user, exclude
+# action: always, never
+
+# 字段过滤
+# -F uid=N       用户 ID
+# -F gid=N       组 ID
+# -F pid=N       PID
+# -F arch=b64    x86_64
+# -F success=0   失败操作
+
+# 文件监视
+# -w /path -p <perms> -k <key>
+# perms: r=读, w=写, x=执行, a=属性修改
+```
+
+## 23. 审计日志分析
+
+```bash
+# 统计事件类型
+ausearch --interpret | grep "^type=" | sort | uniq -c | sort -rn
+
+# 查找特定用户的活动
+ausearch -ua 1000 -ts today -i
+
+# 查找失败的系统调用
+ausearch --success no -i
+
+# 实时监控
+tail -f /var/log/audit/audit.log | ausearch --interpret
+```
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 24. 审计与安全性
+
+| 功能 | 场景 | 说明 |
+|------|------|------|
+| 系统调用监控 | 入侵检测 | 监控 execve、open 等敏感调用 |
+| 文件完整性 | 安全合规 | 监控 /etc/shadow 等关键文件 |
+| 用户行为审计 | 内部威胁 | 记录所有用户的操作历史 |
+| 配置变更 | 合规要求 | PCI DSS、SOC2 等标准要求 |
+
+## 25. auditctl 常用参数
+
+```bash
+# 状态和控制
+auditctl -s                    # 审计状态
+auditctl -e 1                  # 启用审计
+auditctl -e 0                  # 禁用审计
+auditctl -R /etc/audit/rules.d/audit.rules  # 加载规则文件
+
+# 查看统计
+cat /proc/sys/kernel/audit/backlog_limit  # 积压上限
+cat /proc/sys/kernel/audit/backlog_wait_time  # 积压等待时间
+cat /proc/sys/kernel/audit/audit_rate_limit  # 速率限制
+```
+
+## 26. 总结
+
+Linux Audit 是内核级安全审计基础设施。per-CPU 缓冲区减少分配开销，netlink 多播传输事件，灵活规则引擎支持系统调用、文件、用户等多维度过滤。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 分析
+
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
-
-
-## Additional Audit Analysis
-
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
-
-
-## Additional Audit Analysis
-
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
-
-
-## Additional Audit Analysis
-
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
-
-
-## Additional Audit Analysis
-
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
-
-
-## Additional Audit Analysis
-
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
 
-## Additional Audit Analysis
+## 分析
 
-The audit subsystem's filter engine processes rules in priority order: USER, TASK, ENTRY, WATCH, EXIT. Each category serves a specific filtering purpose. The EXIT filter is the most commonly used for system call auditing. Rules can specify conditions on uid, gid, pid, arch, syscall number, and path names. Multiple rules are combined with OR logic - if any rule matches, the event is recorded. The AUDIT_NEVER action takes precedence over AUDIT_ALWAYS. The audit_backlog_limit (default 64) prevents memory exhaustion when events arrive faster than auditd can process them. Events that exceed the backlog are dropped and counted in audit_lost.
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
+
+
+## 分析
+
+审计子系统通过 per-CPU 缓冲区缓存、netlink 多播传输和灵活的过滤引擎，在提供细粒度审计能力的同时保持了低性能影响。关键点是 audit_backlog_limit 防止内存耗尽，audit_lost 计数器跟踪丢失事件，rule 的 AUDIT_NEVER 比 AUDIT_ALWAYS 优先级更高。
 
