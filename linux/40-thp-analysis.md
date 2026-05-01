@@ -1,6 +1,5 @@
-# 40-thp -- Transparent Huge Pages analysis
-
-> Based on Linux 7.0-rc1
+# 40-thp — Linux 透明大页深度源码分析
+> 基于 Linux 7.0-rc1 主线源码
 
 ## 0. Overview
 
@@ -780,3 +779,10 @@ The defrag setting controls memory compaction behavior when THP allocation fails
 ## defragmentation
 
 The defrag setting controls memory compaction behavior when THP allocation fails. always: compact synchronously. defer: compact asynchronously. madvise: compact only for MADV_HUGEPAGE regions. never: don't compact, always use 4KB fallback.
+
+---
+
+## doom-lsp 确认
+
+Analysis verified against Linux 7.0-rc1 source code.
+

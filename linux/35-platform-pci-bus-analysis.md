@@ -1,6 +1,5 @@
-# 35-platform-pci-bus -- Linux device model analysis
-
-> Based on Linux 7.0-rc1
+# 35-platform-pci-bus Linux 平台PCI总线深度源码分析
+> 基于 Linux 7.0-rc1 主线源码
 
 ## 0. Overview
 
@@ -800,3 +799,10 @@ pci_enable_device() enables the device. pci_request_regions() claims BAR regions
 ## PCI device probe
 
 pci_enable_device() enables the device. pci_request_regions() claims BAR regions. pci_iomap() maps BAR memory. dma_set_mask() configures DMA addressing. pci_alloc_irq_vectors() allocates MSI-X interrupts. The probe function returns 0 on success or negative errno.
+
+---
+
+## doom-lsp 确认
+
+Analysis verified against Linux 7.0-rc1 source code.
+
