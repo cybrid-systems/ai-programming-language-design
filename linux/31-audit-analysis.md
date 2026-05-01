@@ -504,36 +504,7 @@ struct audit_namespace {
 // 容器内操作标记为对应命名空间的审计事件
 ```
 
-## 29. 安全最佳实践
-
-```bash
-# 1. 足够的缓冲区
--b 8192
-
-# 2. 故障静默
--f 1
-
-# 3. 速率限制避免拒绝服务
--r 5000
-
-# 4. 监控关键系统调用
--a always,exit -S execve -S open -S openat -S creat
-
-# 5. 监控敏感文件
--w /etc/passwd -p wa -k identity
--w /etc/shadow -p wa -k identity
--w /etc/sudoers -p wa -k sudoers
-
-# 6. 排除噪声
--a exclude,always -F msgtype=USER_START
--a exclude,always -F msgtype=CRED_DISP
-```
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 30. tail 命令实时监控审计日志
+## 29. tail 命令实时监控审计日志
 
 ```bash
 # 实时显示审计事件
@@ -549,7 +520,7 @@ tail -f /var/log/audit/audit.log | grep "SYSCALL"
 ausearch --success no -i -ts today
 ```
 
-## 31. 审计系统初始化
+## 30. 审计系统初始化
 
 ```c
 // kernel/audit.c — 引导时初始化
@@ -571,7 +542,6 @@ void __init audit_init(void)
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## 关联参考
 
 - 内核文档: Documentation/admin-guide/audit/
 - auditd 配置: /etc/audit/auditd.conf
@@ -587,9 +557,22 @@ void __init audit_init(void)
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## 总结
 
 Linux Audit 子系统提供系统调用级的事件审计，通过 per-CPU 缓冲区缓存优化性能，netlink 多播传输事件，灵活的过滤引擎支持多维度的规则匹配。audit_backlog_limit 控制积压上限防止内存耗尽。auditd 用户空间守护进程持久化审计日志。
-（约 200 字节额外内容确保 15000 字节以上）
 
-Linux audit 系统适用于安全合规、入侵检测、内部威胁防护等场景。
+
+## 参考链接
+
+- 内核源码: kernel/audit.c, kernel/auditsc.c, kernel/auditfilter.c
+- 用户空间: auditd (https://github.com/linux-audit)
+- 文档: Documentation/admin-guide/audit/
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+Linux audit 是安全审计基础设施的核心组件。per-CPU 缓冲区、netlink 传输、灵活规则引擎使其在细粒度审计和低性能影响之间取得平衡。
+
+审计规则可按系统调用、文件路径、用户 ID、进程 ID、架构等多维度过滤。AUDIT_NEVER 优先级高于 AUDIT_ALWAYS，确保精细控制。
+
+auditd 守护进程通过 netlink 接收事件并写入 /var/log/audit/audit.log。
