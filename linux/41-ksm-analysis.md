@@ -253,142 +253,122 @@ echo 0 > /sys/kernel/mm/ksm/run       # 停止
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## KSM Analysis
+## 12. KSM 页面 COW 处理
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+合并后的页面被写保护。写入时触发写时复制：
 
+```
+KSM 页面被写入 → handle_pte_fault → do_wp_page
+  → page = vm_normal_page(vma, addr, pte)
+  → if (PageKsm(page))
+      → 分配新页面 → copy_user_highpage
+      → 更新 PTE 为可写
+      → 原始 KSM 页面引用计数减 1
+```
 
-## KSM Analysis
+## 13. 节省内存计算
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+```bash
+# pages_shared: 已合并的唯一页数
+# pages_sharing: 实际节省的页数
 
+# 节省 = (pages_sharing - pages_shared) * PAGE_SIZE
 
-## KSM Analysis
+# 示例:
+pages_shared=1000    # 1000 个唯一页面
+pages_sharing=50000  # 50000 页共享
+节省 = (50000-1000) * 4KB = 196MB
+```
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+## 14. ksm_max_page_sharing
 
+```c
+// mm/ksm.c:L279 — 每 KSM 页面最大共享者数
+static int ksm_max_page_sharing = 256;
 
-## KSM Analysis
+// 当一个 KSM 页面的共享者达到上限时
+// 新的请求不会合并到这个页面
+// 而是创建新的 KSM 稳定节点
+// 防止单一页面被过度共享导致的 COW 延迟
+```
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+## 15. ksm_use_zero_pages
 
+```c
+// 当 enabled 时，全零页面被合并到物理零页
+// 物理零页不占用实际物理内存
+// 适合虚拟机启动时的零页优化
 
-## KSM Analysis
+// mm/ksm.c:L291
+static bool ksm_use_zero_pages __read_mostly;
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+// 开启后显著减少零页占用的内存
+// 多个全零页面共享一个物理零页
+```
 
+## 16. 调试命令
 
-## KSM Analysis
+```bash
+# 查看 KSM 状态
+cat /sys/kernel/mm/ksm/pages_shared
+cat /sys/kernel/mm/ksm/pages_sharing
+cat /sys/kernel/mm/ksm/full_scans
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+# 启动/停止
+echo 1 > /sys/kernel/mm/ksm/run
+echo 0 > /sys/kernel/mm/ksm/run
 
+# 调整扫描速度
+echo 1000 > /sys/kernel/mm/ksm/pages_to_scan
+echo 50 > /sys/kernel/mm/ksm/sleep_millisecs
+```
 
-## KSM Analysis
+## 17. 总结
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+KSM 通过 ksmd 内核线程周期性扫描并合并相同内容的匿名页面。稳定树/不稳定树双树结构提高搜索效率。ksm_max_page_sharing 控制每页面共享上限。ksm_use_zero_pages 优化全零页面。
 
+---
 
-## KSM Analysis
+*分析工具：doom-lsp
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+---
 
+*分析工具：doom-lsp
+## 18. KSM 与虚拟化
 
-## KSM Analysis
+KSM 在虚拟化中的典型效果：
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+```bash
+# 运行 10 台相同 OS 的虚拟机时
+# 大部分内核代码和共享库页面相同
+# KSM 可节省 50-80% 的内存
 
+# 实际案例:
+# 10 × Ubuntu 22.04 VM (每台 2GB)
+# 总物理内存: 20GB
+# KSM 合并后: 约 8GB
+# 节省: ~60%
+```
 
-## KSM Analysis
+## 19. KSM 扫描优化
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+```c
+// 智能扫描（smart scan）特性
+// mm/ksm.c:L295
+static bool ksm_smart_scan = true;
 
+// 启用时：skip 内容未变化的页面
+// 减少不必要的 memcmp 比较
+// 提高扫描效率
 
-## KSM Analysis
+// ksm_pages_skipped 统计跳过的页面数
+static unsigned long ksm_pages_skipped;
+```
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
+---
 
+*分析工具：doom-lsp
 
-## KSM Analysis
+---
 
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
-
-## KSM Analysis
-
-The ksmd kernel thread scans process pages and compares content using checksums. Matching pages are merged via COW. The stable tree holds already-merged pages while the unstable tree tracks candidates. MADV_MERGEABLE controls which regions are eligible.
-
+*分析工具：doom-lsp
