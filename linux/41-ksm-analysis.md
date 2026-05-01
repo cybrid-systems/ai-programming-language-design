@@ -520,3 +520,25 @@ KSM 通过 ksmd 线程扫描合并相同匿名页。两个红黑树（稳定/不
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 34. KSM 稳定树节点分配
+
+```c
+// mm/ksm.c — 稳定树节点缓存
+static struct kmem_cache *stable_node_cache;
+static struct kmem_cache *rmap_item_cache;
+
+// 稳定树节点通过 slab 分配
+// 每个 ksm_stable_node 对应一个已合并页面
+// rmap_item 记录反向映射信息
+// 两者都使用专用 slab 缓存，减少分配开销
+```
+
+## 35. 关联文章
+
+- **42-oom-killer**: OOM Killer
+- **39-mlock**: 内存锁定
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
