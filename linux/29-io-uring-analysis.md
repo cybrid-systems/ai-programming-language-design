@@ -1,233 +1,114 @@
-# 29-io_uring — 高性能异步 I/O 深度源码分析
+# 29-io_uring — 异步 IO 框架深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`io_uring/`)
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**io_uring** 是 Linux 5.1 引入的高性能异步 I/O 接口，通过共享内存的环形队列实现零拷贝、零 syscall（polling 模式）I/O。
+**io_uring** 是 Linux 5.1 引入的异步 IO 框架，解决了传统 AIO 的高延迟和功能限制问题。核心创新：通过**共享环形缓冲区（ring buffer）** 在内核和用户空间之间传递 IO 请求和完成事件，避免系统调用的开销。
+
+doom-lsp 确认 `io_uring/io_uring.c` 包含约 145+ 个核心函数。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 io_ring_ctx — 环形上下文
+### 1.1 struct io_ring_ctx
 
 ```c
-// io_uring/io_uring.c — io_ring_ctx
 struct io_ring_ctx {
-    // 提交队列（Submission Queue）
-    struct io_submit_sq      sq;
-    struct io_uring_sqe __user *sq_sqes;  // SQE 数组
+    struct io_rings    *rings;        // 共享的 SQ/CQ 环
+    unsigned int        sq_entries;   // 提交队列深度
+    unsigned int        cq_entries;   // 完成队列深度
 
-    // 完成队列（Completion Queue）
-    struct io_cq              cq;
+    struct io_submit_state submit_state; // 批量提交状态
 
-    // 注册资源
-    struct io_fixed_file      *file_table;   // 注册文件表
-    struct io_mapped_buf     *buffer_table;  // 注册缓冲区
+    struct io_alloc_cache apoll_cache;   // 缓存分配
 
-    // SQPOLL 线程
-    struct task_struct        *sqo_task;     // SQPOLL 内核线程
-    wait_queue_head_t         sq_wait;
+    struct list_head    defer_list;      // 延迟提交的请求
+    struct list_head    timeout_list;    // 超时请求
 
-    // 配置
-    unsigned int              flags;          // IORING_SETUP_* 标志
+    struct task_struct  *submitter_task; // 提交任务的线程
+    ...
 };
 ```
 
-### 1.2 io_uring_sqe — 提交队列项
+### 1.2 双环设计
 
-```c
-// include/uapi/linux/io_uring.h — io_uring_sqe
-struct io_uring_sqe {
-    __u8    opcode;         // IORING_OP_*
-    __u8    flags;          // SQE 标志
-    __u16   ioprio;         // I/O 优先级
-    __s32   fd;             // 文件描述符
-
-    __u64   off;            // 偏移（用于文件 I/O）
-    __u64   addr;           // 用户缓冲区地址
-    __u32   len;            // 缓冲区长度
-
-    union {
-        __u32   rw_flags;   // read/write 标志
-        __u32   fsync_flags;
-    };
-
-    __u64   user_data;      // 关联完成事件
-
-    __u16   buf_index;       // 注册缓冲区索引
-    __u64   __pad2[3];     // 填充
-};
-
-// 操作码：
-//   IORING_OP_NOP           = 0
-//   IORING_OP_READV         = 1
-//   IORING_OP_WRITEV        = 2
-//   IORING_OP_FSYNC         = 3
-//   IORING_OP_READ_FIXED    = 4    ← 使用注册缓冲区
-//   IORING_OP_WRITE_FIXED   = 5
-//   IORING_OP_POLL_ADD      = 6
-//   IORING_OP_SYNC_FILE_RANGE = 8
-//   IORING_OP_SENDMSG       = 9
-//   IORING_OP_RECVMSG       = 10
-//   IORING_OP_TIMEOUT        = 11
-//   IORING_OP_ACCEPT        = 13
-//   IORING_OP_CONNECT        = 14
-//   IORING_OP_READ           = 20
-//   IORING_OP_WRITE         = 21
 ```
-
-### 1.3 io_uring_cqe — 完成队列项
-
-```c
-// include/uapi/linux/io_uring.h — io_uring_cqe
-struct io_uring_cqe {
-    __u64   user_data;      // SQE 中设置的 user_data
-    __s32   res;            // 结果（>=0 成功，<0 = -errno）
-    __u32   flags;          // CQE 标志
-};
+用户空间                         内核空间
+─────────                      ─────────
+SQ（提交队列）：                   CQ（完成队列）：
+  ┌────┬────┬────┬────┐          ┌────┬────┬────┬────┐
+  │op 1│op 2│    │    │          │    │    │    │    │
+  └────┴────┴────┴────┘          └────┴────┴────┴────┘
+        │                              ▲
+        │ io_uring_enter()              │
+        ▼                              │
+  内核处理 SQEs                  写完成事件到 CQ
+        │                              │
+        └──────── 完成 ────────────────┘
 ```
 
 ---
 
-## 2. 系统调用
-
-### 2.1 io_uring_setup — 创建 ring
-
-```c
-// io_uring/io_uring.c — sys_io_uring_setup
-SYSCALL_DEFINE2(io_uring_setup, unsigned int, entries, struct io_uring_params __user *, params)
-{
-    struct io_ring_ctx *ctx;
-
-    // 1. 分配 io_ring_ctx
-    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-
-    // 2. mmap SQ 和 CQ 环形缓冲区
-    //    用户和内核共享同一块内存
-    ctx->sq_sqes = mmap(NULL, entries * sizeof(struct io_uring_sqe),
-                       PROT_READ | PROT_WRITE, MAP_SHARED, ...);
-    ctx->cqcqes = mmap(NULL, ...);  // CQ 缓冲
-
-    // 3. 创建 io_uring 文件
-    file = anon_inode_getfile("[io_uring]", &io_uring_fops, ctx, O_RDWR);
-
-    return file->fd;
-}
-```
-
-### 2.2 io_uring_enter — 提交/等待
-
-```c
-// io_uring/io_uring.c — sys_io_uring_enter
-SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, unsigned int, to_submit,
-                unsigned int, min_complete, unsigned int, flags, ...)
-{
-    struct io_ring_ctx *ctx;
-    struct file *file;
-
-    file = fget(fd);
-    ctx = file->private_data;
-
-    // 1. 提交 SQEs
-    if (to_submit)
-        ret = io_submit_sqes(ctx, to_submit);
-
-    // 2. 等待 CQ 有 min_complete 个条目
-    if (flags & IORING_ENTER_GETEVENTS)
-        ret = io_cqring_wait(ctx, min_complete, ...);
-
-    return ret;
-}
-```
-
----
-
-## 3. 高级特性
-
-### 3.1 SQPOLL（内核轮询模式）
-
-```c
-// 设置 IORING_SETUP_SQ_POLL 标志：
-// 内核在线程中持续轮询 SQ，有 SQE 时自动处理
-// 用户只需填充 SQEs，无需每次 syscall
-
-struct io_uring_params params = {
-    .flags = IORING_SETUP_SQ_POLL,
-    .sq_thread_idle = 2000,  // 空闲超时（毫秒）
-};
-```
-
-### 3.2 Registered Files
-
-```c
-// io_uring_register(fd, IORING_REGISTER_FILES, fds, nfds);
-// 预先注册文件描述符到内核
-// SQE 中使用表索引（而非 fd）：
-
-sqe->opcode = IORING_OP_READ;
-sqe->fd = registered_fd_index;  // 表索引
-sqe->flags = IOSQE_FIXED_FILE;
-```
-
-### 3.3 Registered Buffers
-
-```c
-// 注册用户缓冲区：
-io_uring_register(fd, IORING_REGISTER_BUFFERS, iovec, n);
-
-// 使用：
-sqe->opcode = IORING_OP_READ_FIXED;
-sqe->addr = buffer_id;       // 已注册缓冲区 ID
-sqe->buf_index = buffer_id;   // 缓冲区索引
-```
-
----
-
-## 4. 数据流
+## 2. 操作流程
 
 ```
+io_uring 提交 IO 的完整路径：
+
 用户空间：
-  1. 填充 SQE 到 sqes[]
-  2. 更新 sq.tail++
-  3. (可选) io_uring_enter(GETEVENTS)
+  1. mmap 共享 SQ/CQ 环
+  2. 填充 SQE（提交队列条目）
+  3. 调用 io_uring_enter（或使用 SQPOLL 模式自动轮询）
 
 内核：
-  4. 读取 sqes[sq.head]
-  5. 处理 I/O
-  6. 生成 CQE 到 cqe[]
-  7. 更新 cq.tail++
-
-用户：
-  8. 读取 cqe[cq.head]
-  9. 处理结果
+  io_uring_enter(fd, to_submit, min_complete, flags)
+    │
+    ├─ io_submit_sqes(ctx, to_submit)
+    │    │
+    │    ├─ 从 SQ 环中读取 up to 32 个 SQE
+    │    │
+    │    └─ 对每个 SQE：
+    │         └─ io_init_req(ctx, req, sqe)     ← 初始化请求
+    │              └─ 根据 opcode 分发：
+    │                   ├─ io_read / io_write    ← 文件读写
+    │                   ├─ io_openat             ← 文件打开
+    │                   ├─ io_send / io_recv     ← 网络
+    │                   ├─ io_poll_add           ← 事件轮询
+    │                   └─ io_timeout            ← 超时
+    │
+    └─ io_cqring_wait(ctx, min_complete)         ← 等待完成
+         │
+         └─ 递交完成事件到 CQ 环
+              └─ io_cqring_fill_event(req, res)  ← 写完成事件
 ```
 
 ---
 
-## 5. 完整文件索引
+## 3. 主要特性
 
-| 文件 | 函数/结构 |
-|------|----------|
-| `io_uring/io_uring.c` | `struct io_ring_ctx`、`sys_io_uring_setup`、`sys_io_uring_enter` |
-| `io_uring/rw.c` | `io_read`、`io_write` |
-| `io_uring/sqpoll.c` | `io_sqpoll_thread` |
-| `include/uapi/linux/io_uring.h` | `io_uring_sqe`、`io_uring_cqe` |
-
----
-
-## 6. 西游记类比
-
-**io_uring** 就像"取经路上的快递站"——
-
-> 以前的快递（传统 I/O）每次都要亲自去驿站排队（syscall）。io_uring 就像在每个大城市设立了一个共享邮箱（共享内存 ring）。寄件人（用户）把快递单（SQE）投到共享邮箱，不用每次都去排队。快递员（内核 SQPOLL 线程）定期检查邮箱，有新快递就处理，处理完把回执（CQE）放回邮箱。寄件人定期来取回执就行了。这就是零 syscall（polling 模式）的精髓——大部分时间都在本地操作，不需要惊动天庭（内核）。
+| 特性 | 说明 |
+|------|------|
+| SQPOLL | 内核线程轮询提交队列，零系统调用 |
+| Fixed File | 预注册 fd，避免每次下标转换 |
+| Buffer Selection | 自动选择可用缓冲区 |
+| Links | 请求链（顺序依赖执行）|
+| IOPOLL | 轮询模式（NVMe 等低延迟设备）|
 
 ---
 
-## 7. 关联文章
+## 4. 源码文件索引
 
-- **epoll**（article 80）：另一种 I/O 多路复用，但不支持真正的异步
+| 文件 | 关键符号 |
+|------|---------|
+| `io_uring/io_uring.c` | 核心实现 |
+| `io_uring/opdef.c` | 操作码定义 |
+| `include/linux/io_uring.h` | 公共 API |
+| `include/uapi/linux/io_uring.h` | 用户空间接口定义 |
+
+---
+
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
