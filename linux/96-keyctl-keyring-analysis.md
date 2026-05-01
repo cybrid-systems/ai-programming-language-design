@@ -1,13 +1,11 @@
-# 96-keyctl-keyring — 深度源码分析
+# 96 — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**keyctl** 管理内核密钥保留服务（key retention service），用于文件系统加密（fscrypt）、NFS/AFS/DNS 的密钥缓存。
+Linux 内核子系统文章 96。详见内核源码 96 对应的初步分析。
 
 ---
 

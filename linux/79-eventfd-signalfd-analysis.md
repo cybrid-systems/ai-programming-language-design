@@ -1,13 +1,11 @@
-# 79-mmap 深入分析：do_mmap 完整路径、缺页处理（文件/匿名/共享）、VMA 合并和分裂。 — 深度源码分析
+# 79-mmap-deep — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-mmap 深入分析：do_mmap 完整路径、缺页处理（文件/匿名/共享）、VMA 合并和分裂。
+mmap 深入：do_mmap 完整路径、缺页处理函数 do_anonymous_page/do_fault/do_swap_page。
 
 ---
 

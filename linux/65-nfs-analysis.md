@@ -1,13 +1,11 @@
-# 65-**NFS (Network File System)** 允许远程访问文件系统的网络文件协议。内核客户端支持 NFS v3/v4，使用 RPC 通信。 — 深度源码分析
+# 65-NFS — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**NFS (Network File System)** 允许远程访问文件系统的网络文件协议。内核客户端支持 NFS v3/v4，使用 RPC 通信。
+**NFS** 网络文件系统客户端。支持 v3/v4，通过 RPC 通信，nfs_getattr/nfs_read/nfs_write 封装 RPC 调用。
 
 ---
 

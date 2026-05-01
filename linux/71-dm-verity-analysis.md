@@ -1,13 +1,11 @@
-# 71-**dm-verity** 提供块设备的只读完整性校验，使用 Merkle 哈希树验证每个数据块。广泛用于 Android verified boot。 — 深度源码分析
+# 71-dm-verity — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**dm-verity** 提供块设备的只读完整性校验，使用 Merkle 哈希树验证每个数据块。广泛用于 Android verified boot。
+**dm-verity** 块设备完整性校验。Merkle 哈希树验证数据块，Android verified boot 使用。
 
 ---
 

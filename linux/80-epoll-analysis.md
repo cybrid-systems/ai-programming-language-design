@@ -1,13 +1,11 @@
-# 80-**binfmt_elf** 负责加载 ELF 格式的可执行文件和共享库，处理解释器（ld.so）的加载。 — 深度源码分析
+# 80-binfmt-elf — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**binfmt_elf** 负责加载 ELF 格式的可执行文件和共享库，处理解释器（ld.so）的加载。
+**binfmt_elf** 加载 ELF 可执行文件。load_elf_binary 解析 ELF header，加载段到内存，设置解释器（ld.so）。
 
 ---
 

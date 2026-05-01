@@ -1,13 +1,11 @@
-# 73-**pinctrl** 管理 SoC 引脚的复用功能（GPIO/I2C/SPI/UART 等）和电气特性。 — 深度源码分析
+# 73-pinctrl — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**pinctrl** 管理 SoC 引脚的复用功能（GPIO/I2C/SPI/UART 等）和电气特性。
+**pinctrl** 管理 SoC 引脚复用。pinctrl_register 注册控制器，pinctrl_select_state 设置引脚功能。
 
 ---
 

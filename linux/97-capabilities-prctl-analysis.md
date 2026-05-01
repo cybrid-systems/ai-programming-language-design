@@ -1,13 +1,11 @@
-# 97-capabilities-prctl — 深度源码分析
+# 97 — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 > Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**capabilities（权能）** 将 root 权限拆分为独立单元（如 CAP_NET_RAW、CAP_SYS_ADMIN），实现最小权限原则。
+Linux 内核子系统文章 97。详见内核源码 97 对应的初步分析。
 
 ---
 
