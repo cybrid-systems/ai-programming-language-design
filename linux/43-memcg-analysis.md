@@ -286,3 +286,54 @@ drgn -c /proc/kcore
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 15. swap 限制
+
+memcg 支持独立限制 swap 使用量：
+
+```bash
+# memory.swap.max 限制 cgroup 的 swap 上限
+# 默认与 memory.max 相同
+
+echo 0 > /sys/fs/cgroup/mygroup/memory.swap.max  # 禁用 swap
+echo 100M > /sys/fs/cgroup/mygroup/memory.swap.max  # 限制 100MB
+```
+
+当 cgroup 的 swap 使用超过 memory.swap.max 时，内核触发 memcg swap OOM，在 cgroup 内杀进程。
+
+## 16. 内核内存跟踪
+
+memcg 跟踪 cgroup 内的内核内存使用（kmem）：
+
+```bash
+# memory.kmem.usage_in_bytes (cgroup v1)
+# 包括：slab、kernel stack、socket buffer 等
+
+# 在 cgroup v2 中，kmem 计入 memory.current
+# 不再单独暴露接口
+```
+
+## 17. 页面迁移
+
+页面在物理内存中迁移时，memcg 归属不变。迁移由 memory compaction 或 NUMA balancing 触发，不影响计费。
+
+## 18. 调试技巧
+
+```bash
+# 查看 cgroup 的具体页面分布
+grep "" /sys/fs/cgroup/<group>/memory.stat | sort
+
+# 跟踪 cgroup 的内存分配
+perf stat -e memcg:memcg_charge -a -- sleep 1
+
+# 查看 cgroup 内当前分配的页面
+cat /sys/fs/cgroup/<group>/memory.current
+```
+
+## 19. 总结
+
+memcg 是容器内存隔离的核心。通过 try_charge 路径逐层检查层级限制，超出时触发回收或 OOM。memory.min/low 提供保护机制，memory.high/max 提供限制机制。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
