@@ -529,802 +529,244 @@ Deep analysis content
 Deep analysis content
 Deep analysis content
 
-## Additional analysis
+## 6. 审计日志轮转
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+max_log_file=8MB, max_log_file_action=ROTATE
 
-## Additional analysis
+## 7. 事件类型
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+SYSCALL(1300), PATH(1302), EXECVE(1309), AVC(1400)
 
-## Additional analysis
+## 8. 总结
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+audit 通过灵活规则引擎和 netlink 传输实现内核级审计。
 
-## Additional analysis
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## 3. 积压控制
 
-## Additional analysis
+audit_backlog_limit=64。超过上限后新事件被丢弃。可用 auditctl -b 增大。
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+```c
+if (skb_queue_len(...) > audit_backlog_limit)
+    atomic_inc(&audit_lost);
+```
 
-## Additional analysis
+## 4. Netlink 多播
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+nlmsg_multicast 发送到 AUDIT_NLGRP_READ 组。auditd 订阅此组接收事件。
 
-## Additional analysis
+## 5. 审计树
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+audit_tree 通过 fsnotify 标记跟踪目录变更。用于 -w 规则。
 
-## Additional analysis
+## 6. 常用调试
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+auditctl -s: 查看状态
+auditctl -l: 查看规则
+ausearch -m SYSCALL: 搜索系统调用
+aureport -x: 可执行文件报告
 
-## Additional analysis
+## 7. 关联文章
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+- **31-audit**: audit 基础
 
-## Additional analysis
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Filter engine
 
-## Additional analysis
+Each filter type has its own list. Rules are checked in priority order. AUDIT_NEVER overrides AUDIT_ALWAYS. The audit_filter function iterates through the list and calls audit_filter_match() for each entry. If match found and action is AUDIT_NEVER, skip logging. If AUDIT_ALWAYS, log the event. Multiple rules can be combined.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Backlog management
 
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+When event rate exceeds auditd processing capacity, the netlink receive queue grows. backlog_limit defaults to 64. When exceeded, new events are dropped and audit_lost counter increments. The audit_log_start function checks queue length before allocating a buffer.

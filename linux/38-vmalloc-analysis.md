@@ -539,802 +539,242 @@ vmalloc details
 vmalloc details
 vmalloc details
 
-## Additional analysis
+## 5. ioremap
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+ioremap(phys_addr, size) 映射设备 MMIO 到内核虚拟空间。
 
-## Additional analysis
+## 6. 调试
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+cat /proc/vmallocinfo
 
-## Additional analysis
+## 7. 源码
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+mm/vmalloc.c, include/linux/vmalloc.h
 
-## Additional analysis
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## 5. ioremap
 
-## Additional analysis
+ioremap 映射设备 MMIO 到内核虚拟地址空间。使用 __ioremap_caller 实现。
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+```c
+void __iomem *base = ioremap(0xfe000000, 4096);
+u32 val = readl(base + 0x10);
+writel(0x1, base + 0x00);
+iounmap(base);
+```
 
-## Additional analysis
+## 6. 调试
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+cat /proc/vmallocinfo 查看 vmalloc 区域使用情况。
 
-## Additional analysis
+## 7. 源码
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+mm/vmalloc.c: vmalloc/vfree 核心实现
+include/linux/vmalloc.h: API 声明
+mm/ioremap.c: ioremap 实现
 
-## Additional analysis
+## 8. 关联文章
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+- **17-page-allocator**: buddy 分配器
+- **187-vmalloc**: vmalloc 深度分析
 
-## Additional analysis
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## vmalloc vs kmalloc
 
-## Additional analysis
+vmalloc allocates virtually contiguous pages. Each page is mapped individually through the page table. kmalloc allocates physically contiguous memory from the slab allocator or buddy system. vmalloc is slower due to page table manipulation but can allocate much larger regions.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## Memory mapping
 
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+map_kernel_range() iterates through each page and establishes page table entries. This involves walking the page table hierarchy (PGD-P4D-PUD-PMD-PTE) for each page. After mapping, flush_tlb_kernel_range() ensures the new mappings are visible.

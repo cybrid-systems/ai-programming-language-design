@@ -526,802 +526,232 @@ Deep analysis
 Deep analysis
 Deep analysis
 
-## Additional analysis
+## 4. fanotify 权限决策阻塞
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+用户空间响应前，发起文件访问的进程阻塞在内核中。
 
-## Additional analysis
+## 5. 缓存
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+FAN_CLASS_CONTENT 模式下，文件内容被缓存供扫描器访问。
 
-## Additional analysis
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## 4. 权限事件阻塞
 
-## Additional analysis
+用户空间响应前，访问文件的进程在内核中阻塞等待。
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## 5. FAN_CLASS_CONTENT 缓存
 
-## Additional analysis
+文件内容被缓存供扫描器访问。减少扫描时的磁盘 I/O。
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## 6. 性能和配置
 
-## Additional analysis
+非权限模式: ~1us/event
+权限模式: ~100us-10ms (阻塞)
+fs.fanotify.max_user_groups = 128
+fs.fanotify.max_user_marks = 8192
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+## 7. 关联文章
 
-## Additional analysis
+- **32-fanotify**: fanotify 基础
+- **81-inotify-fanotify**: 对比
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## Permission event flow
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+Userspace reads event, performs security check, writes response. Process blocks on wait_event in the kernel. When userspace writes FAN_ALLOW, wait_event completes and the file access continues. When FAN_DENY, the syscall returns EPERM. The response is written via write() on the fanotify fd.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
 
-## Additional analysis
+## FAN_CLASS_CONTENT caching
 
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
-
-## Additional analysis
-
-Each kernel subsystem has unique design. Understanding the core data structures and key code paths is essential for Linux kernel programming. The kernel subsystem interfaces with memory management, scheduling, and device drivers through well-defined APIs.
+For antivirus use cases, Content class caches file data locally. This avoids re-reading from disk when the scanner accesses the file through the provided fd. The cache is invalidated after the permission check completes.
