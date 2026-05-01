@@ -1,210 +1,119 @@
-# CFS — 完全公平调度器深度源码分析
+# 37-CFS — 完全公平调度器深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`kernel/sched/fair.c` + `kernel/sched/sched.h`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**CFS（Completely Fair Scheduler）** 是 Linux 2.6.23+ 的默认调度器，核心思想：
-- **虚拟运行时间（vruntime）**：每个任务按"应得 CPU 时间"运行
-- **红黑树**：vruntime 最小的任务在树最左端，最先被调度
-- **权重**：nice 值决定权重，权重越高 vruntime 增长越慢
+**CFS（Completely Fair Scheduler）** 是 Linux 默认的 CPU 调度器（自 2.6.23）。核心思想：**虚拟运行时间（vruntime）**——每个进程获得一个公平的 CPU 时间份额。
+
+doom-lsp 确认 `kernel/sched/fair.c` 包含约 1174+ 个符号。
 
 ---
 
-## 1. 核心数据结构
+## 1. 核心结构
 
-### 1.1 sched_entity — 调度实体
+### 1.1 struct sched_entity
 
 ```c
-// kernel/sched/sched.h:460 — sched_entity
 struct sched_entity {
-    // 嵌入的红黑树节点（接入 cfs_rq 的树）
-    struct rb_node          run_node;         // 行 472
+    struct load_weight      load;         // 调度权重
+    struct rb_node          run_node;     // 红黑树节点
+    struct list_head        group_node;   // 组调度链表
+    unsigned int            on_rq;        // 是否在运行队列
 
-    // 时间记账
-    u64                     exec_start;       // 本次执行开始时间
-    u64                     sum_exec_runtime; // 总执行时间
-    u64                     vruntime;         // 虚拟运行时间（CFS 键！）
-    u64                     prev_sum_exec_runtime; // 上次总执行时间
-    u64                     nr_migrations;     // 迁移次数
+    u64                     vruntime;     // 虚拟运行时间
+    u64                     prev_sum_exec_runtime; // 上次执行总时间
 
-    // 在运行队列中的信息
-    struct list_head        group_node;       // 接入组调度的链表
-    unsigned int            on_rq;            // 是否在运行队列
-
-    // 父子关系
-    struct sched_entity     *parent;          // 父调度实体（CFS 层）
-
-    // 权重（来自 nice 值）
-    unsigned long           weight;            // 权重（1024 * 1.25^nice）
-    unsigned long           load_weight;       // 负载权重
+    struct sched_entity     *parent;      // 父调度实体（组调度）
+    struct cfs_rq           *cfs_rq;      // 所属 cfs_rq
+    struct cfs_rq           *my_q;        // 若为组调度：子 cfs_rq
+    ...
 };
 ```
 
-### 1.2 cfs_rq — CFS 运行队列
+### 1.2 struct cfs_rq
 
 ```c
-// kernel/sched/sched.h:440 — cfs_rq
 struct cfs_rq {
-    // 红黑树根（所有可运行任务按 vruntime 排序）
-    struct rb_root_cached   tasks_timeline;  // 行 445
+    struct load_weight      load;         // 队列总权重
+    unsigned int            nr_running;   // 运行进程数
 
-    /* 树中最左节点 = 最需要调度的任务 */
-    struct rb_node          *rb_leftmost;     // 缓存最左节点（O(1) 查找）
+    struct rb_root_cached   tasks_timeline; // vruntime 红黑树
 
-    // 运行时统计
-    u64                     exec_clock;       // 执行时钟
-    u64                     min_vruntime;      // 基准 vruntime（防止饿死）
+    struct sched_entity     *curr;        // 当前运行的进程
+    struct sched_entity     *next;        // 将要运行的进程
+    struct sched_entity     *last;        // 最后运行的进程
 
-    // 任务链表
-    struct sched_entity     *curr;            // 当前正在运行的任务
-    struct task_struct      *tg;              // 任务组
-
-    // 负载信息
-    struct load_weight      load;             // 总负载
-    unsigned long           nr_running;        // 可运行任务数
-    unsigned long           h_nr_running;     // 层次运行任务数
-
-    // 无延迟的 idle
-    struct sched_entity     *min_vruntime_fair; // 最小 vruntime
+    struct rq               *rq;          // 所属 runqueue
+    ...
 };
 ```
 
-### 1.3 权重计算
+---
 
-```c
-// kernel/sched/core.c — se_weight
-static unsigned long se_weight(struct sched_entity *se)
-{
-    // nice 值权重：weight = 1024 * 1.25^(nice - 1024)
-    // nice = 0  → weight = 1024
-    // nice = -20 → weight = 88761 (最高优先级)
-    // nice = +20 → weight = 78 (最低优先级)
-    return scale_load(se->load.weight);
-}
+## 2. 调度流程
+
+```
+周期性调度 tick：
+  scheduler_tick()
+    └─ task_tick_fair(rq, curr)
+         ├─ update_curr(cfs_rq)
+         │    ├─ delta_exec = now - curr->exec_start
+         │    ├─ curr->vruntime += delta_exec * (NICE_0_LOAD / curr->load.weight)
+         │    └─ 更新当前进程的 vruntime
+         │
+         ├─ if (curr->vruntime > leftmost->vruntime)
+         │    └─ resched_curr(rq)         ← 标记需要重新调度
+         │
+         └─ check_preempt_tick(cfs_rq, curr)
+              └─ 如果当前进程运行时间超过理想时间片
+                   └─ resched_curr(rq)
+
+选择下一个进程：
+  pick_next_task_fair(rq, prev)
+    └─ pick_next_entity(cfs_rq)
+         └─ 从红黑树中取出 vruntime 最小的进程
+              └─ __dequeue_entity(cfs_rq, se)   ← 从树中移除
+              └─ set_next_entity(cfs_rq, se)    ← 设置下一个运行
 ```
 
 ---
 
-## 2. pick_next_entity — 选择下一个任务
+## 3. 虚拟运行时间计算
 
 ```c
-// kernel/sched/fair.c:4720 — pick_next_entity
-struct sched_entity *pick_next_entity(struct cfs_rq *cfs_rq)
-{
-    struct sched_entity *se = NULL;
+// vruntime = 实际运行时间 / 权重比
+// NICE_0_LOAD = 1024（nice=0 的权重）
 
-    // 取树中最左节点（vruntime 最小）
-    se = rb_entry(rb_leftmost(&cfs_rq->tasks_timeline), struct sched_entity, run_node);
+vruntime = delta_exec * NICE0_LOAD / se->load.weight
 
-    return se;
-}
+// 例子：
+//   nice=0 (weight=1024): vruntime = delta_exec
+//   nice=5 (weight=335):  vruntime ≈ delta_exec * 3
+//                         (运行同样时间，nice=5 的 vruntime 增长 3x)
+//                         (所以更少被调度到，CPU 份额更少)
 ```
+
+| nice 值 | 权重 | CPU 份额比例 |
+|---------|------|-------------|
+| -20 | 88761 | ×86.6 |
+| -10 | 9548 | ×9.3 |
+| 0 | 1024 | ×1.0 |
+| 10 | 304 | ×0.3 |
+| 19 | 15 | ×0.01 |
 
 ---
 
-## 3. enqueue_entity — 加入运行队列
+## 4. 源码文件索引
 
-```c
-// kernel/sched/fair.c:4683 — enqueue_entity
-void enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
-{
-    // 1. 更新执行时间
-    update_curr(cfs_rq);
-
-    // 2. 如果已在运行（flags=ENQUEUE_WAKEUP），更新 vruntime
-    if (flags & ENQUEUE_WAKEUP)
-        place_entity(cfs_rq, se, flags);
-
-    // 3. 更新运行队列统计
-    account_enqueue_entity(cfs_rq, se);
-
-    // 4. 加入红黑树（key = vruntime）
-    __enqueue_entity(cfs_rq, se);
-}
-
-static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
-{
-    // 插入红黑树
-    rb_link_node(&se->run_node, parent, link);
-    rb_insert_color_cached(&se->run_node, &cfs_rq->tasks_timeline, leftmost);
-
-    // 如果是最左节点，更新缓存
-    if (leftmost)
-        cfs_rq->rb_leftmost = &se->run_node;
-}
-```
+| 文件 | 关键符号 |
+|------|---------|
+| `kernel/sched/fair.c` | pick_next_entity / enqueue_task_fair |
+| `kernel/sched/sched.h` | struct cfs_rq / struct sched_entity |
 
 ---
 
-## 4. vruntime 计算
-
-```c
-// kernel/sched/fair.c:764 — update_curr
-void update_curr(struct cfs_rq *cfs_rq)
-{
-    u64 now = rq_clock_task(rq_of(cfs_rq));
-    u64 delta_exec = now - se->exec_start;
-
-    // 更新 vruntime
-    // delta_exec * 1024 / weight（高权重 = vruntime 增长慢）
-    se->vruntime += calc_delta_fair(delta_exec, se);
-
-    // 更新 min_vruntime（防止所有任务 vruntime 无限增长）
-    cfs_rq->min_vruntime = max(cfs_rq->min_vruntime, se->vruntime);
-}
-
-static inline u64 calc_delta_fair(u64 delta_exec, struct sched_entity *se)
-{
-    // 公平调度：vruntime 增长速率与权重成反比
-    // 高权重任务 → vruntime 增长慢 → 被调度更多
-    // 低权重任务 → vruntime 增长快 → 被调度更少
-    return mul_div64(delta_exec, NICE_0_LOAD, se->load.weight);
-}
-```
-
----
-
-## 5. entity_key — 红黑树 key
-
-```c
-// kernel/sched/fair.c:726 — entity_key
-static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
-{
-    // vruntime 作为 key，最小的在树最左
-    return se->vruntime - cfs_rq->min_vruntime;
-}
-```
-
----
-
-## 6. 调度周期（sched_slice）
-
-```c
-// kernel/sched/fair.c:460 — sched_slice
-static u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
-{
-    // 每个任务在其调度周期内应得的时间
-    // slice = period * (weight / total_weight)
-    // period 默认 4ms
-    u64 period = sysctl_sched_latency;  // 4ms
-    u64 slice = period * se->load.weight;
-
-    do_div(slice, cfs_rq->load.weight);
-
-    return slice;
-}
-```
-
----
-
-## 7. 完整文件索引
-
-| 文件 | 函数/结构 |
-|------|----------|
-| `kernel/sched/sched.h` | `struct sched_entity`（行460）、`struct cfs_rq`（行440）|
-| `kernel/sched/fair.c` | `pick_next_entity`（行4720）、`enqueue_entity`（行4683）、`update_curr`（行764）|
-| `kernel/sched/core.c` | `se_weight` 权重计算 |
+*分析工具：doom-lsp（clangd LSP）*
