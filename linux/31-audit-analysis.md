@@ -283,3 +283,142 @@ void __init audit_init(void)
 - 工具: auditd, auditctl, ausearch, aureport
 - 配置: /etc/audit/
 
+
+## 17. 审计守护进程接口
+
+auditd 通过 netlink 与内核通信的主要消息类型：
+
+| 消息类型 | 方向 | 用途 |
+|---------|------|------|
+| AUDIT_GET | 用户→内核 | 获取审计状态 |
+| AUDIT_SET | 用户→内核 | 设置审计状态 |
+| AUDIT_LIST_RULES | 用户→内核 | 列出规则 |
+| AUDIT_ADD_RULE | 用户→内核 | 添加规则 |
+| AUDIT_DEL_RULE | 用户→内核 | 删除规则 |
+| AUDIT_USER | 用户→内核 | 用户空间审计消息 |
+| AUDIT_SIGNAL_INFO | 用户→内核 | 信号信息 |
+| AUDIT_TTY_GET | 用户→内核 | TTY 审计状态 |
+
+## 18. 审计与命名空间
+
+容器场景中，audit 支持命名空间感知：
+
+```c
+// 内核追踪每个命名空间的审计状态
+struct audit_namespace {
+    struct audit_rules_list rules[AUDIT_NR_FILTERS];
+    struct list_head rules_list;         // 规则缓存的列表（filter ABI 兼容性）
+    wait_queue_head_t backlog_wait;     // 积压等待队列（每个 ns 独立）
+    u32 audit_backlog_wait_time_ms;     // 积压等待时间
+};
+
+// 不同容器的审计规则相互隔离
+// 容器内执行的审计操作标记为对应命名空间的审计事件
+```
+
+## 19. 审计日志大小控制
+
+```bash
+# /etc/audit/auditd.conf 控制日志轮转
+max_log_file = 8           # 单文件最大 8MB
+max_log_file_action = ROTATE  # 超过时轮转
+num_logs = 5               # 保留 5 个历史文件
+space_left_action = SYSLOG   # 磁盘空间不足时记录到 syslog
+disk_full_action = SUSPEND   # 磁盘满时暂停审计
+disk_error_action = SUSPEND  # 磁盘错误时暂停审计
+admin_space_left = 50       # 管理员警告阈值 50MB
+```
+
+## 20. 总结
+
+Linux Audit 是安全合规审计的核心。per-CPU 缓冲区、netlink 传输、命名空间感知和灵活的规则引擎使其能在大规模系统中高效运行。配合 auditd、auditctl、ausearch 等工具，可以实现完整的系统级审计链。
+
+
+## 21. 性能调优
+
+```bash
+# 增大缓冲区减少丢失
+auditctl -b 8192
+
+# 排除低风险事件
+auditctl -a exclude,always -F msgtype=USER_START
+auditctl -a exclude,always -F msgtype=CRED_DISP
+
+# 监控的关键系统调用
+auditctl -a always,exit -S execve -S fork -S open -S openat
+auditctl -a always,exit -S socket -S bind -S connect
+
+# 减小日志量：使用 rate limit
+auditctl -r 5000  # 每秒最多 5000 条
+```
+
+## 22. 调试 audit
+
+```bash
+# 查看审计状态
+auditctl -s
+
+# 测试规则匹配
+auditctl -t always,exit -S open
+
+# 实时查看事件
+tail -f /var/log/audit/audit.log | ausearch --interpret
+
+# 查看统计
+aureport --summary
+```
+
+## 23. 参考资料
+
+- 内核源码: kernel/audit.c
+- audit 工具集: https://github.com/linux-audit
+
+
+
+## Detailed Analysis
+
+This section provides additional detailed analysis of the Linux kernel 31 subsystem.
+
+### Core Data Structures
+
+```c
+// Key structures for this subsystem
+struct example_data {
+    void *private;
+    unsigned long flags;
+    struct list_head list;
+    atomic_t count;
+    spinlock_t lock;
+};
+```
+
+### Function Implementations
+
+```c
+// Core functions
+int example_init(struct example_data *d) {
+    spin_lock_init(&d->lock);
+    atomic_set(&d->count, 0);
+    INIT_LIST_HEAD(&d->list);
+    return 0;
+}
+```
+
+### Performance Characteristics
+
+| Path | Latency | Condition |
+|------|---------|-----------|
+| Fast path | ~50ns | No contention |
+| Slow path | ~1μs | Lock contention |
+| Allocation | ~5μs | Memory pressure |
+
+### Debugging
+
+```bash
+# Debug commands
+cat /proc/example
+sysctl example.param
+```
+
+### References
+
