@@ -254,3 +254,56 @@ SwapCached:        12345 kB    # swap cache 中的数据
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 14. Swap 与 THP
+
+透明大页被换出时会分裂为 512 个 4KB 页，每个页单独分配 swap slot。这降低了 THP 的内存压力，但增加了 swap 操作的开销。换入时也是逐个 4KB 页读回，性能较差。
+
+## 15. swap_slots 缓存
+
+```c
+// mm/swap_slots.c — swap slot 缓存加速分配
+// 每次从 swap 区域预先分配一批 slot
+// 缓存在 per-CPU 链表中
+// 后续分配直接从缓存取，减少锁竞争
+
+// 批量分配减少 swap_map 锁竞争
+// 提高多核场景的 swap 性能
+```
+
+## 16. 调试命令
+
+```bash
+# 查看 swap 使用
+swapon --show                  # swap 设备和大小
+cat /proc/swaps                # 各 swap 区域状态
+cat /proc/meminfo | grep Swap  # swap 统计
+
+# 启用/禁用 swap
+swapon /dev/sda2               # 启用
+swapoff /dev/sda2              # 禁用
+
+# 创建 swap 文件
+dd if=/dev/zero of=/swapfile bs=1M count=4096
+mkswap /swapfile
+swapon /swapfile
+```
+
+## 17. swap_map 结构详解
+
+swap_map 字节数组的每个字节记录 swap slot 的引用计数：
+
+- 0: 空闲
+- 1-127: 引用计数
+- 128: 页面错误
+- 129-255: 引用计数 + 保留
+
+当多个进程共享同一个 swap 页时（如共享内存被换出），引用计数递增。最后释放时进入 swap cache，等待其他进程使用后最终释放。
+
+## 18. 总结
+
+Swap 提供内存扩展能力。get_swap_page 分配 slot，add_to_swap 标记新页面，swap_writepage 写磁盘，do_swap_page 换入。簇分配优化顺序 I/O，zswap 提供压缩替代。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
