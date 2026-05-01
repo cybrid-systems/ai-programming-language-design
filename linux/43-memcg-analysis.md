@@ -407,3 +407,28 @@ void mem_cgroup_uncharge_folio(struct folio *folio)
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 27. memory.high 回收行为
+
+memory.high 是软上限，超过时触发异步回收但不 OOM：
+
+```bash
+# 设置软上限
+echo 200M > /sys/fs/cgroup/myapp/memory.high
+
+# 当使用量超过 200M 时：
+# 1. 分配进程触发 direct reclaim
+# 2. 回收速度较慢时可能暂时超过上限
+# 3. 不会 OOM kill 进程
+# 4. 适合数据库等需要缓存的应用
+```
+
+## 28. 参考
+
+- mm/memcontrol.c — 核心实现
+- mm/page_counter.h — 页面计数器
+- Documentation/admin-guide/cgroup-v2.rst
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
