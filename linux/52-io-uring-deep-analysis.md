@@ -1,23 +1,12 @@
-# 52-io_uring-deep — io_uring 深度应用分析
+# 52-io_uring-deep — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
+> Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-io_uring 的深层特性：fixed buffers、registered files、polled IO、链接请求。
+io_uring 高级特性：fixed buffers（预注册缓冲区避免 GUP）、registered files（预注册 fd）、IORING_OP_PROVIDE_BUFFERS。
 
 ---
 
-| 特性 | 说明 |
-|------|------|
-| IORING_REGISTER_FILES | 预注册 fd，避免每次 atomic 转换 |
-| IORING_REGISTER_BUFFERS | 预注册缓冲区，跳过 get_user_pages |
-| IORING_SETUP_IOPOLL | 轮询模式（NVMe 最优） |
-| IOSQE_IO_LINK | 请求链式依赖 |
-| IOSQE_IO_HARDLINK | 硬链接（出错后不再执行后续请求） |
-
----
-
-*分析工具：doom-lsp（clangd LSP）*
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01*

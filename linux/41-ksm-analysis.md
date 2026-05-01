@@ -1,37 +1,12 @@
-# 41-KSM — 内核同页合并深度源码分析
+# 41-KSM — 深度源码分析
 
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
+> Linux 7.0-rc1
 
 ---
 
-## 0. 概述
-
-**KSM（Kernel Same-page Merging）** 允许内核合并内容完全相同的物理页（通常来自不同进程的匿名映射），从而节省内存。典型场景：运行大量相同 VM 的宿主机。
+**KSM（Kernel Same-page Merging）** 合并内容相同的匿名页。ksmd 扫描注册的 VMA（MADV_MERGEABLE），计算校验和，合并匹配页为 COW 共享。
 
 ---
 
-## 1. 核心流程
-
-```
-KSM 扫描线程（ksmd）：
-  │
-  ├─ 遍历所有注册的 VMA（通过 madvise MADV_MERGEABLE 标记）
-  │
-  ├─ 对每一页：
-  │    ├─ 计算内容校验和
-  │    ├─ 如果校验和不变（内容稳定）：
-  │    │    └─ 加入候选树
-  │    └─ 如果内容匹配已有页面：
-  │         └─ merge page
-  │
-  ├─ 合并：
-  │    └─ 释放被合并页，修改两个进程的页表指向同一物理页
-  │    └─ 标记为 COW（写时复制）
-  │
-  └─ 如果任意进程写入：
-       → COW → 复制新页
-```
-
----
-
-*分析工具：doom-lsp（clangd LSP）*
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01*
