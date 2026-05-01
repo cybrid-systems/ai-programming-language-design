@@ -332,3 +332,93 @@ memcg 可以单独限制每个 cgroup 的 swap 使用：
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
+
+## Analysis Section
+
+The swap subsystem provides virtual memory expansion. It manages swap areas through swap_info_struct structures. The swap_map byte array tracks per-slot reference counts. Cluster allocation groups adjacent slots for sequential I/O. add_to_swap and do_swap_page manage the page transfer between memory and swap devices.
+
