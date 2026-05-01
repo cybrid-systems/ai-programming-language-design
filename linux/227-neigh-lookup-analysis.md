@@ -1,11 +1,10 @@
-# 227-neigh-lookup-analysis — 深度源码分析
+# 227 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**neigh lookup 深入**：ARP 缓存结构、gc_thresh 回收阈值。
+neigh 查找深入。ARP 缓存 gc_thresh 回收策略。
 
 ---
 

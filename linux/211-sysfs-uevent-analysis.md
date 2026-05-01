@@ -1,11 +1,10 @@
-# 211-sysfs-uevent-analysis — 深度源码分析
+# 211 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**sysfs-uevent 深入**：sysfs 属性文件读写路径、uevent 的环境变量构建。
+sysfs/uevent 深入。属性文件 sysfs_ops->show/store、uevent 环境变量构建。
 
 ---
 

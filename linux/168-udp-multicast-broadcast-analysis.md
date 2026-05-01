@@ -1,11 +1,10 @@
-# 168-udp-multicast-broadcast-analysis — 深度源码分析
+# 168 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**buffer_head** 是块 I/O 的传统缓存层，管理文件系统块的缓冲。
+**buffer_head** 块缓存层。__getblk→__bread→bforget，ext4 的底层 I/O。
 
 ---
 

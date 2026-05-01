@@ -1,11 +1,10 @@
-# 200-timekeeping-analysis — 深度源码分析
+# 200 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 200
+**timekeeping** 内核时间核心。ktime_get（CLOCK_MONOTONIC）、ktime_get_real（CLOCK_REALTIME）。
 
 ---
 

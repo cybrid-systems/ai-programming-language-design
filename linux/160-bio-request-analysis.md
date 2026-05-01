@@ -1,11 +1,10 @@
-# 160-bio-request-analysis — 深度源码分析
+# 160 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**writeback** 是脏页回写机制的核心，wb_workfn 线程执行 inode 级别的回写。
+**writeback** 回写机制。wb_workfn 线程→writeback_sb_inodes 回写脏页。
 
 ---
 

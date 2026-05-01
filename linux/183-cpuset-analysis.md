@@ -1,11 +1,10 @@
-# 183-cpuset-analysis — 深度源码分析
+# 183 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**CMA（Contiguous Memory Allocator）** 预留物理内存区间，用于大块连续分配。
+**CMA** 深入。cma_alloc→cma_alloc 从预留区域分配，dma_alloc_from_contiguous 使用 CMA。
 
 ---
 

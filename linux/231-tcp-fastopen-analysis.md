@@ -1,11 +1,10 @@
-# 231-tcp-fastopen-analysis — 深度源码分析
+# 231 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**TCP Fast Open（TFO）**：在第一个 SYN 中携带数据的优化，减少握手延迟。
+**TCP Fast Open**。SYN 携带数据的零 RTT 连接优化。
 
 ---
 

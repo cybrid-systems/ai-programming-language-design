@@ -1,11 +1,10 @@
-# 125-deadline-server — 深度源码分析
+# 125 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**deadline 服务器**：SCHED_DEADLINE 调度策略的服务器实现细节，带宽继承和预算管理。
+deadline 深入：SCHED_DEADLINE 的 CBS（Constant Bandwidth Server）。
 
 ---
 

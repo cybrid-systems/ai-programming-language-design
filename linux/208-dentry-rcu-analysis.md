@@ -1,11 +1,10 @@
-# 208-dentry-rcu-analysis — 深度源码分析
+# 208 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**dentry-RCU**：RCU 安全遍历 dentry 哈希表（__d_lookup_rcu），无锁路径解析。
+**dentry RCU**。__d_lookup_rcu 无锁路径解析（RCU 保护 dcache）。
 
 ---
 

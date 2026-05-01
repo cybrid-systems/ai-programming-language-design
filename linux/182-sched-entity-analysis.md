@@ -1,11 +1,10 @@
-# 182-sched-entity-analysis — 深度源码分析
+# 182 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**DMA pool/CMA**：DMA 一致性内存池和连续内存分配器（CMA），用于需要连续物理内存的设备。
+**DMA pool**（dma_pool_alloc）和 **CMA**（连续内存分配器）。cma_alloc 从 CMA 区域分配连续页。
 
 ---
 

@@ -1,11 +1,10 @@
-# 158-slab-allocator-analysis — 深度源码分析
+# 158 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 158
+**freezer** 与容器编排的配合使用。
 
 ---
 

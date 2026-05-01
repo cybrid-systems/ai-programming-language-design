@@ -1,11 +1,10 @@
-# 120-lockdep — 深度源码分析
+# 120 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**lockdep** 是 Linux 死锁检测器，在运行时跟踪锁的获取顺序，通过校验锁依赖图发现潜在的死锁。
+**lockdep** 死锁检测器。在校验锁依赖图中记录获取顺序，发现循环依赖时告警。
 
 ---
 

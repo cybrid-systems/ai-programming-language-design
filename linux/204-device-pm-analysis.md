@@ -1,11 +1,10 @@
-# 204-device-pm-analysis — 深度源码分析
+# 204 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**device PM**：运行时电源管理（runtime PM）和系统睡眠（suspend/resume）路径。
+**device PM** 电源管理。runtime PM（pm_runtime_get/put）和系统睡眠（suspend/resume）。
 
 ---
 

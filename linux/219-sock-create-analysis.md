@@ -1,11 +1,10 @@
-# 219-sock-create-analysis — 深度源码分析
+# 219 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**sock_create 深入**：socket 系统调用的完整路径：__sys_socket → sock_map_fd。
+socket 创建深入。sys_socket→sock_create→inet_create→sock_map_fd。
 
 ---
 

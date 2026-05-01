@@ -1,11 +1,10 @@
-# 114-USB-core-Thunderbolt-PCI — 深度源码分析
+# 114 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**USB core** 是 USB 子系统的核心框架，管理 USB 设备枚举、配置、数据传输（控制/批量/中断/等时传输）。
+**USB 子系统**：设备枚举（hub 线程）、配置描述符解析、URB 传输。
 
 ---
 

@@ -1,11 +1,10 @@
-# 102-audit-deep — 深度源码分析
+# 102 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-审计子系统深入：syscall enter/exit 钩子、规则过滤、审计日志生成。
+audit 深入：audit_syscall_entry/exit 完整流程、规则过滤、audit_log_start/audit_log_end。
 
 ---
 

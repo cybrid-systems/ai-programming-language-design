@@ -1,11 +1,10 @@
-# 116-PCI-deep — 深度源码分析
+# 116 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**PCI 子系统** 是 Linux 的 PCI/PCIe 总线管理核心，包括设备枚举、配置空间访问、电源管理和 AER。
+**PCI/PCIe**：总线枚举（pci_scan_bus）、配置空间访问、MSI/MSI-X 中断。
 
 ---
 

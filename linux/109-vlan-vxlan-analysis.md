@@ -1,11 +1,10 @@
-# 109-vlan-vxlan — 深度源码分析
+# 109 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**VLAN**（802.1Q）标记网络帧的 VLAN ID。**VXLAN** 通过 UDP 封装 L2 帧，是 overlay 网络的核心技术。
+**VLAN** (802.1Q) 和 **VXLAN**（UDP 封��� L2）。VXLAN 是 overlay 网络核心技术。
 
 ---
 

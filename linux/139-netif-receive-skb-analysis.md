@@ -1,11 +1,10 @@
-# 139-dev-queue-xmit — 深度源码分析
+# 139 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**dev_queue_xmit** 是网络发送的核心函数：选择队列 → enqueue → 调用 qdisc → 驱动 ndo_start_xmit。
+**dev_queue_xmit** 深入。qdisc enqueue/dequeue，XDP xmit，ndo_start_xmit 驱动发送。
 
 ---
 

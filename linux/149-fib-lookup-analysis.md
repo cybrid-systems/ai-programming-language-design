@@ -1,11 +1,10 @@
-# 149-tcp-retransmit — 深度源码分析
+# 149 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**TCP 重传**：超时重传（RTO）、快速重传（三次重复 ACK）、selective ACK（SACK）和 FACK。
+TCP 重传：RTO 计算（Jacobson）、快速重传（重复 ACK）、SACK（selective ACK）。
 
 ---
 

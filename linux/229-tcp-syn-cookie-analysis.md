@@ -1,11 +1,10 @@
-# 229-tcp-syn-cookie-analysis — 深度源码分析
+# 229 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**TCP SYN cookie**：SYN flood 防护机制，syncookie 的生成／校验算法。
+**SYN cookie** 防 SYN flood。syncookie 生成/校验算法。
 
 ---
 

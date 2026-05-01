@@ -1,11 +1,10 @@
-# 138-netdevice — 深度源码分析
+# 138 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**struct net_device** 是网络设备的核心结构（~200+ 字段），包含设备名、MAC 地址、mtu、操作函数集（ndo_*）。
+**net_device** 深入。^200+ 字段，register_netdev/unregister_netdev 生命周期。
 
 ---
 

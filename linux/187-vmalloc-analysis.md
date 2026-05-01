@@ -1,11 +1,10 @@
-# 187-vmalloc-analysis — 深度源码分析
+# 187 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**vmalloc 深入**：vmalloc 虚拟地址空间管理、vmap_area 缓存、懒 TLB 刷新。
+vmalloc 深入。vmap_area 缓存、懒 TLB 刷新。
 
 ---
 

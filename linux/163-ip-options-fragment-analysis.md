@@ -1,11 +1,10 @@
-# 163-ip-options-fragment-analysis — 深度源码分析
+# 163 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 163
+**super_block** 深入。alloc_super→kill_sb，文件系统实例管理。
 
 ---
 

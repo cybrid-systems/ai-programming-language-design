@@ -1,11 +1,10 @@
-# 205-clocksource-analysis — 深度源码分析
+# 205 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**clocksource** 注册和管理时间源设备（TSC/HPET/ACPI PM timer）。
+**clocksource** 时间源。clocksource_register_hz 注册，clocksource_watchdog 监测稳定性。
 
 ---
 

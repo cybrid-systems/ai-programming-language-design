@@ -1,11 +1,10 @@
-# 197-ACPI-analysis — 深度源码分析
+# 197 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 197
+**ACPI** 高级配置与电源接口。OSPM（操作系统电源管理）使用 ACPI 表格。
 
 ---
 

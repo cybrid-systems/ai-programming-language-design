@@ -1,11 +1,10 @@
-# 233-netfilter-hooks-analysis — 深度源码分析
+# 233 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**netfilter hooks 深入**：5 个 NF_INET 钩子点的完整调用链和 skb 的遍历路径。
+netfilter hooks 深入。5 个 NF_INET 钩子的完整调用路径。
 
 ---
 

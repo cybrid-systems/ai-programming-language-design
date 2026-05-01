@@ -1,11 +1,10 @@
-# 172-tcp-congestion-control-analysis — 深度源码分析
+# 172 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**khugepaged** 后台线程扫描并合并 4KB 页为透明大页（THP）。
+**khugepaged** THP 后台合并线程。scan_mm_slot→collapse_huge_page。
 
 ---
 

@@ -1,11 +1,10 @@
-# 111-packet-mmap-CAN-SocketCAN-RDMA — 深度源码分析
+# 111 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**packet_mmap（PACKET_MMAP）** 允许用户空间通过共享环形缓冲区直接读写网络数据包，实现零拷贝的高速包处理。tcpdump 和 AF_PACKET 使用此接口。
+**packet_mmap**（PACKET_MMAP）通过共享环形缓冲区零拷贝读写网络包。tcpdump 使用此接口。
 
 ---
 

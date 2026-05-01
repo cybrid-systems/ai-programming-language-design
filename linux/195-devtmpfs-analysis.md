@@ -1,11 +1,10 @@
-# 195-devtmpfs-analysis — 深度源码分析
+# 195 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**devtmpfs** 在系统启动时自动填充 /dev 目录的设备节点。
+**devtmpfs** 启动时自动创建 /dev 设备节点。devtmpfs_create_node 创建设备文件。
 
 ---
 

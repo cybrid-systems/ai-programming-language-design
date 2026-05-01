@@ -1,11 +1,10 @@
-# 174-container-runtime-analysis — 深度源码分析
+# 174 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**LRU 链表** 管理页面的活跃/非活跃列表：lru_cache_add、lru_to_page、shrink_active_list。
+**LRU**：活跃/非活跃链表管理。mark_page_accessed→shrink_active_list。
 
 ---
 

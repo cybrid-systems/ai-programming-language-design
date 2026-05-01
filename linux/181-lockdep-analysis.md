@@ -1,11 +1,10 @@
-# 181-lockdep-analysis — 深度源码分析
+# 181 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**zsmalloc** 是 zram/zswap 使用的紧凑内存分配器，存储压缩后的页面。
+**zsmalloc** 压缩分配器，zram/zswap 的底层。管理按大小分级的内存池，存储压缩后的页面。
 
 ---
 

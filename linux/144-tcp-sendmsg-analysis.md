@@ -1,11 +1,10 @@
-# 144-inet-stream-connect — 深度源码分析
+# 144 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**TCP 连接建立**：connect 系统调用 → tcp_v4_connect → tcp_transmit_skb(SYN) → 三次握手全过程。
+TCP 连接建立：tcp_v4_connect→tcp_send_syn→三次握手全过程。
 
 ---
 

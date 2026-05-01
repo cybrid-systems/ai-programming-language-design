@@ -1,11 +1,10 @@
-# 165-bridge-stp-analysis — 深度源码分析
+# 165 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 165
+**super_block** 与块设备的关联（s_bdev）。
 
 ---
 

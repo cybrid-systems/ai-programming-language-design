@@ -1,11 +1,10 @@
-# 243-kvm-virtualization-analysis — 深度源码分析
+# 243 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**KVM virtualization**：KVM 核心架构（kvm_main.c + vendor 模块）、VMX 根/非根模式切换。
+**KVM**。kvm_main.c+VMX/SVM 模块、VM entry/exit。
 
 ---
 

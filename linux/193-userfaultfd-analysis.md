@@ -1,11 +1,10 @@
-# 193-userfaultfd-analysis — 深度源码分析
+# 193 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**userfaultfd 深入**：UFFDIO_COPY/ZEROPAGE/WAKE 的详细实现。
+userfaultfd 深入。UFFDIO_COPY/UFFDIO_ZEROPAGE/UFFDIO_WAKE 的实现。
 
 ---
 

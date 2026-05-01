@@ -1,11 +1,10 @@
-# 106-tap-tun — 深度源码分析
+# 106 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**tun/tap** 是虚拟网络设备。tun 工作于 L3（IP），tap 工作于 L2（以太网），用户空间程序通过字符设备接口读写网络数据包。
+**tun/tap** 虚拟网络设备。tun（L3）+tap（L2），用户空间通过 /dev/net/tun 读写数据包。
 
 ---
 

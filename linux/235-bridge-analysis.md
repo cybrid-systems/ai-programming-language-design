@@ -1,11 +1,10 @@
-# 235-bridge-analysis — 深度源码分析
+# 235 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**bridge 深入**：FDB 学习、STP 状态机、IGMP snooping。
+bridge 深入。FDB 学习、STP 状态机。
 
 ---
 

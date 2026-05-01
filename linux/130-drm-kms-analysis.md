@@ -1,11 +1,10 @@
-# 130-device-model-deep — 深度源码分析
+# 130 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**device model 深入**：bus/driver/device 三方匹配，probe/remove 流程，电源管理回调注册。
+device model 深入：device_register→device_add 完整路径、属性文件创建。
 
 ---
 

@@ -1,11 +1,10 @@
-# 192-kexec-analysis — 深度源码分析
+# 192 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**kexec** 允许在不重启的情况下加载新内核。kexec_file_load 支持签名校验。
+**kexec** 不重启加载新内核。kexec_load/kexec_file_load 加载→machine_kexec 跳转到新内核。
 
 ---
 

@@ -1,11 +1,10 @@
-# 175-kallsyms-livepatch-analysis — 深度源码分析
+# 175 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**IOMMU 框架** 管理 DMA 重映射，支持 Intel VT-d、AMD IOMMU、ARM SMMU。
+**IOMMU** 通用框架。iommu_map/unmap/iommu_attach_device。
 
 ---
 

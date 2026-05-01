@@ -1,11 +1,10 @@
-# 134-percpu — 深度源码分析
+# 134 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**percpu** 变量是每 CPU 数据，避免同步开销。使用 `DEFINE_PER_CPU` 和 `this_cpu_ptr()` 访问。
+**percpu** 变量：DEFINE_PER_CPU、this_cpu_ptr、per-CPU 分配器管理。
 
 ---
 

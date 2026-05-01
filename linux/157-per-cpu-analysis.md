@@ -1,11 +1,10 @@
-# 157-per-cpu-analysis — 深度源码分析
+# 157 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 157
+**freezer 深入**：cgroup_freezer 完整实现、信号处理。
 
 ---
 

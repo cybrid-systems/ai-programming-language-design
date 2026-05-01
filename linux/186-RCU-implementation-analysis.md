@@ -1,11 +1,10 @@
-# 186-RCU-implementation-analysis — 深度源码分析
+# 186 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**/dev/random 和 /dev/urandom**：Linux 随机数生成器，基于硬件熵源和 CRNG。
+**random** 随机数。hw_random 硬件熵源→CRNG（ChaCha20）生成随机数。/dev/random（阻塞）和 /dev/urandom（非阻塞）。
 
 ---
 

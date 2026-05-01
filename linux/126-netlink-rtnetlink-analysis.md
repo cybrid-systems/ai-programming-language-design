@@ -1,11 +1,10 @@
-# 126-tracepoints — 深度源码分析
+# 126 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**tracepoints** 是静态定义的跟踪点，ftrace/perf/eBPF 可以通过注册回调来跟踪内核事件。
+**tracepoints** 静态跟踪点。DECLARE_TRACE 定义，trace_*() 调用时触发回调。
 
 ---
 

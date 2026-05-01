@@ -1,11 +1,10 @@
-# 147-inet-release — 深度源码分析
+# 147 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**inet_release** 描述 TCP/UDP socket 的关闭路径：tcp_close（FIN 发送/等待）→ inet_release → sock_release。
+inet_release：tcp_close(FIN)→inet_release→sock_release 完整关闭。
 
 ---
 

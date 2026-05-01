@@ -1,11 +1,10 @@
-# 105-wireguard — 深度源码分析
+# 105 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**WireGuard** 是现代 VPN 协议的内核实现，通过加密隧道传输数据包，代码量仅 ~4000 行。
+**WireGuard** 精简 VPN 实现。ChaCha20Poly1305 加密，Noise 协议握手，加密隧道接口。
 
 ---
 

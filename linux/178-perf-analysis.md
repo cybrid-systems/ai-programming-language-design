@@ -1,11 +1,10 @@
-# 178-perf-analysis — 深度源码分析
+# 178 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**AMD IOMMU** 是 AMD 架构的 IOMMU 实现。
+**AMD IOMMU**：设备表、命令队列、事件日志。
 
 ---
 

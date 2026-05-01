@@ -1,11 +1,10 @@
-# 164-cfg80211-mac80211-analysis — 深度源码分析
+# 164 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-Linux 内核子系统文章 164
+**super_block** 操作：s_op->write_inode/sync_fs/evict_inode。
 
 ---
 

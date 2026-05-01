@@ -1,11 +1,10 @@
-# 135-page-table-walk — 深度源码分析
+# 135 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**page table walk** 遍历进程的页表，用于/proc/xx/maps、KSM、migration 等场景。
+**page table walk**：walk_page_range 遍历进程页表，用于 KSM/migration/proc。
 
 ---
 

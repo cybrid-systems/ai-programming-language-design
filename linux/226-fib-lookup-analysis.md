@@ -1,11 +1,10 @@
-# 226-fib-lookup-analysis — 深度源码分析
+# 226 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**FIB lookup 深入**：trie（LC-trie）源码分析，最长前缀匹配算法实现。
+FIB 查找深入。fib_trie（LC-trie）最长前缀匹配。
 
 ---
 

@@ -1,11 +1,10 @@
-# 244-device-model-sysfs-analysis — 深度源码分析
+# 244 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**device model 深入**：device_register → device_add 的完整路径，devtmpfs 设备节点创建。
+device model 深入。device_register 完整过程、devtmpfs 创建。
 
 ---
 

@@ -1,11 +1,10 @@
-# 161-mmu-notifier-analysis — 深度源码分析
+# 161 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**dcache** 是目录项缓存的核心实现：哈希表查找、LRU 回收、负 dentry 缓存。
+**dcache** dentry 缓存。__d_lookup（哈希）→dput→LRU 回收。
 
 ---
 

@@ -1,11 +1,10 @@
-# 128-I2C-SPI — 深度源码分析
+# 128 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**I2C** 和 **SPI** 是嵌入式系统中常用的板级总线协议。I2C 双线制（SDA/SCL），SPI 四线制（MOSI/MISO/SCLK/CS）。
+**I2C**（双线）和 **SPI**（四线）嵌入式总线。i2c_transfer/spi_sync 传输。
 
 ---
 

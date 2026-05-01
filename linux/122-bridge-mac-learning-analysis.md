@@ -1,11 +1,10 @@
-# 122-cgroup-bpf — 深度源码分析
+# 122 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**cgroup-bpf** 允许将 eBPF 程序附加到 cgroup 钩子上，实现 per-cgroup 的网络过滤、套接字操作等控制。
+**cgroup-bpf** 将 eBPF 附加到 cgroup。sock_create/sock_ops/device 等钩子点。
 
 ---
 

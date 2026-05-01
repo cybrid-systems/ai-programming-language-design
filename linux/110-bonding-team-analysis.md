@@ -1,11 +1,10 @@
-# 110-bonding-team — 深度源码分析
+# 110 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**bonding** 将多个物理网卡聚合为一个逻辑设备。**team** 提供类似功能但更灵活的架构。
+**bonding** 多网卡聚合。mode 0-6：balance-rr、active-backup、802.3ad。
 
 ---
 

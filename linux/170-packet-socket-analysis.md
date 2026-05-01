@@ -1,11 +1,10 @@
-# 170-packet-socket-analysis — 深度源码分析
+# 170 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**io-wq** 是 io_uring 的异步工作者线程池，执行阻塞操作（如文件 IO）。
+**io-wq** io_uring 的阻塞操作线程池。io_wq_enqueue→worker 线程执行。
 
 ---
 

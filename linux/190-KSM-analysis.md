@@ -1,11 +1,10 @@
-# 190-KSM-analysis — 深度源码分析
+# 190 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**KSM 深入**：KSM 的稳定树和 unstable 树、全量扫描的优化策略。
+KSM 深入。稳定树/unstable 树双树扫描、全量扫描优化。
 
 ---
 

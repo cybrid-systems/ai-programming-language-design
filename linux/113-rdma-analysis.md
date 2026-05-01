@@ -1,11 +1,10 @@
-# 113-RDMA — 深度源码分析
+# 113 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**RDMA（Remote Direct Memory Access）** 允许一台计算机直接访问另一台的内存。Infiniband/iWARP/ RoCE 的 Verbs API 由内核管理。
+**RDMA** 远程直接内存访问。InfiniBand/iWARP/RoCE，verbs API（ibv_post_send/ibv_poll_cq）。
 
 ---
 

@@ -1,11 +1,10 @@
-# 213-VFIO-IOMMU-analysis — 深度源码分析
+# 213 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**VFIO IOMMU 深入**：type1 IOMMU 后端、设备组管理、DMA 映射。
+**VFIO IOMMU** 深入。type1 IOMMU 后端、DMA 映射窗口管理。
 
 ---
 

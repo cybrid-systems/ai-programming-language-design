@@ -1,11 +1,10 @@
-# 185-init-task-analysis — 深度源码分析
+# 185 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**pstore 和 ramoops** 在死机后保留内核日志在 NVRAM/内存中，用于崩溃分析。
+**pstore/ramoops** 死机日志保留。在内存中保留一块区域存储 oops/panic 日志，重启后可读取。
 
 ---
 

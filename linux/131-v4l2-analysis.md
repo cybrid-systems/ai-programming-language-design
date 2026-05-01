@@ -1,11 +1,10 @@
-# 131-irqdomain — 深度源码分析
+# 131 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**irqdomain** 将平台中断号转换为 Linux IRQ 号，支持线性映射和树状映射。
+**irqdomain**：irq_domain_add_linear/tree 将 hwirq 映射到 Linux IRQ 号。
 
 ---
 

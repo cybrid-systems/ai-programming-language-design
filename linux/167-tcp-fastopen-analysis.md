@@ -1,11 +1,10 @@
-# 167-tcp-fastopen-analysis — 深度源码分析
+# 167 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**mount** 命名空间和挂载点管理：attach_recursive_mnt、umount_tree、传播事件。
+**mount** 命名空间。attach_recursive_mnt/umount_tree/传播事件。
 
 ---
 

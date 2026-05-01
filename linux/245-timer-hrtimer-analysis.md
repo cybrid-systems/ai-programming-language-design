@@ -1,11 +1,10 @@
-# 245-timer-hrtimer-analysis — 深度源码分析
+# 245 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**timer hrtimer 深入**：timer wheel vs hrtimer 对比、NO_HZ 模式下定时器处理。
+timer/hrtimer 深入。timer wheel 对比、NO_HZ 处理。
 
 ---
 

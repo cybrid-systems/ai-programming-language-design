@@ -1,11 +1,10 @@
-# 224-tcp-connect-state-machine — 深度源码分析
+# 224 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**TCP state machine 深入**：TCP 所有状态的详细进入条件和转换。
+TCP 状态机深入。所有 11 个 TCP 状态及转换条件。
 
 ---
 

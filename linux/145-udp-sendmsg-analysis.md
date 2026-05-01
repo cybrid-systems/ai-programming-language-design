@@ -1,11 +1,10 @@
-# 145-tcp-send-recv — 深度源码分析
+# 145 — 深度源码分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
+> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
 
 ---
 
-**TCP 发送/接收**：tcp_sendmsg（写 socket 缓冲）→ tcp_push → tcp_transmit_skb → 接收端 tcp_v4_rcv → tcp_rcv_established。
+TCP send/recv：tcp_sendmsg（socket buffer→write_queue）→tcp_recvmsg（receive_queue）。
 
 ---
 
