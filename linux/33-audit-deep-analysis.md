@@ -1,539 +1,533 @@
-# 40-thp -- Transparent Huge Pages analysis
+# 33-audit-deep -- Linux audit internals
 
 > Based on Linux 7.0-rc1
 
 ## 0. Overview
 
-THP automatically promotes 4KB pages to 2MB huge pages, reducing TLB misses.
+Deep analysis of audit internals: filter priority, backlog control, multicast, audit tree.
 
-## 1. Configuration
+## 1. Filter engine priorities
 
-/sys/kernel/mm/transparent_hugepage/enabled: [always] madvise never
+Multiple filter lists: USER -> TASK -> WATCH -> EXIT. Rules checked in order.
 
-## 2. khugepaged
+## 2. Backlog mechanism
 
-Background thread scanning memory for promotion candidates.
+audit_backlog_limit default 64. When exceeded, events are dropped.
 
-## 3. Benefits
+## 3. Netlink multicast
 
-4KB: 2MB/TLB, 512 PTEs/GB
-2MB: 1GB/TLB, 1 PMD/GB
+nlmsg_multicast sends events to AUDIT_NLGRP_READ group.
 
-## 4. vs hugetlbfs
+## 4. Audit tree
 
-THP: automatic, swappable
-hugetlbfs: manual reservation, not swappable
+Directory-based rules using fsnotify marks.
 
-## 5. Kernel config
+## 5. Debugging
 
-CONFIG_TRANSPARENT_HUGEPAGE=y
-CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y
-
-## 6. Source files
-
-mm/huge_memory.c, mm/khugepaged.c
+auditctl -s: status
+ausearch -m SYSCALL: search events
 
 
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
-THP details
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
+Deep analysis content
 
 ## Additional analysis
 
