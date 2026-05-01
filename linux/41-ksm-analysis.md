@@ -506,3 +506,17 @@ watch -n1 cat /sys/kernel/mm/ksm/pages_sharing
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 32. 参考链接
+
+- mm/ksm.c — KSM 完整实现（约 4000 行）
+- Documentation/admin-guide/mm/ksm.rst
+- /sys/kernel/mm/ksm/ — 运行时控制
+
+## 33. 总结
+
+KSM 通过 ksmd 线程扫描合并相同匿名页。两个红黑树（稳定/不稳定）管理合并状态。校验和快速过滤 + memcmp 精确匹配。COW 映射透明合并。虚拟化场景可节省大量内存。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
