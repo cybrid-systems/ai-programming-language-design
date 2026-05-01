@@ -384,3 +384,23 @@ sysctl vm.overcommit_ratio=80  # 最多使用 80% 物理内存
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 19. OOM 定时器
+
+当 OOM Killer 选中并杀死一个进程后，系统需要一些时间恢复可用内存。如果短时间内又发生 OOM，说明内存压力仍然很大。内核使用 `oom_lock` 互斥锁序列化 OOM 操作，避免并发 OOM 导致的选择混乱：
+
+```c
+static DEFINE_MUTEX(oom_lock);
+```
+
+## 20. OOM 设计权衡
+
+OOM Killer 的设计面临一个基本权衡：公平性与系统可用性。选择占用内存最多的进程可以最快释放更多内存，但可能杀死关键服务。选择占用最少内存的进程对系统影响最小，但需要杀死更多进程才能释放足够内存。当前实现的 oom_badness 在两者之间取得了平衡——以 RSS 为基础分，但允许管理员通过 oom_score_adj 调整。
+
+## 21. 总结
+
+OOM Killer 是内存管理的最后防线。oom_badness 函数根据 RSS 和 swap 用量评分，select_bad_process 选择最高分进程，__oom_kill_process 发送 SIGKILL。oom_score_adj 允许用户空间精细控制。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
