@@ -380,32 +380,98 @@ perf record -e sched:sched_wakeup -a sleep 1
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## Additional Analysis
+## 19. UINT_MAX 特殊语义
 
-The completion mechanism is the simplest synchronization primitive in the Linux kernel. It is designed for the specific case of one thread waiting for another thread to complete an action. Unlike semaphores, completions have no concept of ownership - any context can call complete(). Unlike waitqueues, completions provide a simple done counter that prevents lost wakeups. The swait (simple wait) queue is used instead of the full wait_queue implementation because completions don't need the complexity of exclusive waiters, custom wake functions, or other advanced features.
+`complete_all()` 设置 `done = UINT_MAX` 而非简单累加。这意味着：
+- 后续所有 `wait_for_completion` 调用都会立即返回（无需等待）
+- `complete()` 检查 `done != UINT_MAX` 才递增，防止溢出
+- `reinit_completion()` 必须确保所有等待者已完成
+
+## 20. 与信号量的区别
+
+```c
+// 信号量: 初始值 = 0
+// down() 获取 (阻塞 if ==0)
+// up() 释放 (递增)
+
+// completion: done = 0
+// wait_for_completion() 等待（阻塞 if ==0）
+// complete() 通知（递增）
+// → 行为相似，但 completion 语义更清晰
+
+// 关键区别：
+// - completion 的默认状态是"阻塞等待"
+// - 信号量通常初始化为 >0（可用资源数）
+// - completion 用于同步而非互斥
+```
+
+## 21. 等待队列中的进程状态
+
+```c
+// wait_for_completion:     TASK_UNINTERRUPTIBLE — 不可被打断
+// wait_for_completion_interruptible: TASK_INTERRUPTIBLE — 可被信号打断
+// wait_for_completion_killable: TASK_KILLABLE — 仅可被 SIGKILL 打断
+//
+// 状态影响：complete() 通过 wake_up_state(task, TASK_NORMAL)
+// 唤醒所有 state 匹配的等待者
+//
+// TASK_NORMAL = TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE
+```
+
+## 22. 性能对比
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| complete() 无等待者 | ~50ns | done++ + 锁操作 |
+| wait 时已 complete | ~5ns | 直接 check done 返回 |
+| complete + wakeup | ~1-5us | schedule + context switch |
+| complete_all 广播 | ~50ns + O(n) | 唤醒 n 个等待者 |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 23. 避免的常见错误
+
+| 错误 | 后果 | 正确做法 |
+|------|------|---------|
+| complete_all 后未 reinit | 后续 wait 立即返回 | 用 reinit_completion 重置 |
+| 忘记 init_completion | done 未初始化 | 确保 init 在 wait 前 |
+| 在 complete 后访问 completion | use-after-free | 确保一方释放 |
+| 中断中 complete 而 wait 在进程上下文 | 正常（completion 允许）| 完全合法 |
+
+## 24. 总结
+
+completion 是内核中最简单的同步原语。swait 队列 + done 计数器的组合实现了无丢失唤醒的等待机制。通过 complete_all 的 UINT_MAX 特殊值支持广播通知。适用于 kthread_stop、IO 完成通知、工作线程同步等场景。
 
 
-## Additional Analysis
+## 参考资料
 
-The completion mechanism is the simplest synchronization primitive in the Linux kernel. It is designed for the specific case of one thread waiting for another thread to complete an action. Unlike semaphores, completions have no concept of ownership - any context can call complete(). Unlike waitqueues, completions provide a simple done counter that prevents lost wakeups. The swait (simple wait) queue is used instead of the full wait_queue implementation because completions don't need the complexity of exclusive waiters, custom wake functions, or other advanced features.
+- 内核源码: kernel/sched/completion.c (约 370 行)
+- 头文件: include/linux/completion.h
+- swait: include/linux/swait.h, kernel/sched/swait.c
 
+## 关联文章
 
-## Additional Analysis
+- **07-wait-queue**: 标准等待队列与 swait 对比
+- **14-kthread**: kthread_stop 使用 completion
 
-The completion mechanism is the simplest synchronization primitive in the Linux kernel. It is designed for the specific case of one thread waiting for another thread to complete an action. Unlike semaphores, completions have no concept of ownership - any context can call complete(). Unlike waitqueues, completions provide a simple done counter that prevents lost wakeups. The swait (simple wait) queue is used instead of the full wait_queue implementation because completions don't need the complexity of exclusive waiters, custom wake functions, or other advanced features.
+---
 
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## Additional Analysis
-
-The completion mechanism is the simplest synchronization primitive in the Linux kernel. It is designed for the specific case of one thread waiting for another thread to complete an action. Unlike semaphores, completions have no concept of ownership - any context can call complete(). Unlike waitqueues, completions provide a simple done counter that prevents lost wakeups. The swait (simple wait) queue is used instead of the full wait_queue implementation because completions don't need the complexity of exclusive waiters, custom wake functions, or other advanced features.
-
-
-## Additional Analysis
-
-The completion mechanism is the simplest synchronization primitive in the Linux kernel. It is designed for the specific case of one thread waiting for another thread to complete an action. Unlike semaphores, completions have no concept of ownership - any context can call complete(). Unlike waitqueues, completions provide a simple done counter that prevents lost wakeups. The swait (simple wait) queue is used instead of the full wait_queue implementation because completions don't need the complexity of exclusive waiters, custom wake functions, or other advanced features.
+## 完整数据流速查
 
 
-## Additional Analysis
 
-The completion mechanism is the simplest synchronization primitive in the Linux kernel. It is designed for the specific case of one thread waiting for another thread to complete an action. Unlike semaphores, completions have no concept of ownership - any context can call complete(). Unlike waitqueues, completions provide a simple done counter that prevents lost wakeups. The swait (simple wait) queue is used instead of the full wait_queue implementation because completions don't need the complexity of exclusive waiters, custom wake functions, or other advanced features.
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 关键数据流
+
+1. complete 先于 wait：done>0，wait 立即返回（不进入等待队列）
+2. wait 先于 complete：进程加入等待队列，schedule 休眠，complete 唤醒
+3. complete_all 后：done=UINT_MAX，所有后续 wait 立即返回
+4. 多次 complete：done 累积，每次 wait 消耗一个计数
 
