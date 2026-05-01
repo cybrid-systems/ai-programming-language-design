@@ -372,3 +372,36 @@ static unsigned long ksm_pages_skipped;
 ---
 
 *分析工具：doom-lsp
+
+## 20. KSM 关键配置参数
+
+```c
+// mm/ksm.c — 控制 ksmd 行为的参数
+static unsigned int ksm_thread_pages_to_scan = 100;    // 每轮扫描
+static unsigned int ksm_thread_sleep_millisecs = 20;    // 休眠间隔
+static unsigned int ksm_max_page_sharing = 256;          // 最大共享
+static bool ksm_use_zero_pages = false;                 // 零页合并
+static bool ksm_smart_scan = true;                      // 智能扫描
+```
+
+## 21. KSM 统计
+
+```bash
+# /sys/kernel/mm/ksm/ 目录
+pages_shared        # 已合并的唯⼀页
+pages_sharing       # 实际共享的页（含自身）
+pages_unshared      # 待比较的页
+pages_volatile      # 频繁变化的页
+full_scans          # 完全扫描次数
+stable_node_chains  # 稳定树链
+stable_node_dups    # 稳定树重复
+```
+
+## 22. 关联文章
+
+- **42-oom-killer**: OOM Killer
+- **39-mlock**: 内存锁定
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
