@@ -308,3 +308,79 @@ vm.oom_dump_tasks = 1             # 1=OOM 时打印进程信息
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 15. oom_unkillable_task 保护逻辑
+
+OOM Killer 并非对所有进程都有效。以下类型的进程被标记为不可杀：
+
+```c
+// mm/oom_kill.c:160 — 检查进程是否不可杀
+static bool oom_unkillable_task(struct task_struct *p)
+{
+    // init 进程 (PID 1) 永远不可杀
+    if (is_global_init(p))
+        return true;
+
+    // 内核线程没有 mm_struct，不可杀
+    if (!p->mm)
+        return true;
+
+    // oom_score_adj 设为 -1000 的进程
+    // 由用户空间显式保护
+    if (p->signal->oom_score_adj == OOM_SCORE_ADJ_MIN)
+        return true;
+
+    return false;
+}
+```
+
+init 进程是系统中第一个用户空间进程，杀死它会直接导致系统崩溃。内核线程没有用户空间内存，杀死它们没有意义。oom_score_adj = -1000 允许管理员显式保护关键服务。
+
+## 16. OOM 避免策略
+
+与其依赖 OOM Killer 在内存耗尽后恢复，更好的策略是预防 OOM：
+
+```bash
+# 1. 设置合理的 memory cgroup 限制
+# 每个容器设置 memory.max，防止单容器耗尽系统内存
+
+# 2. 启用 overcommit 控制
+# vm.overcommit_memory = 2 禁止超额分配
+sysctl vm.overcommit_memory=2
+sysctl vm.overcommit_ratio=80  # 最多使用 80% 物理内存
+
+# 3. 监控内存使用趋势
+# 使用 sar、free、/proc/meminfo 定期检查
+
+# 4. 配置 swap space
+# 合理的 swap 空间提供缓冲，但注意性能影响
+```
+
+## 17. OOM 与容器
+
+在 Kubernetes/Docker 容器环境中，OOM Killer 与 cgroup 的内存限制配合工作：
+
+```bash
+# 每个 Pod 设置 memory limit
+# 超限时触发 memcg OOM
+# 只在 Pod 内部选择受害者
+# 不影响宿主机或其他 Pod
+
+# 设置 Pod 的 OOM 优先级
+# oom_score_adj 通过 Pod QoS 级别自动设置
+# Guaranteed: -998
+# Burstable: 0-999
+# BestEffort: 1000
+```
+
+## 18. 源码文件索引
+
+| 文件 | 符号数 | 关键行 |
+|------|--------|--------|
+| mm/oom_kill.c | 72 | oom_badness @ L199, select_bad_process @ L362 |
+| mm/oom_kill.c | | __oom_kill_process @ L912, oom_init @ L726 |
+| include/linux/oom.h | — | API 声明 |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
