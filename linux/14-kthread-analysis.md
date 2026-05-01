@@ -1,4 +1,4 @@
-# 14-kthread — 内核线程深度源码分析
+# 14-kthread — Linux 内核线程深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -7,197 +7,229 @@
 
 ## 0. 概述
 
-**kthread（内核线程）** 是在内核空间运行的线程。与用户空间线程不同，内核线程：
-- 没有自己的地址空间（复用 `init_mm`，即上一进程的 mm）
-- 只能访问内核地址空间
-- 可以被调度、睡眠、被抢占
-- 常用于：workqueue worker、kswapd（内存回收）、btrfs-transaction、kblockd
+**kthread（内核线程）** 是 Linux 内核中在后台运行任务的机制。与用户空间线程不同，内核线程没有独立的地址空间——它运行在内核态，共享内核地址空间，但拥有独立的执行栈和调度上下文。
 
-doom-lsp 确认 `kernel/kthread.c` 包含约 270+ 个符号，`include/linux/kthread.h` 定义了外部 API。
+内核线程的生命周期由 `kthreadd`（PID 2）管理——这个特殊的进程是所有内核线程的父进程，负责创建和回收内核线程。
+
+**doom-lsp 确认**：`kernel/kthread.c` 包含 **200 个符号**，定义在 `include/linux/kthread.h`。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 struct kthread（`kernel/kthread.c` 内部）
+### 1.1 `struct kthread`——每个内核线程的元数据
 
 ```c
+// kernel/kthread.c — 嵌入在 task_struct 中
 struct kthread {
-    unsigned long flags;             // KTHREAD_IS_STOPPED 等
-    unsigned int cpu;                // 绑定的 CPU（-1 = 无）
-    void *data;                      // 用户传入的数据
-    struct completion parked;        // park 同步
-    struct completion exited;        // 退出同步
+    unsigned long flags;            // 标志位：KTHREAD_IS_STOPPED 等
+    unsigned int cpu;               // 绑定的 CPU
+    void *data;                     // 线程函数数据
+    struct completion parked;       // 等待停放完成
+    struct completion exited;       // 等待退出完成
+    struct io_callback *io_cb;      // IO 回调
+    int (*threadfn)(void *data);    // 线程函数（仅当 kthread_run 时）
 };
 ```
 
-每个内核线程的 `task_struct` 中的 `set_child_tid` 指针指向这个结构。通过 `to_kthread(current)` 宏可以获取。
+内核线程通过 `task_struct->set_child_tid` 指向其 `struct kthread`，这是一种轻量级的关联方式——不增加额外指针。
 
 ---
 
-## 2. 创建流程
+## 2. kthreadd——所有内核线程的守护者
 
-### 2.1 kthread_create（`kernel/kthread.c`）
+`kthreadd` 是 PID 2 的特殊进程，在内核初始化时启动：
+
+```c
+// kernel/kthread.c — doom-lsp 确认的全局变量
+static struct task_struct *kthreadd_task;  // kthreadd 的 task_struct
+static LIST_HEAD(kthread_create_list);      // 待创建列表
+static DEFINE_SPINLOCK(kthread_create_lock); // 保护列表
+```
+
+**kthreadd 主循环**：
+
+```
+kthreadd()                             @ kernel/kthread.c
+  │
+  ├─ for (;;) {
+  │      │
+  │      ├─ spin_lock(&kthread_create_lock)
+  │      ├─ while (!list_empty(&kthread_create_list)) {
+  │      │      create = list_first_entry(&kthread_create_list)
+  │      │      list_del_init(&create->list)
+  │      │      spin_unlock(...)
+  │      │
+  │      │      └─ create_kthread(create)       ← 创建线程
+  │      │           └─ kernel_thread(kthread, create, ...)
+  │      │               └─ do_fork(CLONE_VM | ...)
+  │      │                    └─ 新线程从 kthread() 开始执行
+  │      │
+  │      ├─ spin_lock(...)
+  │      └─ }
+  │
+  ├─ 如果创建列表空：
+  │   └─ schedule()                    ← 休眠等待
+  │
+  └─ }
+```
+
+---
+
+## 3. 创建内核线程——doom-lsp 数据流
 
 ```
 kthread_create(threadfn, data, "mythread")
   │
-  ├─ 创建 kthread_create_info（包含 threadfn + data + completion）
-  │
-  ├─ kernel_thread(kthread, create, CLONE_FS | CLONE_FILES | ...)
-  │    └─ 通过 do_fork() 创建新线程
-  │    └─ 新线程从 kthread() 函数开始执行
-  │
-  ├─ wait_for_completion(&create->done)   ← 等待线程初始化完成
-  │
-  └─ return create->result               ← 返回 task_struct*
+  ├─ kthread_create_on_node(threadfn, data, NUMA_NO_NODE, "mythread")
+  │    │                                 @ kernel/kthread.c
+  │    ├─ 分配 struct kthread_create_info
+  │    │   create->threadfn = threadfn
+  │    │   create->data = data
+  │    │   init_completion(&create->done)
+  │    │
+  │    ├─ spin_lock(&kthread_create_lock)
+  │    ├─ list_add_tail(&create->list, &kthread_create_list)
+  │    ├─ spin_unlock(&kthread_create_lock)
+  │    │
+  │    ├─ wake_up_process(kthreadd_task)    ← 唤醒 kthreadd
+  │    │
+  │    ├─ wait_for_completion(&create->done) ← 等待创建完成
+  │    │   [这里调用进程会阻塞]
+  │    │
+  │    └─ 返回 task_struct 指针（新线程）
 ```
 
-### 2.2 kthread_run——创建+立即启动
+**kthreadd 响应后**：
 
-```c
-#define kthread_run(threadfn, data, namefmt, ...)   \
-    ({                                              \
-        struct task_struct *__k =                   \
-            kthread_create(threadfn, data, namefmt);\
-        if (!IS_ERR(__k))                           \
-            wake_up_process(__k);                   \
-        __k;                                        \
-    })
+```
+kthreadd 被唤醒
+  │
+  ├─ 从 kthread_create_list 取出 create 项
+  │
+  └─ create_kthread(create)
+       │
+       ├─ kernel_thread(kthread, create, CLONE_FS | CLONE_FILES | ...)
+       │    └─ do_fork(...)
+       │         └─ 新进程（内核线程）从 kthread() 函数开始执行
+       │
+       ├─ kthread() 在新线程中执行：
+       │    │
+       │    ├─ current->set_child_tid = (int *)&self
+       │    ├─ self = alloc_percpu(struct kthread)
+       │    ├─ current->kthread = self
+       │    │
+       │    ├─ complete(&create->done)        ← 通知创建者：线程已就绪
+       │    │
+       │    ├─ 当前线程被 kthread_stop() 或 __set_current_state(TASK_INTERRUPTIBLE)
+       │    │
+       │    └─ ret = threadfn(data)           ← 执行用户提供的线程函数！
+       │         └─ do_exit(ret)              ← 返回后自动退出
 ```
 
 ---
 
-## 3. 线程初始化入口
-
-新线程从 `kthread()` 函数开始执行（`kernel/kthread.c`）：
-
-```
-kthread(void *_create)
-  │
-  ├─ 设置 current->set_child_tid = &self  ← 关联 kthread 结构
-  │
-  ├─ self->data = data                     ← 保存用户数据指针
-  │
-  ├─ complete(&create->done)               ← 通知创建者：已启动
-  │
-  ├─ schedule()                            ← 让出 CPU，等待被 wake_up_process
-  │    └─ 此时创建者可以设置亲和性/优先级
-  │
-  ├─ ret = threadfn(data)                  ← 执行用户提供的线程函数
-  │
-  └─ do_exit(ret)                          ← 线程函数返回后退出
-```
-
-关键设计：`schedule()` 让创建者有机会在 threadfn 运行之前配置线程属性（CPU 亲和性、调度策略等）。
-
----
-
-## 4. 标准线程循环
-
-典型的正确退出模式：
+## 4. 线程函数模式
 
 ```c
+// 标准模式 —— 循环直到被停止
 int my_kthread(void *data)
 {
-    // 1. 可以接收 kthread_stop 信号
-    while (!kthread_should_stop()) {
-        // 2. 执行工作
-        do_work(data);
+    struct my_data *m = data;
 
-        // 3. 等待下次被唤醒
-        set_current_state(TASK_INTERRUPTIBLE);
-        if (kthread_should_stop()) {
-            __set_current_state(TASK_RUNNING);
-            break;
-        }
-        schedule();
+    while (!kthread_should_stop()) {
+        // 执行工作
+        do_work(m);
+
+        // 让出 CPU（可中断睡眠）
+        if (need_resched())
+            schedule_timeout_interruptible(HZ);
     }
-    __set_current_state(TASK_RUNNING);
+
     return 0;
+}
+
+// 创建并运行
+struct task_struct *tsk = kthread_run(my_kthread, &data, "my_kthread");
+if (IS_ERR(tsk))
+    return PTR_ERR(tsk);
+
+// 停止
+kthread_stop(tsk);    // 设置 KTHREAD_IS_STOPPED → 唤醒线程 → 等待退出
+```
+
+---
+
+## 5. kthread_stop——停止内核线程
+
+```c
+// kernel/kthread.c — doom-lsp 确认
+int kthread_stop(struct task_struct *k)
+{
+    struct kthread *kthread = to_kthread(k);
+
+    set_bit(KTHREAD_IS_STOPPED, &kthread->flags);
+
+    // 唤醒线程（线程可能在 TASK_INTERRUPTIBLE 睡眠）
+    wake_up_process(k);
+
+    // 等待线程完全退出
+    wait_for_completion(&kthread->exited);
+
+    return kthread->result;
 }
 ```
 
----
-
-## 5. 停止线程
+**数据流**：
 
 ```
-kthread_stop(task)
-  │
-  ├─ set_bit(KTHREAD_SHOULD_STOP, &kthread->flags)  ← 设置停止标志
-  │
-  ├─ wake_up_process(task)                           ← 唤醒线程
-  │    └─ 线程被唤醒后检查 kthread_should_stop() → 退出循环
-  │
-  ├─ wait_for_completion(&kthread->exited)           ← 等待线程退出
-  │
-  └─ return ret                                      ← 返回 threadfn 的返回值
-```
-
-**重要**：`kthread_stop()` 是阻塞的——它等待线程真正退出后才返回。因此持有锁的线程不能直接调用 `kthread_stop()` 等待另一个线程，否则可能死锁。
-
----
-
-## 6. 完整生命周期
-
-```
-kthread_run(my_fn, data, "mythread")
-  │
-  ├── kernel_thread ── kthread() 入口
-  │     ├── 初始化 kthread 结构
-  │     ├── complete() → 通知创建者
-  │     └── schedule() → 等待被唤醒
-  │
-  ├── (创建者设置亲和性/调度策略)
-  │
-  ├── wake_up_process(tp)               ← 开始执行 threadfn
-  │     └── my_fn(data)
-  │          ├── while (!kthread_should_stop()) {
-  │          │       // 执行工作
-  │          │       schedule_timeout(HZ);
-  │          │   }
-  │          └── return 0
-  │
-  └── kthread_stop(tp)
-        ├── 设置 KTHREAD_SHOULD_STOP
-        ├── wake_up_process(tp)
-        │     └── my_fn 检查标志 → 退出循环 → do_exit
-        └── wait_for_completion(&exited) → 返回
+调用者：                               内核线程：
+kthread_stop(worker)                   my_kthread() 循环中
+  │                                      │
+  ├─ set_bit(KTHREAD_IS_STOPPED)        ├─ kthread_should_stop() → true
+  ├─ wake_up_process(worker) ──→         ├─ 退出循环
+  │                                      ├─ return ret
+  │                                      └─ do_exit(ret)
+  │                                           └─ complete(&exited)
+  │                                              │
+  └─ wait_for_completion(&exited) ←────────────┘
+       → 线程已退出 → 安全返回
 ```
 
 ---
 
-## 7. 设计决策总结
+## 6. kthread_park / kthread_unpark——暂停与恢复
 
-| 决策 | 原因 |
-|------|------|
-| `kthread_create` + `wake_up_process` 分离 | 创建者可在启动前设置属性 |
-| `kthread_should_stop()` 轮询模式 | 线程决定何时安全退出 |
-| `complete()` 同步 | 可靠等待线程到达某个状态点 |
-| 共享 `init_mm` | 不浪费页表，无需用户空间地址 |
+内核线程可以被"停放"——使其暂停而不终止：
 
----
+```c
+int kthread_park(struct task_struct *k);     // 暂停
+void kthread_unpark(struct task_struct *k);  // 恢复
 
-## 8. 源码文件索引
+// 线程函数检测是否被要求暂停：
+if (kthread_should_park())
+    kthread_parkme();    // 阻塞直到 unpark
+```
 
-| 文件 | 关键符号 | 行 |
-|------|---------|-----|
-| `include/linux/kthread.h` | `kthread_create` / `kthread_run` | API 宏 |
-| `include/linux/kthread.h` | `kthread_should_stop` | 内联 |
-| `kernel/kthread.c` | `kthread` | 线程入口 |
-| `kernel/kthread.c` | `kthread_create` | 创建逻辑 |
-| `kernel/kthread.c` | `kthread_stop` | 停止逻辑 |
-| `kernel/kthread.c` | `__kthread_create_on_node` | 实际创建函数 |
-| `kernel/kthread.c` | `kthreadd` | kthreadd 守护线程 |
+这在 CPU 热插拔场景中特别重要——当一个 CPU 被下线时，绑定在该 CPU 上的内核线程需要被暂停。
 
 ---
 
-## 9. 关联文章
+## 7. 源码文件索引
 
-- **workqueue**（article 13）：worker 线程实质上是 kthread
-- **completion**（article 11）：kthread_stop 使用 completion 同步
+| 文件 | 内容 | 符号数 |
+|------|------|--------|
+| `kernel/kthread.c` | kthreadd + 创建/停止/停放 | **200 个** |
+| `include/linux/kthread.h` | API 声明 + inline | — |
 
 ---
 
-*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+## 8. 关联文章
+
+- **11-completion**：kthread_stop 使用 completion 同步
+- **13-workqueue**：workqueue 的 worker 线程是内核线程的一种
+- **48-kworker**：kworker 是 workqueue 中的内核线程
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
