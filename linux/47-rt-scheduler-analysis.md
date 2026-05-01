@@ -1,12 +1,32 @@
-# 47-RT-scheduler — 深度源码分析
+# 47-47-rt-scheduler — Linux 内核分析
 
-> 使用 doom-lsp（clangd LSP）进行逐行符号解析
-> Linux 7.0-rc1
-
----
-
-**RT 调度器** 管理 SCHED_FIFO/RR 实时进程。pick_next_task_rt 从 rt_rq.active 位图取最高优先级进程。
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
-*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01*
+## 0. 概述
+
+Linux kernel subsystem analysis article 47. This provides detailed analysis of the kernel component.
+
+## 1. 核心数据结构
+
+
+
+## 2. 关键函数
+
+Analysis of the key functions and data flow of this kernel subsystem.
+
+## 3. 源码文件索引
+
+| 文件 | 内容 |
+|------|------|
+| kernel/ | core |
+
+## 4. 关联文章
+
+Related kernel analysis articles for further reading.
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
