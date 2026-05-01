@@ -542,3 +542,13 @@ static struct kmem_cache *rmap_item_cache;
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 36. 参考资料
+
+- 内核源码: mm/ksm.c
+- 文档: Documentation/admin-guide/mm/ksm.rst
+- sysfs: /sys/kernel/mm/ksm/
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
