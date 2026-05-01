@@ -388,41 +388,124 @@ pthread_mutex_unlock(&mutex);      [用户空间 glibc]
 
 ## Additional Details
 
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
-This section provides additional detail on the kernel mechanism described above. Understanding these details is essential for kernel development work.
+
+## 10. 哈希桶系统
+
+futex 在内核中使用全局哈希表来管理等待队列：
+
+```c
+// kernel/futex/core.c — 全局哈希表
+struct futex_hash_bucket {
+    spinlock_t     lock;
+    struct plist_head chain;    // 优先级链表
+};
+
+static struct {
+    struct futex_hash_bucket *queues;
+    unsigned long            hash_mask;
+} __futex_data;
+
+// 哈希函数
+static struct futex_hash_bucket *hash_futex(union futex_key *key)
+{
+    u32 hash = jhash2((u32 *)key, sizeof(*key)/sizeof(u32), seed);
+    return &__futex_data.queues[hash & __futex_data.hash_mask];
+}
+```
+
+## 11. FUTEX_WAIT 完整数据流
+
+```c
+// kernel/futex/waitwake.c
+futex_wait(uaddr, val, timeout, flags)
+  │
+  ├─ 1. get_futex_value(uaddr) → 读取用户空间值
+  ├─ 2. if (*uaddr != val) → return -EAGAIN（值已变）
+  ├─ 3. futex_get_key(uaddr, &key) → 计算 futex_key
+  ├─ 4. hash_bucket = hash_futex(&key)
+  ├─ 5. queue_me(&q, hash_bucket, &key)
+  │     → spin_lock(&hb->lock)
+  │     → plist_add(&q->list, &hb->chain)
+  │     → q->task = current
+  │     → spin_unlock(&hb->lock)
+  ├─ 6. set_current_state(TASK_INTERRUPTIBLE)
+  ├─ 7. 再次检查 *uaddr（防止丢失唤醒）
+  │     if (*uaddr != val) → dequeue + return 0
+  ├─ 8. schedule() ← 让出 CPU
+  └─ 9. 被 FUTEX_WAKE 唤醒后 → dequeue → 返回 0
+```
+
+## 12. FUTEX_WAKE 数据流
+
+```c
+futex_wake(uaddr, nr_wake, flags)
+  │
+  ├─ 1. futex_get_key(uaddr, &key)
+  ├─ 2. hb = hash_futex(&key)
+  ├─ 3. spin_lock(&hb->lock)
+  ├─ 4. plist_for_each_entry(q, &hb->chain, list)
+  │     if (match_futex(&q->key, &key)) {
+  │         wake_futex(q);
+  │         // → wake_up_process(q->task)
+  │         // → plist_del(&q->list, &hb->chain)
+  │         if (--nr_wake == 0) break;
+  │     }
+  └─ 5. spin_unlock(&hb->lock)
+```
+
+## 13. PI-futex 优先级继承
+
+```c
+// 场景：
+// 低优先级(L)持有锁 → 中优先级(M)抢占L → 高优先级(H)等待L
+// → H 被 L 阻塞，L 被 M 抢占 → H 无限等待
+
+// PI-futex 解决：
+// H 尝试获取锁，发现 L 持有
+// L 被提升到 H 的优先级
+// L 不被 M 抢占，快速释放锁
+// L 恢复原优先级
+// H 获取锁
+
+// kernel/futex/pi.c — futex_lock_pi
+// 依赖 rt_mutex 实现优先级继承
+```
+
+## 14. requeue 机制
+
+```c
+// FUTEX_REQUEUE 将 cond_addr 的等待者迁移到 mutex_addr
+// 用于 pthread_cond_wait 优化
+
+// 无 requeue:
+//   pthread_cond_signal → FUTEX_WAKE(cond)
+//   → 等待者被唤醒 → 再 FUTEX_WAIT(mutex)
+//   → 两次系统调用
+
+// 有 requeue:
+//   pthread_cond_signal → FUTEX_REQUEUE(cond, mutex)
+//   → 直接迁移等待者到 mutex 队列
+//   → 等待者被唤醒时 mutex 可能已可用
+//   → 减少一次系统调用
+```
+
+## 15. futex_waitv（futex2）
+
+Linux 7.0-rc1 的 futex2 支持同时等待多个 futex：
+
+```c
+// syscalls.c:318 — doom-lsp 确认
+SYSCALL_DEFINE5(futex_waitv, struct futex_waitv __user *, waiters,
+                unsigned int, nr_futexes, unsigned int, flags, ...)
+
+// struct futex_waitv {
+//     __u64 val;     // 期望值
+//     __u64 uaddr;   // 用户空间地址
+//     __u32 flags;   // FUTEX_32, FUTEX_PRIVATE
+//     __u32 __reserved;
+// };
+```
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
