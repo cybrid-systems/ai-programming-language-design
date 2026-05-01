@@ -207,286 +207,304 @@ void __iomem *ioremap(phys_addr_t phys_addr, unsigned long size)
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01*
+*分析工具：doom-lsp
 
 ## 9. vmap_area 红黑树管理
 
 ```c
-// mm/vmalloc.c — 使用红黑树管理已分配的虚拟地址区间
+// 使用红黑树组织所有 vmap_area，支持 O(log n) 查找
 static struct rb_root vmap_area_root = RB_ROOT;
-static struct rb_root purge_vmap_area_root = RB_ROOT;
 
-// 分配 vmap_area（在 VMALLOC 空间中查找空闲区间）
-static struct vmap_area *alloc_vmap_area(unsigned long size,
-                                          unsigned long align,
-                                          unsigned long vstart,
-                                          unsigned long vend)
+static struct vmap_area *alloc_vmap_area(unsigned long size, ...)
 {
-    struct vmap_area *va;
-
-    // 从 slab 分配 vmap_area 结构
-    va = kmem_cache_alloc_node(vmap_area_cachep, GFP_NOWAIT, node);
+    // 在红黑树中查找 size 大小的空闲间隙
+    // 遍历 vmap_area_root 找到可用的地址区间
+    // 考虑对齐要求（默认 1 页对齐）
+    
+    struct vmap_area *va = kmem_cache_zalloc(vmap_area_cachep, GFP_KERNEL);
     if (!va) return ERR_PTR(-ENOMEM);
 
-    // 在红黑树中查找空闲区间
-    // 遍历 vmap_area_root，找到 size 大小的空闲间隙
-    // 考虑地址对齐需求
-
-    // 插入红黑树
+    // 插入红黑树和链表
     rb_insert_augmented(&va->rb_node, &vmap_area_root, &vmap_area_rb_augment);
     list_add(&va->list, &vmap_area_list);
-
     return va;
 }
 ```
 
-## 10. 懒惰释放（lazy free）
-
-vmalloc 的物理页释放不是立即回收，而是通过懒惰链表异步处理：
+## 10. 懒惰释放
 
 ```c
-// mm/vmalloc.c — 懒惰释放机制
 struct vfree_deferred {
-    struct llist_head list;     // 待释放链表
-    struct work_struct wq;      // 工作队列
+    struct llist_head list;
+    struct work_struct wq;
 };
 
 static DEFINE_PER_CPU(struct vfree_deferred, vfree_deferred);
 
-// 将物理页放入懒惰链表
-void __vfree_deferred(const void *addr)
-{
-    struct vfree_deferred *p = raw_cpu_ptr(&vfree_deferred);
-
-    // 将页加入 per-CPU 懒惰链表
-    if (llist_add(&area->list, &p->list))
-        // 首次入队时调度工作队列
-        schedule_work(&p->wq);
-}
-
-// 工作队列处理函数
+// 物理页通过 per-CPU 懒惰链表延迟释放
+// 避免在持锁上下文或中断中直接释放
 static void vfree_deferred_flush(struct work_struct *work)
 {
-    struct vfree_deferred *p = container_of(work, ...);
-    struct llist_node *node;
-
-    // 处理链表中的所有待释放页面
-    while ((node = llist_del_all(&p->list))) {
-        // 释放物理页面
-        __free_page(...);
-    }
+    // 处理 per-CPU 链表中的所有待释放页面
+    // 调用 __free_page 归还到 buddy
 }
 ```
 
-## 11. NUMA 感知
+## 11. 大页映射
 
 ```c
-// vmalloc 支持 NUMA 节点优先的物理页分配
-
-void *__vmalloc_node_range(unsigned long size, unsigned long align,
-                            unsigned long start, unsigned long end,
-                            gfp_t gfp_mask, pgprot_t prot,
-                            unsigned long vm_flags, int node, ...)
+// vmalloc 在映射时尝试使用 2MB 大页
+static int vmap_try_huge_pmd(pmd_t *pmd, unsigned long addr, ...)
 {
-    // node 参数指定优先从哪个 NUMA 节点分配
-    // NUMA_NO_NODE = -1 表示不限制
-
-    // 物理页分配时：
-    for (i = 0; i < nr_pages; i++) {
-        if (node == NUMA_NO_NODE)
-            page = alloc_page(gfp_mask);           // 任意节点
-        else
-            page = alloc_pages_node(node, gfp_mask, 0);  // 指定节点
-
-        area->pages[i] = page;
-    }
+    if (IS_ALIGNED(addr, PMD_SIZE) && IS_ALIGNED(phys_addr, PMD_SIZE))
+        // 设置 PMD 大页映射（代替 512 个 PTE）
+        set_pmd(pmd, pmd_pfn_phys(phys_addr, prot | _PAGE_PSE));
+    return 0;  // 回退到 4KB
 }
 ```
 
-## 12. 调试接口
+## 12. ioremap
 
-```bash
-# 查看 vmalloc 使用情况
-$ cat /proc/vmallocinfo
-0xffffc90000000000-0xffffc90000100000 1048576 module_alloc+0x5c/0x60
-   pages=256 vmalloc
-0xffffc90000200000-0xffffc90000400000 2097152 module_alloc+0x5c/0x60
-   pages=512 vmalloc N0=256 N1=256
-
-# 查看 vmalloc 总用量
-$ cat /proc/meminfo | grep Vmalloc
-VmallocTotal:   34359738367 kB    # 总虚拟地址空间 (32TB)
-VmallocUsed:        14567 kB      # 已使用
-VmallocChunk:   34359738367 kB    # 最大连续空闲块
+```c
+void __iomem *ioremap(phys_addr_t phys_addr, unsigned long size)
+{
+    // 与 vmalloc 共享 vmap 机制
+    // 区别：不分配物理页，设置 uncacheable
+    return __ioremap_caller(phys_addr, size, _PAGE_CACHE_MODE_UC_MINUS, ...);
+}
 ```
 
-## 13. 性能数据
+## 13. 性能对比
 
 | 操作 | 延迟 | 说明 |
 |------|------|------|
-| vmalloc(4KB) | ~1-2us | 单页分配 + 页表映射 |
-| vmalloc(1MB) | ~5-10us | 256 页分配 + TLB 刷新 |
-| vmalloc(1GB) | ~5-10ms | 大量页表操作 |
+| vmalloc(4KB) | ~1-2us | 单页+页表映射 |
+| vmalloc(1MB) | ~5-10us | 256 页分配 |
 | vfree | ~500ns-10us | 懒惰释放 |
-| kmalloc(1MB) | 不可用 | 超过 MAX_ORDER |
-| ioremap | ~1-5us | 不分配物理页 |
+| kmalloc(128B) | ~30ns | SLUB 快速路径 |
+| ioremap | ~1-5us | 仅映射不分配 |
 
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## 14. 大页支持
+## 14. 调试命令
 
-vmalloc 支持在映射时使用大页（PMD 级别 2MB）以减少 TLB 压力：
+```bash
+cat /proc/vmallocinfo      # 所有分配
+cat /proc/meminfo | grep Vmalloc  # 统计
+# VmallocTotal: vmalloc 总大小
+# VmallocUsed: 已使用
+# VmallocChunk: 最大连续空闲
+
+# 查看 vmalloc 相关符号
+grep vmalloc /proc/kallsyms | head -5
+```
+
+## 15. 使用场景
+
+| 场景 | 原因 | 典型大小 |
+|------|------|---------|
+| 模块加载 | 需大块可执行内存 | 10KB-10MB |
+| 帧缓冲 | 大块连续虚拟内存 | 1MB-32MB |
+| 网络缓存 | 大块数据分配 | 64KB-1MB |
+| 设备驱动 | ioremap MMIO | 4KB-1MB |
+| kprobe | 指令替换 | ~1KB |
+
+## 16. 关联文章
+
+- **17-page-allocator**: buddy 分配器
+- **116-pci-deep**: PCI ioremap
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 17. 关键 API 速查
+
+| 函数 | 返回值 | 说明 |
+|------|--------|------|
+| vmalloc(size) | void* | 通用分配 |
+| vzalloc(size) | void* | 零初始化 |
+| vmalloc_user(size) | void* | 用户空间可访问 |
+| vfree(addr) | void | 释放 |
+| vmalloc_to_page(addr) | struct page* | 虚拟→物理 |
+| is_vmalloc_addr(addr) | bool | 检测 |
+| ioremap(phys, size) | void __iomem* | 设备映射 |
+
+## 18. 总结
+
+vmalloc 通过红黑树管理 vmap_area、逐页分配物理内存、页表映射建立虚拟连续性、懒惰释放异步回收。适合大块内存分配，性能低于 kmalloc 但灵活性更高。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 19. vmalloc_to_page 实现
 
 ```c
-// mm/vmalloc.c — 尝试使用大页映射
-static int vmap_try_huge_pmd(pmd_t *pmd, unsigned long addr,
-                              unsigned long end, phys_addr_t phys_addr, pgprot_t prot)
+// mm/vmalloc.c:799 — 通过 vmalloc 地址查找物理页
+struct page *vmalloc_to_page(const void *vmalloc_addr)
 {
-    // 条件：地址 2MB 对齐、物理地址 2MB 对齐、长度 ≥ 2MB
-    if (IS_ALIGNED(addr, PMD_SIZE) && IS_ALIGNED(phys_addr, PMD_SIZE) &&
-        end - addr >= PMD_SIZE) {
-        // 设置 PMD 大页映射（代替 512 个 PTE）
-        set_pmd(pmd, pmd_pfn_phys(phys_addr, prot | _PAGE_PSE));
-        return 1;  // 使用大页
+    unsigned long addr = (unsigned long)vmalloc_addr;
+    struct page *page;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+
+    // 遍历页表找到物理地址
+    pgd = pgd_offset_k(addr);
+    p4d = p4d_offset(pgd, addr);
+    pud = pud_offset(p4d, addr);
+
+    // 处理大页映射
+    if (pud_leaf(*pud))
+        return pud_page(*pud) + pte_index(addr);
+
+    pmd = pmd_offset(pud, addr);
+    if (pmd_leaf(*pmd))
+        return pmd_page(*pmd) + pte_index(addr);
+
+    pte = pte_offset_kernel(pmd, addr);
+    return pte_page(*pte);
+}
+```
+
+## 20. vmap_block 管理
+
+```c
+// 对于频繁的 vmalloc/vfree 小对象
+// 使用 vmap_block 批量管理
+// 每块包含多个 vmap_area
+// 减少红黑树操作频率
+```
+
+## 21. 相关文章
+
+- **17-page-allocator**: buddy 分配器
+- **116-pci-deep**: PCI ioremap
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 22. 页表映射源码分析
+
+```c
+// mm/vmalloc.c:298 — 核心映射函数
+static int vmap_range_noflush(unsigned long addr, unsigned long end,
+                               phys_addr_t phys_addr, pgprot_t prot, int shift)
+{
+    pgd_t *pgd;
+    unsigned long next;
+
+    for (pgd = pgd_offset_k(addr); addr < end; pgd++) {
+        next = pgd_addr_end(addr, end);
+        // 递归建立各级页表
+        if (vmap_p4d_range(pgd, addr, next, phys_addr, prot, shift))
+            return -ENOMEM;
+        phys_addr += next - addr;
+        addr = next;
     }
-    return 0;  // 回退到 4KB 小页
+    flush_tlb_kernel_range(start, end);
+    return 0;
 }
-
-// 默认启用大页，可通过内核参数关闭：
-// nohugevmalloc
 ```
 
-## 15. is_vmalloc_addr 检测
+## 23. 源码文件索引
+
+| 文件 | 行数 | 内容 |
+|------|------|------|
+| mm/vmalloc.c | ~4000 | 核心实现 |
+| include/linux/vmalloc.h | — | 结构体定义 |
+| mm/ioremap.c | — | ioremap 实现 |
+
+## 24. 总结
+
+vmalloc 实现了虚拟连续内存分配。主要组件：vmap_area 红黑树管理地址空间、页表映射建立连续性、懒惰释放优化性能、大页映射减少 TLB 开销。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 20. vmalloc 分配示例
 
 ```c
-// mm/vmalloc.c:79 — 检测地址是否属于 vmalloc 区域
-bool is_vmalloc_addr(const void *x)
-{
-    unsigned long addr = (unsigned long)x;
+// 分配 1MB 连续虚拟内存
+void *buf = vmalloc(1024 * 1024);
+if (!buf) return -ENOMEM;
 
-    // 检查地址是否在 VMALLOC_START 和 VMALLOC_END 之间
-    return addr >= VMALLOC_START && addr < VMALLOC_END;
-}
+// 使用（非连续物理页被映射到连续虚拟地址）
+memset(buf, 0, 1024 * 1024);
 
-// 用于内核内存调试和页表处理
-// 例如在 __free_pages 中检查是否释放了 vmalloc 地址
+// 释放
+vfree(buf);
+
+// 大块分配对比
+void *k = kmalloc(1024 * 1024, GFP_KERNEL);  // 可能失败（物理连续）
+void *v = vmalloc(1024 * 1024);               // 成功（虚拟连续）
 ```
 
-## 16. 总结
+## 21. 结论
 
-vmalloc 通过页表映射实现虚拟连续的大块内存分配。懒惰释放机制减少释放开销，红黑树管理 vmap_area 区间，NUMA 感知分配优化本地内存访问。
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 17. 常用 API
-
-| 函数 | 用途 | 特点 |
-|------|------|------|
-| vmalloc(size) | 通用分配 | GFP_KERNEL |
-| vzalloc(size) | 零初始化 | GFP_KERNEL + __GFP_ZERO |
-| vmalloc_user(size) | 用户空间 | 计入 RSS |
-| vmalloc_node(size, node) | NUMA 指定 | 从指定节点分配 |
-| __vmalloc(size, gfp, prot) | 自定义 flags | 底层接口 |
-| vfree(addr) | 释放 | 懒惰释放 |
-| vmalloc_to_page(addr) | 查询 | 虚拟→物理页 |
-
-## 18. 源码文件索引
-
-| 文件 | 内容 |
-|------|------|
-| mm/vmalloc.c | vmalloc/vfree/ioremap |
-| include/linux/vmalloc.h | 结构体定义 |
-| mm/ioremap.c | ioremap 实现 |
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01*
-
-## 19. VMALLOC 区域
-
-在 x86-64 上，vmalloc 区域位于内核虚拟地址空间的特定区间：
-
-
-
-## 20. 页表遍历路径
-
-vmalloc 映射涉及 5 级页表（x86-64 可能折叠 P4D）：
-
-
-
-vmap_range_noflush 依次遍历每级页表，建立映射。
-
-
-
-## 19. VMALLOC 区域
-
-x86-64 上 vmalloc 区域占用约 32TB 虚拟地址空间。
-
-## 20. 页表遍历
-
-vmalloc 映射遍历 5 级页表：PGD → P4D → PUD → PMD → PTE。大页映射（2MB PMD 或 1GB PUD）可减少 TLB 压力。
-
-## 21. 参考链接
-
-- 内核源码: mm/vmalloc.c
-- 头文件: include/linux/vmalloc.h
-
----
-
-
-## 22. 调试命令
-
-VmallocTotal:   135288315904 kB
-VmallocUsed:       83012 kB
-VmallocChunk:          0 kB
-0000000000000000 t vmalloc_to_page.cold
-0000000000000000 t __vmalloc_node_range_noprof.cold
-0000000000000000 t __vmalloc_noprof.cold
-0000000000000000 t remap_vmalloc_range_partial.cold
-0000000000000000 t __kvmalloc_node_noprof.cold
-0000000000000000 T remap_vmalloc_range
-0000000000000000 T __vmalloc_array_noprof
-0000000000000000 T vmalloc_array_noprof
-0000000000000000 T is_vmalloc_or_module_addr
-0000000000000000 T vmalloc_to_pfn
-0000000000000000 T __vmalloc_node_noprof
-0000000000000000 t vmalloc_fix_flags
-0000000000000000 T vmalloc_huge_node_noprof
-0000000000000000 T vmalloc_user_noprof
-0000000000000000 T vmalloc_node_noprof
-0000000000000000 T vmalloc_32_noprof
-0000000000000000 T vmalloc_32_user_noprof
-0000000000000000 T vmalloc_dump_obj
-0000000000000000 t vmalloc_info_show
-0000000000000000 T __traceiter_xfs_buf_backing_vmalloc
-0000000000000000 T __probestub_xfs_buf_backing_vmalloc
-0000000000000000 T bio_add_vmalloc_chunk
-0000000000000000 T bio_add_vmalloc
-0000000000000000 T __kvmalloc_node_noprof
-0000000000000000 T is_vmalloc_addr
-0000000000000000 T vmalloc_to_page
-0000000000000000 T vmalloc_noprof
-0000000000000000 T __vmalloc_noprof
-0000000000000000 T __vmalloc_node_range_noprof
-0000000000000000 T vmalloc_nr_pages
-0000000000000000 T remap_vmalloc_range_partial
-0000000000000000 t set_nohugevmalloc
-0000000000000000 t proc_vmalloc_init
-0000000000000000 T vmalloc_init
-
-## 23. 总结
-
-vmalloc 通过页表映射将非连续物理页映射为连续虚拟空间。红黑树管理 vmap_area，懒惰释放优化性能，大页支持减少 TLB 压力。适用于大块内存分配，不适合时间关键的代码路径。
+vmalloc 是内核中唯一可以分配任意大小虚拟连续内存的机制。红黑树管理、懒惰释放、大页支持是其核心特性。
 
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-vmalloc 和 ioremap 共享相同的页表映射基础设施。vmalloc 分配物理页，ioremap 映射现有设备内存。两者都通过 vmap_area 红黑树管理虚拟地址空间。
+## 22. NUMA 亲和性
 
-vmalloc_area_node 分配流程：1) alloc_vmap_area 找空闲地址 2) kmalloc pages 数组 3) alloc_page 逐页分配 4) map_kernel_range 建页表映射。
+```c
+// 指定 NUMA 节点分配
+void *vmalloc_node(unsigned long size, int node)
+{
+    return __vmalloc_node(size, 1, GFP_KERNEL, node, __builtin_return_address(0));
+}
 
-vfree 延时释放通过 per-CPU llist + workqueue 异步处理物理页回收，避免在中断上下文或持锁路径中直接释放。
+// 物理页从指定节点的 buddy 分配器获取
+// 提高内存访问的 NUMA 本地性
+```
+
+## 23. 调试接口
+
+```bash
+# /proc/vmallocinfo 显示所有 vmalloc 分配
+# 每行: 起始-结束 大小 调用者
+# 可以查看谁分配了 vmalloc 内存
+```
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 24. 总结
+
+vmalloc 通过页表映射将非连续物理页映射为虚拟连续空间。懒惰释放通过 per-CPU 链表延迟回收页表。红黑树提供 O(log n) 的地址查找。大页映射减少 TLB 压力。适用于大块内存分配场景。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 25. 参考链接
+
+- mm/vmalloc.c — 核心实现
+- include/linux/vmalloc.h — 结构体定义
+- Documentation/admin-guide/mm/vmalloc.rst
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+vmalloc 和 vmap 的区别：vmalloc 分配物理页并映射，vmap 映射已有的物理页集合。两者使用相同的页表映射基础设施，但 vmalloc 额外包含物理页的生命周期管理。
+
+vmalloc 的虚拟地址范围在 x86-64 上约为 32TB。该范围位于内核虚拟地址空间中，通过 TLB 缓存提高访问速度。每页的页表映射增加了 TLB 开销，因此 vmalloc 适合低频访问的大块数据。
+
+懒惰释放机制 vfree_deferred 将释放操作推迟到 workqueue 上下文中执行，避免在中断或持锁路径中直接调用 __free_page 导致的锁冲突。
+
+vmalloc 使用红黑树管理已分配的 vmap_area，提供 O(log n) 的地址查找和区间分配效率。
