@@ -499,3 +499,134 @@ CFS 替代了 O(1) 调度器，是 Linux 调度器发展的重要里程碑。EEV
 ## CFS 核心调度参数
 
 
+
+## 29. CFS 调度循环完整数据流
+
+```
+scheduler_tick() (每 4ms 定时器中断)
+  │
+  └─ task_tick_fair(rq, curr)
+       │
+       └─ entity_tick(cfs_rq, se, 0)
+            │
+            └─ update_curr(cfs_rq)           @ kernel/sched/fair.c:1378
+                 │
+                 ├─ delta_exec = now - curr->exec_start
+                 ├─ curr->sum_exec_runtime += delta_exec
+                 │
+                 └─ curr->vruntime += calc_delta_fair(delta_exec, curr)
+                      │ calc_delta_fair(delta, se):
+                      │   return delta * NICE_0_LOAD / se->load.weight
+                      │
+                      └─ 更新 min_vruntime
+                           min_vruntime = min(curr->vruntime, leftmost->vruntime)
+```
+
+## 30. enqueue_entity 数据流
+
+```c
+// kernel/sched/fair.c:5494 — 将进程加入运行队列
+enqueue_entity(cfs_rq, se, flags)
+  │
+  ├─ update_curr(cfs_rq)         // 更新当前进程的 vruntime
+  │
+  ├─ if (se != cfs_rq->curr)     // 如果不是当前运行进程
+  │    __enqueue_entity(cfs_rq, se)  // @ L1006
+  │    │
+  │    └─ sum_w_vruntime_add(cfs_rq, se)  // 累加权重 vruntime
+  │         │
+  │         └─ rb_add_augmented_cached(   // ★ 插入红黑树！
+  │              &se->run_node,
+  │              &cfs_rq->tasks_timeline,
+  │              __entity_less,           // 比较函数 (se->vruntime)
+  │              &min_vruntime_cb)        // 增强回调
+  │
+  └─ se->on_rq = 1
+```
+
+## 31. dequeue_entity 数据流
+
+```c
+// kernel/sched/fair.c:5618 — 从运行队列移除进程
+dequeue_entity(cfs_rq, se, flags)
+  │
+  ├─ update_curr(cfs_rq)         // 更新 vruntime
+  │
+  └─ __dequeue_entity(cfs_rq, se)   // @ L1015
+       │
+       └─ rb_erase_augmented_cached( // ★ 从红黑树移除！
+            &se->run_node,
+            &cfs_rq->tasks_timeline,
+            &min_vruntime_cb)
+```
+
+## 32. EEVDF 选择算法
+
+Linux 7.0-rc1 中的 CFS 使用 EEVDF（Earliest Eligible Virtual Deadline First）替代了纯 vruntime 选择：
+
+```c
+// kernel/sched/fair.c — pick_eevdf()
+// 选择 eligible time 最早的任务，而非最小 vruntime
+//
+// eligible time = max(vruntime, min_vruntime - lag)
+// deadline = vruntime + slice
+//
+// 选择策略：
+// 1. 跳过 eligible time > 当前时间的任务
+// 2. 选择 deadline 最早的任务
+// 3. 如果没有 eligible 任务，选择 vruntime 最小的
+
+static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
+{
+    struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
+    struct sched_entity *se, *best = NULL;
+
+    while (node) {
+        se = rb_entry(node, struct sched_entity, run_node);
+
+        // 检查 eligiblity
+        if (se->deadline > se->min_vruntime) {
+            // 任务还未到 eligible 时间
+            if (!best || se->deadline < best->deadline)
+                best = se;
+        }
+
+        // 向左或向右搜索
+        node = (se->vruntime < best->vruntime) ?
+               node->rb_left : node->rb_right;
+    }
+
+    return best ? best : __pick_first_entity(cfs_rq);
+}
+```
+
+## 33. calc_delta_fair — vruntime 计算
+
+```c
+// kernel/sched/fair.c:297 — 计算 vruntime 增量
+static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+{
+    // delta = 实际执行时间
+    // weight = se->load.weight
+    //
+    // vruntime += delta * NICE_0_LOAD / weight
+    //
+    // NICE_0_LOAD = 1024
+    // weight(nice 0) = 1024
+    // weight(nice -20) = 88761 (~87x)
+    // weight(nice 19) = 15 (~1/68)
+    //
+    // nice 0 的进程: vruntime += delta * 1024 / 1024 = delta
+    // nice -5 的进程: vruntime += delta * 1024 / 3121 = delta * 0.33
+    // nice 5 的进程:  vruntime += delta * 1024 / 335 = delta * 3.06
+
+    if (unlikely(se->load.weight != NICE_0_LOAD))
+        delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+
+    return delta;
+}
+```
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
