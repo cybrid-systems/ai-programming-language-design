@@ -522,20 +522,40 @@ mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT);
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-mlock 通过设置 VM_LOCKED 标志将页面锁定。被锁定页面从 LRU 移到 unevictable 链表，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。CAP_IPC_LOCK 绕过限制。MLOCK_ONFAULT 仅在缺页时锁定。
+## 32. 关键函数速查
+
+| 函数 | 位置 | 作用 |
+|------|------|------|
+| can_do_mlock | L40 | 权限检查 |
+| mlock_fixup | L467 | VMA 标志更新 |
+| mlock_vma_pages_range | L423 | 填充物理页 |
+| apply_mlockall_flags | L710 | mlockall 实现 |
+| __mlock_posix_error_return | L609 | 错误码处理 |
+
+## 33. 源码文件索引
+
+| 文件 | 行数 | 内容 |
+|------|------|------|
+| mm/mlock.c | ~800 | 完整实现 |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 34. 总结
+
+mlock 通过 VMA 标志控制内存锁定。被锁定页面移到 unevictable LRU，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。MLOCK_ONFAULT 优化避免一次性填充大块内存的延迟。适用于实时、安全和数据库场景。
 
 
-mlock 通过设置 VM_LOCKED 标志将页面锁定。被锁定页面从 LRU 移到 unevictable 链表，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。CAP_IPC_LOCK 绕过限制。MLOCK_ONFAULT 仅在缺页时锁定。
+## 关联文章
 
+- **40-thp**: 透明大页与 mlock 的交互
+- **188-mlock**: mlock 深度分析
 
-mlock 通过设置 VM_LOCKED 标志将页面锁定。被锁定页面从 LRU 移到 unevictable 链表，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。CAP_IPC_LOCK 绕过限制。MLOCK_ONFAULT 仅在缺页时锁定。
+---
 
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-mlock 通过设置 VM_LOCKED 标志将页面锁定。被锁定页面从 LRU 移到 unevictable 链表，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。CAP_IPC_LOCK 绕过限制。MLOCK_ONFAULT 仅在缺页时锁定。
+mlock 系统调用通过 do_mlock 遍历 VMA 设置 VM_LOCKED 标志。mlock_fixup 处理 VMA 分裂和标志更新。mlock_vma_pages_range 通过 get_user_pages 强制缺页填充物理内存。MLOCK_ONFAULT 跳过预缺页步骤。
 
-
-mlock 通过设置 VM_LOCKED 标志将页面锁定。被锁定页面从 LRU 移到 unevictable 链表，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。CAP_IPC_LOCK 绕过限制。MLOCK_ONFAULT 仅在缺页时锁定。
-
-
-mlock 通过设置 VM_LOCKED 标志将页面锁定。被锁定页面从 LRU 移到 unevictable 链表，不受 kswapd 回收。RLIMIT_MEMLOCK 限制非 root 用户的锁定上限。CAP_IPC_LOCK 绕过限制。MLOCK_ONFAULT 仅在缺页时锁定。
-
+unevictable LRU 链表中的页面不被 kswapd 回收。mlock 页面通过 lru_cache_add_inactive_or_unevictable 加入该链表。页面回收代码在 shrink_inactive_list 中跳过该链表。
