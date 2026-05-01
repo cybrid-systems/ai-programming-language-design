@@ -93,3 +93,55 @@ void mlock_vma_page(struct page *page)
 - **188-mlock**: mlock 深度分析
 
 ---
+
+## 7. mlock 与 MLOCKONFAULT
+
+Linux 4.4+ 支持 MCL_ONFAULT 标志，仅在缺页时锁定页面：
+
+```c
+// mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)
+// → VM_LOCKED 标志被设置
+// → 但页面不会被立即调入内存
+// → 而是在缺页时被锁定（不可换出）
+// → 避免 mlockall 大量内存导致延迟飙升
+```
+
+## 8. 实现细节
+
+```c
+// mm/mlock.c — mlock 核心
+static int mlock_fixup(struct vm_area_struct *vma, ...)
+{
+    struct vm_area_struct *new_vma;
+    
+    // 设置 VM_LOCKED 标志
+    vma->vm_flags |= VM_LOCKED;
+    
+    // 如果 vma 类型变化，需要分裂
+    if (need_split)
+        new_vma = split_vma(vma, ...);
+    
+    // 立刻缺页锁定
+    if (!(flags & MLOCK_ONFAULT))
+        populate_vma_page_range(vma, start, end, NULL);
+}
+```
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+

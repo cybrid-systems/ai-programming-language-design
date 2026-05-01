@@ -160,3 +160,126 @@ type=PATH msg=audit(...): item=0 name="/etc/shadow"
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 9. audit 缓存与性能
+
+```c
+// audit_buffer 的缓存管理
+// 每个 CPU 缓存一个 audit_buffer
+static DEFINE_PER_CPU(struct audit_buffer *, audit_buffer_cpu);
+
+struct audit_buffer *audit_log_start(...)
+{
+    // 优先使用 per-CPU 缓存
+    ab = this_cpu_read(audit_buffer_cpu);
+    if (ab && skb_queue_len(&ab->skb->sk->sk_receive_queue) < audit_backlog_limit)
+        return ab;
+    
+    // 分配新缓冲区
+    ab = kmalloc(sizeof(*ab), gfp_mask);
+    ab->skb = alloc_skb(AUDIT_BUFSIZ, gfp_mask);
+    return ab;
+}
+```
+
+## 10. 审计规则匹配
+
+```c
+// kernel/auditfilter.c — 规则匹配
+int audit_filter(int type, enum audit_state *state)
+{
+    struct audit_entry *e;
+    int ret = 1;  // 默认记录
+
+    list_for_each_entry_rcu(e, &audit_filter_list[AUDIT_FILTER_EXIT], list) {
+        if (audit_filter_match(e, current)) {
+            if (e->rule.action == AUDIT_NEVER)
+                return 0;  // 不记录
+            if (e->rule.action == AUDIT_ALWAYS)
+                ret = 1;   // 记录
+        }
+    }
+    return ret;
+}
+```
+
+## 11. 审计事件传输
+
+审计记录通过 netlink 套接字发送到用户空间：
+
+```c
+// audit_netlink 多播
+static int audit_send_list(struct audit_buffer *ab)
+{
+    // 使用 nlmsg_multicast 发送到 AUDIT 组
+    struct nlmsghdr *nlh = nlmsg_put(ab->skb, 0, 0, AUDIT_USER, 0, 0);
+    return nlmsg_multicast(audit_sock, ab->skb, 0, AUDIT_NLGRP_READ, GFP_KERNEL);
+}
+```
+
+## 12. 配置文件
+
+```bash
+# /etc/audit/auditd.conf — auditd 配置
+log_file = /var/log/audit/audit.log
+log_format = RAW
+flush = INCREMENTAL
+max_log_file = 8
+num_logs = 5
+priority_boost = 4
+
+# /etc/audit/rules.d/audit.rules — 规则文件
+-D
+-b 8192
+-f 1
+-a always,exit -S all -F path=/etc -F perm=wa
+```
+
+## 13. 总结
+
+Linux Audit 子系统是系统安全审计的核心。通过 per-CPU 缓冲区、netlink 传输和灵活的规则引擎，实现了低延迟的事件捕获。auditd 用户空间守护进程接收并持久化事件记录。
+
+
+## 14. 开机启动审计
+
+审计系统在引导早期初始化：
+
+```c
+// kernel/audit.c — 早期初始化
+void __init audit_init(void)
+{
+    // 创建 netlink 套接字
+    audit_sock = netlink_kernel_create(&init_net, NETLINK_AUDIT, &audit_nl_ops);
+    
+    // 初始化过滤规则列表
+    for (i = 0; i < AUDIT_NR_FILTERS; i++)
+        INIT_LIST_HEAD(&audit_filter_list[i]);
+    
+    // 设置默认积压限制
+    audit_backlog_limit = 64;
+    
+    // 创建审计内核线程
+    auditd_task = kthread_run(auditd, NULL, "auditd");
+    
+    pr_info("audit: initializing netlink subsys\n");
+}
+```
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+

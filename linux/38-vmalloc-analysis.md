@@ -113,3 +113,123 @@ struct vmap_area {
 - **187-vmalloc**: vmalloc 深度分析
 
 ---
+
+## 8. ioremap——设备内存映射
+
+```c
+// ioremap 将设备 MMIO 区域映射到内核虚拟地址空间
+void __iomem *ioremap(phys_addr_t phys_addr, unsigned long size)
+{
+    return __ioremap_caller(phys_addr, size, _PAGE_CACHE_MODE_UC_MINUS,
+                             __builtin_return_address(0));
+}
+
+// 映射完成后，通过 readl/writel 访问设备寄存器
+void __iomem *base = ioremap(0xfe000000, SZ_4K);
+u32 val = readl(base + 0x10);   // 读设备寄存器
+writel(0x1, base + 0x00);       // 写设备寄存器
+iounmap(base);                   // 取消映射
+```
+
+## 9. 物理连续 vs 非连续
+
+```c
+// 物理连续分配（DMA 需要）：
+dma_addr_t dma_handle;
+void *cpu_addr = dma_alloc_coherent(dev, size, &dma_handle, GFP_KERNEL);
+// → 返回虚拟地址连续、物理地址也连续的内存
+// → 适合 DMA 操作
+
+// vmalloc 的物理地址不连续：
+void *virt = vmalloc(size);
+// → 虚拟地址连续，物理地址可能不连续
+// → 不能直接用于 DMA
+// → 对于大多数 CPU 访问场景没问题
+```
+
+## 10. 调试
+
+```bash
+# 查看 vmalloc 区域使用
+$ cat /proc/vmallocinfo
+0xffffc90000000000-0xffffc90000100000 1048576  module_alloc+0x5c/0x60
+0xffffc90000200000-0xffffc90000300000 1048576  module_alloc+0x5c/0x60
+
+# 查看虚拟内存区域分布
+$ cat /proc/meminfo | grep Vmalloc
+VmallocTotal:   34359738367 kB
+VmallocUsed:        12345 kB
+```
+
+## 11. 源码文件索引
+
+| 文件 | 内容 |
+|------|------|
+| mm/vmalloc.c | vmalloc 核心 |
+| include/linux/vmalloc.h | API |
+| mm/ioremap.c | ioremap 实现 |
+
+
+## 12. vmap 区块管理
+
+```c
+// mm/vmalloc.c — vmap_area 管理
+// 使用红黑树组织所有已分配的 VMAP 区域
+static struct rb_root vmap_area_root = RB_ROOT;
+static struct list_head vmap_area_list = LIST_HEAD_INIT(vmap_area_list);
+
+// 分配 vmap_area
+static struct vmap_area *alloc_vmap_area(unsigned long size, ...)
+{
+    struct vmap_area *va = kmem_cache_alloc(vmap_area_cachep, GFP_NOWAIT);
+    
+    // 在红黑树中查找空闲区间
+    // → 使用 RB 树快速定位
+    // → 处理可能的碎片（相邻空闲区间合并）
+    
+    // 插入红黑树
+    rb_insert_augmented(&va->rb_node, &vmap_area_root, &vmap_area_rb_augment);
+    list_add(&va->list, &vmap_area_list);
+    
+    return va;
+}
+```
+
+## 13. 物理页的懒惰清理
+
+```c
+// vmalloc 的物理页释放策略
+// 不是立即回收到 buddy
+// 而是缓存到 llist（lock-free 链表）中异步释放
+
+// 缓存释放：将页面放入惰性链表
+static DEFINE_PER_CPU(struct page *, vfree_deferred_pages[FREE_N_PAGES]);
+
+// flush_work 周期性处理
+static void vfree_deferred_flush(struct work_struct *work)
+{
+    struct page *page;
+    while ((page = llist_del_first(&vfree_deferred_pages))) {
+        __free_page(page);
+    }
+}
+```
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+

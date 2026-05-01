@@ -132,3 +132,86 @@ struct fanotify_group {
 - **81-inotify-fanotify**: inotify vs fanotify 对比
 
 ---
+
+## 8. 通知组和事件队列
+
+```c
+// fs/notify/group.c
+struct fsnotify_group {
+    const struct fsnotify_ops *ops;    // 操作函数
+    spinlock_t event_lock;              // 事件队列锁
+    struct list_head notification_list; // 待处理事件
+    wait_queue_head_t notification_waitq; // 等待队列
+    unsigned int q_len;                 // 队列长度
+    unsigned int max_events;            // 最大事件数
+    struct ida inode_mark_ida;
+    atomic_t user_waits;
+};
+
+// fanotify 初始化时分配通知组
+struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
+{
+    struct fsnotify_group *group = kzalloc(sizeof(*group), GFP_KERNEL);
+    spin_lock_init(&group->event_lock);
+    INIT_LIST_HEAD(&group->notification_list);
+    init_waitqueue_head(&group->notification_waitq);
+    return group;
+}
+```
+
+## 9. 事件传递
+
+```c
+// 事件从内核到用户空间传递链
+fsnotify(f_path, mask, data, data_type, dir)
+  → fanotify_handle_event(group, mask, data, data_type, dir)
+    → fanotify_alloc_event(group, mask, data, data_type, dir)
+      → 分配 fanotify_event 结构
+    → fsnotify_add_event(group, event, NULL, fanotify_merge)
+      → 加入 notification_list，唤醒等待的 read()
+    → 用户空间执行 read(fanotify_fd, buf, sizeof(buf))
+      → fsnotify_read() → copy_event_to_user()
+```
+
+## 10. fanotify 与容器
+
+fanotify 支持 PID 命名空间，适合在容器中监控文件访问：
+
+```c
+// 事件中的 PID 信息
+fanotify_event_metadata->pid
+// → 在内核 5.x+ 版本中转换为容器内的 PID
+// → 使用 pid_nr_ns(pid, task_active_pid_ns(current))
+```
+
+## 11. 性能考虑
+
+```bash
+# fanotify 延迟
+# FAN_CLASS_NOTIF: 事件写入 fd 的时间 ~1μs
+# FAN_CLASS_CONTENT: 阻塞决策等待 ~100μs - 10ms
+#   （取决于用户空间响应时间）
+
+# 大量操作的延迟影响
+# 监控整个文件系统时，每个 open 增加 ~2-5μs
+# 监控大量文件时考虑使用 FAN_MARK_FILESYSTEM
+```
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+

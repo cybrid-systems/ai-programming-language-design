@@ -69,3 +69,74 @@ int audit_log_start(struct audit_context *ctx, gfp_t gfp_mask, int type)
 - **31-audit**: audit 基础
 
 ---
+
+## 4. 多播传输
+
+audit 通过 netlink 将事件同时发送到多个监听者：
+
+```c
+// kernel/audit.c
+static int audit_send_list(struct audit_buffer *ab)
+{
+    struct sk_buff *skb = ab->skb;
+    int ret = nlmsg_multicast(audit_sock, skb, 0, AUDIT_NLGRP_READ, GFP_KERNEL);
+    // 所有订阅了 AUDIT_NLGRP_READ 组的进程都会收到此消息
+    // 典型的监听者：auditd, ausearch, 审计代理
+    if (ret < 0) {
+        // 没有监听者时记录丢失
+        atomic_inc(&audit_lost);
+    }
+    return ret;
+}
+```
+
+## 5. vsyscall 审计
+
+通过 seccomp 或 audit syscall 实现对修改：
+
+```bash
+# 限制危险系统调用
+auditctl -a always,exit -S execve -S execveat
+
+# 监控特权操作
+auditctl -a always,exit -F arch=b64 -S mount -S umount2
+```
+
+## 6. 配置最佳实践
+
+```bash
+# 合理的缓冲区大小（默认 64）
+-b 8192
+
+# 失败模式（1=silent, 2=printk）
+-f 1
+
+# 速率限制
+-r 1000
+
+# 建议排除噪声事件
+-a exclude,always -F msgtype=USER_START
+-a exclude,always -F msgtype=CRED_REFR
+```
+
+## 7. 关联文章
+- **31-audit**: 审计基础
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+

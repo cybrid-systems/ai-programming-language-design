@@ -495,3 +495,7 @@ CFS 是 Linux 默认调度器，使用 vruntime + 红黑树实现完全公平。
 - 文档: Documentation/scheduler/
 
 CFS 替代了 O(1) 调度器，是 Linux 调度器发展的重要里程碑。EEVDF 作为 CFS 的后继者，在 7.x 内核中提供了更精确的调度延迟控制。
+
+## CFS 核心调度参数
+
+

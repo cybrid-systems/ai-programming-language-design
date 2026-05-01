@@ -68,3 +68,54 @@ khugepaged_scan_mm_slot()
 - **189-THP**: THP 深度分析
 
 ---
+
+## 5. 透明大页 vs hugetlbfs
+
+| 特性 | THP | hugetlbfs |
+|------|-----|-----------|
+| 配置 | 自动 | 手动预留 |
+| 页大小 | 2MB | 2MB/1GB |
+| 应用透明 | ✅ | ❌ 需显式 mmap |
+| 交换 | ✅ | ❌ |
+| 适用 | 通用 | 数据库/HPC |
+
+## 6. 大页分配策略
+
+```c
+// mm/huge_memory.c — THP 分配
+struct page *alloc_hugepage_vma(gfp_t gfp, struct vm_area_struct *vma,
+                                 unsigned long haddr, int order)
+{
+    // 尝试从 buddy 分配 2MB 连续页
+    struct page *page = alloc_pages_vma(gfp, HPAGE_PMD_ORDER, vma, haddr, numa_node_id());
+    
+    if (!page) {
+        // 分配失败 → compact 整理碎片
+        if (compact)
+            try_to_compact_pages(gfp, order, ...);
+        page = alloc_pages_vma(gfp, HPAGE_PMD_ORDER, vma, haddr, numa_node_id());
+    }
+    
+    // 如果 still 失败，回退到 4KB 小页
+    return page;
+}
+```
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+

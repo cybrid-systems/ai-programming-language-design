@@ -448,3 +448,9 @@ SLUB 根据分配请求的 NUMA 节点偏好，优先从本地内存节点分配
 这就是 kmalloc 使用 2 的幂次大小、对齐到 8 字节的原因——在利用率和速度之间平衡。
 
 ---
+
+## 25. SLUB 和 KASAN
+
+KASAN（Kernel Address Sanitizer）利用 SLUB 的对象分配跟踪检测内存错误：
+
+

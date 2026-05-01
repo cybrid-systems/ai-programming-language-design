@@ -167,3 +167,137 @@ pci_write_config_word(pdev, PCI_COMMAND, cmd);
 ---
 
 *分析工具：doom-lsp*
+
+## 5. device tree 和 platform 设备匹配
+
+平台设备通过设备树节点名称或 compatible 属性匹配驱动：
+
+```dts
+// 设备树节点
+my_device: my-device@1c00000 {
+    compatible = "myvendor,mydevice-v2", "myvendor,mydevice";
+    reg = <0x1c00000 0x1000>;
+    interrupts = <0 42 4>;
+};
+```
+
+驱动优先匹配精确的 compatible 字符串。
+
+## 6. PCI 枚举
+
+```c
+// drivers/pci/probe.c — PCI 设备枚举
+void pci_scan_single_device(struct pci_bus *bus, int devfn)
+{
+    u32 l;
+    // 读取 Vendor ID 检测设备是否存在
+    if (pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
+        return;
+    
+    // 分配 PCI 设备
+    dev = pci_alloc_dev(bus);
+    dev->devfn = devfn;
+    
+    // 读取配置空间
+    pci_setup_device(dev);
+    
+    // 添加到总线
+    pci_bus_add_device(dev);
+}
+```
+
+## 7. PCI MSI/MSI-X
+
+```c
+// PCI 中断——MSI 消息信号中断
+// pci_alloc_irq_vectors 分配 MSI/MSI-X 向量
+int nr_irqs = pci_alloc_irq_vectors(pdev, 1, num_vectors, PCI_IRQ_MSI);
+// → 通过写 MMIO 寄存器触发中断
+// → 不需要中断引脚（节省 I/O APIC 引脚）
+```
+
+## 8. AMBA/AXI 总线
+
+ARM SoC 中常用的 AMBA/AXI 总线使用 `amba_device` 和 `amba_driver`：
+
+```c
+struct amba_device {
+    struct device dev;
+    struct resource res;
+    u64 periphid;  // 外设 ID
+};
+```
+
+通过 PrimCell ID 识别外设。
+
+
+## 9. PCIe 配置空间
+
+PCIe 设备通过配置空间（256 字节标准 + 4KB PCIe 扩展空间）识别和配置：
+
+```c
+// PCI 配置空间结构（x86）
+// offset 0x00: Vendor ID, Device ID
+// offset 0x04: Command, Status
+// offset 0x08: Revision ID, Class Code
+// offset 0x10-0x24: BAR0-BAR5（内存/IO 基址）
+// offset 0x3C: Interrupt Line, Interrupt Pin
+// offset 0x40+: 能力指针链表
+//   - 0x10 MSI 能力
+//   - 0x25 PCIe 能力
+//   - 0x26 AER 高级错误报告
+
+// PCIe 扩展配置空间（offset 0x100+）
+// 通过 MMIO 访问（ECAM）
+// 地址格式: bus:device:function:register
+```
+
+## 10. PCIe 错误处理
+
+```c
+// 高级错误报告（AER）
+// drivers/pci/pcie/aer.c
+static irqreturn_t aer_irq(int irq, void *context)
+{
+    struct aer_rpc *rpc = context;
+    u32 status, mask;
+    
+    // 读取错误状态寄存器
+    pci_read_config_dword(dev, aer + PCI_ERR_COR_STATUS, &status);
+    pci_read_config_dword(dev, aer + PCI_ERR_COR_MASK, &mask);
+    
+    if (status & ~mask) {
+        // 记录可纠正错误
+        pci_err(dev, "Correctable error: status=%#x\n", status);
+        pci_write_config_dword(dev, aer + PCI_ERR_COR_STATUS, status);
+    }
+    
+    // 不可纠正错误处理（可能触发）
+    pci_read_config_dword(dev, aer + PCI_ERR_UNCOR_STATUS, &status);
+    if (status) {
+        pci_err(dev, "Uncorrectable error: status=%#x\n", status);
+        // 可能触发 pciehp 热插拔或链路重置
+    }
+    
+    return IRQ_HANDLED;
+}
+```
+
+  
+---
+
+## 15. 性能与最佳实践
+
+| 操作 | 延迟 | 说明 |
+|------|------|------|
+| 简单审计日志 | ~1μs | 单一系统调用事件 |
+| 规则匹配 | ~100ns | 线性扫描规则列表 |
+| 路径名解析 | ~1-5μs | 每次系统调用需解析 |
+| netlink 发送 | ~1μs | skb 分配+传递 |
+
+## 16. 关联参考
+
+- 内核文档: Documentation/admin-guide/audit/
+- 工具: auditd, auditctl, ausearch, aureport
+- 配置: /etc/audit/
+
