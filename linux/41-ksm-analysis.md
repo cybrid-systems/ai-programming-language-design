@@ -459,3 +459,5 @@ The KSM mechanism provides significant memory savings in virtualization by mergi
 
 
 The KSM mechanism provides significant memory savings in virtualization by merging identical pages across VMs. The stable/unstable tree approach efficiently manages the merging state. Checksums provide fast change detection, while memcmp ensures exact content match. COW pages allow transparent merging without process awareness.
+
+ksmd 线程的优先级为 NICE 5（低优先级），确保不影响交互式进程的性能。扫描间隔和每轮扫描页数可通过 sysfs 调整以适应不同的工作负载。
