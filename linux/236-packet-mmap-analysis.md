@@ -3,8 +3,6 @@
 > 源码基于：Linux 7.0-rc1 (`net/packet/af_packet.c` + `include/uapi/linux/if_packet.h`)
 > 核心数据结构：`struct packet_sock`、`struct packet_ring_buffer`、`struct pgv`、`struct tpacket_kbdq_core`
 
----
-
 ## 1. 概述：为什么需要 packet_mmap？
 
 传统 AF_PACKET socket 接收数据路径：
@@ -22,8 +20,6 @@ netif_receive_skb()
 2. skb → 用户 buffer（可通过 mmap 消除）
 
 packet_mmap 通过让用户进程直接 mmap 内核分配的页框，实现**零拷贝**（除 DMA 本身）。
-
----
 
 ## 2. mmap 内存布局：页框是如何映射的
 
@@ -132,8 +128,6 @@ static inline struct page *pgv_to_page(void *addr)
 
 **注意**：`__get_free_pages` 失败时降级到 `vmalloc`，所以同一 ring buffer 可能混合两种分配方式。`pgv_to_page()` 统一处理。
 
----
-
 ## 3. 发送路径：send() → ring buffer → skb
 
 ### 3.1 tpacket_snd 完整流程
@@ -224,8 +218,6 @@ send(fd, buf, len, 0)
 3. `ph` 指针通过 `skb_zcopy_set_nouarg(skb, ph)` 绑定到 skb
 4. `packet_inc_pending()` 增加 pending count，延迟 frame 回收
 
----
-
 ## 4. 接收路径：netif_receive_skb → ring buffer
 
 ### 4.1 从 NIC 到 packet socket 的完整调用链
@@ -303,8 +295,6 @@ static int __packet_rcv_has_room(const struct packet_sock *po, struct sk_buff *s
     ...
 }
 ```
-
----
 
 ## 5. TPACKET_V3：Block 抽象与线性化
 
@@ -414,8 +404,6 @@ if (BLOCK_NUM_PKTS(pbd)) {
 }
 ```
 
----
-
 ## 6. tp_status 状态机：读写冲突管理
 
 ### 6.1 接收侧（rx_ring）状态
@@ -494,8 +482,6 @@ tp_status 值（Tx）：
                                   若为 0（用户已消费）→ 可写
 ```
 
----
-
 ## 7. Fanout 机制：多进程共享同一个 socket
 
 ### 7.1 为什么需要 Fanout？
@@ -565,8 +551,6 @@ packet_rcv_fanout
         → 先重组再分发（用于 IP 分片包）
 ```
 
----
-
 ## 8. 时间戳：SO_TIMESTAMPING 与 tp_reserve
 
 ### 8.1 时间戳相关标志
@@ -618,8 +602,6 @@ netoff = TPACKET_ALIGN(po->tp_hdrlen +
 
 **这不是时间戳专用字段**，而是为将来扩展（如 TPACKET_V4 的新元数据）预留。
 
----
-
 ## 9. packet_mmap vs AF_INET raw socket：本质区别
 
 | 维度 | packet_mmap (AF_PACKET) | AF_INET raw socket |
@@ -640,8 +622,6 @@ netoff = TPACKET_ALIGN(po->tp_hdrlen +
 - `AF_INET raw` socket 是**网络层 socket**，数据流经 L3 协议处理
 - packet_mmap 通过 ring buffer 避免了内核→用户的最后一次拷贝
 - raw socket 始终需要一次 `skb_copy_to_datagram_iovec` 或 `skb_recvmmsg`
-
----
 
 ## 10. 总结：各组件关系全图
 
@@ -690,3 +670,126 @@ netoff = TPACKET_ALIGN(po->tp_hdrlen +
 **核心设计哲学**：packet_mmap 通过两层抽象实现零拷贝：
 1. **物理层**：vm_insert_page 将内核分配的页框直接映射到用户进程地址空间
 2. **逻辑层**：tp_status 状态机在用户进程和内核之间实现无锁（lock-free）的单生产者单消费者队列（V1/V2 使用位图，V3 使用 block 级别的状态和 sequence number）
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+

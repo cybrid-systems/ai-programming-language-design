@@ -1,71 +1,48 @@
 # 23-interrupt — 中断处理深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`kernel/irq/`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-Linux 中断处理采用分层架构：**硬件中断** → **irq_desc** → **irq_chip** → **handle_** → **中断处理函数**。
+**中断** 是硬件通知 CPU 事件的核心机制。Linux 中断处理分为两半：
+- **上半部（hardirq）**：在中断上下文中运行，必须极快，只做最必要的操作
+- **下半部（softirq/tasklet/workqueue）**：稍后运行，可以做更多工作
+
+doom-lsp 确认 `kernel/irq/` 目录包含 irqdesc/manage/chip 等多个子模块。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 irq_desc — 中断描述符
+### 1.1 struct irq_desc
 
 ```c
-// include/linux/irqdesc.h — irq_desc
 struct irq_desc {
-    struct irq_data         irq_data;        // 中断信息
-    unsigned int            irq;              // 中断号
-    unsigned int            node;             // NUMA 节点
-
-    // 处理函数
-    irq_flow_handler_t      handle_irq;      // 主处理函数（edge/high/level）
-    irq_preflow_handler_t    *preflow_handler; // 前置处理
-    irq_handler_t           *action;          // 链表（用户注册的中断处理）
-
-    // 状态
+    struct irq_common_data  irq_common_data;
+    struct irq_data         irq_data;
+    unsigned int __percpu   *kstat_irqs;   // 中断统计
+    irq_flow_handler_t      handle_irq;    // 中断流处理函数
+    struct irqaction        *action;       // 中断处理动作链表
     unsigned int            status_use_accessors;
-    //   IRQ_DISABLED    = 中断被禁用
-    //   IRQ_PENDING     = 中断被挂起
-    //   IRQ_INPROGRESS  = 正在处理
-
-    // chip
-    struct irq_chip         *chip;           // 中断控制器芯片
-    struct irq_domain       *domain;         // IRQ domain 映射
+    ...
 };
 ```
 
-### 1.2 irq_chip — 中断控制器芯片
+### 1.2 struct irqaction
 
 ```c
-// include/linux/irq.h — irq_chip
-struct irq_chip {
-    const char            *name;           // 芯片名（如 "IO-APIC"）
-    unsigned int           (*irq_startup)(struct irq_data *);
-    void                  (*irq_shutdown)(struct irq_data *);
-    void                  (*irq_enable)(struct irq_data *);
-    void                  (*irq_disable)(struct irq_data *);
-    void                  (*irq_ack)(struct irq_data *);         // 应答中断
-    void                  (*irq_mask)(struct irq_data *);         // 屏蔽
-    void                  (*irq_unmask)(struct irq_data *);       // 取消屏蔽
-    void                  (*irq_eoi)(struct irq_data *);         // EOI（中断结束）
-};
-```
-
-### 1.3 irqaction — 中断处理函数
-
-```c
-// include/linux/interrupt.h — irqaction
 struct irqaction {
-    irq_handler_t           handler;         // 中断处理函数
-    void                   *dev_id;         // 设备 ID（用于共享中断）
-    struct irqaction        *next;          // 下一个处理函数（共享多个设备）
-    unsigned long           flags;           // IRQF_SHARED 等
-    const char             *name;            // 设备名（/proc/interrupts 显示）
+    irq_handler_t           handler;       // 上半部处理函数
+    unsigned long           flags;         // IRQF_* 标志
+    const char             *name;          // 中断名
+    void                   *dev_id;        // 设备 ID
+    struct irqaction       *next;          // 共享中断的链表
+    irq_handler_t           thread_fn;     // 线程化下半部
+    struct task_struct     *thread;        // 中断线程
+    ...
 };
 ```
 
@@ -73,119 +50,52 @@ struct irqaction {
 
 ## 2. 中断处理流程
 
-### 2.1 handle_edge_irq — 边沿触发中断
-
-```c
-// kernel/irq/chip.c — handle_edge_irq
-void handle_edge_irq(struct irq_desc *desc)
-{
-    struct irq_chip *chip = desc->chip;
-
-    // 1. 检查是否在处理中
-    if (irq_check_status(desc, IRQ_INPROGRESS)) {
-        // 已经在处理中，只标记 pending
-        irq_set_status(desc, IRQ_PENDING);
-        return;
-    }
-
-    // 2. mask + ack
-    chip->irq_mask_ack(&desc->irq_data);
-
-    // 3. 设置 INPROGRESS
-    irq_set_status(desc, IRQ_INPROGRESS);
-
-    // 4. 调用 handle_irq_event
-    handle_irq_event(desc);
-
-    // 5. unmask
-    chip->irq_unmask(&desc->irq_data);
-}
 ```
-
-### 2.2 handle_irq_event — 处理中断事件
-
-```c
-// kernel/irq/handle.c — handle_irq_event
-int handle_irq_event(struct irq_desc *desc)
-{
-    int ret = IRQ_HANDLED;
-    struct irqaction *action;
-
-    // 遍历所有注册的中断处理函数
-    action = desc->action;
-    do {
-        if (action->flags & IRQF_SHARED) {
-            // 共享中断：检查是否是本设备的中断
-        }
-
-        ret = action->handler(irq, action->dev_id);
-        if (ret == IRQ_HANDLED) {
-            action->flags |= IRQF_SHARED;
-        }
-
-        action = action->next;
-    } while (action);
-
-    return ret;
-}
+硬件中断触发
+  │
+  ├─ CPU 硬件自动处理：
+  │    ├─ 保存上下文（CS:RIP, RFLAGS）
+  │    ├─ 禁用本地中断
+  │    └─ 跳转到 IDT 表项 → common_interrupt
+  │
+  ├─ 内核入口：
+  │    └─ handle_irq(desc, regs)
+  │         └─ desc->handle_irq(desc)     ← 流处理函数
+  │              │
+  │              └─ handle_edge_irq / handle_level_irq
+  │                   │
+  │                   ├─ 调用 action->handler(irq, dev_id) ← 上半部
+  │                   │    └─ 只能做最少操作（ACK/read HW regs）
+  │                   │
+  │                   ├─ 如果注册了 thread_fn：
+  │                   │    └─ wake_up_process(desc->action->thread)
+  │                   │         └─ 中断线程在进程上下文执行下半部
+  │                   │              └─ thread_fn(irq, dev_id)
+  │                   │
+  │                   └─ 检查是否需要 EOI
 ```
 
 ---
 
-## 3. 线程化中断（Threaded IRQ）
+## 3. 流处理函数
 
-### 3.1 request_threaded_irq
-
-```c
-// kernel/irq/manage.c — request_threaded_irq
-int request_threaded_irq(unsigned int irq, irq_handler_t handler,
-                         irq_handler_t thread_fn,
-                         unsigned long flags, const char *name, void *dev)
-{
-    struct irqaction *action;
-
-    // 1. 分配 irqaction
-    action = kzalloc(sizeof(*action), GFP_KERNEL);
-    action->handler = handler;         // 主处理函数（可选）
-    action->thread_fn = thread_fn;   // 线程函数
-    action->flags = flags;
-    action->name = name;
-    action->dev_id = dev;
-
-    // 2. 创建线程
-    if (thread_fn) {
-        action->thread = kthread_run(thread_fn, dev, "irq/%d-%s", irq, name);
-    }
-
-    // 3. 注册
-    return setup_irq(irq, action);
-}
-```
+| 类型 | 函数 | 适用 |
+|------|------|------|
+| 边沿触发 | `handle_edge_irq` | PCI 传统中断 |
+| 电平触发 | `handle_level_irq` | 某些 SoC 中断 |
+| 简单 | `handle_simple_irq` | 不需要 ACK 的中断 |
+| Per-CPU | `handle_percpu_irq` | 每个 CPU 独立中断 |
 
 ---
 
-## 4. 完整文件索引
+## 4. 源码文件索引
 
-| 文件 | 函数/结构 |
-|------|----------|
-| `include/linux/irqdesc.h` | `struct irq_desc` |
-| `include/linux/irq.h` | `struct irq_chip` |
-| `include/linux/interrupt.h` | `struct irqaction` |
-| `kernel/irq/chip.c` | `handle_edge_irq`、`handle_level_irq` |
-| `kernel/irq/handle.c` | `handle_irq_event` |
-| `kernel/irq/manage.c` | `request_threaded_irq` |
+| 文件 | 关键符号 |
+|------|---------|
+| `kernel/irq/irqdesc.c` | 中断描述符管理 |
+| `kernel/irq/manage.c` | request_irq / request_threaded_irq |
+| `kernel/irq/chip.c` | 中断控制器操作 |
 
 ---
 
-## 5. 西游记类比
-
-**中断处理** 就像"取经路上的紧急军情"——
-
-> 每个妖怪据点（设备）都有紧急信号灯（irq）和守门人（irq_chip）。有紧急情况时，守门人拉响警报（中断），天神（CPU）看到后，先 mask + ack（确认收到），然后根据警报类型（edge/level）决定怎么处理。如果是边沿触发（有人在门口晃了一下），天神直接去找相应部门的中断处理函数（handler）处理；如果设置了线程化中断，天神就把任务交给专门的信使（kthread）去处理，自己继续巡逻。
-
----
-
-## 6. 关联文章
-
-- **softirq**（article 24）：底半部处理
-- **kthread**（article 14）：线程化中断
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*

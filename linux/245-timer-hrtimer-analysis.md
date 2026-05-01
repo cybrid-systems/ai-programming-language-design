@@ -3,8 +3,6 @@
 > 内核版本：Linux 7.0-rc1 (commit 验证于 /home/dev/code/linux)
 > 源码分析基于：kernel/time/hrtimer.c, fs/timerfd.c, include/linux/hrtimer.h, kernel/time/tick-sched.c
 
----
-
 ## 1. hrtimer 的红黑树存储结构
 
 ### 1.1 per-CPU clock_base 数组
@@ -90,8 +88,6 @@ void hrtimer_interrupt_rearm(struct hrtimer_cpu_base *cpu_base, ktime_t expires_
 
 `TIF_HRTIMER_REARM` 是一个线程标志，在下一次用户空间调度时才会重新编程硬件定时器。这种设计**避免了频繁的硬件重编程开销**（在 VM 环境中尤其昂贵），代价是可能错过一个精确的到期时刻（懒性重排，lazy rear。
 
----
-
 ## 2. nohz_mode 和 tick_sched
 
 ### 2.1 struct tick_sched
@@ -164,8 +160,6 @@ static inline struct hrtimer_cpu_base *get_target_base(...) {
 
 当一个 CPU 离线或进入长时间 idle，其 hrtimer 需要迁移到 `housekeeping_cpumask(HK_TYPE_TIMER)` 中的某个 CPU。`nohz_idle_balance` 在 idle 退出时将 flags 清零并触发实际的迁移操作。
 
----
-
 ## 3. hrtimer_interrupt 完整调用链
 
 ### 3.1 ASCII 调用图
@@ -233,8 +227,6 @@ clock_base_next_timer(struct hrtimer_clock_base *base)
 ### 3.3 skip_hrtimer 和 reprogram 的关系
 
 `hrtimer_interrupt_rearm` 中的 `TIF_HRTIMER_REARM` 机制实现了一种"skip"优化：硬件 timer 被设置为下一次到期时间，但如果在用户空间重评诂时发现 timer 已经被取消或迁移，则可以跳过不必要的硬件重编程。相比每次都强制重编程，这种方式在 VM 环境中可节省大量 VM-Exit 开销。
-
----
 
 ## 4. timerfd 完整串联
 
@@ -323,8 +315,6 @@ timerfd_create() → 直接操作 hrtimer/alarm
 - `alarm_init()` / `alarm_start()`
 - `timerfd_clock_was_set()` —— 时钟设置时同时通知所有 timerfd
 
----
-
 ## 5. timers 子系统和 clock_gettime 关系
 
 ### 5.1 clock_was_set_delayed 的作用
@@ -374,8 +364,6 @@ hrtimer_update_base(cpu_base)
 
 在 `hrtimer.c` 中有 `clock_gettime` 相关的 `__hrtimer_get_remaining` 路径，但 `posix_get_monitor_times` 主要用于 POSIX timer fdinfo 接口中展示每个 timer's 到期时间，不是内核直接暴露的系统调用。
 
----
-
 ## 6. 定时器 和 workqueue 的本质区别
 
 ### 6.1 时间精度对比
@@ -412,8 +400,6 @@ workqueue: 进程上下文，可以 sleep、schedule、获取信号
            用于延后工作（如 driver shutdown、内存回收）
            精度：jiffies 级，最小延迟 ~1ms（取决于 HZ）
 ```
-
----
 
 ## 7. 迁移和亲和性：CPU idle 时 hrtimer 的迁移
 
@@ -496,8 +482,6 @@ CPU 进入 idle
 
 在 NO_HZ_FULL 模式下，只有 housekeeping CPU 处理 tick，不承担任务的 CPU 可以长期处于 idle 且不被打断。`timers_migration_enabled` key 控制是否开启 timer 迁移功能。
 
----
-
 ## 附录：关键数据结构一览
 
 ```
@@ -534,8 +518,6 @@ timerfd_ctx
   └── wqh: wait_queue_head_t
 ```
 
----
-
 ## 总结
 
 Linux 定时器子系统是一个分层的精密系统：
@@ -546,3 +528,72 @@ Linux 定时器子系统是一个分层的精密系统：
 4. **timerfd 层**：将 hrtimer/alarm 封装为 fd 接口，支持 poll/read，统一了 Linux timer 抽象
 5. **nohz 层**：tick_sched + housekeeping CPU design，使得非关键 CPU 可以真正 idle
 6. **migration 层**：migration_base + nohz_idle_balance 确保在 CPU hotplug 时 timer 不丢失
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `kernel/time/hrtimer.c` | 156 | 0 | 113 | 23 |
+
+### 关键函数
+
+- **retrigger_next_event** `hrtimer.c:91`
+- **__hrtimer_cb_get_time** `hrtimer.c:92`
+- **hrtimer_base_is_online** `hrtimer.c:122`
+- **hrtimer_hres_workfn** `hrtimer.c:133`
+- **hrtimer_schedule_hres_work** `hrtimer.c:140`
+- **lock_hrtimer_base** `hrtimer.c:183`
+- **hrtimer_suitable_target** `hrtimer.c:215`
+- **get_target_base** `hrtimer.c:242`
+- **switch_hrtimer_base** `hrtimer.c:269`
+- **ktime_add_safe** `hrtimer.c:363`
+- **ktime_add_safe** `hrtimer.c:377`
+- **debug_hrtimer_init** `hrtimer.c:506`
+- **debug_hrtimer_init_on_stack** `hrtimer.c:507`
+- **debug_hrtimer_activate** `hrtimer.c:508`
+- **debug_hrtimer_deactivate** `hrtimer.c:509`
+- **debug_hrtimer_assert_init** `hrtimer.c:510`
+- **debug_setup** `hrtimer.c:513`
+- **debug_setup_on_stack** `hrtimer.c:519`
+- **debug_activate** `hrtimer.c:526`
+- **hrtimer_bases_next_event_without** `hrtimer.c:544`
+- **clock_base_next_timer** `hrtimer.c:579`
+- **hrtimer_bases_first** `hrtimer.c:587`
+- **__hrtimer_get_next_event** `hrtimer.c:622`
+- **hrtimer_update_next_event** `hrtimer.c:646`
+- **hrtimer_update_base** `hrtimer.c:677`
+- **hrtimer_hres_active** `hrtimer.c:698`
+- **hrtimer_rearm_event** `hrtimer.c:704`
+- **__hrtimer_reprogram** `hrtimer.c:710`
+- **hrtimer_force_reprogram** `hrtimer.c:739`
+- **setup_hrtimer_hres** `hrtimer.c:758`
+- **hrtimer_is_hres_enabled** `hrtimer.c:765`
+- **hrtimer_switch_to_hres** `hrtimer.c:771`
+- **retrigger_next_event** `hrtimer.c:808`
+- **hrtimer_reprogram** `hrtimer.c:844`
+- **update_needs_ipi** `hrtimer.c:902`
+
+### 全局变量
+
+- **hrtimer_bases** `hrtimer.c:106`
+- **hrtimer_highres_enabled_key** `hrtimer.c:131`
+- **hrtimer_hres_work** `hrtimer.c:138`
+- **migration_cpu_base** `hrtimer.c:159`
+- **__UNIQUE_ID_addressable_ktime_add_safe_4** `hrtimer.c:377`
+- **hrtimer_hres_enabled** `hrtimer.c:753`
+- **hrtimer_resolution** `hrtimer.c:754`
+- **hrtimer_resolution** `hrtimer.c:755`
+- **__UNIQUE_ID_addressable_hrtimer_resolution_11** `hrtimer.c:755`
+- **__setup_str_setup_hrtimer_hres** `hrtimer.c:762`
+- **__setup_setup_hrtimer_hres** `hrtimer.c:762`
+- **hrtimer_work** `hrtimer.c:1012`
+- **__UNIQUE_ID_addressable_hrtimer_forward_18** `hrtimer.c:1094`
+- **__UNIQUE_ID_addressable_hrtimer_start_range_ns_22** `hrtimer.c:1496`
+- **__UNIQUE_ID_addressable_hrtimer_try_to_cancel_23** `hrtimer.c:1537`
+

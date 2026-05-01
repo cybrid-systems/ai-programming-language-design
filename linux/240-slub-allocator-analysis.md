@@ -3,8 +3,6 @@
 > 内核源码: Linux 7.0-rc1 (`mm/slub.c` + `mm/slab.h`)
 > 分析工具: doom-lsp (clangd LSP)
 
----
-
 ## 一、SLUB 架构总览
 
 SLUB 是 Linux 主流 slab 分配器，其核心设计目标：**用 O(1) 快速路径减少锁竞争，用 lockless freelist 和 per-CPU sheaves 实现高吞吐。**
@@ -22,8 +20,6 @@ kmem_cache_alloc()
         ├── new_slab()             ← 分配新 slab 页
         └── shuffle_freelist()     ← 随机化 freelist (熵)
 ```
-
----
 
 ## 二、SLUB 布局串联：核心数据结构
 
@@ -144,8 +140,6 @@ CPU (per-core)
   └─────────────────────────────────────────────┘
 ```
 
----
-
 ## 三、快速路径 `kmem_cache_alloc`
 
 ### 3.1 CPU 本地缓存命中：O(1) 分配
@@ -261,8 +255,6 @@ static void *get_from_partial(struct kmem_cache *s, int node, struct partial_con
 }
 ```
 
----
-
 ### 完整分配路径 ASCII 图
 
 ```
@@ -300,8 +292,6 @@ kmem_cache_alloc()
     └─ [debug] set_track()                 记录 alloc 堆栈
         └─ 返回 object ✓
 ```
-
----
 
 ## 四、Freelist 随机化：分配器熵
 
@@ -379,8 +369,6 @@ static inline freeptr_t freelist_ptr_encode(const struct kmem_cache *s,
 ```
 
 即使攻击者获得了 freelist 指针，也要知道 `s->random` 和地址才能解密出真实对象指针。
-
----
 
 ## 五、`slub_debug` 实现：红区、Poison 与 alloc_track
 
@@ -460,8 +448,6 @@ static __always_inline void set_track(struct kmem_cache *s, void *object,
 
 在 `___slab_alloc()` 成功路径调用 `set_track()` 记录分配点，调试时可追溯对象来源。
 
----
-
 ## 六、Shrink 路径：与 vmscan 配合
 
 ### 6.1 `kmem_cache_shrink()` 入口
@@ -508,8 +494,6 @@ static void barn_shrink(struct kmem_cache *s, struct node_barn *barn)
 SLUB 本身不直接参与 memory reclaim，但 `list_lru` 机制允许 slab 对象在内存压力时被 LRU 驱逐。当 `SLAB_STORE_USER` 开启且 `CONFIG_MEMCG` 时，`memcg_slab_post_alloc_hook()` 将 slab 对象接入 memcg LRU。
 
 `objects per slab` 动态调整发生在 `allocate_slab()` → `oo_order()` 根据对象大小和页阶计算，若对象很大（超过 `PAGE_SIZE`）会降为单页 slab。
-
----
 
 ## 七、NUMA 亲和性
 
@@ -567,8 +551,6 @@ if (static_branch_unlikely(&strict_numa) && node == NUMA_NO_NODE) {
 
 `memcpy` 代价与 NUMA 配置密切相关：跨 node 内存复制需要 QPI/UPI 互联，延迟比本地内存复制高 2-4 倍。对于大对象 `kmalloc`（通常 > 128B），NUMA 局部性影响更显著。
 
----
-
 ## 八、Per-CPU Freelist 竞争分析
 
 ### 8.1 竞争来源
@@ -610,8 +592,6 @@ struct local_trylock {
 ### 8.4 竞争热点的避免
 
 当多个 CPU 同时耗尽本地 sheaf，进入 `barn_replace_empty_sheaf()` 时竞争 `node_barn->lock`。但 `barn_shrink()` 在 shrink 时会批量归还 sheaf 到 partial，降低竞争压力。
-
----
 
 ## 九、完整对象生命周期图
 
@@ -661,8 +641,6 @@ struct local_trylock {
  └─ scan partial lists → 释放空 slab
 ```
 
----
-
 ## 十、关键源码索引
 
 | 主题 | 函数 / 符号 | 文件位置 |
@@ -688,8 +666,117 @@ struct local_trylock {
 | kmem_cache_node | `struct kmem_cache_node` | slub.c:430 |
 | slab 结构 | `struct slab` | slab.h:74 |
 
----
-
 ## 总结
 
 SLUB 的设计哲学是**最大程度减少全局竞争**：CPU 本地 sheaves 实现 lockless O(1) 分配，node_barn 作为跨 CPU 的批量缓冲层，kmem_cache_node.partial 作为最后兜底的全局链表。Freelist 随机化通过预计算的 `random_seq[]` 在 slab 分配时对 freelist head 进行不可预测的初始化，配合 `SLAB_FREELIST_HARDENED` 的指针 XOR 混淆，构建纵深防御。Debug 体系（红区、Poison、alloc_track）利用 `stack_depot` 做全局堆栈去重存储，开销可控。
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `mm/slub.c` | 660 | 16 | 356 | 105 |
+
+### 核心数据结构
+
+- **partial_context** `slub.c:217`
+- **partial_bulk_context** `slub.c:223`
+- **track** `slub.c:309`
+- **node_barn** `slub.c:396`
+- **slab_sheaf** `slub.c:404`
+- **(anonymous union)** `slub.c:405`
+- **(anonymous struct)** `slub.c:409`
+- **slub_percpu_sheaves** `slub.c:420`
+- **kmem_cache_node** `slub.c:430`
+- **slub_flush_work** `slub.c:486`
+- **defer_free** `slub.c:6168`
+- **detached_freelist** `slub.c:6955`
+- **location** `slub.c:8731`
+- **loc_track** `slub.c:8745`
+- **slab_attribute** `slub.c:8981`
+- **saved_alias** `slub.c:9622`
+
+### 关键函数
+
+- **kmem_cache_debug** `slub.c:230`
+- **fixup_red_left** `slub.c:235`
+- **sysfs_slab_add** `slub.c:322`
+- **debugfs_slab_add** `slub.c:328`
+- **stat** `slub.c:374`
+- **stat_add** `slub.c:385`
+- **get_node** `slub.c:441`
+- **get_barn_node** `slub.c:446`
+- **get_barn** `slub.c:454`
+- **freelist_ptr_encode** `slub.c:504`
+- **freelist_ptr_decode** `slub.c:517`
+- **get_freepointer** `slub.c:530`
+- **set_freepointer** `slub.c:541`
+- **freeptr_outside_object** `slub.c:556`
+- **get_info_end** `slub.c:565`
+- **order_objects** `slub.c:579`
+- **oo_make** `slub.c:584`
+- **oo_order** `slub.c:594`
+- **oo_objects** `slub.c:599`
+- **slab_test_pfmemalloc** `slub.c:608`
+- **slab_set_pfmemalloc** `slub.c:613`
+- **__slab_clear_pfmemalloc** `slub.c:618`
+- **slab_lock** `slub.c:626`
+- **slab_unlock** `slub.c:631`
+- **__update_freelist_fast** `slub.c:636`
+- **__update_freelist_slow** `slub.c:649`
+- **__slab_update_freelist** `slub.c:675`
+- **slab_update_freelist** `slub.c:701`
+- **set_orig_size** `slub.c:734`
+- **get_orig_size** `slub.c:748`
+- **need_slab_obj_exts** `slub.c:777`
+- **obj_exts_size_in_slab** `slub.c:791`
+- **obj_exts_offset_in_slab** `slub.c:796`
+- **obj_exts_fit_within_slab_leftover** `slub.c:806`
+- **obj_exts_in_slab** `slub.c:815`
+
+### 全局变量
+
+- **slub_debug_enabled** `slub.c:208`
+- **strict_numa** `slub.c:213`
+- **slab_nodes** `slub.c:473`
+- **slab_barn_nodes** `slub.c:479`
+- **flushwq** `slub.c:484`
+- **flush_lock** `slub.c:492`
+- **slub_flush** `slub.c:493`
+- **object_map** `slub.c:909`
+- **object_map_lock** `slub.c:910`
+- **slub_debug** `slub.c:981`
+- **slub_debug_string** `slub.c:984`
+- **disable_higher_order_debug** `slub.c:985`
+- **param_ops_slab_debug** `slub.c:1927`
+- **__param_str_slab_debug** `slub.c:1931`
+- **__param_slab_debug** `slub.c:1931`
+
+### 成员/枚举
+
+- **flags** `slub.c:218`
+- **orig_size** `slub.c:219`
+- **flags** `slub.c:224`
+- **min_objects** `slub.c:225`
+- **max_objects** `slub.c:226`
+- **slabs** `slub.c:227`
+- **addr** `slub.c:310`
+- **handle** `slub.c:312`
+- **cpu** `slub.c:314`
+- **pid** `slub.c:315`
+- **when** `slub.c:316`
+- **lock** `slub.c:397`
+- **sheaves_full** `slub.c:398`
+- **sheaves_empty** `slub.c:399`
+- **nr_full** `slub.c:400`
+- **nr_empty** `slub.c:401`
+- **callback_head** `slub.c:406`
+- **barn_list** `slub.c:407`
+- **capacity** `slub.c:410`
+- **pfmemalloc** `slub.c:411`
+

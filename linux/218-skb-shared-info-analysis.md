@@ -2,8 +2,6 @@
 
 **内核源码:** Linux 7.0-rc1 (`/home/dev/code/linux/include/linux/skbuff.h`)
 
----
-
 ## 1. 内存布局总览
 
 `struct skb_shared_info` 位于 `skb->head` 缓冲区的**末尾**，紧跟在实际数据之后。它是 skb 内存布局的最后一块，位于 `skb->end`（字节偏移）处。
@@ -30,8 +28,6 @@ skb->head                                    skb->head + skb->end
 ```
 
 **重要:** `skb_shared_info` 的大小在 `__alloc_skb()` 中被预先扣除——实际可用的 head 空间是 `SKB_WITH_OVERHEAD(X)`，而非用户请求的 `X`（第 255-265 行）。
-
----
 
 ## 2. struct skb_shared_info 核心字段
 
@@ -96,8 +92,6 @@ struct skb_shared_info {
 - **高 16 位**: 仅 payload 的引用数——用于判断 `skb_header_cloned()` 是否允许写头部
 
 这是 transport layer（如 TCP）实现"header-cloned skb"机制的关键。
-
----
 
 ## 3. struct skb_frag_t 与页面碎片
 
@@ -228,8 +222,6 @@ static inline dma_addr_t __skb_frag_dma_map(struct device *dev,
 }
 ```
 
----
-
 ## 4. frag_list — 片段链表
 
 `frag_list` 是管理非线性数据的**第二种方式**，与 `frags[]` 互斥。`frag_list` 是一个 `struct sk_buff *` 指针，指向一个子 skb 链表:
@@ -274,8 +266,6 @@ int skb_gro_receive_list(struct sk_buff *p, struct sk_buff *skb)
 ```
 
 **注意:** `skb_segment_list` (`skbuff.c:4639`) 处理的是 `SKB_GSO_FRAGLIST` 类型，即发送端主动使用 frag_list 进行 GSO 分段。
-
----
 
 ## 5. GSO (Generic Segmentation Offload)
 
@@ -375,8 +365,6 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 
 当 `gso_size == GSO_BY_FRAGS` 时，`skb_segment` 不做线性分段，而是直接返回 frag_list 中的子 skb 列表（用于 `SKB_GSO_FRAGLIST`）。
 
----
-
 ## 6. NETIF_F_GSO_* 特性标志
 
 定义在 `netdev_features.h:26-57`:
@@ -426,8 +414,6 @@ static inline bool net_gso_ok(netdev_features_t features, int gso_type)
 }
 ```
 
----
-
 ## 7. tx_flags — 传输时间戳标志
 
 `skbuff.h:469-491`:
@@ -449,8 +435,6 @@ enum {
 #define SKBTX_ANY_TSTAMP  (SKBTX_HW_TSTAMP | SKBTX_ANY_SW_TSTAMP)
 ```
 
----
-
 ## 8. SKBFL_* — Zero-copy 与共享片段标志
 
 `skbuff.h:502-519`:
@@ -470,8 +454,6 @@ enum {
 ```
 
 `destructor_arg` (`void *`) 通常指向 `struct ubuf_info`，用于零拷贝完成后通知用户空间释放缓冲区。
-
----
 
 ## 9. pfmemalloc 标志与内存压力处理
 
@@ -522,8 +504,6 @@ static inline bool skb_page_frag_refill(unsigned int sz, void **ptr,
 1. `SKBFL_PURE_ZEROCOPY` 标记表示段不需要计入内核内存
 2. `SKBFL_MANAGED_FRAG_REFS` 表示 fragment 引用由 `ubuf_info` 管理，在 `ubuf_info` 释放前是安全的
 3. `pfmemalloc` page 在 DMA 完成后必须立即归还 page pool，不能长期持有
-
----
 
 ## 10. frags[] 数组管理细节
 
@@ -578,8 +558,6 @@ if (skb_has_shared_frag(nskb) && __skb_linearize(nskb))
 - 内核直接遍历 `frag_list`，每个子 skb 对应一个 GSO 段
 - 不需要从 `frags[]` 合并/分割
 
----
-
 ## 11. 完整内存布局图
 
 ```
@@ -627,8 +605,6 @@ skb_shared_info (位于 head buffer 末尾):
 
 > **注意:** `frags[]` 数组每个元素 12 字节（`netmem_ref`(8) + `len`(4) 实际在 64-bit 上), 实际上 `skb_frag_t` 是 16 字节对齐: `netmem_ref`(8) + `unsigned int len`(4) + `unsigned int offset`(4) = 16 字节。17 个 frag 共 272 字节。
 
----
-
 ## 12. 关键宏与 Helper 速查
 
 | 宏/函数 | 定义位置 | 说明 |
@@ -652,8 +628,6 @@ skb_shared_info (位于 head buffer 末尾):
 | `skb_segment_list()` | skbuff.c:4639 | Fraglist GSO 分割 |
 | `skb_propagate_pfmemalloc()` | skbuff.h:3630 | 传播 pfmemalloc 到 skb |
 
----
-
 ## 13. 小结
 
 `struct skb_shared_info` 是 Linux 网络栈中处理**非线性 skb 数据**和**GSO 卸载**的核心数据结构。它位于每个 skb 的 head buffer 末尾，通过两种互补机制管理数据片段:
@@ -664,3 +638,126 @@ skb_shared_info (位于 head buffer 末尾):
 GSO 相关的三个字段 `gso_size`、`gso_segs`、`gso_type` 为 NIC 驱动提供分段指令，由 `skb_segment()` 在软件中执行最终的段切分。`NETIF_F_GSO_*` 特性标志则在设备能力层面控制了可用 GSO 类型。
 
 `dataref` 的 16-bit 分半设计允许 transport layer（如 TCP）在保持 payload 引用的情况下安全地"release header"，这是零拷贝路径优化的重要基础。
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+

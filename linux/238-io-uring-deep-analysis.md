@@ -13,8 +13,6 @@ io_uring 是 Linux 5.1 引入的异步 I/O 接口，被设计为 epoll 的下一
 - **批量提交**：一次 `io_uring_enter()` 可提交多个 SQE 并等待多个 CQE，大幅降低 syscall 开销
 - **统一接口**：文件 I/O、网络 I/O、计时器、同步原语全部通过 SQE 表达
 
----
-
 ## 2. SQ/CQ 环形缓冲区
 
 ### 2.1 内存布局（io_uring_setup → mmap）
@@ -148,8 +146,6 @@ SQ Ring mmap 区域布局（IORING_OFF_SQES）：
 ```
 
 **注意**：内核**不修改** sq_array 和 sq_sqes，这是 io_uring "zero syscall data copy" 的关键——数据在 mmap 之前已经由用户态填充完毕，`io_uring_enter()` 只是通知内核"有新 SQE 请处理"。
-
----
 
 ## 3. Submission 路径
 
@@ -314,8 +310,6 @@ static inline void io_commit_sqring(struct io_ring_ctx *ctx)
 }
 ```
 
----
-
 ## 4. task_work 机制
 
 ### 4.1 为什么需要 task_work？
@@ -413,8 +407,6 @@ void io_run_task_work(void)
 // TIF_NOTIFY_SIGNAL 会被检查 → do_signal() → task_work_run() → io_run_task_work()
 ```
 
----
-
 ## 5. Multi-shot 和 LINK 语义
 
 ### 5.1 Multi-shot（IOSQE_CQE_SKIP_SUCCESS）
@@ -482,8 +474,6 @@ static void io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags)
 
 `IORING_FEAT_LINKED_FILE` 特性允许某些 SQE（splice/tee/send_zc）跨越不同 ring 的文件描述符，但仍保持串行化语义。
 
----
-
 ## 6. Fixed File Table
 
 ### 6.1 为什么需要固定文件表？
@@ -536,8 +526,6 @@ req->file = io_file_get_fixed(req, file_index, issue_flags);
 ```
 
 固定文件表大小由 `io_uring_params.sq_entries` 和注册的文件数量共同决定，受 `RLIMIT_NOFILE` 和内核配置限制。
-
----
 
 ## 7. SQPOLL 模式
 
@@ -618,8 +606,6 @@ SQPOLL 内核线程状态机：
 | SQPOLL + 长 idle | 低（在 idle 期间） | 稍高（取决于 idle 时长） | 中等频率 I/O，需要零 syscall 提交 |
 | SQPOLL + 绑定特定 CPU | 取决于 spin 占比 | 低 | 核心数充裕，追求最低延迟 |
 
----
-
 ## 8. 和 epoll 的本质区别
 
 ### 8.1 概念对比
@@ -657,8 +643,6 @@ SQPOLL 内核线程状态机：
   ✓ 遗留代码库，迁移成本高
   ✓ 超简单场景（仅监听几个 fd）
 ```
-
----
 
 ## 9. 缓存和内存管理
 
@@ -712,8 +696,6 @@ sqes[i].len = count;   // 请求的字节数
 // 内核从对应 buffer group 选择一个 buffer
 // CQE 的 buf_index 标识用了哪个 buffer
 ```
-
----
 
 ## 10. 关键数据结构汇总
 
@@ -777,8 +759,6 @@ sqes[i].len = count;   // 请求的字节数
 └──────────────────────────────────────────────────────────────────┘
 ```
 
----
-
 ## 11. 总结
 
 io_uring 通过三个核心机制实现了高性能异步 I/O：
@@ -788,3 +768,75 @@ io_uring 通过三个核心机制实现了高性能异步 I/O：
 3. **io-wq 线程池**：在内核线程中执行真正耗时的 I/O 操作，保持用户进程响应性
 
 这三个机制配合 `io_uring_enter()` 的批量提交/等待语义，使得 io_uring 在高吞吐量场景下 syscall 次数降低 **O(N)** → **O(1)**，这是它相比 epoll 最根本的性能优势。
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `io_uring/io_uring.c` | 145 | 1 | 129 | 8 |
+
+### 核心数据结构
+
+- **io_tctx_exit** `io_uring.c:2282`
+
+### 关键函数
+
+- **io_queue_sqe** `io_uring.c:121`
+- **__io_req_caches_free** `io_uring.c:122`
+- **io_poison_cached_req** `io_uring.c:153`
+- **io_poison_req** `io_uring.c:163`
+- **req_fail_link_node** `io_uring.c:173`
+- **io_req_add_to_cache** `io_uring.c:179`
+- **io_ring_ctx_ref_free** `io_uring.c:186`
+- **io_alloc_hash_table** `io_uring.c:193`
+- **io_free_alloc_caches** `io_uring.c:215`
+- **io_ring_ctx_alloc** `io_uring.c:225`
+- **io_clean_op** `io_uring.c:309`
+- **io_req_track_inflight** `io_uring.c:336`
+- **__io_prep_linked_timeout** `io_uring.c:344`
+- **io_prep_async_work** `io_uring.c:358`
+- **io_prep_async_link** `io_uring.c:390`
+- **io_queue_iowq** `io_uring.c:407`
+- **io_req_queue_iowq_tw** `io_uring.c:435`
+- **io_req_queue_iowq** `io_uring.c:440`
+- **io_linked_nr** `io_uring.c:446`
+- **io_queue_deferred** `io_uring.c:456`
+- **__io_commit_cqring_flush** `io_uring.c:479`
+- **__io_cq_lock** `io_uring.c:489`
+- **io_cq_lock** `io_uring.c:495`
+- **__io_cq_unlock_post** `io_uring.c:501`
+- **io_cq_unlock_post** `io_uring.c:514`
+- **__io_cqring_overflow_flush** `io_uring.c:523`
+- **io_cqring_overflow_kill** `io_uring.c:580`
+- **io_cqring_do_overflow_flush** `io_uring.c:586`
+- **io_cqring_overflow_flush_locked** `io_uring.c:593`
+- **io_put_task** `io_uring.c:599`
+- **io_task_refs_refill** `io_uring.c:613`
+- **io_uring_drop_tctx_refs** `io_uring.c:622`
+- **io_cqring_add_overflow** `io_uring.c:634`
+- **io_alloc_ocqe** `io_uring.c:660`
+- **io_fill_nop_cqe** `io_uring.c:693`
+
+### 全局变量
+
+- **io_key_has_sqarray** `io_uring.c:124`
+- **req_cachep** `io_uring.c:126`
+- **iou_wq** `io_uring.c:127`
+- **sysctl_io_uring_disabled** `io_uring.c:129`
+- **sysctl_io_uring_group** `io_uring.c:130`
+- **kernel_io_uring_disabled_table** `io_uring.c:133`
+- **io_uring_fops** `io_uring.c:2697`
+- **__UNIQUE_ID_addressable_io_uring_init_172** `io_uring.c:3259`
+
+### 成员/枚举
+
+- **task_work** `io_uring.c:2283`
+- **completion** `io_uring.c:2284`
+- **ctx** `io_uring.c:2285`
+

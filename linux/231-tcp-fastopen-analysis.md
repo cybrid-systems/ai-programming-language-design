@@ -29,8 +29,6 @@ TFO 1-RTT（第二次及以后的连接）：
 - **Cookie**：服务器生成并由客户端保存的认证令牌，用于验证 TFO 请求的合法性
 - **TFO_SERVER_ENABLE / TFO_CLIENT_ENABLE**：分别对应服务端和客户端的开关（`net.ipv4.tcp_fastopen` 位掩码）
 
----
-
 ## 2. 数据结构
 
 ### fastopen_queue — TFO 等待队列
@@ -114,8 +112,6 @@ struct tcp_fastopen_request {
 };
 ```
 
----
-
 ## 3. tcp_sendmsg 中的 TFO 检查路径
 
 在 `/home/dev/code/linux/net/ipv4/tcp.c:1178-1193`，`tcp_sendmsg_locked` 中：
@@ -183,8 +179,6 @@ bool tcp_fastopen_defer_connect(struct sock *sk, int *err)
 ```
 
 如果 `fastopen_connect` 已设置但没有有效 cookie，则分配 `fastopen_req` 并在后续 `tcp_connect()` 中发送 SYN 时附上 cookie 请求选项。
-
----
 
 ## 4. tcp_fastopen_cookie_gen 与 tcp_fastopen_cookie_gen_check
 
@@ -277,8 +271,6 @@ out:
 
 返回 `ret == 2` 时表示 cookie 使用备用密钥验证通过，服务端会在响应中标记 `MIB_TCPFASTOPENPASSIVEALTKEY`。
 
----
-
 ## 5. fastopen_queue 与 max_qlen 限制
 
 `tcp_fastopen_queue_check`（`tcp_fastopen.c:389`）负责 TFO 的队列长度检查：
@@ -343,8 +335,6 @@ fastopenq->qlen++;
 
 **欺骗攻击防御原理**：攻击者伪造大量带 cookie 的 TFO SYN 到服务器，如果服务器为每个这样的 SYN 都创建 child socket 并排队，会消耗资源。通过在 RST 后将 req 保留 60 秒并计入 `qlen`，服务器可以在 `max_qlen` 限制内快速拒绝大量欺骗流量，防止 `qlen` 无限增长导致 DoS。
 
----
-
 ## 6. SYN 数据包的 skb 处理 — tcp_fastopen_add_skb
 
 当服务端收到带数据的 SYN（`syn_data = true`），`tcp_fastopen_add_skb`（`tcp_fastopen.c:223`）将数据 skb 附加到刚创建的 child socket：
@@ -385,8 +375,6 @@ void tcp_fastopen_add_skb(struct sock *sk, struct sk_buff *skb)
 ```
 
 注意 `TCP_SKB_CB(skb)->tcp_flags &= ~TCPHDR_SYN` 这行——SYN 中的数据不再带有 SYN 标志，接收窗口按照正常数据处理。`tcp_urg_fin` 的处理实际上是 `tcp_fin()` 函数，FIN 如果出现在 SYN data 中会被正确处理。
-
----
 
 ## 7. TFO 的三条路径 — tcp_try_fastopen
 
@@ -459,8 +447,6 @@ static bool tcp_fastopen_no_cookie(const struct sock *sk,
 1. `sysctl_tcp_fastopen` 包含 `TFO_SERVER_COOKIE_NOT_REQD`
 2. socket 设置了 `fastopen_no_cookie`
 3. 路由 `dst` 设置了 `RTAX_FASTOPEN_NO_COOKIE`
-
----
 
 ## 8. fastopen_key 与 Cookie 加密机制
 
@@ -558,8 +544,6 @@ bool tcp_fastopen_cookie_match(const struct tcp_fastopen_cookie *foc,
 
 必须长度相等（`TCP_FASTOPEN_COOKIE_SIZE == 8`）且字节内容完全匹配。
 
----
-
 ## 9. tcp_fastopen_create_child — 创建 TFO child socket
 
 `tcp_fastopen_create_child`（`tcp_fastopen.c:310`）在服务端收到带有效 cookie 的 SYN 时被调用：
@@ -609,8 +593,6 @@ static struct sock *tcp_fastopen_create_child(struct sock *sk,
 - `refcount_set(&req->rsk_refcnt, 2)` — child 和 listener 各持一个引用，确保 req 不会过早释放
 - `tcp_fastopen_add_skb` 将 SYN 中的数据（如果有）移入 receive queue
 
----
-
 ## 10. TFO 攻击面与限制措施
 
 ### max_qlen 限制 — 防 DoS
@@ -633,8 +615,6 @@ static struct sock *tcp_fastopen_create_child(struct sock *sk,
 ### tcp_fastopen_blackhole_timeout
 
 `sysctl_tcp_fastopen_blackhole_timeout` 控制上述全局禁用时长。如果为 0，则禁用此防护机制。
-
----
 
 ## 11. TCP_FASTOPEN 选项的 setsockopt 处理
 
@@ -671,8 +651,6 @@ case TCP_FASTOPEN_NO_COOKIE:
 - `TCP_FASTOPEN` 只允许在 `CLOSED` 或 `LISTEN` 状态设置
 - `TCP_FASTOPEN_CONNECT` 只允许在 `CLOSED` 状态设置
 - `TCP_FASTOPEN_NO_COOKIE` 允许在 `CLOSED` 或 `LISTEN` 状态设置
-
----
 
 ## 12. tcp_send_syn_data — SYN+DATA 的发送
 
@@ -716,8 +694,6 @@ done:
 
 fallback 路径说明：如果因为任何原因（SYN+DATA 包传输失败、cookie 无效等），内核会回退到发送普通 SYN 并请求新 cookie。如果 `fo->cookie.len > 0`（之前有有效 cookie 但失败了），会将其重置为 0 以请求新 cookie，避免重用失败的 cookie。
 
----
-
 ## 总结
 
 Linux 内核的 TCP Fast Open 实现涉及：
@@ -727,3 +703,125 @@ Linux 内核的 TCP Fast Open 实现涉及：
 3. **三条路径**：Cookie 请求、有效 Cookie（有无数据均可）、无 Cookie 模式
 4. **child socket 创建**：通过 `tcp_fastopen_create_child` 在 SYN 阶段创建socket，数据通过 `tcp_fastopen_add_skb` 移入 receive queue
 5. **主动 TFO 保护**：指数退避的 blackhole 检测机制防止中间件导致的数据黑洞
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+

@@ -3,8 +3,6 @@
 > 基于 Linux 7.0-rc1 内核源码
 > 核心源码路径：`virt/kvm/kvm_main.c`、`arch/x86/kvm/`
 
----
-
 ## 一、整体架构总览
 
 KVM（Kernel-based Virtual Machine）是 Linux 内核的硬件虚拟化基础设施。它不是独立的 Hypervisor，而是依赖 CPU 硬件虚拟化支持（Intel VT-x / AMD-V），将 Linux 内核本身转化为 Hypervisor。
@@ -36,8 +34,6 @@ KVM（Kernel-based Virtual Machine）是 Linux 内核的硬件虚拟化基础设
 │    x86.c         ← 通用 x86 逻辑                     │
 └──────────────────────────────────────────────────────┘
 ```
-
----
 
 ## 二、VM 创建 —— 从 KVM_CREATE_VM 到 struct kvm
 
@@ -164,8 +160,6 @@ struct kvm {
 };
 ```
 
----
-
 ## 三、vCPU 创建 —— KVM_CREATE_VCPU
 
 ### 3.1 VM fd → kvm_vm_ioctl()
@@ -272,8 +266,6 @@ ioctl(vcpu_fd, KVM_RUN, 0)
   └→ kvm_vcpu_ioctl()         ← vCPU fd（绑定 kvm_vcpu_fops）
        └→ case KVM_RUN → kvm_arch_vcpu_ioctl_run(vcpu)
 ```
-
----
 
 ## 四、vCPU 运行路径 —— KVM_RUN 完整链路
 
@@ -538,8 +530,6 @@ int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 └─────────────────────────────────────────────────────────────────┘
 ```
 
----
-
 ## 五、内存虚拟化 —— gpa_to_hva 与 mmu_notifier
 
 ### 5.1 客户机物理地址 → 宿主虚拟地址的映射体系
@@ -680,8 +670,6 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 }
 ```
 
----
-
 ## 六、中断虚拟化 —— LAPIC + IOAPIC
 
 ### 6.1 虚拟 LAPIC (Local APIC)
@@ -788,8 +776,6 @@ case KVM_SET_GSI_ROUTING: {
 }
 ```
 
----
-
 ## 七、Hypercall 机制 —— 从 guest 到 host
 
 ### 7.1 KVM Hypercall 入口：VMMCALL / VMCALL
@@ -887,8 +873,6 @@ case KVM_HC_MAP_GPA_RANGE: {     // 12 — ★ 映射 GPA（SEV/TDX）
 #define KVM_HC_MAP_GPA_RANGE        12  // SEV/TDX 私有内存映射
 ```
 
----
-
 ## 八、/dev/kvm 注册 —— 完整 ioctl 路由图
 
 ```
@@ -941,8 +925,6 @@ case KVM_HC_MAP_GPA_RANGE: {     // 12 — ★ 映射 GPA（SEV/TDX）
   └───────────────────────────────────────────────────────┘
 ```
 
----
-
 ## 九、核心数据结构关系图
 
 ```
@@ -969,8 +951,6 @@ struct kvm_run（mmap 到用户空间）
   └── eoi                      ← EOI 信息
 ```
 
----
-
 ## 十、关键源码位置索引
 
 | 功能 | 文件 | 行号 |
@@ -996,3 +976,93 @@ struct kvm_run（mmap 到用户空间）
 | kvm_apic_set_irq | lapic.c | 829 |
 | ioapic_set_irq | ioapic.c | 187 |
 | KVM_HC_* 定义 | kvm_para.h | 21-32 |
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `virt/kvm/kvm_main.c` | 366 | 5 | 267 | 62 |
+
+### 核心数据结构
+
+- **gfn_handler_t** `kvm_main.c:509`
+- **on_lock_fn_t** `kvm_main.c:511`
+- **kvm_mmu_notifier_range** `kvm_main.c:513`
+- **kvm_mmu_notifier_return** `kvm_main.c:536`
+- **kvm_mn_ret_t** `kvm_main.c:536`
+
+### 关键函数
+
+- **__check_halt_poll_ns** `kvm_main.c:79`
+- **__check_halt_poll_ns_grow** `kvm_main.c:84`
+- **__check_halt_poll_ns_grow_start** `kvm_main.c:89`
+- **__check_halt_poll_ns_shrink** `kvm_main.c:94`
+- **__check_allow_unsafe_mappings** `kvm_main.c:102`
+- **kvm_vcpu_ioctl** `kvm_main.c:122`
+- **kvm_no_compat_ioctl** `kvm_main.c:136`
+- **kvm_no_compat_open** `kvm_main.c:139`
+- **kvm_io_bus_destroy** `kvm_main.c:147`
+- **kvm_uevent_notify_change** `kvm_main.c:151`
+- **kvm_arch_guest_memory_reclaimed** `kvm_main.c:157`
+- **vcpu_load** `kvm_main.c:164`
+- **vcpu_put** `kvm_main.c:175`
+- **kvm_request_needs_ipi** `kvm_main.c:186`
+- **ack_kick** `kvm_main.c:203`
+- **kvm_kick_many_cpus** `kvm_main.c:207`
+- **kvm_make_vcpu_request** `kvm_main.c:216`
+- **kvm_make_vcpus_request_mask** `kvm_main.c:244`
+- **kvm_make_all_cpus_request** `kvm_main.c:270`
+- **kvm_flush_remote_tlbs** `kvm_main.c:293`
+- **kvm_flush_remote_tlbs_range** `kvm_main.c:314`
+- **kvm_flush_remote_tlbs_memslot** `kvm_main.c:327`
+- **kvm_flush_shadow_all** `kvm_main.c:341`
+- **mmu_memory_cache_alloc_obj** `kvm_main.c:348`
+- **__kvm_mmu_topup_memory_cache** `kvm_main.c:364`
+- **kvm_mmu_topup_memory_cache** `kvm_main.c:403`
+- **kvm_mmu_memory_cache_nr_free_objects** `kvm_main.c:408`
+- **kvm_mmu_free_memory_cache** `kvm_main.c:413`
+- **kvm_mmu_memory_cache_alloc** `kvm_main.c:428`
+- **kvm_vcpu_init** `kvm_main.c:441`
+- **kvm_vcpu_destroy** `kvm_main.c:466`
+- **kvm_destroy_vcpus** `kvm_main.c:482`
+- **mmu_notifier_to_kvm** `kvm_main.c:504`
+- **kvm_null_fn** `kvm_main.c:548`
+- **kvm_handle_hva_range** `kvm_main.c:560`
+
+### 全局变量
+
+- **__UNIQUE_ID_modinfo_0** `kvm_main.c:73`
+- **__UNIQUE_ID_modinfo_1** `kvm_main.c:74`
+- **__UNIQUE_ID_modinfo_2** `kvm_main.c:75`
+- **__UNIQUE_ID_modinfo_3** `kvm_main.c:75`
+- **halt_poll_ns** `kvm_main.c:78`
+- **__param_str_halt_poll_ns** `kvm_main.c:79`
+- **__param_halt_poll_ns** `kvm_main.c:79`
+- **__UNIQUE_ID_modinfo_4** `kvm_main.c:79`
+- **halt_poll_ns_grow** `kvm_main.c:83`
+- **__param_str_halt_poll_ns_grow** `kvm_main.c:84`
+- **__param_halt_poll_ns_grow** `kvm_main.c:84`
+- **__UNIQUE_ID_modinfo_5** `kvm_main.c:84`
+- **halt_poll_ns_grow_start** `kvm_main.c:88`
+- **__param_str_halt_poll_ns_grow_start** `kvm_main.c:89`
+- **__param_halt_poll_ns_grow_start** `kvm_main.c:89`
+
+### 成员/枚举
+
+- **start** `kvm_main.c:518`
+- **end** `kvm_main.c:519`
+- **arg** `kvm_main.c:520`
+- **handler** `kvm_main.c:521`
+- **on_lock** `kvm_main.c:522`
+- **flush_on_ret** `kvm_main.c:523`
+- **may_block** `kvm_main.c:524`
+- **lockless** `kvm_main.c:525`
+- **ret** `kvm_main.c:537`
+- **found_memslot** `kvm_main.c:538`
+

@@ -1,211 +1,150 @@
-# 22-sk_buff — Socket Buffer 套接字缓冲区深度源码分析
+# 22-sk_buff — 网络缓冲区深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`include/linux/skbuff.h` + `net/core/skbuff.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**sk_buff（socket buffer）** 是 Linux 网络协议栈的核心数据结构，贯穿从网卡到用户空间的数据包。
+**sk_buff（socket buffer）** 是 Linux 网络子���统中最核心的数据结构，贯穿整个网络协议栈——从网卡驱动到 socket 层，每个网络包都封装在一个 sk_buff 中。
+
+sk_buff 的设计核心是**灵活的头部空间管理**：通过 head/tail/end/data 指针，协议栈各层可以轻松地添加/移除 协议头部，无需复制数据。
+
+doom-lsp 确认 `include/linux/skbuff.h` 定义了核心结构，`net/core/skbuff.c` 包含分配/释放/克隆/复制等操作。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 struct sk_buff — 套接字缓冲区
+### 1.1 struct sk_buff
 
 ```c
-// include/linux/skbuff.h:82 — sk_buff
 struct sk_buff {
-    // 链表（用于 frag 列表等）
-    struct sk_buff          *next;        // 下一个 skb（用于链表）
-    struct sk_buff          *prev;        // 上一个 skb
+    union {
+        struct {
+            struct sk_buff  *next;      // skb 链表
+            struct sk_buff  *prev;
+        };
+        struct rb_node      rbnode;     // 红黑树节点（TCP 重传队列）
+    };
 
-    // 套接字关联
-    struct sock             *sk;          // 所属 socket
+    struct sock             *sk;        // 所属 socket
 
-    // 网络层头
-    struct sk_buff_head     *list;        // 所属链表
-    unsigned int            len;           // 总长度（包含数据）
-    unsigned int            data_len;     // 数据长度（不包括线性区）
-    __u16                   mac_len;     // MAC 头长度
-    __u16                   hdr_len;     // 可被克隆的头部长度
+    ktime_t                 tstamp;     // 时间戳
 
-    // 偏移
-    skb_frag_t            *frag_list;    // frag 链表（线性区外的页）
-    struct page            *page;          // 数据页（用于 frag）
-    unsigned int            page_offset;   // 页内偏移
-    unsigned int            truesize;      // 总大小（含 sk_buff 本身）
+    struct net_device       *dev;       // 输入/输出设备
 
-    // 协议头指针
-    unsigned char           *head;         // 缓冲起始
-    unsigned char           *end;          // 缓冲结束
-    unsigned char           *data;         // 数据起始（当前）
-    unsigned char           *tail;         // 数据结束（当前）
+    unsigned int            len,        // 数据总长度
+                            data_len;   // 非线性数据长度（paged frags）
 
-    // 校验
-    __u32                   csum;         // 校验和
-    __u16                   csum_start;   // 校验起始偏移
-    __u16                   csum_offset;  // 校验偏移
+    __u16                   protocol;   // 上层协议
 
-    // 网络层头（通过 skb_mac_header 访问）
-    unsigned char           *mac_header;    // MAC 头位置
-    unsigned char           *network_header; // 网络层头位置
-    unsigned char           *transport_header; // 传输层头位置
+    sk_buff_data_t          transport_header; // 传输层头部偏移
+    sk_buff_data_t          network_header;   // 网络层头部偏移
+    sk_buff_data_t          mac_header;       // 链路层头部偏移
 
-    // 输出队列
-    struct sk_buff          *destructor;   // 析构函数
+    union {
+        struct skb_shared_info *skb_shinfo; // 指向 skb_shared_info
+    };
+
+    /* 数据缓冲区指针 */
+    unsigned char           *head,      // 缓冲区起始
+                            *data,      // 当前数据起始
+                            *tail,      // 当前数据结束
+                            *end;       // 缓冲区结束
+
+    ...
+};
+```
+
+### 1.2 缓冲区布局
+
+```
+sk_buff 结构本身 ~ 200 字节
+数据缓冲区（head → end）在结构体外，通过指针引用
+
+head                     data              tail              end
+  │                       │                 │                │
+  ├──────────┬────────────┼─────────────────┼────────────────┤
+  │ headroom │  L2 header │   L3 header     │    payload     │
+  │ (预留)   │  (MAC)     │   (IP)          │                │
+  └──────────┴────────────┴─────────────────┴────────────────┘
+
+              headroom          数据区域           tailroom
+```
+
+各层对缓冲区的操作：
+
+```
+L2（网卡驱动）:     data → MAC 头
+L3（IP 层）:        skb_pull(skb, ETH_HLEN) → data 跳过 MAC 头
+L4（TCP/UDP）:      skb_pull(skb, ip_hdrlen) → data 跳过 IP 头
+发送时：            skb_push(skb, header_len) → data 前移，填充头部
+```
+
+---
+
+## 2. 关键操作
+
+### 2.1 分配
+
+```c
+struct sk_buff *alloc_skb(unsigned int size, gfp_t priority)
+{
+    return __alloc_skb(size, priority, 0, -1);
+}
+```
+
+`__alloc_skb` 分配 sk_buff 结构 + 数据缓冲区，初始化 head/data/tail/end 指针。
+
+### 2.2 数据操作
+
+| 函数 | 操作 | 效果 |
+|------|------|------|
+| `skb_put(skb, len)` | tail 后移 | 增加数据长度 |
+| `skb_push(skb, len)` | data 前移 | 在头部添加协议头 |
+| `skb_pull(skb, len)` | data 后移 | 剥离协议头 |
+| `skb_reserve(skb, len)` | data+tail 一起前移 | 预留 headroom |
+
+### 2.3 克隆与复制
+
+```c
+struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t priority);
+struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t priority);
+```
+
+- **skb_clone**: 共享数据缓冲区，只复制 sk_buff 结构体（引用计数 +1）
+- **skb_copy**: 复制完整的 sk_buff + 数据缓冲区（深拷贝）
+
+---
+
+## 3. skb_shared_info
+
+每个 sk_buff 尾部有一个 `skb_shared_info` 结构，管理非线性数据（碎片页）：
+
+```c
+struct skb_shared_info {
+    unsigned char   nr_frags;           // 碎片页数
+    skb_frag_t      frags[MAX_SKB_FRAGS]; // 碎片数组
+    struct sk_buff  *frag_list;         // skb 链表（GSO 分段）
+
+    unsigned int    gso_size;           // GSO 分段大小
+    unsigned short  gso_segs;           // GSO 分段数
+    unsigned short  gso_type;           // GSO 类型
 };
 ```
 
 ---
 
-## 2. 内存布局
+## 4. 源码文件索引
 
-```
-sk_buff 线性数据区布局：
-
-head     ────── skb->head（缓冲起始）
-           ├─ MAC 头（mac_header）
-data     ────── skb->data（当前数据起始）
-           ├─ 网络层头（network_header，如 IP 头）
-           ├─ 传输层头（transport_header，如 TCP 头）
-tail     ────── skb->tail（当前数据结束）
-end      ────── skb->end（缓冲结束）
-
-实际数据包：
-[ ETH | IP | TCP | DATA ]    ← 线性区
-
-如果数据很大（超过 MTU）：
-skb->frag_list → 指向额外的 skb（线性区外的页）
-```
+| 文件 | 关键符号 |
+|------|---------|
+| `include/linux/skbuff.h` | `struct sk_buff` 定义 |
+| `net/core/skbuff.c` | `__alloc_skb` / `skb_clone` / `skb_copy` |
+| `net/core/dev.c` | netif_receive_skb 等接收路径 |
 
 ---
 
-## 3. 核心操作
-
-### 3.1 skb_put — 尾部扩展
-
-```c
-// include/linux/skbuff.h — skb_put
-static inline void *skb_put(struct sk_buff *skb, unsigned int len)
-{
-    void *tmp = skb->tail;    // 旧 tail
-    skb->tail += len;         // 新 tail
-    skb->len += len;          // 更新长度
-    return tmp;               // 返回旧 tail（即新数据起始位置
-}
-
-// skb_push — 头部扩展（在 data 前插入）
-static inline void *skb_push(struct sk_buff *skb, unsigned int len)
-{
-    skb->data -= len;
-    skb->len += len;
-    return skb->data;
-}
-
-// skb_pull — 头部收缩（移除头部）
-static inline void *skb_pull(struct sk_buff *skb, unsigned int len)
-{
-    skb->len -= len;
-    skb->data += len;
-    return skb->data;
-}
-```
-
-### 3.2 skb_reserve — 保留头部空间
-
-```c
-// include/linux/skbuff.h — skb_reserve
-static inline void skb_reserve(struct sk_buff *skb, int len)
-{
-    skb->data += len;   // data 前移，为协议头腾出空间
-    skb->tail += len;   // tail 也前移
-}
-```
-
----
-
-## 4. 数据包接收流程
-
-### 4.1 netif_receive_skb — 接收数据包
-
-```c
-// net/core/dev.c — netif_receive_skb
-int netif_receive_skb(struct sk_buff *skb)
-{
-    struct packet_type *ptype;
-    int ret = NET_RX_SUCCESS;
-
-    // 1. 检查是否混杂模式
-    if (skb->dev->flags & IFF_PROMISC)
-        skb->pkt_type = PACKET_OTHERHOST;
-
-    // 2. 分配 vlan_tag
-    if (vlan_tx_tag_present(skb))
-        __vlan_hwaccel_put_tag(skb);
-
-    // 3. 分发到协议层
-    list_for_each_entry_rcu(ptype, &ptype_all, list) {
-        if (ptype->dev == skb->dev ||
-            ptype->dev == dev_get_by_index(&init_net, skb->dev->ifindex)) {
-            if (ptype->func(skb, skb->dev, pt_prev) == NET_RX_DROP)
-                ret = NET_RX_DROP;
-        }
-    }
-
-    return ret;
-}
-```
-
----
-
-## 5. TCP 发送流程
-
-```c
-// net/ipv4/tcp_output.c — tcp_sendmsg
-int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
-{
-    // 1. 分配 skb
-    struct sk_buff *skb = alloc_skb(size + tcp_header_size, sk->sk_allocation);
-
-    // 2. 填充 TCP 头
-    th = tcp_hdr(skb);
-    th->source = htons(sk->sk_sport);
-    th->dest = htons(peer_port);
-    th->seq = htonl(sk->sk_write_seq);
-    th->ack_seq = htonl(sk->rcv_nxt);
-
-    // 3. 复制数据
-    copy_from_iter(skb_put(skb, copy), copy, &msg->msg_iter);
-
-    // 4. 发送
-    tcp_push(skb);
-}
-```
-
----
-
-## 6. 完整文件索引
-
-| 文件 | 函数/结构 |
-|------|----------|
-| `include/linux/skbuff.h` | `struct sk_buff` |
-| `include/linux/skbuff.h` | `skb_put`、`skb_push`、`skb_pull`、`skb_reserve` |
-| `net/core/dev.c` | `netif_receive_skb` |
-
----
-
-## 7. 西游记类比
-
-**sk_buff** 就像"取经路上的快递包裹"——
-
-> 包裹（sk_buff）有自己的包装区（head~end），里面有货物（data~tail）和各种标签（MAC头、IP头、TCP头）。每过一个驿站（协议层），就会在头部加一个新的标签（skb_push）。拆掉标签看内容（skb_pull）。如果货物太大，就用额外的袋子装（skb->frag_list）。快递公司（网卡驱动）负责收货（netif_receive_skb），把包裹贴上标签（MAC 头），然后根据标签送到各个部门（IP层、TCP层）。
-
----
-
-## 8. 关联文章
-
-- **netfilter**（article 28）：sk_buff 在 netfilter hook 中的修改
-- **socket**（网络部分）：sk_buff 与 socket 的关联
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*

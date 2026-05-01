@@ -4,8 +4,6 @@
 > 源码路径: `/home/dev/code/linux/kernel/rcu/` + `/home/dev/code/linux/include/linux/rcupdate.h`
 > 关键词: Read-Copy-Update, grace period, call_rcu, synchronize_rcu, srcu, tree RCU
 
----
-
 ## 1. RCU 核心概念
 
 ### 1.1 什么是 RCU？为什么读端不需要锁？
@@ -73,8 +71,6 @@ CPU0: rcu_read_unlock()         // 离开临界区
 ```
 
 `synchronize_rcu()` 保证：**在它返回之前，所有在调用之前开始的读端临界区都已经结束**，因此此时释放旧对象是安全的。
-
----
 
 ## 2. `rcu_head` 和 `call_rcu` 路径
 
@@ -156,8 +152,6 @@ CPU2: call_rcu(cb_C) → 放入 local CPU 的 cblist [RCU_NEXT_TAIL]
 ```
 
 RCU 设计者故意**不在每次 `call_rcu()` 时立即唤醒 GP kthread**（除非积压严重），以避免频繁创建 GP 产生的性能开销。批量处理显著提高了写端的效率。
-
----
 
 ## 3. Grace Period 检测：三阶段
 
@@ -294,8 +288,6 @@ Linux 6.x 引入的解决方案：**context_tracking** 机制**持续监控 CPU 
 
 关键洞察：**idle CPU 天然就是 quiescent**（没有持有任何 RCU 读锁），所以 NO_HZ_FULL 只需要确保 non-idle CPU 在持有读锁时不阻塞 GP 进展。`context_tracking_cpu_acquire()` 和 `context_tracking_cpu_release()` 记录 CPU 当前是否在 RCU 等价区域内。
 
----
-
 ## 4. `synchronize_rcu()` vs `synchronize_rcu_expedited()`
 
 ### 4.1 普通 `synchronize_rcu()`
@@ -385,8 +377,6 @@ static void rcu_exp_handler(void *unused)
 
 **Expedited GP 的核心优势：**通过 IPI 主动向所有 CPU 发送请求，比被动等待 `schedule()` 快得多——通常可以在几百微秒内完成，而不是几十毫秒。但代价是 IPI 会干扰所有 CPU 的当前执行，对实时负载不友好。
 
----
-
 ## 5. `rcu_bh` 和 `rcu_sched`
 
 ### 5.1 为什么需要多种 RCU？
@@ -437,8 +427,6 @@ static inline void rcu_read_lock_sched(void)
 **`rcu_sched` 的意义：**在 v5.0+ 内核中，`synchronize_rcu()` **同时等待** `rcu_read_lock_sched()` 区域，即所有 `preempt_disable()` 区域也被视为读端临界区。
 
 `rcu_read_lock()` 和 `rcu_read_lock_sched()` 在 v5.0+ 代码中是等价的——都通过 `__rcu_read_lock()` 实现。
-
----
 
 ## 6. SRCU（Sleepable RCU）
 
@@ -547,8 +535,6 @@ void synchronize_srcu(struct srcu_struct *ssp)
 
 **`srcu_gp_started`**（或等价的 `srcu_gp_seq` 状态）用于追踪当前 srcu_struct 是否处于活跃的 GP 等待中。`srcu_get_delay()` 在有其他 expedited GP pending 时返回 0（不睡眠），以加快进度。
 
----
-
 ## 7. Tree RCU 分层架构
 
 ### 7.1 `rcu_node` 和 `rcu_data` 的关系
@@ -642,8 +628,6 @@ Level 2 (leaf):      [每个 CPU]   位图
 ```
 
 **效果：**单个 CPU 报告 QS 的复杂度从 `O(ncpus)` 降到 `O(log ncpus)`，且锁竞争分布在不同节点上。
-
----
 
 ## 8. Grace Period 完整状态机图（ASCII）
 
@@ -746,8 +730,6 @@ Level 2 (leaf):      [每个 CPU]   位图
                                     下次 rcu_read_unlock() 报告
 ```
 
----
-
 ## 9. 总结
 
 | 方面 | 普通 RCU | Expedited RCU | SRCU |
@@ -759,3 +741,72 @@ Level 2 (leaf):      [每个 CPU]   位图
 | 写端代价 | 启动 GP（或 batch） | 广播 IPI | 轮询读端退出 |
 
 核心设计原则：**读者不需要任何同步操作**（no read-side overhead），代价全部由写端承担。这使得 RCU 成为读多写少场景下性能最优的同步机制。
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `kernel/rcu/tree.c` | 385 | 0 | 199 | 135 |
+
+### 关键函数
+
+- **rcu_sr_normal_gp_cleanup_work** `tree.c:78`
+- **rcu_get_gpwrap_count** `tree.c:84`
+- **rcu_get_gpwrap_count** `tree.c:90`
+- **__check_dump_tree** `tree.c:113`
+- **__check_use_softirq** `tree.c:117`
+- **__check_rcu_fanout_exact** `tree.c:121`
+- **__check_rcu_fanout_leaf** `tree.c:124`
+- **rcu_report_qs_rnp** `tree.c:159`
+- **invoke_rcu_core** `tree.c:161`
+- **rcu_report_exp_rdp** `tree.c:162`
+- **rcu_report_qs_rdp** `tree.c:163`
+- **check_cb_ovld_locked** `tree.c:164`
+- **rcu_rdp_is_offloaded** `tree.c:165`
+- **rcu_rdp_cpu_online** `tree.c:166`
+- **rcu_init_invoked** `tree.c:167`
+- **rcu_cleanup_dead_rnp** `tree.c:168`
+- **rcu_init_new_rnp** `tree.c:169`
+- **__check_kthread_prio** `tree.c:177`
+- **__check_gp_preinit_delay** `tree.c:182`
+- **__check_gp_init_delay** `tree.c:184`
+- **__check_gp_cleanup_delay** `tree.c:186`
+- **__check_nohz_full_patience_delay** `tree.c:188`
+- **rcu_get_gp_kthreads_prio** `tree.c:198`
+- **rcu_get_gp_kthreads_prio** `tree.c:202`
+- **rcu_gp_in_progress** `tree.c:220`
+- **rcu_get_n_cbs_cpu** `tree.c:229`
+- **rcu_softirq_qs** `tree.c:262`
+- **rcu_watching_online** `tree.c:283`
+- **rcu_watching_snap_in_eqs** `tree.c:294`
+- **rcu_watching_snap_stopped_since** `tree.c:312`
+- **rcu_watching_zero_in_eqs** `tree.c:332`
+- **rcu_momentary_eqs** `tree.c:358`
+- **rcu_momentary_eqs** `tree.c:368`
+- **rcu_is_cpu_rrupt_from_idle** `tree.c:378`
+- **__check_blimit** `tree.c:429`
+
+### 全局变量
+
+- **rcu_data** `tree.c:80`
+- **__UNIQUE_ID_addressable_rcu_get_gpwrap_count_1** `tree.c:90`
+- **rcu_state** `tree.c:92`
+- **dump_tree** `tree.c:112`
+- **__param_str_dump_tree** `tree.c:113`
+- **__param_dump_tree** `tree.c:113`
+- **__UNIQUE_ID_modinfo_2** `tree.c:113`
+- **use_softirq** `tree.c:115`
+- **__param_str_use_softirq** `tree.c:117`
+- **__param_use_softirq** `tree.c:117`
+- **__UNIQUE_ID_modinfo_3** `tree.c:117`
+- **rcu_fanout_exact** `tree.c:120`
+- **__param_str_rcu_fanout_exact** `tree.c:121`
+- **__param_rcu_fanout_exact** `tree.c:121`
+- **__UNIQUE_ID_modinfo_4** `tree.c:121`
+

@@ -3,8 +3,6 @@
 > 基于 Linux 7.0-rc1 主线源码（`net/ipv4/tcp.c` + `net/ipv4/tcp_input.c` + `net/ipv4/tcp_output.c`）
 > 关键词：TCP 发送 / 接收、MSG_MORE、zero-copy、out-of-order、skb_copy_datagram_iter
 
----
-
 ## 0. 概述
 
 TCP 的发送和接收是内核网络栈中最核心的两个路径：
@@ -13,8 +11,6 @@ TCP 的发送和接收是内核网络栈中最核心的两个路径：
 - **`tcp_recvmsg`**（`tcp.c:2934`）：从接收队列取出 SKB，复制数据到用户缓冲区
 
 两者都遵循"加锁 → 调用Locked版本 → 解锁"的外层模式，核心逻辑在 `*_locked` 函数中。
-
----
 
 ## 1. tcp_sendmsg 入口和 MSG_MORE 处理
 
@@ -79,8 +75,6 @@ mss_now = tcp_send_mss(sk, &size_goal, flags);
 ```
 
 然后进入核心 `while (msg_data_left(msg))` 循环（`tcp.c:1248`），对每一块数据进行复制。
-
----
 
 ## 2. skb_append_data → skb_add_data 缓存逻辑
 
@@ -181,8 +175,6 @@ if (!msg_data_left(msg)) {               // 数据全部复制完毕
     goto out;
 }
 ```
-
----
 
 ## 3. tcp_push_pending_frames → tcp_write_xmit 发送
 
@@ -313,8 +305,6 @@ if (sent_pkts) {
 }
 ```
 
----
-
 ## 4. tcp_recvmsg 入口和 MSG_PEEK / MSG_WAITALL
 
 ### 4.1 外层 wrapper
@@ -428,8 +418,6 @@ do {
 
 接收循环靠 `do { ... } while (len > 0)` 驱动：每次复制部分数据、减少 `len`，直到读完请求的字节数（或遇到 FIN）。
 
----
-
 ## 5. skb_recv_datagram → skb_copy_datagram_iter 拷贝
 
 ### 5.1 skb_copy_datagram_msg — 核心拷贝函数
@@ -475,8 +463,6 @@ return copied;
 ```
 
 `tcp_cleanup_rbuf` 在每次读取后更新 `sk_rcvbuf`、触发 window update ACK，告知对端可用接收窗口增大。
-
----
 
 ## 6. out-of-order SKB 处理（tcp_data_queue_ofo）
 
@@ -565,8 +551,6 @@ while ((skb = skb_rb_first(&tp->out_of_order_queue)) != NULL) {
 }
 ```
 
----
-
 ## 7. zero-copy 路径（MSG_ZEROCOPY）
 
 ### 7.1 MSG_ZEROCOPY 识别
@@ -648,8 +632,6 @@ if (!skb->len)
 
 Linux 6.6+ 引入的 `MSG_SPLICE_PAGES`，将用户页直接从 `msg->msg_iter` splice 进 SKB，绕过 copy。
 
----
-
 ## 8. 关键数据结构汇总
 
 | 数据结构 | 位置 | 用途 |
@@ -661,8 +643,6 @@ Linux 6.6+ 引入的 `MSG_SPLICE_PAGES`，将用户页直接从 `msg->msg_iter` 
 | `tp->pushed_seq` | `tcp.c:695` | 已 push 的最大 seq |
 | `sk->sk_receive_queue` | `tcp.c:2700` | 接收数据 SKB 链表 |
 | `struct sk_buff` | `include/linux/skbuff.h` | 网络数据包 buffer |
-
----
 
 ## 9. 流程总览
 
@@ -696,8 +676,6 @@ Linux 6.6+ 引入的 `MSG_SPLICE_PAGES`，将用户页直接从 `msg->msg_iter` 
        └─ TCP_CMSG_INQ 返回 inq hint
 ```
 
----
-
 ## 10. 与旧版本的主要差异
 
 Linux 7.0-rc1 对比 5.x 的主要变化：
@@ -708,7 +686,128 @@ Linux 7.0-rc1 对比 5.x 的主要变化：
 - **pure zerocopy SKB 标记**：`SKBFL_PURE_ZEROCOPY` + `SKBFL_SHARED_FRAG`，区分纯零拷贝和普通 zerocopy SKB
 - **tsorted_sent_queue 排序**：`tcp_event_new_data_sent` 用 TSQ 机制延迟发送，避免过度唤醒 TX softirq
 
----
-
 > 分析基于 Linux 7.0-rc1 主线源码，commit 约 2025 年初版本。
 > 相关文件：`net/ipv4/tcp.c`（5389行）、`net/ipv4/tcp_input.c`、`net/ipv4/tcp_output.c`。
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+

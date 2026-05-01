@@ -45,8 +45,6 @@ kset ──→ 内嵌 struct kobject kobj
         └── list (struct list_head) ──→ 所有子 kobject，通过 entry 串联
 ```
 
----
-
 ## 2. kobject / kset 层级串联
 
 ### 2.1 kobject 的结构
@@ -128,8 +126,6 @@ struct kset_uevent_ops {
     int (*uevent)(struct kobject *kobj, struct kobj_uevent_env *env);
 };
 ```
-
----
 
 ## 3. struct bus_type 和设备注册路径
 
@@ -229,8 +225,6 @@ int bus_add_device(struct device *dev)
 
 即 **`/sys/bus/<name>/devices/` 是 `/sys/devices/` 的镜像视图**，不是独立目录。
 
----
-
 ## 4. uevent 机制：从内核到用户空间
 
 ### 4.1 完整发送路径 ASCII 图
@@ -300,8 +294,6 @@ cat /sys/kernel/uevent_sink  # 旧接口
 ```
 
 现代系统使用 **systemd-udevd**，监听 netlink 套接字，根据 uevent 创建 `/dev/` 下的设备节点。
-
----
 
 ## 5. device_add 和 driver_probe 的匹配流程
 
@@ -380,8 +372,6 @@ device_add(dev)
 **probe 何时被叫起来：**  
 在 `device_add()` 中 `bus_probe_device()` 之前，`dev->fwnode->dev = dev` 会建立 fwnode 链接，用于 fw_devlink 机制。`really_probe()` 调用驱动的 `probe()` 回调（总线提供的或驱动自己的）。
 
----
-
 ## 6. device_link：为什么需要，如何建立
 
 ### 6.1 为什么 device_link 是必要的
@@ -453,8 +443,6 @@ device_link_add(consumer, supplier, flags)
   ├─ consumer->links.suppliers += link
   └─ supplier->links.consumers += link
 ```
-
----
 
 ## 7. class 和设备节点：device_create 与 class_create 的关系
 
@@ -536,8 +524,6 @@ void device_destroy(const struct class *class, dev_t devt)
 }
 ```
 
----
-
 ## 8. 完整的 kobject 树形结构 ASCII 图
 
 ```
@@ -582,8 +568,6 @@ kset.kobj                    → /sys/bus/pci/      （一个 kset = 一个 sysf
   └── devices_kset.kobj     → /sys/bus/pci/devices/  （子 kset）
   └── drivers_kset.kobj     → /sys/bus/pci/drivers/   （子 kset）
 ```
-
----
 
 ## 9. uevent 发送路径 ASCII 图（完整版）
 
@@ -643,8 +627,6 @@ kset.kobj                    → /sys/bus/pci/      （一个 kset = 一个 sysf
         └───────────────────────────────────┘
 ```
 
----
-
 ## 10. 小结
 
 | 机制 | 核心数据结构 | 核心文件 |
@@ -659,3 +641,88 @@ kset.kobj                    → /sys/bus/pci/      （一个 kset = 一个 sysf
 | class 与设备节点 | `device_create()` + devtmpfs | `drivers/base/core.c` |
 
 理解 Linux 设备模型的关键是把握两条独立的链：**(1) kobject.parent 构成的树形层级** 和 **(2) kset.list 构成的平级集合**，两者共同决定 sysfs 的目录布局。device_link 则在设备模型之上引入了跨设备的依赖追踪机制，配合 runtime PM 和 sync_state 共同管理系统电源与初始化顺序。
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `drivers/base/core.c` | 489 | 3 | 278 | 113 |
+
+### 核心数据结构
+
+- **device_attr_group_devres** `core.c:2848`
+- **class_dir** `core.c:3193`
+- **root_device** `core.c:4256`
+
+### 关键函数
+
+- **fw_devlink_is_permissive** `core.c:44`
+- **__fw_devlink_link_to_consumers** `core.c:45`
+- **__fwnode_link_add** `core.c:68`
+- **fwnode_link_add** `core.c:97`
+- **__fwnode_link_del** `core.c:111`
+- **__fwnode_link_cycle** `core.c:126`
+- **fwnode_links_purge_suppliers** `core.c:139`
+- **fwnode_links_purge_consumers** `core.c:155`
+- **fwnode_links_purge** `core.c:171`
+- **fw_devlink_purge_absent_suppliers** `core.c:177`
+- **fw_devlink_purge_absent_suppliers** `core.c:191`
+- **__fwnode_links_move_consumers** `core.c:200`
+- **__fw_devlink_pickup_dangling_consumers** `core.c:223`
+- **device_links_write_lock** `core.c:241`
+- **device_links_write_unlock** `core.c:246`
+- **device_links_read_lock** `core.c:251`
+- **device_links_read_unlock** `core.c:256`
+- **device_links_read_lock_held** `core.c:261`
+- **device_link_synchronize_removal** `core.c:266`
+- **device_link_remove_from_lists** `core.c:271`
+- **device_is_ancestor** `core.c:277`
+- **device_link_flag_is_sync_state_only** `core.c:290`
+- **device_is_dependent** `core.c:303`
+- **device_link_init_status** `core.c:334`
+- **device_reorder_to_tail** `core.c:378`
+- **device_pm_move_to_tail** `core.c:411`
+- **status_show** `core.c:424`
+- **auto_remove_on_show** `core.c:457`
+- **runtime_pm_show** `core.c:474`
+- **sync_state_only_show** `core.c:483`
+- **device_link_release_fn** `core.c:501`
+- **devlink_dev_release** `core.c:526`
+- **device_link_wait_removal** `core.c:543`
+- **device_link_wait_removal** `core.c:552`
+- **devlink_add_symlinks** `core.c:560`
+
+### 全局变量
+
+- **deferred_sync** `core.c:41`
+- **defer_sync_state_count** `core.c:42`
+- **fwnode_link_lock** `core.c:43`
+- **fw_devlink_drv_reg_done** `core.c:46`
+- **fw_devlink_best_effort** `core.c:47`
+- **device_link_wq** `core.c:48`
+- **__UNIQUE_ID_addressable_fw_devlink_purge_absent_suppliers_6** `core.c:191`
+- **device_links_lock** `core.c:238`
+- **device_links_srcu_srcu_data** `core.c:239`
+- **device_links_srcu_srcu_usage** `core.c:239`
+- **device_links_srcu** `core.c:239`
+- **dev_attr_status** `core.c:455`
+- **dev_attr_auto_remove_on** `core.c:472`
+- **dev_attr_runtime_pm** `core.c:481`
+- **dev_attr_sync_state_only** `core.c:490`
+
+### 成员/枚举
+
+- **group** `core.c:2849`
+- **groups** `core.c:2850`
+- **kobj** `core.c:3194`
+- **class** `core.c:3195`
+- **dev** `core.c:4257`
+- **owner** `core.c:4258`
+

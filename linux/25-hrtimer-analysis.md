@@ -1,196 +1,147 @@
 # 25-hrtimer — 高精度定时器深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`kernel/time/hrtimer.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码逐行对照
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**hrtimer（High-Resolution Timer）** 是 Linux 的高精度定时器（微秒/纳秒级），替代了传统的低精度定时器（jiffies）。
+**hrtimer（High-Resolution Timer）** 是 Linux 高精度定时器子系统。与传统的 `timer_list`（基于 jiffies，通常 1-10ms 精度）不同，hrtimer 基于 **ktime**（纳秒精度），由硬件高精度事件定时器（如 TSC、HPET、ARM Generic Timer）驱动。
+
+hrtimer 使用**红黑树**组织定时器，而非传统的时间轮（time wheel）。
+
+doom-lsp 确认 `kernel/time/hrtimer.c` 包含约 230+ 个符号。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 struct hrtimer — 高精度定时器
+### 1.1 struct hrtimer
 
 ```c
-// include/linux/hrtimer.h — hrtimer
 struct hrtimer {
-    struct timerqueue_node      node;       // 红黑树节点
-    ktime_t                    expires;     // 到期时间（绝对时间）
-    ktime_t                    softexpires; // 软件到期时间
-    enum hrtimer_restart       (*function)(struct hrtimer *); // 到期回调
-    struct hrtimer_clock_base *base;        // 所属时钟基
-    void                      *data;        // 传递给回调的数据
-    unsigned long              state;        // HRTIMER_STATE_* 状态
-    unsigned int              is_rel;       // 是否是相对时间
+    struct timerqueue_node  node;        // 红黑树节点
+    ktime_t                 _softexpires;// 最早到期时间
+    ktime_t                 expires;     // 最迟到���时间
+    enum hrtimer_restart   (*function)(struct hrtimer *); // 回调
+    struct hrtimer_clock_base *base;     // 时钟基
+    u8                      state;       // 状态：HRTIMER_STATE_*
+    ...
 };
 ```
 
-### 1.2 struct hrtimer_cpu_base — per-CPU 时钟基
+### 1.2 struct hrtimer_clock_base
 
-```c
-// kernel/time/hrtimer.c — hrtimer_cpu_base
-struct hrtimer_cpu_base {
-    raw_spinlock_t              lock;           // 保护
-    ktime_t                    expires_next;   // 最近到期时间
-    int                         nr_events;       // 到期事件数
-    int                         nr_retries;     // 重试次数
+每个 CPU 维护两种时钟基：
 
-    // per-CPU 时钟基（不同 CLOCK_*）
-    struct hrtimer_clock_base   clock_base[4];
-    //   clock_base[0] = CLOCK_REALTIME
-    //   clock_base[1] = CLOCK_MONOTONIC
-    //   clock_base[2] = CLOCK_BOOTTIME
-    //   clock_base[3] = CLOCK_TAI
-};
+```
+clock_base[HRTIMER_MAX_CLOCK_BASES]:
+  [0] = CLOCK_MONOTONIC     （单调时间，系统启动后递增）
+  [1] = CLOCK_REALTIME      （实时时间，可能回退）
+  [2] = CLOCK_BOOTTIME      （单调+休眠时间）
+  [3] = CLOCK_TAI           （TAI 时间）
 ```
 
-### 1.3 timerqueue_node — 红黑树节点
-
-```c
-// include/linux/timerqueue.h — timerqueue_node
-struct timerqueue_node {
-    struct rb_node              node;           // 红黑树节点
-    ktime_t                    expires;         // 到期时间
-};
-```
+每个 clock_base 包含一个 `timerqueue_head`（红黑树根），按过期时间排序。
 
 ---
 
-## 2. hrtimer_start — 启动定时器
+## 2. 核心操作
 
 ### 2.1 hrtimer_start
 
 ```c
-// kernel/time/hrtimer.c — hrtimer_start
 void hrtimer_start(struct hrtimer *timer, ktime_t tim, const enum hrtimer_mode mode)
-{
-    struct hrtimer_cpu_base *base = this_cpu_ptr(&hrtimer_bases);
+```
 
-    // 1. 绝对/相对时间转换
-    if (mode == HRTIMER_MODE_ABS)
-        timer->expires = tim;
-    else
-        timer->expires = ktime_add(tim, base->clock_base[...].get_time());
+```
+hrtimer_start(timer, expires, HRTIMER_MODE_REL)
+  │
+  ├─ ktime_add(now, expires)          ← 将相对时间转为绝对时间
+  │
+  ├─ 从红黑树移除旧的定时器（如果已插入）
+  │
+  ├─ 插入到 clock_base 的红黑树
+  │    └─ timerqueue_add(&base->active, &timer->node)  ← O(log n)
+  │
+  ├─ 如果新定时器是树中最早到期的
+  │    └─ hrtimer_reprogram(timer, base) ← 设置硬件定时器
+  │
+  └─ 更新定时器状态
+```
 
-    // 2. 加入红黑树
-    enqueue_hrtimer(timer, base);
+### 2.2 hrtimer_run_queues（到期检查）
 
-    // 3. 如果是最早到期的，更新 expires_next
-    if (timer->expires < base->expires_next)
-        base->expires_next = timer->expires;
-}
+在以下时机检查：
+
+```
+hrtimer_run_queues()
+  │
+  ├─ 每个 tick（传统方式）
+  └─ 硬件中断（高精度模式）
+       │
+       ├─ __hrtimer_run_queues(base, now)
+       │    │
+       │    ├─ 遍历红黑树中所有到期的定时器
+       │    │    └─ timerqueue_getnext(&base->active)
+       │    │
+       │    ├─ 对每个到期的定时器：
+       │    │    ├─ 从红黑树移除
+       │    │    ├─ 设置状态 HRTIMER_STATE_CALLBACK
+       │    │    ├─ timer->function(timer)     ← 执行回调
+       │    │    └─ 检查返回类型：
+       │    │         └─ HRTIMER_RESTART → 重新插入
+       │    │         └─ HRTIMER_NORESTART → 不做处理
+       │    │
+       │    └─ 如果还有未到期定时器：
+       │         └─ hrtimer_reprogram() → 设置下一个到期时间
 ```
 
 ---
 
-## 3. hrtimer_interrupt — tick 中断处理
+## 3. 高精度模式切换
 
-### 3.1 hrtimer_interrupt
+hrtimer 支持两种运行模式：
 
-```c
-// kernel/time/hrtimer.c — hrtimer_interrupt
-void hrtimer_interrupt(struct clock_event_device *dev)
-{
-    struct hrtimer_cpu_base *base = this_cpu_ptr(&hrtimer_bases);
-    ktime_t now, expires_next;
+| 模式 | 触发方式 | 精度 | 功耗 |
+|------|---------|------|------|
+| 低精度（legacy） | 基于 tick | jiffies (~4ms) | 低 |
+| 高精度（HR） | 硬件事件 | 纳秒 | 高 |
 
-    base->expires_next = KTIME_MAX;
+切换条件：`hrtimer_hres_enabled` + 硬件支持（arch_timer/HPET/LAPIC timer）。
 
-    // 遍历所有到期的定时器
-    while (ktime_compare(base->clock_base[0].expires_next, now) <= 0) {
-        struct hrtimer *timer;
-        struct timerqueue_node *next;
+---
 
-        next = timerqueue_getnext(&base->clock_base[0].active);
-        timer = container_of(next, struct hrtimer, node);
+## 4. 数据类型流
 
-        // 移除
-        timerqueue_del(&base->clock_base[0].active, &timer->node);
+```
+应用程序：
+  timerfd_create(CLOCK_MONOTONIC)
+  timerfd_settime(fd, 0, &its, NULL)
 
-        // 重启或移除
-        restart = timer->function(timer);
-        if (restart != HRTIMER_NORESTART) {
-            timer->expires = ktime_add(timer->expires, ...);
-            timerqueue_add(&base->clock_base[0].active, &timer->node);
-        }
-    }
-}
+内核：
+  do_timerfd_settime()
+    └─ hrtimer_start(&ctx->tmr, expires, mode)
+
+到期时：
+  __hrtimer_run_queues()
+    └─ timer->function(timer) = hrtimer_wakeup
+         └─ wake_up(&ctx->wqh)          ← 唤醒等待的进程
+
+用户空间：
+  read(fd, buf, 8)                      ← 接收到期通知
 ```
 
 ---
 
-## 4. ktime_t — 时间表示
+## 5. 源码文件索引
 
-```c
-// include/linux/ktime.h — ktime_t
-typedef union {
-    s64 tv64;              // 64位纳秒
-} ktime_t;
-
-// 转换函数：
-#define ktime_to_ns(t)       ((t).tv64)
-#define ns_to_ktime(ns)     ((ktime_t) { .tv64 = (ns) })
-
-// 算术运算：
-ktime_t ktime_add(ktime_t a, ktime_t b);
-ktime_t ktime_sub(ktime_t a, ktime_t b);
-ktime_t ktime_add_ns(ktime_t a, u64 ns);
-```
+| 文件 | 关键符号 |
+|------|---------|
+| `kernel/time/hrtimer.c` | `hrtimer_start` / `hrtimer_run_queues` / `hrtimer_reprogram` |
+| `include/linux/hrtimer.h` | `struct hrtimer` 定义 |
 
 ---
 
-## 5. 红黑树存储
-
-```
-hrtimer的红黑树（per-CPU per-clock_base）：
-
-expires_next（最近到期时间）
-      │
-      ├── timerqueue_node (timer A) ←── expires最小
-      ├── timerqueue_node (timer B)
-      └── timerqueue_node (timer C) ←── expires最大
-
-rb_root:
-  按 expires 排序
-  最左 = 最早到期 = expires_next
-```
-
----
-
-## 6. 与传统定时器的对比
-
-| 特性 | hrtimer | 传统 timer_list |
-|------|---------|----------------|
-| 精度 | 纳秒（CLOCK_MONOTONIC）| jiffies（毫秒级）|
-| 定时器数量 | 无限制（红黑树 O(log n)）| 无限制 |
-| per-CPU | ✓ | ✓ |
-| tickless | 支持 | 受 jiffies 限制 |
-
----
-
-## 7. 完整文件索引
-
-| 文件 | 函数/结构 |
-|------|----------|
-| `include/linux/hrtimer.h` | `struct hrtimer`、`ktime_t` |
-| `include/linux/timerqueue.h` | `struct timerqueue_node` |
-| `kernel/time/hrtimer.c` | `hrtimer_start`、`hrtimer_interrupt` |
-
----
-
-## 8. 西游记类比
-
-**hrtimer** 就像"取经路上的精准沙漏"——
-
-> 每个需要计时的任务（hrtimer）都往沙漏堆（红黑树）里放一个沙漏，倒过来开始计时。每个沙漏（node）有精确的到期时间（expires）。最小的沙漏（expires_next）放在最左边，玉帝（CPU）每次看时间（tick 中断）时，只需要看最左边的沙漏就知道下一个要处理的任务。每个沙漏到期时（hrtimer_interrupt），就调用沙漏上附带的处理函数。如果要继续计时（restart），就把新的到期时间加入沙漏堆。这就是 hrtimer 为什么比传统 jiffies 定时器精度高的原因——不依赖系统的 jiffy 节拍，而是用 CPU 的 tick 中断和红黑树精确管理。
-
----
-
-## 9. 关联文章
-
-- **softirq**（article 24）：hrtimer 触发 HRTIMER_SOFTIRQ
-- **timer_list**（相关）：传统低精度定时器
+*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*

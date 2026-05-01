@@ -3,8 +3,6 @@
 > 基于 Linux 7.0-rc1 内核源码
 > 分析文件：kernel/bpf/syscall.c、verifier.c、core.c、arraymap.c、hashtab.c
 
----
-
 ## 1. 概述：什么是 eBPF？
 
 eBPF（extended Berkeley Packet Filter）是 Linux 内核中的一个轻量级虚拟机，设计初衷是允许用户态程序在安全沙箱中运行并拦截/处理内核事件。其演进路径：
@@ -19,8 +17,6 @@ Classic BPF (cBPF)          eBPF
 ```
 
 eBPF 程序被编译为字节码，由内核 verifier 验证安全性后，由 JIT 编译器转换为机器码执行。
-
----
 
 ## 2. 程序加载完整路径
 
@@ -231,8 +227,6 @@ bpf_prog_new_fd(prog);               // 分配 fd，返回给用户态
           程序已在内核中驻留，可通过 fd 操作
 ```
 
----
-
 ## 3. Verifier 逻辑深度分析
 
 ### 3.1 bpf_check() 概览（verifier.c:19900）
@@ -432,8 +426,6 @@ if (env->total_states > 16 * 1024 * 1024)
     return -EMFILE;  // 超过 16M 状态，拒绝
 ```
 
----
-
 ## 4. JIT 编译
 
 ### 4.1 编译流程
@@ -552,8 +544,6 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
     prog->jited_len = proglen;
 }
 ```
-
----
 
 ## 5. Map 数据结构
 
@@ -700,8 +690,6 @@ BPF 程序中:
          └── ...
 ```
 
----
-
 ## 6. BPF Prog Types 与 Attach 机制
 
 ### 6.1 Prog Type 注册
@@ -782,8 +770,6 @@ TC (Traffic Control) 入口
 │     │
 └──────────────────────────────────────┘
 ```
-
----
 
 ## 7. Tail Call vs BPF-to-BPF Call
 
@@ -905,8 +891,6 @@ Tail Call（尾调用）:
 └────────────────────────────────────────┘
 ```
 
----
-
 ## 8. 安全边界：eBPF Capabilities
 
 ### 8.1 eBPF 与 Capabilities
@@ -983,8 +967,6 @@ Layer 5: 运行时（noexec stack、smap）
   - 使用 smap/ustack 防止数据执行
 ```
 
----
-
 ## 9. 关键数据结构总结
 
 ### 9.1 eBPF 指令格式
@@ -1032,8 +1014,6 @@ x86_64 映射:
   R0 → rax, R6 → rbx, R7 → r13, R8 → r14, R9 → r15, R10 → rbp
 ```
 
----
-
 ## 10. 总结
 
 eBPF 的程序加载链路：
@@ -1046,3 +1026,123 @@ eBPF 的程序加载链路：
 6. **fd 创建**返回用户态，程序驻留在内核
 
 eBPF 的安全建立在多层防御上：verifier 字节码验证、Caps 能力模型、JIT 混淆、运行时保护。Root 持有 CAP_SYS_ADMIN 仍然受 verifier 约束，verifier 是不可逾越的沙箱边界。
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `kernel/bpf/verifier.c` | 848 | 26 | 582 | 31 |
+
+### 核心数据结构
+
+- **bpf_verifier_stack_elem** `verifier.c:182`
+- **bpf_call_arg_meta** `verifier.c:233`
+- **bpf_kfunc_meta** `verifier.c:254`
+- **bpf_kfunc_btf** `verifier.c:2754`
+- **bpf_kfunc_btf_tab** `verifier.c:2760`
+- **linked_reg** `verifier.c:3516`
+- **(anonymous union)** `verifier.c:3518`
+- **linked_regs** `verifier.c:3525`
+- **bpf_subprog_call_depth_info** `verifier.c:5317`
+- **task_struct__safe_rcu** `verifier.c:5862`
+- **cgroup__safe_rcu** `verifier.c:5869`
+- **css_set__safe_rcu** `verifier.c:5874`
+- **cgroup_subsys_state__safe_rcu** `verifier.c:5878`
+- **mm_struct__safe_rcu_or_null** `verifier.c:5883`
+- **sk_buff__safe_rcu_or_null** `verifier.c:5893`
+- **request_sock__safe_rcu_or_null** `verifier.c:5897`
+- **bpf_iter_meta__safe_trusted** `verifier.c:5902`
+- **bpf_iter__task__safe_trusted** `verifier.c:5906`
+- **linux_binprm__safe_trusted** `verifier.c:5911`
+- **file__safe_trusted** `verifier.c:5915`
+- **dentry__safe_trusted_or_null** `verifier.c:5919`
+- **socket__safe_trusted_or_null** `verifier.c:5923`
+- **vm_area_struct__safe_trusted_or_null** `verifier.c:5927`
+- **bpf_reg_types** `verifier.c:7931`
+- **set_callee_state_fn** `verifier.c:9247`
+
+### 关键函数
+
+- **acquire_reference** `verifier.c:202`
+- **release_reference_nomark** `verifier.c:203`
+- **release_reference** `verifier.c:204`
+- **invalidate_non_owning_refs** `verifier.c:205`
+- **in_rbtree_lock_required_cb** `verifier.c:206`
+- **ref_set_non_owning** `verifier.c:207`
+- **is_trusted_reg** `verifier.c:209`
+- **in_sleepable_context** `verifier.c:210`
+- **non_sleepable_context_description** `verifier.c:211`
+- **scalar32_min_max_add** `verifier.c:212`
+- **scalar_min_max_add** `verifier.c:213`
+- **bpf_map_ptr_store** `verifier.c:215`
+- **bpf_map_key_store** `verifier.c:225`
+- **btf_type_name** `verifier.c:264`
+- **verbose** `verifier.c:272`
+- **verbose_invalid_scalar** `verifier.c:285`
+- **reg_not_null** `verifier.c:306`
+- **reg_btf_record** `verifier.c:325`
+- **bpf_subprog_is_global** `verifier.c:340`
+- **subprog_returns_void** `verifier.c:347`
+- **subprog_name** `verifier.c:370`
+- **bpf_mark_subprog_exc_cb** `verifier.c:381`
+- **subprog_is_exc_cb** `verifier.c:390`
+- **reg_may_point_to_spin_lock** `verifier.c:395`
+- **type_is_rdonly_mem** `verifier.c:400`
+- **is_acquire_function** `verifier.c:405`
+- **is_ptr_cast_function** `verifier.c:425`
+- **is_dynptr_ref_function** `verifier.c:437`
+- **is_sync_callback_calling_kfunc** `verifier.c:442`
+- **is_async_callback_calling_kfunc** `verifier.c:443`
+- **is_callback_calling_kfunc** `verifier.c:444`
+- **is_bpf_throw_kfunc** `verifier.c:445`
+- **is_bpf_wq_set_callback_kfunc** `verifier.c:447`
+- **is_task_work_add_kfunc** `verifier.c:448`
+- **is_sync_callback_calling_function** `verifier.c:450`
+
+### 全局变量
+
+- **bpf_verifier_ops** `verifier.c:36`
+- **bpf_global_percpu_ma** `verifier.c:53`
+- **bpf_global_percpu_ma_set** `verifier.c:54`
+- **btf_vmlinux** `verifier.c:262`
+- **bpf_verifier_lock** `verifier.c:269`
+- **bpf_percpu_ma_lock** `verifier.c:270`
+- **caller_saved** `verifier.c:1754`
+- **rcu_protected_types** `verifier.c:4639`
+- **reg2btf_ids** `verifier.c:5118`
+- **sock_types** `verifier.c:7936`
+- **btf_id_sock_common_types** `verifier.c:7946`
+- **mem_types** `verifier.c:7959`
+- **spin_lock_types** `verifier.c:7974`
+- **fullsock_types** `verifier.c:7981`
+- **scalar_types** `verifier.c:7982`
+
+### 成员/枚举
+
+- **st** `verifier.c:187`
+- **insn_idx** `verifier.c:188`
+- **prev_insn_idx** `verifier.c:189`
+- **next** `verifier.c:190`
+- **log_pos** `verifier.c:192`
+- **map** `verifier.c:234`
+- **raw_mode** `verifier.c:235`
+- **pkt_access** `verifier.c:236`
+- **release_regno** `verifier.c:237`
+- **regno** `verifier.c:238`
+- **access_size** `verifier.c:239`
+- **mem_size** `verifier.c:240`
+- **msize_max_value** `verifier.c:241`
+- **ref_obj_id** `verifier.c:242`
+- **dynptr_id** `verifier.c:243`
+- **func_id** `verifier.c:244`
+- **btf** `verifier.c:245`
+- **btf_id** `verifier.c:246`
+- **ret_btf** `verifier.c:247`
+- **ret_btf_id** `verifier.c:248`
+

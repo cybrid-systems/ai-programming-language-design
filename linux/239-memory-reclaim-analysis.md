@@ -4,8 +4,6 @@
 > 分析文件: `mm/vmscan.c`, `mm/swap.c`, `include/linux/swap.h`  
 > 核心问题: 从内存压力检测 → LRU 链表扫描 → 页回收/换出 → ocompaction 的完整路径
 
----
-
 ## 1. LRU 链表体系 — 数据结构与页分类
 
 ### 1.1 四类 LRU 链表
@@ -86,8 +84,6 @@ static void lruvec_del_folio(struct lruvec *lruvec, struct folio *folio)
 }
 ```
 
----
-
 ## 2. scan_balance 与 get_scan_count — 匿名/文件扫描比例决策
 
 ### 2.1 决策状态机：enum scan_balance
@@ -151,8 +147,6 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
     // 设置 target_memcg，平衡各 memcg 间扫描
 }
 ```
-
----
 
 ## 3. watermark 检测 — kswapd vs direct reclaim
 
@@ -239,8 +233,6 @@ if (pgdat_balanced(pgdat, order, highest_zoneidx)) {
 
 OOM killer 触发条件：**所有 zone 都低于 min_wmark**，且 direct reclaim 已尽力（`sc->nr_reclaimed >= sc->nr_to_reclaim` 仍未满足，或扫描优先级降到 0）。
 
----
-
 ## 4. shrink_folio_list — 回收决策核心
 
 ### 4.1 调用链
@@ -293,8 +285,6 @@ file-backed 页生命周期：
 ```
 
 在 `shrink_folio_list` 中，如果页是 dirty，先触发 `writepage`（通过 `__filemap_fault` 路径），等 `folio_end_writeback()` 后才认为可回收。
-
----
 
 ## 5. PG_active / PG_reclaim 状态机 — 页在 LRU 上的生命周期
 
@@ -384,8 +374,6 @@ static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclai
 
 每个代龄在 `lruvec->lrugen` 中有独立的计数，当 `min_seq[type]` 推进时，最老的代被整体 reclaim。这解决了传统 LRU 的"one-time access"问题（只访问一次的页不会因为一次访问就长期占居 active）。
 
----
-
 ## 6. compaction — 为什么需要迁移页而非直接释放
 
 ### 6.1 核心矛盾
@@ -449,8 +437,6 @@ migrate_vma(pgdat, cc->zone, order, ...)
 
 compaction 和 migrate_vma 都依赖**页表锁**（PTE lock）来原子地重映射，这意味着可迁移页的虚拟地址保持不变（只有物理地址改变）。
 
----
-
 ## 7. swap 机制 — 匿名页换出
 
 ### 7.1 触发条件
@@ -498,8 +484,6 @@ if (!sc->may_swap || !can_reclaim_anon_pages(...)) {
 | 缓存 | swap cache + swap device | page cache + disk（通一个地址空间） |
 | 预读 | swap 没有预读机制 | 文件有 readahead 优化 |
 | 压缩 | zswap 等可压缩，但需 CPU 开销 | 通常不压缩 |
-
----
 
 ## 8. 完整路径状态机
 
@@ -576,8 +560,6 @@ if (!sc->may_swap || !can_reclaim_anon_pages(...)) {
          └───────────────────────────────────┘
 ```
 
----
-
 ## 9. inactive_is_low — 何时停止向 inactive 转移
 
 ```c
@@ -598,8 +580,6 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 
 这个比例确保当 active 列表太小（大量热点数据）时，不会过度向 inactive 迁移导致 working set 被错误 evict。
 
----
-
 ## 10. 关键数据结构汇总
 
 | 结构体/宏 | 文件 | 作用 |
@@ -619,8 +599,6 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 | `isolate_migratepages()` | compaction.c:2062 | 隔离可迁移页 |
 | `__swap_writepage()` | page_io.c:451 | 写匿名页到 swap 设备 |
 
----
-
 ## 11. 核心设计哲学
 
 1. **分层防御**：kswapd 先于 direct reclaim 响应（low vs min wmark），避免进程阻塞
@@ -629,3 +607,96 @@ static bool inactive_is_low(struct lruvec *lruvec, enum lru_list inactive_lru)
 4. **compaction 不释放而是移动**：大页分配需要连续空间，只有迁移才能合并碎片
 5. **swap cache 解歧义**：匿名页和文件页都可能有 swap entry，通过 swap cache 区分
 6. **多代 LRU 解决 one-time access**：传统 LRU 无法区分一次访问和频繁访问，多代 LRU 用时间轴替代简单的 active/inactive 二分
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `mm/vmscan.c` | 168 | 3 | 96 | 9 |
+
+### 核心数据结构
+
+- **scan_control** `vmscan.c:74`
+- **(anonymous struct)** `vmscan.c:170`
+- **pageout_t** `vmscan.c:606`
+
+### 关键函数
+
+- **cgroup_reclaim** `vmscan.c:206`
+- **root_reclaim** `vmscan.c:215`
+- **writeback_throttling_sane** `vmscan.c:233`
+- **sc_swappiness** `vmscan.c:244`
+- **set_task_reclaim_state** `vmscan.c:272`
+- **flush_reclaim_state** `vmscan.c:288`
+- **can_demote** `vmscan.c:324`
+- **can_reclaim_anon_pages** `vmscan.c:344`
+- **zone_reclaimable_pages** `vmscan.c:374`
+- **lruvec_lru_size** `vmscan.c:393`
+- **drop_slab_node** `vmscan.c:408`
+- **drop_slab** `vmscan.c:421`
+- **reclaimer_offset** `vmscan.c:446`
+- **handle_write_error** `vmscan.c:473`
+- **skip_throttle_noprogress** `vmscan.c:482`
+- **reclaim_throttle** `vmscan.c:510`
+- **__acct_reclaim_writeback** `vmscan.c:584`
+- **writeout** `vmscan.c:617`
+- **pageout** `vmscan.c:653`
+- **__remove_mapping** `vmscan.c:686`
+- **remove_mapping** `vmscan.c:802`
+- **folio_putback_lru** `vmscan.c:825`
+- **lru_gen_set_refs** `vmscan.c:857`
+- **folio_check_references** `vmscan.c:863`
+- **folio_check_dirty_writeback** `vmscan.c:934`
+- **alloc_demote_folio** `vmscan.c:965`
+- **demote_folio_list** `vmscan.c:996`
+- **may_enter_fs** `vmscan.c:1039`
+- **shrink_folio_list** `vmscan.c:1058`
+- **reclaim_clean_pages_from_list** `vmscan.c:1595`
+- **update_lru_sizes** `vmscan.c:1650`
+- **isolate_lru_folios** `vmscan.c:1685`
+- **folio_isolate_lru** `vmscan.c:1802`
+- **too_many_isolated** `vmscan.c:1828`
+- **move_folios_to_lru** `vmscan.c:1872`
+
+### 全局变量
+
+- **vm_swappiness** `vmscan.c:201`
+- **vmscan_sysctl_table** `vmscan.c:7670`
+- **__UNIQUE_ID_addressable_kswapd_init_64** `vmscan.c:7703`
+- **node_reclaim_mode** `vmscan.c:7712`
+- **sysctl_min_unmapped_ratio** `vmscan.c:7725`
+- **sysctl_min_slab_ratio** `vmscan.c:7731`
+- **tokens** `vmscan.c:7899`
+- **__UNIQUE_ID_addressable_check_move_unevictable_folios_71** `vmscan.c:8045`
+- **dev_attr_reclaim** `vmscan.c:8058`
+
+### 成员/枚举
+
+- **nr_to_reclaim** `vmscan.c:76`
+- **nodemask** `vmscan.c:82`
+- **target_mem_cgroup** `vmscan.c:88`
+- **anon_cost** `vmscan.c:93`
+- **file_cost** `vmscan.c:94`
+- **proactive_swappiness** `vmscan.c:97`
+- **may_deactivate** `vmscan.c:102`
+- **force_deactivate** `vmscan.c:103`
+- **skipped_deactivate** `vmscan.c:104`
+- **may_writepage** `vmscan.c:107`
+- **may_unmap** `vmscan.c:110`
+- **may_swap** `vmscan.c:113`
+- **no_cache_trim_mode** `vmscan.c:116`
+- **cache_trim_mode_failed** `vmscan.c:119`
+- **proactive** `vmscan.c:122`
+- **memcg_low_reclaim** `vmscan.c:132`
+- **memcg_low_skipped** `vmscan.c:133`
+- **memcg_full_walk** `vmscan.c:136`
+- **hibernation_mode** `vmscan.c:138`
+- **compaction_ready** `vmscan.c:141`
+

@@ -14,8 +14,6 @@ netfilter 是 Linux 内核中实现数据包过滤、网络地址转换（NAT）
 - `/home/dev/code/linux/net/netfilter/nfnetlink_hook.c` — nfnetlink hook 查询接口
 - `/home/dev/code/linux/net/netfilter/nf_bpf_link.c` — BPF link 附加方式
 
----
-
 ## 2. struct nf_hook_ops — Hook 注册结构
 
 ### 2.1 数据结构定义
@@ -76,8 +74,6 @@ struct nf_hook_state {
 **（2）`hook_ops_type` 字段**：用于区分不同子系统注册的 hook。核心逻辑中对 `NF_HOOK_OP_BPF` 类型有特殊处理 — 当两个 BPF hook 优先级相同时，禁止共享同一个优先级槽位（core.c:125），避免 BPF 程序之间的排序歧义。
 
 **（3）`dev` 字段**：对于 `NFPROTO_NETDEV` 协议族（`NF_NETDEV_INGRESS`/`NF_NETDEV_EGRESS`）或 `NFPROTO_INET` + `NF_INET_INGRESS`，`dev` 必须指定具体的网络设备。非 netdev hook 此字段为 NULL。
-
----
 
 ## 3. Hook 存储结构 — nf_hook_entries
 
@@ -144,8 +140,6 @@ static struct nf_hook_entries *allocate_hook_entries_size(u16 num)
 ```
 
 最大允许 1024 个 hook（`MAX_HOOK_COUNT`，core.c:40）。
-
----
 
 ## 4. Hook 注册 — nf_register_net_hook / __nf_register_net_hook
 
@@ -250,8 +244,6 @@ if (!inserted) { ... }
 
 `NFPROTO_INET` 是一个协议族别名，代表"不区分 IPv4/IPv6"。当注册一个非 Ingress 的 hook（如 `NF_INET_PRE_ROUTING`）到 `NFPROTO_INET` 时，实际上同时在 `net->nf.hooks_ipv4[hook]` 和 `net->nf.hooks_ipv6[hook]` 各注册了一份。这样做的好处是 iptables/nftables 等工具无需关心数据包是 IPv4 还是 IPv6，可以统一注册。
 
----
-
 ## 5. Hook 注销 — nf_unregister_net_hook / __nf_unregister_net_hook
 
 ### 5.1 核心原理：惰性删除
@@ -280,8 +272,6 @@ static bool nf_remove_net_hook(struct nf_hook_entries *old,
 ```
 
 为什么这样设计？因为 hook 可能正在 RCU 保护的数据包处理路径中被访问（`nf_hook_slow` 中）。直接 free 会导致 use-after-free。通过 RCU，读取方最多看到旧数组，而新数组不包含正在注销的 hook — 实现了无锁的安全删除。
-
----
 
 ## 6. Hook 遍历入口 — nf_hook_slow
 
@@ -364,8 +354,6 @@ static inline int nf_hook(u_int8_t pf, unsigned int hook, struct net *net,
 }
 ```
 
----
-
 ## 7. Ingress Hook — NF_INET_INGRESS / NF_NETDEV_INGRESS
 
 ### 7.1 两套 Ingress hook 体系
@@ -422,8 +410,6 @@ nf_hook_entry_head(struct net *net, int pf, unsigned int hooknum,
 
 Ingress hook 在 `netif_receive_skb` 或 `netdev_rx_queue` 流程中被调用，是数据包最早可被 netfilter 处理的时机 — **在协议层解析之前**，数据包以 raw SKB 的形式经过。
 
----
-
 ## 8. Hook Num 与优先级体系
 
 ### 8.1 Hook Num 枚举
@@ -479,8 +465,6 @@ enum nf_ip_hook_priorities {
 
 `nf_hook_entries_grow` 的插入过程保证 hook 数组按 `priority` **升序**（小值在前）排列，因此 `nf_hook_slow` 遍历时自然按优先级从高到低执行。
 
----
-
 ## 9. Verdict 返回值
 
 ### 9.1 基本 Verdict（定义于 `include/uapi/linux/netfilter.h:42~50`）
@@ -526,8 +510,6 @@ static inline int NF_DROP_GETERR(int verdict) {
 - `NF_STOLEN`：直接返回，不释放 skb（已废弃，容易导致资源泄漏）。
 - `NF_REPEAT`：历史上表示重新执行当前 hook；但当前实现中**已不再支持此行为**（core.c:407 的 `default` 分支会 WARN），因为 hook 重入非常危险。
 
----
-
 ## 10. Egress Hook — NF_NETDEV_EGRESS
 
 ### 10.1 存储位置
@@ -541,8 +523,6 @@ static inline int NF_DROP_GETERR(int verdict) {
 ### 10.3 与 POST_ROUTING 的区别
 
 `NF_INET_POST_ROUTING` 是在 **协议栈层**（IP 层）注册的 hook，在路由决策之后、发送到设备之前执行。而 `NF_NETDEV_EGRESS` 是在 **设备驱动层**，数据包即将通过网卡发送出去前执行，更接近硬件。`POST_ROUTING` 理论上可以对同一数据包执行多次（通过虚拟设备重发送），而 `EGRESS` 每个数据包只会经过一次。
-
----
 
 ## 11. BPF 扩展 — bpf_nfnl_hook 与 bpf_nf_link
 
@@ -601,8 +581,6 @@ BPF 程序接收 `struct bpf_nf_ctx`（包含 `skb` 和 `nf_hook_state`），可
 
 `nfnetlink_hook.c` 提供了通过 netlink 查询当前系统注册的 hook 的接口（`NFNL_SUBSYS_HOOK`）。`nfnl_hook_dump_one`（第 195~262 行）以可读格式输出每个 hook 的函数符号名、模块名、优先级和类型信息。这使得用户空间工具（如 `ss`、`ip` 命令的扩展）可以枚举系统中的 netfilter hook。
 
----
-
 ## 12. dummy_ops 与 __nf_hook_entries_try_shrink — 注销的安全机制
 
 ### 12.1 dummy_ops 的设计
@@ -632,8 +610,6 @@ static unsigned int accept_all(void *priv, struct sk_buff *skb,
 
 `__nf_hook_entries_try_shrink`（core.c:227~253）统计 dummy hook 数量，若全部已移除则分配新数组（跳过所有 dummy），否则返回 NULL（不做收缩）。通过 RCU 机制，原数组会在宽限期后被 `kvfree` 释放。
 
----
-
 ## 13. static_key — 编译期优化
 
 ```c
@@ -643,8 +619,6 @@ struct static_key nf_hooks_needed[NFPROTO_NUMPROTO][NF_MAX_HOOKS];
 ```
 
 当某个 `pf/hooknum` 组合没有任何 hook 注册时，对应的 `static_key` 为 false，内联函数 `nf_hook` 中的 `static_key_false()` 检查会直接在编译期跳过整个 hook 调用逻辑，无需进入 `nf_hook_slow` 再判断。这是 Linux 内核中经典的"条件分支消除"优化。
-
----
 
 ## 14. 整体数据流图
 
@@ -674,8 +648,6 @@ nf_hook_slow(skb, &state, hook_head, 0)
     └─ return 1  → 调用 okfn() 继续协议栈处理
 ```
 
----
-
 ## 15. 关键要点总结
 
 | 主题 | 关键点 |
@@ -689,3 +661,126 @@ nf_hook_slow(skb, &state, hook_head, 0)
 | **Verdict 编码** | 低 8 位类型，高位可编码队列号（NF_QUEUE）或错误码（NF_DROP） |
 | **BPF 扩展** | `NF_HOOK_OP_BPF` 类型，通过 `bpf_nf_link` 附加，支持 defrag 联动 |
 | **static_key** | 零 hook 注册时完全跳过数据包路径，无条件分支开销 |
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+

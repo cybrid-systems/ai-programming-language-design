@@ -3,8 +3,6 @@
 > 基于 Linux 7.0-rc1 (commit `fib_lookup` 分支相关文件)
 > 内核源码：`/home/dev/code/linux`
 
----
-
 ## 1. fib_lookup 入口
 
 ### 1.1 单表模式 vs 多表模式
@@ -98,8 +96,6 @@ struct flowi4 {
     // ...
 };
 ```
-
----
 
 ## 2. fib_table_lookup 详解
 
@@ -208,8 +204,6 @@ found:
     }
 ```
 
----
-
 ## 3. Trie 结构（LC-trie）
 
 ### 3.1 整体架构
@@ -299,8 +293,6 @@ static const int halve_threshold_root = 15;   // 根节点更保守
 static const int inflate_threshold_root= 30;
 ```
 
----
-
 ## 4. 最长前缀匹配（Longest Prefix Match, LPM）
 
 ### 4.1 算法核心
@@ -347,8 +339,6 @@ if (index >= (1ul << fa->fa_slen))
 
 res->prefixlen = KEYLENGTH - fa->fa_slen;
 ```
-
----
 
 ## 5. fib_result 结构
 
@@ -443,8 +433,6 @@ struct fib_nh {
 };
 ```
 
----
-
 ## 6. 路由缓存、Rules 与 rp_filter
 
 ### 6.1 查找标志位
@@ -512,8 +500,6 @@ INDIRECT_CALLABLE_SCOPE int fib4_rule_action(struct fib_rule *rule,
 ### 6.4 路由缓存历史
 
 Linux 2.6 之前的路由缓存（`rtable`/`rt_hash`）在 modern 内核中已被移除。当前完全依赖 `fib_table_lookup` 实时查找。`fnhe_hash_bucket`（`ip_fib.h:145`）用于缓存每个 nexthop 的 PMTU 和网关信息。
-
----
 
 ## 7. 多路径路由（ECMP）
 
@@ -607,8 +593,6 @@ int fib_multipath_hash(const struct net *net, const struct flowi4 *fl4,
 // 等等
 ```
 
----
-
 ## 8. 基于 MARK 的路由策略
 
 ### 8.1 fwmark 流程
@@ -640,8 +624,6 @@ struct flowi4 fl4 = {
 ### 8.4 rp_filter 与 mark 交互
 
 `__fib_validate_source` 中的 `fl4.flowi4_mark` 会影响反向路径查找，但 rp_filter 检查的是路由本身，不是 mark 值。自定义规则中可以用 `fwmark` 匹配来改变路由行为。
-
----
 
 ## 9. 关键代码路径总结
 
@@ -681,8 +663,6 @@ ip_route_input_slow()
        └─ fib_result_prefsrc()    ← 自动选择源地址
 ```
 
----
-
 ## 10. 关键数据结构一览
 
 | 结构 | 文件 | 用途 |
@@ -697,8 +677,6 @@ ip_route_input_slow()
 | `tnode` | `fib_trie.c:131` | 内部节点，含 empty/full_children 计数 |
 | `flowi4` | `flow.h` | 查找关键字：daddr/saddr/mark/oif/dscp/proto |
 
----
-
 ## 11. 参考
 
 - `net/ipv4/fib_frontend.c` — 表初始化、地址类型、源校验、ioctl
@@ -710,3 +688,126 @@ ip_route_input_slow()
 - `include/net/fib_rules.h` — `FIB_LOOKUP_NOREF` 等标志位
 - `include/net/flow.h` — `flowi4` 定义
 - `net/ipv4/fib_lookup.h` — `fib_alias` 定义
+
+
+---
+
+## doom-lsp 源码分析
+
+> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+
+### 文件分析摘要
+
+| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
+|--------|--------|--------|------|------|
+| `include/linux/list.h` | 51 | 0 | 51 | 0 |
+| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
+| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+
+### 核心数据结构
+
+- **audit_context** `sched.h:58`
+- **bio_list** `sched.h:59`
+- **blk_plug** `sched.h:60`
+- **bpf_local_storage** `sched.h:61`
+- **bpf_run_ctx** `sched.h:62`
+- **bpf_net_context** `sched.h:63`
+- **capture_control** `sched.h:64`
+- **cfs_rq** `sched.h:65`
+- **fs_struct** `sched.h:66`
+- **futex_pi_state** `sched.h:67`
+- **io_context** `sched.h:68`
+- **io_uring_task** `sched.h:69`
+- **mempolicy** `sched.h:70`
+- **nameidata** `sched.h:71`
+- **nsproxy** `sched.h:72`
+- **perf_event_context** `sched.h:73`
+- **perf_ctx_data** `sched.h:74`
+- **pid_namespace** `sched.h:75`
+- **pipe_inode_info** `sched.h:76`
+- **rcu_node** `sched.h:77`
+- **reclaim_state** `sched.h:78`
+- **robust_list_head** `sched.h:79`
+- **root_domain** `sched.h:80`
+- **rq** `sched.h:81`
+- **sched_attr** `sched.h:82`
+
+### 关键函数
+
+- **INIT_LIST_HEAD** `list.h:43`
+- **__list_add_valid** `list.h:136`
+- **__list_del_entry_valid** `list.h:142`
+- **__list_add** `list.h:154`
+- **list_add** `list.h:175`
+- **list_add_tail** `list.h:189`
+- **__list_del** `list.h:201`
+- **__list_del_clearprev** `list.h:215`
+- **__list_del_entry** `list.h:221`
+- **list_del** `list.h:235`
+- **list_replace** `list.h:249`
+- **list_replace_init** `list.h:265`
+- **list_swap** `list.h:277`
+- **list_del_init** `list.h:293`
+- **list_move** `list.h:304`
+- **list_move_tail** `list.h:315`
+- **list_bulk_move_tail** `list.h:331`
+- **list_is_first** `list.h:350`
+- **list_is_last** `list.h:360`
+- **list_is_head** `list.h:370`
+- **list_empty** `list.h:379`
+- **list_del_init_careful** `list.h:395`
+- **list_empty_careful** `list.h:415`
+- **list_rotate_left** `list.h:425`
+- **list_rotate_to_front** `list.h:442`
+- **list_is_singular** `list.h:457`
+- **__list_cut_position** `list.h:462`
+- **list_cut_position** `list.h:488`
+- **list_cut_before** `list.h:515`
+- **__list_splice** `list.h:531`
+- **list_splice** `list.h:550`
+- **list_splice_tail** `list.h:562`
+- **list_splice_init** `list.h:576`
+- **list_splice_tail_init** `list.h:593`
+- **list_count_nodes** `list.h:755`
+
+### 全局变量
+
+- **__tracepoint_sched_set_state_tp** `sched.h:350`
+- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
+- **def_root_domain** `sched.h:407`
+- **sched_domains_mutex** `sched.h:408`
+- **cad_pid** `sched.h:1749`
+- **init_stack** `sched.h:1964`
+- **class_migrate_is_conditional** `sched.h:2519`
+- **_totalram_pages** `mm.h:53`
+- **high_memory** `mm.h:74`
+- **sysctl_legacy_va_layout** `mm.h:86`
+- **mmap_rnd_bits_min** `mm.h:92`
+- **mmap_rnd_bits_max** `mm.h:93`
+- **mmap_rnd_bits** `mm.h:94`
+- **sysctl_user_reserve_kbytes** `mm.h:210`
+- **sysctl_admin_reserve_kbytes** `mm.h:211`
+
+### 成员/枚举
+
+- **utime** `sched.h:366`
+- **stime** `sched.h:367`
+- **lock** `sched.h:368`
+- **seqcount** `sched.h:386`
+- **starttime** `sched.h:387`
+- **state** `sched.h:388`
+- **cpu** `sched.h:389`
+- **utime** `sched.h:390`
+- **stime** `sched.h:391`
+- **gtime** `sched.h:392`
+- **sched_priority** `sched.h:413`
+- **pcount** `sched.h:421`
+- **run_delay** `sched.h:424`
+- **max_run_delay** `sched.h:427`
+- **min_run_delay** `sched.h:430`
+- **last_arrival** `sched.h:435`
+- **last_queued** `sched.h:438`
+- **max_run_delay_ts** `sched.h:441`
+- **weight** `sched.h:461`
+- **inv_weight** `sched.h:462`
+
