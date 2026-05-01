@@ -168,3 +168,49 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 11. intel_pstate 驱动
+
+Intel CPU 使用 intel_pstate 驱动通过 MSR 直接控制 P-State：
+
+```c
+// drivers/cpufreq/intel_pstate.c
+// intel_pstate 直接读写 MSR 寄存器
+// 不需要 ACPI 交互，延迟更低
+
+// 两种模式：
+// passive: 通过 cpufreq 框架（兼容）
+// active: 直接控制（更快）
+
+// 支持的 CPU：
+// Sandy Bridge 及更新的 Intel CPU
+```
+
+## 12. cpufreq 与热管理
+
+```bash
+# /sys/devices/system/cpu/cpuX/cpufreq/ 中的热相关文件
+# scaling_max_freq 受 thermal throttle 影响
+# CPU 温度过高时自动降低频率
+```
+
+## 13. 调试命令
+
+```bash
+# 查看 CPU 频率实时变化
+watch -n1 "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+
+# 使用 perf 查看频率切换
+perf stat -e power:cpu_frequency -a -- sleep 1
+
+# 查看 cpufreq 统计
+cat /sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state
+```
+
+## 14. 总结
+
+CPUFreq 通过 governor 决定频率策略。schedutil 基于 PELT 信号动态调频。intel_pstate 通过 MSR 直接控制。系统管理员可通过 sysfs 调整策略和频率范围。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
