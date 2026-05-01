@@ -256,3 +256,21 @@ echo 50 > /sys/kernel/mm/ksm/sleep_millisecs
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 16. KSM 在虚拟化中的应用
+
+KSM 在虚拟化平台（如 KVM）中特别有用。多台运行相同操作系统的虚拟机之间存在大量重复页面：内核代码、共享库、空置内存页等。QEMU/KVM 通过 `madvise(MADV_MERGEABLE)` 标记客户机内存，ksmd 自动扫描并合并这些页面。
+
+在一个运行 10 台 Ubuntu 虚拟机（每台 2GB 内存）的宿主机上，KSM 通常能将内存占用从 20GB 降至 8GB 左右，节省率约 60%。
+
+## 17. ksmd 优先级与调度
+
+ksmd 线程的优先级设为 NICE 5（比普通进程低），CPU 占用通常小于 1%。但在大内存系统中，如果大量页面频繁变化，ksmd 的 CPU 占用可能上升到 5-10%。此时可以调大 `sleep_millisecs` 减少扫描频率，或调小 `pages_to_scan` 减少每轮工作量。
+
+## 18. 与 THP 的关系
+
+KSM 与透明大页（THP）可以共存。THP 将 4KB 页面合并为 2MB 大页以减少 TLB miss，而 KSM 合并不同进程间内容相同的页面以减少内存占用。两者优化目标不同，互不干扰。KSM 可以在 THP 已经合并的大页基础上进一步合并。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
