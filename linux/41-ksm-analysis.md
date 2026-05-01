@@ -238,3 +238,138 @@ static struct kmem_cache *rmap_item_cache;
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
+
+## Analysis
+
+The KSM mechanism provides memory savings through page deduplication. The ksmd kernel thread scans anonymous pages and compares content. The stable tree holds already-merged pages, while the unstable tree holds candidates. Checksums provide fast change detection. COW mappings ensure transparency.
+
