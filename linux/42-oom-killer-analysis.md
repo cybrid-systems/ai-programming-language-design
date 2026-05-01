@@ -465,3 +465,11 @@ cat /sys/kernel/debug/tracing/trace_pipe
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 27. 总结
+
+OOM Killer 在内存耗尽时通过 oom_badness 评分选择并杀死进程。评分基于 RSS 和 swap 用量，root 进程分数减半，oom_score_adj 允许显式调整。oom_unkillable_task 保护 init 和内核线程。memcg OOM 在 cgroup 内隔离。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
