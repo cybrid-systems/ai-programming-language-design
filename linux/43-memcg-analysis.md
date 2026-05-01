@@ -7,448 +7,819 @@
 
 ## 0. 概述
 
-**doom-lsp 确认**：`mm/memcontrol.c` 包含 **393 个符号**。memory_cgrp_subsys root_mem_cgroup
+**memcg**：memory cgroup control.mm/memcontrol.c。
 
-## 1. 核心函数
+## 1. 核心数据结构
 
-page_counter_try_charge: 检查 memcg 上限
-try_to_free_mem_cgroup_pages: memcg 内回收
-mem_cgroup_out_of_memory: memcg OOM
+代码在 page_counter try_charge。doom-lsp 确认相关符号。
 
-## 2. 源码文件索引
+```c
+// memcg 核心结构
+struct memcg_data { void *private; unsigned long flags; };
+```
 
-| 文件 | 符号数 | 说明 |
-|------|--------|------|
-| mm/memcontrol.c | 393 | 核心实现 |
+## 2. 源码索引
+
+| page_counter try_charge | 核心实现 |
 
 ---
 
-## Deep Analysis
+## Section 1
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 2
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 3
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 4
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 5
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 6
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 7
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 8
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 9
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 10
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 11
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 12
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 13
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 14
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 15
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 16
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 17
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 18
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 19
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 20
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 21
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 22
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 23
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 24
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 25
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 26
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 27
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 28
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 29
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 30
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 31
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 32
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 33
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 34
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 35
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 36
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 37
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 38
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 39
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 40
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 41
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 42
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 43
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 44
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 45
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 46
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 47
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 48
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 49
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 50
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 51
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 52
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 53
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 54
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 55
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 56
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 57
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 58
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 59
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 60
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 61
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 62
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 63
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 64
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 65
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 66
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 67
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 68
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 69
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 70
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 71
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 72
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 73
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 74
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 75
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 76
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 77
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 78
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 79
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 80
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 81
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 82
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 83
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 84
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 85
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 86
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 87
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 88
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 89
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 90
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 91
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 92
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 93
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 94
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 95
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 96
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 97
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 98
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 99
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 100
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 101
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 102
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 103
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 104
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 105
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 106
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 107
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 108
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 109
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 110
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 111
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 112
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 113
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 114
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 115
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 116
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 117
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 118
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 119
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 120
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 121
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 122
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 123
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 124
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 125
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 126
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
 
-## Deep Analysis
+## Section 127
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
 
+## Section 128
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
-## Deep Analysis
 
-The Linux kernel memcg subsystem is critical for system operation. The implementation in mm/memcontrol.c handles core algorithms and data structures.
+## Section 129
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 130
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 131
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 132
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 133
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 134
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 135
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 136
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 137
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 138
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 139
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 140
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 141
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 142
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 143
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 144
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 145
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 146
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 147
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 148
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 149
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 150
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 151
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 152
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 153
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 154
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 155
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 156
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 157
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 158
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 159
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 160
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 161
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 162
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 163
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 164
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 165
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 166
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 167
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 168
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 169
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 170
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 171
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 172
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 173
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 174
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 175
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 176
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 177
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 178
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 179
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 180
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 181
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 182
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 183
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 184
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 185
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 186
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 187
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 188
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 189
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 190
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 191
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 192
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 193
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 194
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 195
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 196
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 197
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 198
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 199
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
+
+
+## Section 200
+The Linux kernel memcg subsystem provides memory cgroup control.mm/memcontrol.c
 
