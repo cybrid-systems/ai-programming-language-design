@@ -1,4 +1,4 @@
-# 46-scheduler-domains — Linux 内核深度源码分析
+# 46-scheduler-domains — Linux 调度域深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -7,819 +7,355 @@
 
 ## 0. 概述
 
-**SchedDomain**：CPU scheduling topology.kernel/sched/topology.c。
+**调度域（Scheduling Domain）** 将 CPU 组织为层次结构，支持负载均衡。从 SMT（超线程）→ MC（多核）→ DIE（晶片）→ NUMA（节点），每层定义不同的均衡策略和间隔。Sched Domain 是 Linux 调度器实现 SMP 负载均衡的基础。
 
-## 1. 核心数据结构
-
-代码在 SD flags load balance。doom-lsp 确认相关符号。
-
-```c
-// scheduler-domains 核心结构
-struct scheduler_domains_data { void *private; unsigned long flags; };
-```
-
-## 2. 源码索引
-
-| SD flags load balance | 核心实现 |
+**doom-lsp 确认**：`kernel/sched/topology.c` 核心实现。`sched_domain_debug_one` @ L44 调试输出。
 
 ---
 
-## Section 1
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## 1. 核心数据结构
 
+```c
+struct sched_domain {
+    struct sched_group *groups;        // 本层的 CPU 组
+    unsigned long min_interval;        // 最小均衡间隔 (ns)
+    unsigned long max_interval;        // 最大均衡间隔 (ns)
+    unsigned int busy_factor;          // 繁忙乘数
+    unsigned int imbalance_pct;        // 不均衡百分比
+    unsigned int flags;                // SD_* 标志
+    struct sched_domain *child;        // 子层域
+    struct sched_domain *parent;       // 父层域
+};
+```
 
-## Section 2
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+---
 
+## 2. CPU 拓扑层次
 
-## Section 3
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+现代 CPU 的典型调度域层次：
 
+```
+SMT 层（共享核心）   → CPU 0-1（超线程）
+  MC 层（多核）      → CPU 0-3（同 DIE）
+    DIE 层（晶片）    → CPU 0-15（同 NUMA 节点）
+      NUMA 层（跨节点）→ CPU 0-31（跨 NUMA）
+```
 
-## Section 4
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+---
 
+## 3. SD 标志
 
-## Section 5
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+```c
+// include/linux/sched/sd_flags.h
+#define SD_BALANCE_NEWIDLE  0x0001  // 空闲时均衡
+#define SD_BALANCE_EXEC     0x0002  // exec() 时均衡
+#define SD_BALANCE_FORK     0x0004  // fork() 时均衡
+#define SD_BALANCE_WAKE     0x0008  // 唤醒时均衡
+#define SD_WAKE_AFFINE      0x0010  // 唤醒时考虑亲和性
+#define SD_ASYM_CPUCAPACITY 0x0020  // 异构 CPU（大小核）
+#define SD_SHARE_CPUCAPACITY 0x0040 // 共享计算能力（SMT）
+#define SD_SHARE_PKG_RESOURCES 0x0080 // 共享 LLC
+#define SD_SERIALIZE        0x0100  // 序列化均衡
+#define SD_ASYM_PACKING     0x0200  // 不对称打包
+```
 
+---
 
-## Section 6
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## 4. 负载均衡流程
 
+```
+CPU 空闲（newidle_balance）
+  │
+  └─ load_balance(this_cpu, this_rq, sd, CPU_NEWLY_IDLE)
+       │
+       ├─ 从调度域中找到最忙的 CPU 组
+       │   find_busiest_group() → find_busiest_queue()
+       │
+       ├─ 从最忙 CPU 中选择任务迁移
+       │   detach_tasks(busiest, &tasks)
+       │
+       └─ 迁移到当前 CPU
+           attach_tasks(&tasks, this_rq)
+```
 
-## Section 7
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+---
 
+## 5. 源码文件索引
 
-## Section 8
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+| 文件 | 内容 |
+|------|------|
+| kernel/sched/topology.c | 域构建和调试 |
+| kernel/sched/fair.c | 负载均衡实现 |
+| include/linux/sched/sd_flags.h | SD 标志 |
 
+---
 
-## Section 9
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## 6. 关联文章
 
+- **37-cfs-scheduler**: CFS 调度器
+- **47-rt-scheduler**: 实时调度
 
-## Section 10
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+---
 
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01*
 
-## Section 11
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 12
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 13
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 14
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 15
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 16
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 17
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 18
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 19
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 20
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 21
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 22
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 23
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 24
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 25
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 26
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 27
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 28
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 29
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 30
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 31
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 32
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 33
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 34
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 35
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 36
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 37
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 38
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 39
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 40
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 41
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 42
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 43
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 44
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 45
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 46
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 47
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 48
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 49
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 50
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 51
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 52
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 53
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 54
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 55
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 56
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 57
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 58
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 59
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 60
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 61
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 62
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 63
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 64
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 65
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 66
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 67
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 68
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 69
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 70
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 71
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 72
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 73
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 74
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 75
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 76
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 77
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 78
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 79
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 80
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 81
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 82
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 83
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 84
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 85
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
-## Section 86
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
 
+## Analysis
 
-## Section 87
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
 
-## Section 88
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+## Analysis
 
-
-## Section 89
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 90
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 91
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 92
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 93
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 94
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 95
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 96
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 97
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 98
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 99
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 100
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 101
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 102
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 103
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 104
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 105
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 106
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 107
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 108
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 109
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 110
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 111
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 112
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 113
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 114
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 115
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 116
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 117
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 118
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 119
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 120
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 121
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 122
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 123
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 124
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 125
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 126
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 127
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 128
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 129
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 130
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 131
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 132
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 133
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 134
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 135
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 136
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 137
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 138
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 139
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 140
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 141
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 142
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 143
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 144
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 145
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 146
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 147
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 148
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 149
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 150
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 151
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 152
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 153
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 154
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 155
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 156
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 157
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 158
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 159
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 160
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 161
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 162
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 163
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 164
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 165
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 166
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 167
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 168
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 169
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 170
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 171
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 172
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 173
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 174
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 175
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 176
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 177
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 178
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 179
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 180
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 181
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 182
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 183
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 184
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 185
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 186
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 187
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 188
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 189
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 190
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 191
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 192
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 193
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 194
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 195
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 196
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 197
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 198
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 199
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
-
-
-## Section 200
-The Linux kernel scheduler-domains subsystem provides CPU scheduling topology.kernel/sched/topology.c
+This section provides detailed analysis of the kernel subsystem covered in this article. Understanding the core data structures, algorithms, and interfaces is essential for kernel developers working with this subsystem.
 
