@@ -404,3 +404,25 @@ OOM Killer 是内存管理的最后防线。oom_badness 函数根据 RSS 和 swa
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+
+## 22. 使用 perf 跟踪 OOM
+
+```bash
+# 跟踪 OOM 事件
+perf record -e oom:oom_mark_victim -a -- sleep 10
+perf script
+
+# 使用 ftrace 观察 OOM 路径
+echo function_graph > /sys/kernel/debug/tracing/current_tracer
+echo __alloc_pages_slowpath > /sys/kernel/debug/tracing/set_ftrace_filter
+cat /sys/kernel/debug/tracing/trace_pipe
+```
+
+## 23. 关联文章
+
+- **17-page-allocator**: 页面分配触发 OOM
+- **43-memcg**: memcg OOM 隔离
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
