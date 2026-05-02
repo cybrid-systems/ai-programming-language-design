@@ -236,9 +236,49 @@ struct fanotify_event_metadata {
 
 ---
 
-## 5. 总结
+## 5. fsnotify_mark——事件标记
 
-inotify 和 fanotify 基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492` → `send_to_group` @ `:331` → `group->ops->handle_event`）。inotify 通过 `inotify_read` @ `:249` 读取 `struct inotify_event`，fanotify 通过 `fanotify_get_response` @ `:224` 支持访问控制，通过 `fanotify_merge` @ `:182` 支持事件合并。
+```c
+// fsnotify_mark 是 inode/挂载点与 fsnotify_group 之间的关联：
+struct fsnotify_mark {
+    struct fsnotify_mark_connector __rcu *connector;  // 关联的 inode/mount
+    struct fsnotify_group *group;                      // 所属组
+    struct list_head obj_list;                         // connector 中的链表
+
+    __u32 mask;                  // 感兴趣的事件掩码（IN_CREATE|IN_DELETE...）
+    __u32 ignore_mask;           // 忽略的事件掩码
+    refcount_t refcnt;
+    unsigned long flags;
+};
+
+// mark 通过 fsnotify_add_mark() 注册到 inode：
+// → 分配 fsnotify_mark
+// → 设置 mask（要监控的事件类型）
+// → 添加到 inode->i_fsnotify_marks 链表
+// → 当 VFS 操作发生时：fsnotify() 遍历此链表
+//   → send_to_group() 检查 mask 匹配
+//   → group->ops->handle_event() 发送事件
+```
+
+## 6. inotify_add_watch 注册路径
+
+```c
+// inotify_add_watch(fd, pathname, IN_CREATE|IN_DELETE|...)
+// → sys_inotify_add_watch
+//   → inotify_update_watch(group, inode, mask, flags)
+//     → inotify_add_to_idr(group, i_mark, inode)
+//       → idr_alloc(&group->inotify_data.idr, i_mark, 1, 0, ...)
+//         → 分配 watch descriptor（wd，整数句柄）
+//     → fsnotify_add_mark(&i_mark->fsn_mark, group, inode, 0, ...)
+//       → 将 mark 添加到 inode 的标记链表
+
+// 用户通过 read() 读取时返回 struct inotify_event {wd, mask, cookie, len, name}：
+// wd 就是 idr 分配的 watch descriptor
+```
+
+## 7. 总结
+
+inotify 和 fanotify 基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492` → `send_to_group` @ `:331` → `group->ops->handle_event`）。`fsnotify_mark` 通过 `fsnotify_add_mark()` 注册到 inode，`mask` 决定监控的事件类型。inotify 通过 `inotify_read` @ `:249` 读取 `struct inotify_event`，fanotify 通过 `fanotify_get_response` @ `:224` 支持访问控制。
 
 ---
 
