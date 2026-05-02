@@ -236,3 +236,90 @@ AF_PACKET 通过 `packet_sendmsg`/`tpacket_rcv` 收发 L2 数据包。PACKET_MMA
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 8. PACKET_MMAP V3 块模式详解
+
+```c
+// TPACKET_V3 块模式（推荐）——多个帧组合为一个块：
+
+// struct tpacket_req3 {
+//     unsigned int tp_block_size;     // 块大小（必须 2^N 对齐）
+//     unsigned int tp_block_nr;        // 块数
+//     unsigned int tp_frame_size;     // 帧大小
+//     unsigned int tp_frame_nr;        // 帧数
+//     unsigned int tp_retire_blk_tov; // 块超时（ms）
+//     unsigned int tp_sizeof_priv;    // 私有数据大小
+//     unsigned int tp_feature_req_word; // 特性请求
+// };
+
+// V3 优势：
+// → 减少系统调用（一次 poll 可能收到多个帧）
+// → 降低延迟（块超时机制：tp_retire_blk_tov）
+// → 批量处理提高吞吐量
+
+// 块生命周期：
+// 1. 内核写帧到块 → 标记 TP_STATUS_USER
+// 2. 用户收到 POLLIN → 读取整个块
+// 3. 用户完成 → 标记块为 TP_STATUS_KERNEL
+// 4. 内核继续写入该块
+
+// tpacket_rcv @ :192 — V3 接收处理：
+// → prb_retire_current_block() — 满块切换
+// → prb_open_block() — 打开新块
+// → 写入帧到当前块
+```
+
+## 9. PACKET_MMAP V2 扩展功能
+
+```c
+// TPACKET_V2 相比 V1 的改进：
+
+// struct tpacket2_hdr {
+//     __u32 tp_status;
+//     __u16 tp_len;                 // 数据长度
+//     __u16 tp_snaplen;             // 捕获长度
+//     __u16 tp_mac;                 // MAC 偏移
+//     __u16 tp_net;                 // 网络层偏移
+//     __u32 tp_sec;                 // 秒级时间戳
+//     __u32 tp_nsec;                // 纳秒级时间戳
+//     __u16 tp_vlan_tci;            // VLAN 标签
+//     __u16 tp_vlan_tpid;           // VLAN 协议
+//     __u8 tp_padding[4];
+// };
+
+// 新增功能：
+// → 纳秒时间戳（V1 只有秒级）
+// → VLAN 标签透传（tp_vlan_tci/tp_vlan_tpid）
+// → 更大的 snaplen 范围
+```
+
+## 10. packet_set_ring @ :174
+
+```c
+// packet_set_ring — 设置 PACKET_MMAP 环形缓冲区：
+
+// 1. 检查 socket 是否已绑定（已绑定时不能设置 ring）
+// 2. 根据 req->tp_block_size 分配页面
+//    pg_vec = alloc_pg_vec(btp, req, po->pg_vec_lock);
+//    → alloc_one_pg_vec_page() — 分配连续物理页
+//    → 每个块由多个物理页组成
+// 3. 初始化 ring 参数：
+//    po->rx_ring.pg_vec = pg_vec
+//    po->rx_ring.frame_size = req->tp_frame_size
+//    po->rx_ring.head = 0
+// 4. 替换接收函数为 tpacket_rcv（非 mmap 时是 packet_rcv）
+```
+
+## 11. 关键函数索引
+
+| 函数 | 符号数 | 作用 |
+|------|--------|------|
+| `af_packet.c` | 196 | AF_PACKET 实现 |
+| `tpacket_rcv` | `:192` | mmap 接收（V1/V2/V3）|
+| `packet_mmap` | — | mmap 映射建立 |
+| `packet_sendmsg` | — | 发送入口 |
+| `packet_set_ring` | `:174` | ring 缓冲区设置 |
+| `packet_previous_frame` | `:195` | 前一个帧定位 |
+| `prb_retire_current_block` | `:202` | 块完成处理 |
+| `prb_open_block` | `:205` | 块打开初始化 |
+
