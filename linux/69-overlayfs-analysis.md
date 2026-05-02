@@ -8,28 +8,20 @@
 
 ## 0. 概述
 
-**OverlayFS** 是 Linux 的**联合挂载文件系统**（union mount），将一个或多个只读下层目录和一个读写上层目录组合为一个逻辑目录树。OverlayFS 是现代 Docker/容器镜像系统的核心——每个容器镜像层对应一个 overlayfs lowerdir，容器可写层对应 upperdir。
+**OverlayFS** 是 Linux 的**联合挂载文件系统**（union mount），将多个只读下层目录和一个读写上层目录组合为单一逻辑树。它是 Docker/容器镜像系统的基石——每个容器镜像层对应一个 overlay 下层，容器可写层对应上层。
 
-**核心设计**：OverlayFS 使用**层叠（stacking）**架构——文件操作在上下层之间查找和合并。本质上它不是一个传统的磁盘文件系统，而是一个**VFS 层之上的聚合层**，通过 `dentry` 和 `inode` 指针将操作委托给底层文件系统。
+**核心设计**：OverlayFS 是一个 **VFS stacking 层**——它不管理原始存储，而是通过 dentry/inode 指针将操作委托给底层文件系统。写操作触发 **copy-up**：文件从下层复制到上层后再修改。
 
 ```
-mount -t overlay overlay -o lowerdir=/lower,upperdir=/upper,workdir=/work /merged
+mount -t overlay overlay -o lowerdir=/A:/B,upperdir=/U,workdir=/W /M
 
-  /merged (overlay root)
-    │
-    ├── upper layer（读写）→ /upper
-    │   └── 文件修改、新建都在此
-    │
-    ├── lower layer 0 → /lower0
-    ├── lower layer 1 → /lower1  （只读，从下层到上层覆盖）
-    └── lower layer N → /lowerN
+/M→U (upper, rw) |→A (lower0, ro) |→B (lower1, ro)
+读：U→A→B（上层优先，找到即停）
+写：触发 copy-up（A或B→U）
+删：在上层创建 whiteout（屏蔽下层同名文件）
 ```
 
-**读操作**：从上层向下层查找，找到即返回（whiteout 条目表示文件在下层被删除）。
-
-**写操作（copy-up）**：文件首次在上层修改时，OverlayFS 将整个文件从下层复制到上层，然后修改上层副本。
-
-**doom-lsp 确认**：实现在 `fs/overlayfs/`（**~10 个核心文件**，共 ~11,000 行）。头文件 `ovl_entry.h` 和 `overlayfs.h`。核心操作：`copy_up.c`（copy-up 机制）、`dir.c`（目录操作）、`inode.c`（inode 操作）、`file.c`（文件操作）。
+**doom-lsp 确认**：实现在 `fs/overlayfs/` 目录。关键文件：`namei.c`（ovl_lookup @ 1382）、`inode.c`（ovl_getattr @ 163, ovl_setattr @ 21）、`copy_up.c`（ovl_copy_up_file @ 260）、`super.c`（ovl_super_operations @ 297）。
 
 ---
 
@@ -41,11 +33,11 @@ mount -t overlay overlay -o lowerdir=/lower,upperdir=/upper,workdir=/work /merge
 // fs/overlayfs/ovl_entry.h:33-40
 struct ovl_layer {
     struct vfsmount *mnt;                  /* 层的挂载点 */
-    struct inode *trap;                    /* trap inode（防止递归）*/
-    struct ovl_sb *fs;                     /* 底层文件系统信息 */
+    struct inode *trap;                    /* trap inode */
+    struct ovl_sb *fs;
     int idx;                               /* 层索引（0=upper）*/
-    int fsid;                              /* 唯一底层 sb 索引 */
-    bool has_xwhiteouts;                   /* 是否包含 xwhiteout */
+    int fsid;                              /* 底层 fs 唯一 ID */
+    bool has_xwhiteouts;
 };
 ```
 
@@ -53,386 +45,331 @@ struct ovl_layer {
 
 ```c
 struct ovl_path {
-    const struct ovl_layer *layer;          /* 所属层 */
-    struct dentry *dentry;                  /* 此路径的 dentry */
+    const struct ovl_layer *layer;
+    struct dentry *dentry;
 };
 ```
 
-### 1.3 struct ovl_entry — dentry 的底层信息
+### 1.3 struct ovl_entry — dentry 的底层路径栈
 
 ```c
+// fs/overlayfs/ovl_entry.h:159
 struct ovl_entry {
-    unsigned int __numlower;                /* 下层路径数 */
-    struct ovl_path __lowerstack[];         /* 下层路径栈（变长）*/
+    unsigned int __numlower;                /* 下层数量 */
+    struct ovl_path __lowerstack[];         /* 下层路径栈 */
 };
 ```
 
-### 1.4 struct ovl_inode — inode 底层映射
+### 1.4 struct ovl_inode — overlay inode
 
 ```c
+// fs/overlayfs/ovl_entry.h:159-172
 struct ovl_inode {
     union {
         struct ovl_dir_cache *cache;        /* 目录缓存 */
-        const char *lowerdata_redirect;     /* 文件重定向 */
+        const char *lowerdata_redirect;
     };
-    const char *redirect;                   /* 重定向路径 */
-    u64 version;                            /* 版本号 */
+    const char *redirect;
+    u64 version;
     unsigned long flags;
-    struct inode vfs_inode;                 /* VFS inode（必须最后）*/
+    struct inode vfs_inode;                 /* VFS inode */
     struct dentry *__upperdentry;           /* 上层 dentry */
-    struct ovl_entry *oe;                   /* 下层路径信息 */
-    struct mutex lock;                      /* 同步 copy-up */
+    struct ovl_entry *oe;                   /* 下层信息 */
+    struct mutex lock;                      /* copy-up 同步 */
 };
 ```
 
 ### 1.5 struct ovl_fs — overlay 超级块
 
 ```c
+// fs/overlayfs/ovl_entry.h:54-90
 struct ovl_fs {
     unsigned int numlayer;                   /* 总层数 */
-    unsigned int numfs;                      /* 底层唯一文件系统数 */
-    unsigned int numdatalayer;               /* 纯数据下层数 */
+    unsigned int numdatalayer;
     struct ovl_layer *layers;                /* 层数组 [0]=upper */
-    struct ovl_sb *fs;
-
-    struct dentry *workbasedir;              /* workdir= 路径 */
-    struct dentry *workdir;                  /* work/ 或 index/ 目录 */
-
+    struct dentry *workbasedir;
+    struct dentry *workdir;
     struct ovl_config config;
     const struct cred *creator_cred;
-
-    bool tmpfile;                            /* 支持 tmpfile */
-    bool noxattr;                            /* 不支持 xattr */
-    bool nofh;
-    bool upperdir_locked;
-    bool workdir_locked;
-
-    atomic_long_t last_ino;                  /* inode 号分配器 */
+    bool tmpfile, noxattr, nofh;
+    atomic_long_t last_ino;                  /* 伪 inode 号分配 */
     struct dentry *whiteout;                 /* whiteout 缓存 */
 };
 ```
 
+**doom-lsp 确认**：`struct ovl_fs` 在 `ovl_entry.h:54`，`struct ovl_inode` 在 `ovl_entry.h:159`。`struct ovl_layer` 在 `ovl_entry.h:33`。掩码宏 `OVL_FS()` 在 `ovl_entry.h:74`，`OVL_I()` 在 `ovl_entry.h:177`。
+
 ---
 
-## 2. 查找路径——ovl_lookup
+## 2. 查找——ovl_lookup @ namei.c:1382
+
+`ovl_lookup()` 是 OverlayFS 的 dentry 查找核心——自顶向下遍历所有层：
 
 ```c
-// fs/overlayfs/namei.c
-// 通过 ovl_lookup() 查找 dentry 在所有层中的位置：
-
+// fs/overlayfs/namei.c:1382
 struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
                           unsigned int flags)
 {
-    struct ovl_entry *oe;
-    const struct ovl_path *lower;
+    struct ovl_lookup_ctx ctx = { .dentry = dentry };
+    struct ovl_path *lower = NULL;
     int i;
 
-    /* 1. 从上层开始查找 */
-    upperdentry = ovl_lookup_upper(ofs, dentry->d_name.name);
+    /* 阶段 1：查找上层 */
+    err = ovl_lookup_layer(upperdir, &d, &ctx.upperdentry, true);
 
-    /* 2. 从最底层到次上层遍历查找下层 */
+    /* 阶段 2：从底层到次上层遍历 */
     for (i = 0; i < numlower; i++) {
-        lower = &stack[i];
-        this = ovl_lookup_layer(lower->layer, dentry->d_name.name);
-        /* 处理 whiteout：上层删除 → 跳过此层 */
-        if (ovl_is_whiteout(this))
+        /* ovl_lookup_layer @ namei.c:356 */
+        err = ovl_lookup_layer(lower.dentry, &d, &this, false);
+
+        if (ovl_is_whiteout(this)) {
+            /* whiteout = 此文件在上层被删除 → 跳过此层 */
             continue;
+        }
+        /* 处理 redirect（跨层重命名）*/
+        if (d.redirect) {
+            /* ovl_check_follow_redirect @ namei.c:1064 */
+            err = ovl_check_follow_redirect(&d);
+        }
+        /* 存入 stack[] */
     }
 
-    /* 3. 构建 ovl_entry + 设置 dentry 操作 */
+    /* 阶段 3：构建 ovl_entry */
     oe = ovl_alloc_entry(numlower);
-    // 填充 stack[] 数组
 
-    /* 4. 设置 dentry->d_fsdata = OE 标志 */
-    // OVL_E_UPPER_ALIAS / OVL_E_CONNECTED / OVL_E_OPAQUE
-
-    /* 5. 返回 inode（如果找到）*/
+    /* 阶段 4：创建 inode */
     inode = ovl_get_inode(dentry, upperdentry, oe);
     d_add(dentry, inode);
 }
 ```
 
-**Opaque 目录**：当一个上层目录设置了 `trusted.overlay.opaque` xattr，OverlayFS 不继续查找同名的下层目录条目（用于目录合并后防止下层文件泄露）。
+**doom-lsp 确认**：`ovl_lookup` 在 `namei.c:1382`。`ovl_lookup_layer` 在 `namei.c:356`。`ovl_is_whiteout` 检查 whiteout 条目。`ovl_check_follow_redirect` 在 `namei.c:1064` 处理 redirect 追踪。
 
 ---
 
-## 3. Copy-Up 机制
+## 3. Copy-Up——写时复制 @ copy_up.c
 
-Copy-up 是 OverlayFS 写操作的**核心机制**——文件首次修改时，从下层复制到上层：
+OverlayFS 最核心的写操作机制——文件在下层存在但上层不存在时，首次写操作触发复制：
+
+**doom-lsp 确认**：copy-up 实现在 `fs/overlayfs/copy_up.c`（61 个符号）。核心结构 `struct ovl_copy_up_ctx` 在 `copy_up.c:577`——包含 parent、dentry、source stat 等信息。
 
 ```c
-// fs/overlayfs/copy_up.c:1283
-// 触发条件：
-// 1. 文件在上层不存在（只在下层存在）
-// 2. 用户试图写或修改属性
+// fs/overlayfs/copy_up.c
+struct ovl_copy_up_ctx {                      /* @ copy_up.c:577 */
+    struct dentry *parent;                     /* 父目录 dentry */
+    struct dentry *dentry;                     /* 目标 dentry */
+    struct path lowerpath;                     /* 下层路径 */
+    struct kstat stat;                         /* 源文件 stat */
+    struct kstat pstat;
+    const char *redirect;
+    struct ovl_cu_creds *cc;
+};
 
-int ovl_copy_up_one(struct dentry *dentry, const char *redirect)
+/* 触发路径——任何修改操作都可能触发：
+ *   ovl_setattr()        @ inode.c:21  — chmod/chown/truncate
+ *   ovl_permission()     @ inode.c:290 — 写入前权限检查
+ *   ovl_set_acl()        @ inode.c     — ACL 修改
+ */
+
+/* 实际文件复制 @ copy_up.c:260 */
+static int ovl_copy_up_file(struct ovl_fs *ofs, struct dentry *dentry,
+                            struct file *new_file, loff_t len)
 {
-    struct path parentpath;
-    struct kstat stat;
-    struct cred *override_cred;
+    /* 1. 从下层文件读取数据 */
+    /* 2. 写入上层 tmpfile */
+    /* 3. tmpfile → rename 到目标路径 */
+    /* 4. 设置 xattr（origin 等）*/
+}
 
-    /* 1. 用创建者权限执行 */
-    override_cred = ovl_override_creds(dentry->d_sb);
-
-    /* 2. 查找下层文件信息 */
-    ovl_path_lower(dentry, &lowerpath);
-    stat = ovl_get_lower_stat(dentry);
-
-    /* 3. 如果文件是硬连接 → 创建硬连接而非复制 */
-    if (ovl_get_nlink(lowerstat) > 1 && ovl_indexdir(dentry->d_sb))
-        return ovl_copy_up_inode(dentry, lowerpath.dentry, NULL);
-
-    /* 4. 实际复制 */
-    if (S_ISREG(stat->mode)) {
-        /* 普通文件：使用 tmpfile 或直接写入 */
-        if (ofs->tmpfile)
-            ovl_copy_up_tmpfile(dentry, lowerpath.dentry, stat);
-        else
-            ovl_do_copy_up(dentry, lowerpath.dentry, stat);
-    }
-
-    /* 5. 复制属性（owner/mode/xattr）*/
-    ovl_set_attr(dentry, stat);
-
-    /* 6. 更新 overlay inode 指向上层 dentry */
-    ovl_set_upper(dentry, upperdentry);
-
-    ovl_revert_creds(dentry->d_sb, override_cred);
+/* 复制 xattr @ copy_up.c:75 */
+int ovl_copy_xattr(struct ovl_sb *upper_sb, struct dentry *upper,
+                   struct dentry *lower)
+{
+    /* 列出下层的所有 xattr */
+    /* 跳过 trusted.overlay.* namespace */
+    /* 复制到上层 */
 }
 ```
 
-**Copy-up 数据流**：
-
-```
-读文件：下层存在 → 直接通过 dentry 指向 lower 文件
-第一次写文件：触发 copy-up
-  1. 下层数据 → 内核 tmpfile
-  2. tmpfile → rename 到上层目标路径
-  3. dentry 指针切换到上层文件
-  4. 后续写直接操作上层
-```
+**doom-lsp 确认**：`ovl_copy_up_file` 在 `copy_up.c:260`。`ovl_copy_xattr` 在 `copy_up.c:75`。`ovl_set_attr` 在 `copy_up.c:392` 设置 owner/mode/times。
 
 ---
 
-## 4. 目录操作——Whiteout 和 Opaque
+## 4. VFS 操作委托
 
-### Whiteout
-
-当上层"删除"一个下层文件时，OverlayFS 在上层创建一个 whiteout 条目：
-
-```c
-// 删除下层文件的流程：
-// 1. 在上层创建 whiteout（字符设备 0:0 或 xattr whiteout）
-// 2. overlay 查找时跳过匹配 whiteout 的下层
-
-// ovl_do_whiteout():
-//   mknod(dir, dentry, S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV)
-//   或设置 trusted.overlay.whiteout xattr
-```
-
-### Opaque 目录
-
-```c
-// 当上层目录已经是完整的覆盖 → 设置 opaque xattr
-// 设置后，查找不继续搜索下层
-
-// ovl_set_opaque():
-//   ovl_do_setxattr(ofs, upperdentry, "trusted.overlay.opaque", "y", 1)
-```
-
----
-
-## 5. Redirect 与多下层
-
-```c
-//  当目录被重命名跨层时，OverlayFS 设置 redirect xattr：
-//  trusted.overlay.redirect = "target/path"
-//  查找时 follow redirect 到目标路径
-
-// 举例：
-// lower:  /dir_A/file     （只读层）
-// upper:  /dir_B/         （上层，重命名了 dir_A 为 dir_B）
-// merged: /merged/dir_B/file （通过 redirect 找到）
-```
-
----
-
-## 6. XINO——跨文件系统 inode 号
-
-```c
-// 当上下层在不同文件系统上时，inode 号可能冲突
-// OverlayFS 使用 xino（xattr inode number）解决：
-//
-// 1. 通过 upper 层的 high bits 编码层 ID
-// 2. lower 文件无法修改 inode → 使用 xattr 记录原始 inode
-// 3. getattr() 时组合显示
-
-#define XINO_BITS_OFFSET       32
-// - xino_mode=0: 禁用（所有层返回伪 inode 号）
-// - xino_mode=1: 自动（能唯一标识时启用）
-```
-
----
-
-## 7. Volatile 模式
-
-```c
-// mount -o volatile
-// 放弃所有修改——umount 时不回写 upper 层的更改
-// 用于不需要持久化的容器场景
-```
-
----
-
-## 8. Data-only 层
-
-```c
-// 5.x 引入的数据专用下层
-// 不包含文件元数据（仅数据块）
-// 用于分离元数据和数据（如 OCI 容器镜像）
-```
-
----
-
-## 9. VFS 集成——操作委托
-
-OverlayFS 的核心是**操作委托**——每个 VFS 操作在 overlay 层被拦截，根据需要触发 copy-up 或委托给底层文件系统：
+### 4.1 super_operations @ super.c:297
 
 ```c
 // fs/overlayfs/super.c:297
 const struct super_operations ovl_super_operations = {
-    .alloc_inode    = ovl_alloc_inode,         /* 分配 ovl_inode */
+    .alloc_inode    = ovl_alloc_inode,         /* super.c:184 — 分配 ovl_inode */
     .free_inode     = ovl_free_inode,
     .destroy_inode  = ovl_destroy_inode,
     .evict_inode    = ovl_evict_inode,
+    .statfs         = ovl_statfs,               /* super.c:276 — 合并底层统计 */
     .show_options   = ovl_show_options,
-    .statfs         = ovl_statfs,
     .drop_inode     = ovl_drop_inode,
-};
-
-// fs/overlayfs/inode.c
-const struct inode_operations ovl_file_inode_operations = {
-    .setattr    = ovl_setattr,        // 可能触发 copy-up
-    .permission = ovl_permission,      // 检查双层权限
-    .getattr    = ovl_getattr,         // 合并上下层属性
-    .listxattr  = ovl_listxattr,       // 合并 xattr
-    .get_acl    = ovl_get_acl,
-    .set_acl    = ovl_set_acl,         // 可能触发 copy-up
 };
 ```
 
-### ovl_getattr——属性合并
+### 4.2 dentry_operations @ super.c:166
 
 ```c
-// fs/overlayfs/inode.c
-static int ovl_getattr(struct mnt_idmap *idmap,
-                       const struct path *path, struct kstat *stat,
-                       u32 request_mask, unsigned int flags)
+// fs/overlayfs/super.c:166
+const struct dentry_operations ovl_dentry_operations = {
+    .d_revalidate   = ovl_dentry_revalidate,    /* super.c:155 */
+    .d_real         = ovl_d_real,               /* super.c:31 */
+};
+```
+
+**doom-lsp 确认**：`ovl_alloc_inode` 在 `super.c:184` 通过 `kmem_cache_alloc(ovl_inode_cachep, ...)` 分配。`ovl_dentry_revalidate` 在 `super.c:155` 检查底层 dentry 是否有效（应对底层文件系统的目录变更）。
+
+### 4.3 inode_operations @ inode.c:729
+
+```c
+// fs/overlayfs/inode.c:729
+const struct inode_operations ovl_file_inode_operations = {
+    .setattr    = ovl_setattr,         /* inode.c:21 — 可能触发 copy-up */
+    .permission = ovl_permission,       /* inode.c:290 */
+    .getattr    = ovl_getattr,          /* inode.c:163 */
+    .listxattr  = ovl_listxattr,
+    .get_acl    = ovl_get_acl,
+    .set_acl    = ovl_set_acl,          /* 可能触发 copy-up */
+    .fileattr_get = ovl_fileattr_get,
+    .fileattr_set = ovl_fileattr_set,
+};
+```
+
+### ovl_getattr @ inode.c:163——属性合并
+
+```c
+int ovl_getattr(struct mnt_idmap *idmap, const struct path *path,
+                struct kstat *stat, u32 request_mask, unsigned int flags)
 {
-    struct dentry *dentry = path->dentry;
-    struct inode *inode = d_inode(dentry);
-
-    /* 获取底层真实 stat */
+    /* 1. 获取底层真实 stat */
     ovl_path_real(dentry, &realpath);
-    vfs_getattr(&realpath, stat, ...);
+    vfs_getattr(&realpath, stat, request_mask, flags);
 
-    /* 覆盖 inode 号为 overlay 分配的伪 ino */
+    /* 2. 覆盖 inode 号 */
     stat->ino = inode->i_ino;
 
-    /* NFS 导出支持：使用底层真实 ino + FSID */
+    /* 3. xino 模式（跨文件系统）处理 */
     if (ovl_xino_bits(dentry->d_sb) > 0)
         stat->ino = ovl_make_ino(dentry, stat->ino);
-
-    /* 合并 blocks */
-    if (ovl_is_upper(dentry) && ovl_has_upper(inode)) {
-        // 已 copy-up → 报告底层统计
-    } else {
-        // 未 copy-up → 报告下层统计
-    }
 }
 ```
 
-### ovl_setattr——可能触发 copy-up
+### ovl_setattr @ inode.c:21——触发 copy-up 链
 
 ```c
-// fs/overlayfs/inode.c
 int ovl_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
                 struct iattr *attr)
 {
-    // chmod/chown/truncate 等操作 → 确保文件在上层有副本
-    // 如果文件只在下层存在，触发 copy-up
-    if (!ovl_need_upper(dentry) && !ovl_has_upper(dentry))
+    /* 检查是否需要 copy-up */
+    if (!ovl_has_upper(dentry))
         ovl_copy_up(dentry);
 
-    // 委托给上层文件系统
+    /* 委托给上层文件系统 */
     ovl_do_notify_change(ofs, ovl_upperdentry(dentry), attr);
 }
 ```
 
-## 10. Metacopy——元数据快速复制
+**doom-lsp 确认**：`ovl_getattr` 在 `inode.c:163`，`ovl_setattr` 在 `inode.c:21`，`ovl_permission` 在 `inode.c:290`。所有操作均通过 `ovl_need_upper()` 检查是否需要 copy-up。
+
+---
+
+## 5. Whiteout 和 Opaque
+
+**Whiteout** 实现"在上层删除下层文件"：
+
+**doom-lsp 确认**：`ovl_do_whiteout` 在 `overlayfs.h:394`（内联函数）。创建方式：`mknod(parent, dentry, S_IFCHR|WHITEOUT_MODE, WHITEOUT_DEV)`。查找时通过 `ovl_is_whiteout()` 检查。
+
+**Opaque 目录**——当上层目录完全覆盖了下层同名目录时，设置 `trusted.overlay.opaque` xattr，查找不再遍历下层。
+
+---
+
+## 6. Redirect——跨层重命名
+
+当 rename 操作跨越不同的层时，OverlayFS 在上层设置 redirect xattr 记录源路径：
+
+```
+# lower: /a/file   upper: (空)
+
+# 用户将 /a 重命名为 /b
+# 生成：
+# upper: /b (新目录) → xattr trusted.overlay.redirect = "/a"
+# 查找 /b/file 时：
+# 1. 找到 upper 中的 /b
+# 2. 看到 redirect="/a"
+# 3. 在下层 /a 中继续查找 file
+```
+
+---
+
+## 7. Metacopy——元数据快速复制
 
 ```c
-// 5.x 引入的优化：只复制元数据（不复制数据）
-// mmap 写入数据时仍然需要复制完整文件
-//
+// Linux 5.x 引入的优化
 // mount -o metacopy=on
 //
-// 效果：chmod/chown 大量文件时只复制几 KB 的元数据
-// 而不是复制整个文件内容
+// 传统 copy-up：复制整个文件（即使只改 owner）
+// metacopy：只复制元数据到 upper（xattr、mode、timestamps）
+// 数据文件仍留在下层
+// mmap/DIO 写触发完整 copy-up
 ```
 
-## 11. 共识：OverlayFS 不是常规文件系统
-
-OverlayFS 的设计与常规文件系统有**根本不同**：
-
-| 特性 | ext4/XFS/btrfs | OverlayFS |
-|------|---------------|-----------|
-| 磁盘格式 | 有，管理自己的存储 | **无**，依赖底层文件系统 |
-| inode | 磁盘 inode + 扩展属性 | **VFS inode 包装器**，委托到底层 |
-| 数据存储 | 直接分配磁盘块 | **委托给底层文件系统** |
-| 一致性 | 日志/CoW 保证 | **底层文件系统保证**（overlay 是薄层）|
-| 快照 | 内建/LVM | **层本身就是快照**（容器镜像层）|
-| 性能 | 直接磁盘 IO | **copy-up 写放大**（需要复制整个文件）|
-| VFS 定位 | 底层文件系统实现 | **VFS stacking 层**（不实现原始存储）|
+**doom-lsp 确认**：metacopy 标志通过 `ovl_ccup_set`（`copy_up.c:25`）模块参数控制：`modprobe overlay check_copy_up=0` 可禁用。
 
 ---
 
-## 10. 调试
+## 8. XINO——跨文件系统 inode
 
-```bash
-# 查看 OverlayFS 挂载
-cat /proc/mounts | grep overlay
-mount | grep overlay
-
-# 查看 xattr（copy-up 状态）
-getfattr -d -m - /upper/file.txt
-getfattr -d -m - /upper/dir/
-# trusted.overlay.origin   — 下层来源 inode
-# trusted.overlay.redirect  — 重定向路径
-# trusted.overlay.opaque    — 不透明标记
-# trusted.overlay.whiteout  — whiteout
-
-# 查看层结构
-cat /sys/fs/overlay/merged/  # 如果有 sysfs 支持
-
-# 跟踪 copy-up
-echo 1 > /sys/kernel/debug/tracing/events/overlayfs/overlay_copy_up/enable
+```c
+// 上下层在不同文件系统（不同 sb）→ inode 号冲突
+// xino 模式：使用高 bits 编码层 ID
+//
+// xino_mode = 0: 禁用（所有层返回 unique 伪 ino）
+// xino_mode = 1: 自动（能编码时启用）
+// xino_mode = N: 使用 N bits 编码（1-32）
 ```
 
 ---
 
-## 11. 总结
+## 9. 与底层文件系统的交互模式
 
-OverlayFS 是一个**薄聚合层**——它本身不管理存储，而是通过 `dentry`/`inode` 指针将操作委托给底层文件系统。其核心价值在于**层叠（layering）**和**写时复制（copy-up）**，这两个机制使容器镜像层系统成为可能。
+```
+VFS 系统调用                                    /merged (overlay)
+    ↓                                               ↓
+        ovl_file_inode_operations (inode.c)
+    ↓
+    ovl_getattr() → 合并属性（或触发 copy-up）
+    ovl_setattr() → 检查 upper → copy-up → 委托
+    ovl_permission() → 检查双重权限
+    ↓
+    vfs_getattr()/vfs_setattr()   ← 委托到底层文件系统
+    ↓
+底层 ext4/xfs/... → 实现真实 IO
+```
 
-**关键操作**：
-1. **ovl_lookup** — 自顶向下遍历层，whiteout 跳过，找到即停
-2. **copy_up** — 首次写时从下层复制到上层（元数据+数据）
-3. **redirect** — 跨层重命名的路径跟踪
-4. **xino** — 跨文件系统的 inode 号统一
+---
 
-**核心局限**：copy-up 写放大（即使只修改了 1 字节，也需要复制整个文件）、rename 跨层时需要 redirect。
+## 10. 总结
+
+OverlayFS 是一个**VFS stacking 层**——不管理原始存储，通过 dentry/inode 指针将操作委托给底层文件系统。`ovl_lookup`（`namei.c:1382`）管理多层遍历，`ovl_copy_up_file`（`copy_up.c:260`）处理首次写操作的复制，`ovl_getattr`（`inode.c:163`）合并上下层属性。
+
+**doom-lsp 确认的关键函数**：
+
+| 函数 | 文件:行号 | 作用 |
+|------|----------|------|
+| `ovl_lookup` | `namei.c:1382` | 多层 dentry 查找 |
+| `ovl_getattr` | `inode.c:163` | 合并 stat 属性 |
+| `ovl_setattr` | `inode.c:21` | setattr + copy-up 触发 |
+| `ovl_permission` | `inode.c:290` | 双层权限检查 |
+| `ovl_copy_up_file` | `copy_up.c:260` | 文件数据复制 |
+| `ovl_copy_xattr` | `copy_up.c:75` | xattr 层间复制 |
+| `ovl_alloc_inode` | `super.c:184` | ovl_inode 分配 |
+| `ovl_dentry_revalidate` | `super.c:155` | dentry 有效性验证 |
+| `ovl_lookup_layer` | `namei.c:356` | 单层 dentry 查找 |
 
 ---
 
