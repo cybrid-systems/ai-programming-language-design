@@ -209,3 +209,97 @@ USB 核心通过 `hub_events` 检测设备插拔，`usb_new_device` 枚举并配
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 8. USB 枚举详解——hub.c
+
+```c
+// hub_events() @ hub.c — USB 集线器核心事件循环：
+// → 周期性检查所有端口状态
+// → 检测到连接 → hub_port_connect_change()
+//   → usb_alloc_dev(hdev, hub, port1) 分配设备
+//   → usb_new_device(udev)
+//     → usb_enumerate_device(udev) 读取描述符
+//       → usb_get_descriptor(udev, USB_DT_DEVICE, 0, &desc, 8) — 设备描述符
+//       → usb_get_configuration(udev) — 配置描述符
+//       → usb_parse_configuration(udev, cfgdesc) — 解析接口和端点
+//     → usb_choose_configuration(udev) — 选择配置
+//     → usb_set_configuration(udev, configuration)
+//   → device_add(&udev->dev) — 注册设备
+
+// 断开检测：
+// → hub_port_connect_change() 检测到断开
+// → usb_disconnect() — 卸载设备+通知驱动
+
+// usb.c（154 符号）其他功能：
+// usb_disabled @ :60 — 检查 usbcore 是否被禁用
+// usb_find_common_endpoints @ :136 — 查找公共端点
+// match_endpoint @ :76 — 端点匹配
+```
+
+## 9. URB 生命周期详解
+
+```c
+// URB（USB Request Block）的完整生命周期：
+
+// 1. 创建（驱动调用 usb_alloc_urb(iso_packets, mem_flags)）
+//    → 分配 urb 结构体
+//    → 设置 urb->dev, urb->pipe, urb->complete 等
+
+// 2. 填充（usb_fill_bulk_urb / usb_fill_control_urb / usb_fill_int_urb）
+//    → 设置传输缓冲区和回调函数
+
+// 3. 提交（usb_submit_urb(urb, mem_flags) @ core/urb.c）
+//    → 检查设备状态（必须已配置）
+//    → 检查端点类型匹配
+//    → 调用 HCD 的 urb_enqueue
+//    → 硬件执行传输
+
+// 4. 完成
+//    → 硬件完成传输 → HCD 中断
+//    → usb_hcd_giveback_urb() — 返回 URB
+//    → urb->complete(urb) — 驱动回调
+
+// 5. 取消（usb_kill_urb(urb)）
+//    → 等待 URB 完成/取消
+//    → 同步（会休眠，不能在中断上下文调用）
+
+// 6. 释放（usb_free_urb(urb)）
+```
+
+## 10. USB 电源管理
+
+```c
+// USB 支持自动挂起/恢复：
+
+// usb_autosuspend_device(udev) — 自动挂起设备：
+// → 当设备空闲超过 autosuspend_delay 时
+// → 调用 usb_suspend_both(udev, PMSG_SUSPEND)
+// → 设备进入挂起状态（消耗 < 500μA）
+
+// usb_autoresume_device(udev) — 自动恢复设备：
+// → 当有新 URB 提交时自动唤醒
+// → 调用 usb_resume_both(udev, PMSG_RESUME)
+// → 恢复后 URB 继续传输
+
+// sysfs 控制：
+// /sys/class/usb_device/*/power/control — auto/on
+// /sys/class/usb_device/*/power/autosuspend_delay_ms
+
+// usb_autosuspend_delay @ :68 — 全局自动挂起延迟（模块参数）
+```
+
+## 11. USB 关键函数索引
+
+| 函数 | 文件 | 作用 |
+|------|------|------|
+| `usb_alloc_dev` | `usb.c` | 分配 USB 设备 |
+| `usb_new_device` | `usb.c` | 初始化+注册设备 |
+| `usb_enumerate_device` | `usb.c` | 读取描述符 |
+| `hub_events` | `hub.c` | 集线器事件循环 |
+| `usb_submit_urb` | `urb.c` | 提交 URB 传输 |
+| `usb_kill_urb` | `urb.c` | 取消 URB |
+| `usb_control_msg` | `message.c` | 同步控制传输 |
+| `usb_bulk_msg` | `message.c` | 同步批量传输 |
+| `usb_register` | `driver.c` | 驱动注册 |
+| `usb_autosuspend_device` | `usb.c` | 自动挂起 |
+
