@@ -127,32 +127,77 @@ struct drm_atomic_state {
 
 ## 2. Atomic 提交流程 @ drm_atomic.c
 
-```c
-// 用户调用 DRM_IOCTL_MODE_ATOMIC → drm_mode_atomic_ioctl()
-// → drm_atomic_commit()
+### 2.1 drm_atomic_state——原子状态
 
+```c
+// 一次 atomic ioctl 构建一个 drm_atomic_state，包含所有对象的新状态：
+// struct drm_atomic_state {
+//     struct drm_crtc_state *crtc_states[];
+//     struct drm_plane_state *plane_states[];
+//     struct drm_connector_state *connector_states[];
+// };
+
+// 平面状态（plane_state）关联帧缓冲：
+struct drm_plane_state {
+    struct drm_plane *plane;
+    struct drm_framebuffer *fb;              // 关联的帧缓冲
+    struct dma_fence *fence;                 // GPU 渲染完成 fence
+
+    uint32_t src_x, src_y;                   // 源区域（帧缓冲中）
+    uint32_t src_w, src_h;
+    uint32_t crtc_x, crtc_y;                 // 目标区域（屏幕上）
+    uint32_t crtc_w, crtc_h;
+
+    bool visible;                            // 是否可见
+};
+```
+
+### 2.2 drm_atomic_commit——四阶段提交
+
+```c
 int drm_atomic_commit(struct drm_atomic_state *state)
 {
     // 阶段 1：检查（drm_atomic_check_only）
-    // → 遍历所有 CRTC/Plane/Connector
-    // → 调用每个对象的 .atomic_check() 回调
-    // → 驱动验证状态是否可行（如 PLL 分频、带宽限制）
+    // → 遍历所有 CRTC：crtc->funcs->atomic_check(crtc, state)
+    // → 遍历所有 Plane：plane->funcs->atomic_check(plane, state)
+    // → 驱动验证：带宽是否足够、PLL 是否可用、格式是否支持
 
-    // 阶段 2：提交（drm_atomic_commit）
-    // → drm_atomic_helper_setup_commit()
-    // → 等待前一帧完成（hw_done/flip_done）
-    // → drm_atomic_helper_prepare_planes()
-    //   → plane->prepare_fb() → dma_fence 等待（GPU 渲染完成）
-    // → drm_atomic_helper_swap_state()
-    //   → 交换新旧状态（atomic 替换）
-    // → drm_atomic_helper_commit_tail()
-    //   → crtc->mode_set_nofb() / crtc->enable()
-    //   → encoder->atomic_mode_set()
-    //   → connector->atomic_mode_set()
-    //   → plane->update_plane()
-    //   → drm_atomic_helper_commit_hw_done()
-    //   → drm_atomic_helper_wait_for_flip_done()
+    // 阶段 2：准备帧缓冲
+    // → drm_atomic_helper_prepare_planes(state)
+    //   → plane->funcs->prepare_fb(plane, plane_state)
+    //     → drm_gem_fb_prepare_fb() — 等待 GPU fence
+    //     → dma_fence_wait(plane_state->fence) — 等渲染完成
+
+    // 阶段 3：交换状态
+    // → drm_atomic_helper_swap_state(state, ...)
+    //   → 将所有 obj->state 指向新状态
+    //   → 旧状态保存到 old_state
+
+    // 阶段 4：提交到硬件（commit_tail）
+    // 由驱动 crtc->commit() 或异步 worker 调用：
+    // → drm_atomic_helper_commit_modeset_disables()
+    // → drm_atomic_helper_commit_planes()
+    //   → 设置新平面（如切换帧缓冲地址、更新缩放）
+    // → drm_atomic_helper_commit_modeset_enables()
+    //   → 启动新模式
+    // → drm_atomic_helper_wait_for_vblanks()
+    //   → 等待 VBlank 确保新帧显示
 }
+```
+
+### 2.3 struct drm_framebuffer @ drm_framebuffer.h:120
+
+```c
+// 帧缓冲——包含像素数据的内存区域
+struct drm_framebuffer {
+    struct drm_device *dev;
+    const struct drm_format_info *format;     // 像素格式（XRGB8888/NV12）
+    unsigned int width, height;               // 分辨率
+    unsigned int pitches[4];                  // 每平面每行字节数
+    unsigned int offsets[4];                  // 每平面偏移
+    uint64_t modifier;                         // 修饰符（tiling/CCS）
+    struct drm_gem_object *obj[4];            // GEM 对象
+};
 ```
 
 ---
