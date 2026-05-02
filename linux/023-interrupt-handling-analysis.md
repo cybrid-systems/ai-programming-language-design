@@ -1,4 +1,4 @@
-# 23-interrupt — Linux 内核中断处理深度源码分析
+# 023-interrupt-handling — Linux 内核中断处理深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪

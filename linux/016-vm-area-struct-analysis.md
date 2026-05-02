@@ -1,4 +1,4 @@
-# 16-vm_area_struct — Linux 内核 VMA 深度源码分析
+# 016-vm-area-struct — Linux 内核 VMA 深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
