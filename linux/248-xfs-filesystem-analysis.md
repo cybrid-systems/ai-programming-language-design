@@ -1,447 +1,599 @@
-# XFS 文件系统深度分析
+# 248-xfs-filesystem-analysis — XFS 文件系统深度分析
 
-> 基于 Linux 7.0-rc1 内核源码分析
-> 源码路径：`/home/dev/code/linux/fs/xfs/`
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行符号解析与代码追踪
+> 分析文件：`fs/xfs/xfs_inode.c`（3072行）、`fs/xfs/xfs_log.c`（3477行）、`fs/xfs/xfs_super.c`（2721行）
+> 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1
 
 ---
 
-## 1. inode 和 extent 布局
+## 0. 概述
 
-### 1.1 磁盘上的 inode：struct xfs_dinode
+XFS 是 SGI 于 1993 年为 IRIX 操作系统开发的高性能日志文件系统，2001 年进入 Linux 主线，以其**大文件支持**（最大 8EB）、**高并发目录**（HTree B+tree）、**延迟分配**、**配额精细控制**和**崩溃快速恢复**著称。与 ext4 相比，XFS 的日志机制基于**逻辑日志**（记录元数据操作而非物理块变化），采用 **CIL（Checkpoint Interval Log）** 批量提交策略，在高 IO 负载下表现尤为突出。
 
-XFS 的 inode 存在于磁盘上，结构体为 `xfs_dinode`（定义于 `libxfs/xfs_format.h:901`）：
+---
+
+## 1. inode 磁盘布局——dinode 与 ifork
+
+### 1.1 dinode 核心结构
+
+XFS 的磁盘 inode 称为 **dinode**，固定为 256 字节（V3 inode）或 176 字节（V2 inode）。`struct xfs_dinode` 定义于 `libxfs/xfs_format.h:901`：
 
 ```c
 struct xfs_dinode {
-    __be16      di_magic;        /* XFS_DINODE_MAGIC = 0x494e */
-    __be16      di_mode;         /* 文件类型 + 权限位 */
-    __u8        di_version;      /* V1/V2/V3 */
-    __u8        di_format;      /* 数据存放方式，enum xfs_dinode_fmt */
-    __be32      di_uid, di_gid;
-    __be32      di_nlink;
-    xfs_timestamp_t di_atime/di_mtime/di_ctime;
-    __be64      di_size;         /* 文件字节数 */
-    __be64      di_nblocks;      /* 实际占用块数（含 btree block） */
-    __be32      di_extsize;      /* extent 最小尺寸提示 */
-    union { __be32 di_nextents; __be64 di_big_nextents; };
-    __u8        di_forkoff;      /* attr fork 在 inode 内偏移，<<3 */
-    __s8        di_aformat;      /* attr fork 格式 */
-    /* ... */
-    __be32      di_next_unlinked; /* AGI unlinked 链表指针 */
-    /* V3 新增字段 */
-    __le32      di_crc;          /* inode CRC */
-    __be64      di_changecount;
-    __be64      di_lsn;          /* flush sequence */
-    __be64      di_flags2;
-    xfs_timestamp_t di_crtime;
-    __be64      di_ino;
-    uuid_t      di_uuid;
+    __be16      di_magic;         /* XFS_DINODE_MAGIC = 0x494e */
+    __be16      di_mode;          /* 文件类型 + 权限位 */
+    __u8        di_version;       /* 版本号：1/2 (V2) 或 3 (V3) */
+    __u8        di_format;        /* 数据fork格式（见下文） */
+    __be16      di_metatype;      /* 元数据类型（V3 metafile inode） */
+    __be32      di_uid;           /* 所有者用户 ID */
+    __be32      di_gid;           /* 所有者组 ID */
+    __be32      di_nlink;         /* 硬链接数 */
+    __be16      di_projid_lo;     /* 项目 ID 低 16 位 */
+    __be16      di_projid_hi;     /* 项目 ID 高 16 位 */
+    union {
+        __be64  di_big_nextents;  /* V3+NREXT64: 数据fork extent 数 */
+        struct { __u8 di_v2_pad[6]; __be16 di_flushiter; }; /* V2 */
+    };
+    xfs_timestamp_t di_atime;     /* 访问时间 */
+    xfs_timestamp_t di_mtime;     /* 修改时间 */
+    xfs_timestamp_t di_ctime;     /* 状态改变时间 */
+    __be64      di_size;          /* 文件字节大小 */
+    __be64      di_nblocks;       /* 占用块数（含间接块） */
+    __be32      di_extsize;       /* 基本 extent 大小（按块计） */
+    union {
+        struct { __be32 di_nextents;   /* V2/V3无NREXT64: extent数 */
+                 __be16 di_anextents;  /* 属性fork extent数 */ };
+        struct { __be32 di_big_anextents; /* NREXT64: 属性extent数 */
+                 __be16 di_nrext64_pad; };
+    };
+    __u8        di_forkoff;       /* 属性fork偏移 >> 3（按8字节对齐） */
+    __s8        di_aformat;        /* 属性fork的数据格式 */
+    __be32      di_dmevmask;      /* DMIG 事件掩码 */
+    __be16      di_dmstate;       /* DMIG 状态 */
+    __be16      di_flags;         /* XFS_DIFLAG_* 标志 */
+    __be32      di_gen;           /* 代号（用于 inode 回收） */
+    __be32      di_next_unlinked; /* AGI 未链接链表指针 */
+    /* ————— V3 扩展字段（从 di_crc 开始）————— */
+    __le32      di_crc;           /* dinode CRC 校验（V3） */
+    __be64      di_changecount;   /* 属性变更计数 */
+    __be64      di_lsn;           /* 日志序列号 */
+    __be64      di_flags2;        /* 扩展标志 */
+    union { __be32 di_cowextsize; __be32 di_used_blocks; };
+    __u8        di_pad2[12];
+    /* 紧接其后：数据fork + 属性fork，内容取决于 di_forkoff */
 };
 ```
 
-**关键点**：di_format 指定数据 fork 的存放方式，di_aformat 指定 attr fork 的格式。两者互相独立。
+关键字段：
+- **`di_forkoff`**：将 inode 256 字节空间在数据fork和属性fork之间划分。`di_forkoff << 3` 为数据fork的字节边界。无属性fork时为 0，数据fork直接占用整个 `XFS_LITINO`（= inode_size - 176/256 字节核心区）。
+- **`di_format`**（数据fork）和 **`di_aformat`**（属性fork）共用一套格式枚举：
 
-### 1.2 dinode 与 ifork 的关系
+```c
+enum xfs_dinode_fmt {
+    XFS_DINODE_FMT_DEV,      /* 设备文件：低32位存储 dev_t */
+    XFS_DINODE_FMT_LOCAL,    /* 数据直接内嵌在 inode 中（小文件） */
+    XFS_DINODE_FMT_EXTENTS,  /* extent 数组（最常见） */
+    XFS_DINODE_FMT_BTREE,    /* Btree 索引（extent 数超限时） */
+    XFS_DINODE_FMT_UUID,     /* 历史遗留，从未使用 */
+    XFS_DINODE_FMT_META_BTREE, /* 用于特殊 inode（如 RT bitmap） */
+};
+```
 
-`xfs_ifork` 是内核内存中的结构（`libxfs/xfs_inode_fork.h:15`），对应磁盘上 data fork 和 attr fork 的描述信息：
+### 1.2 ifork——内存中的 fork 结构
+
+内存中的 `struct xfs_ifork`（`xfs_inode_fork.h`）对应磁盘上 dinode 的数据fork或属性fork：
 
 ```c
 struct xfs_ifork {
-    int                 if_format;    /* XFS_DINODE_FMT_* */
-    xfs_extnum_t        if_bytes;     /* fork 数据总字节数 */
-    xfs_extnum_t        if_nextents;  /* extent 数量 */
-    union {
-        char            *if_data;     /* XFS_DINODE_FMT_LOCAL：inline 数据 */
-        struct xfs_bmbt_rec *if_bmx;  /* XFS_DINODE_FMT_EXTENTS：extent 数组 */
-        struct xfs_bmdr_block *if_broot; /* XFS_DINODE_FMT_BTREE：bmdr block */
-    };
+    int64_t         if_bytes;     /* if_data 已分配字节数 */
+    struct xfs_btree_block *if_broot; /* Btree 根块（fmt=BTREE时） */
+    unsigned int    if_seq;       /* Fork 修改计数器（用于缓存一致性） */
+    int             if_height;    /* Btree 高度；0=内嵌/extent/empty */
+    void            *if_data;     /* 内嵌数据（fmt=LOCAL）或 extent 数组 */
+    xfs_extnum_t    if_nextents;  /* 当前 extent 数量 */
+    short           if_broot_bytes; /* Btree 根块字节数 */
+    int8_t          if_format;    /* 磁盘格式（XFS_DINODE_FMT_*） */
+    uint8_t         if_needextents; /* 是否需要从磁盘读取 extent */
 };
 ```
 
-`di_format`（disk format）和 `if_format`（内存 format）的关系：
-
-| di_format | 含义 | if_data/if_bmx/if_broot |
-|---|---|---|
-| `XFS_DINODE_FMT_LOCAL` | 数据直接内嵌在 inode 尾部（`di_forkoff` 之后的 LITINO 空间） | `if_data` 指向内嵌数据 |
-| `XFS_DINODE_FMT_EXTENTS` | 数据 fork 是 `xfs_bmbt_rec[]` 数组 | `if_bmx` 指向 extent 数组 |
-| `XFS_DINODE_FMT_BTREE` | 数据 fork 是 B+tree（`struct xfs_bmdr_block`） | `if_broot` 指向 btree 根 |
-| `XFS_DINODE_FMT_DEV` | 设备文件 | `di_rdev` 存储设备号 |
-| `XFS_DINODE_FMT_META_BTREE` | 元数据专用 Btree | — |
-
-`di_forkoff << 3` 给出 attr fork 在 inode 内的字节偏移。如果 `di_forkoff = 0`，说明没有 attr fork。
-
-### 1.3 inode chunk 分配
-
-XFS inode 并不逐个分配，而是以 **inode chunk** 为单位批量分配（`libxfs/xfs_ialloc.c`）。
-
-- 每个 allocation group（AG）维护一个 **inode B+tree**（inobt），管理该 AG 内所有已分配和空闲的 inode。
-- inode chunk 大小由 `inode_size` 和 `inode_per_cluster` 决定，通常是 **64 字节/inode**，若干个 inode 打包在同一块（或相邻块）中。
-- inode 的磁盘地址由 `AGI`（Allocation Group Header）的 `agi_root` 指向的 inobt B+tree 管理。
+`xfs_inode` 结构体本身（`xfs_inode.h:25`）包含两个 ifork：
 
 ```c
-// xfs_dialloc() — 在某个 AG 内分配一个 inode
-xfs_dialloc_ag_inobt()   // 在 inobt 中查找空闲 slot
-xfs_dialloc_ag_finobt()  // 用 free inode B+tree 加速查找（如果文件系统支持）
+typedef struct xfs_inode {
+    struct xfs_ifork    i_df;      /* 数据 fork（必定存在） */
+    struct xfs_ifork    i_af;      /* 属性 fork（di_forkoff > 0 时存在） */
+    struct xfs_ifork    *i_cowfp;  /* COW fork（仅 reflink 文件有） */
+    /* ... */
+    uint64_t        i_delayed_blks; /* 延迟分配块计数（尚未落盘的分配） */
+    xfs_fsize_t     i_disk_size;    /* 磁盘上的文件大小 */
+    xfs_rfsblock_t  i_nblocks;      /* 已落盘块数（含 Btree 块） */
+    /* ... */
+} xfs_inode_t;
 ```
 
-分配时更新 `AGI` 的 `freecount` 和 inobt。`xfs_dinode` 的 `di_next_unlinked` 字段用于实现 **unlinked inode list**（用于删除时保留 inode 直到所有引用关闭）。
+**extent 三种格式的判断**（`xfs_ifork_has_extents()`）：
+- `XFS_DINODE_FMT_EXTENTS` → `if_data` 为 `xfs_bmbt_rec_t[]` 数组
+- `XFS_DINODE_FMT_BTREE` → `if_broot` 指向 Btree 根块，`if_height >= 1`
+- `XFS_DINODE_FMT_LOCAL` → `if_data` 直接存储文件内容（适合小文件）
+
+### 1.3 dinode 到 inode 的转换
+
+`xfs_inode_from_disk()`（`xfs_inode_buf.c`）将磁盘 dinode 转换为内存 inode：
+
+```c
+inode->i_mode = be16_to_cpu(from->di_mode);
+/VFS inode 填充...
+/* extent 格式：从磁盘 dinode 读取 extent 数组或初始化 Btree */
+if (xfs_ifork_format(&ip->i_df) == XFS_DINODE_FMT_EXTENTS)
+    xfs_iext_read(ip, XFS_DATA_FORK); /* 惰性读取 extent */
+```
+
+反向转换 `xfs_inode_to_disk()` 将内存 inode 写回 dinode（仅在日志操作中进行）。
 
 ---
 
-## 2. 实时区域（Realtime Subvolume）
+## 2. 日志机制——XFS log vs ext4 jbd2
 
-### 2.1 架构概览
+### 2.1 设计哲学的根本差异
 
-XFS 可以配置一个独立的 realtime 子卷（通常在 SSD 或专用盘上），由以下三个特殊 inode 描述：
+| 维度 | XFS CIL | ext4 jbd2 |
+|------|---------|-----------|
+| 日志类型 | **逻辑日志**（记录元数据操作语义） | **物理日志**（journal_writeback 模式）或**日志文件系统（ordered）** |
+| 提交策略 | CIL 批量收集，批量提交（高吞吐） | 每笔事务独立提交（更保守） |
+| 恢复速度 | 快（逻辑日志记录已计算好的变更） | 中等 |
+| 元数据放大 | 低 | 中（journal_data 模式下较高） |
+| 顺序写入优化 | CIL push 时合并多事务，连续写入 | 每事务独立，碎片化风险高 |
 
-```c
-sb_rbmino   // realtime bitmap inode — 记录 rt extents 的占用位图
-sb_rsumino  // realtime summary inode — 记录 rtbitmap 每块的已用块数（用于分配优化）
-sb_rextsize // realtime extent 的大小（默认 1 block，或按 rtdev 指定）
-```
+ext4 的 jbd2 基于**每事务提交**模型，每个 `journal_commit_transaction()` 都需要等待日志写入完成。XFS 的 CIL 则将一段时间内的多个事务合并为一个**检查点间隔**（Checkpoint Interval），一次性写入日志。
 
-### 2.2 rbmino 和实时 extent 映射
+### 2.2 CIL——Checkpoint Interval Log
 
-`xfs_rtalloc.c` 是 realtime 分配的核心模块。
-
-**rtbitmap inode** 是一个特殊的 inode，其数据 fork 以 **extent 格式**存储位图。每位对应一个 realtime extent（rtextent），1 = 已分配，0 = 空闲。
-
-关键函数 `xfs_rtallocate_extent()` 的流程：
+CIL 是 XFS 日志的核心结构。`xfs_log_cil.c` 中实现。每次事务发生时，元数据变更被**序列化**到一个 `struct xfs_log_item` 中，并追加到当前 CIL 上下文的链表：
 
 ```c
-// xfs_rtalloc.c
-xfs_rtallocate_range()    // 在 rtbitmap 中找连续空闲 rtextent
-  → xfs_rtfind_back()    // 向前找连续空闲
-  → xfs_rtfind_forw()    // 向后找连续空闲
-  → xfs_rtmodify_range() // 修改 rtbitmap（原子写 log）
-  → xfs_rtmodify_summary() // 更新 rt summary inode
-```
-
-**rt summary inode** 是 `XFS_DINODE_FMT_BTREE` 格式的元数据 inode，用于维护 rtbitmap 的稀疏位图摘要。它的存在使得 realtime 分配可以快速找到合适的空闲区域，而不必扫描整个 rtbitmap。
-
-### 2.3 rtgroup（Linux 7.0-rc1 新增）
-
-Linux 7.0-rc1 引入 **rtgroup**（`xfs_rtgroup.h`），将 realtime volume 划分为多个 rtgroup，每个 rtgroup 有自己的 `rtbitmap` 和 `rtrmap`（realtime reference map）B+tree，支持更大规模的 realtime volume。
-
----
-
-## 3. 日志机制
-
-### 3.1 XFS log vs ext4 jbd2：本质区别
-
-| | XFS log | ext4 jbd2 |
-|---|---|---|
-| 粒度 | **record-based**（逻辑日志） | **block-based**（物理日志） |
-| 组织方式 | CIL（Checkpoint Interval Log），逻辑操作打包 | transaction，物理块列表 |
-| 恢复速度 | 快（只重放逻辑操作） | 慢（需重放所有块修改） |
-| 日志内容 | inode extent 变化、buffer 引用计数变化 | 块内容的完整 before/after image |
-| 元数据开销 | 低（只记 intent） | 高（需要 copy 整个块） |
-| 空间回收 | CIL 批量提交，自动清理 | 需要显式 checkpoint |
-
-### 3.2 XFS log 是 record-based
-
-XFS 日志记录的不是磁盘块的原始内容，而是 **log record**——描述元数据变更的 intent。
-
-log record 的基本结构（`xfs_log_format.h`）：
-
-```c
-struct xlog_op_header {
-    __u8   oh_flags;    // FLAG_META / FLAG_NER / ...
-    __u8   oh_len;      // 数据区长度
-    __be32 oh_tail;     // 本条 record 的 tail lsn
-    __be32 oh_lsn;      // 本 record 的 lsn
-    __be16 oh_crc;      // record CRC
-    __be16 oh_clientid; // XFS_TRANSACTION / XFS_LOGSPACE / ...
+struct xfs_cil_ctx {
+    struct list_head    iclog_entry;  /* 链接到 iclog 的链表节点 */
+    struct xfs_log_vec  *lv_chain;    /* 该 checkpoint 的所有 log vector */
+    xfs_lsn_t           checkpoint_lsn; /* 检查点 LSN（提交后写入头部）*/
+    struct work_struct  push_work;    /* 延迟 push 工作项 */
+    /* ... */
 };
 ```
 
-### 3.3 xlog_write_iclog 状态机
+关键流程：
+1. **事务修改** → 生成 `xfs_log_item`，加入当前 CIL 的 `lv_chain`
+2. **CIL push 触发**（空间阈值或超时） → `xlog_cil_push_work()` 将整个 CIL 打包为一个日志记录
+3. **写入 iclog** → 通过 `xlog_write()` 将 CIL 记录以**逻辑向量**（log vector）形式写入 iclog
+4. **commit LSN** → CIL 提交后生成 `checkpoint_lsn`，用于崩溃恢复定位
 
-iclog（in-core log buffer）的状态机定义于 `xfs_log_priv.h:54`：
+### 2.3 iclog 状态机
 
-```
-XLOG_STATE_ACTIVE      ← 当前正在写入的 iclog
-XLOG_STATE_WANT_SYNC   ← 写入完成，等待 sync
-XLOG_STATE_SYNCING     ← 正在同步到磁盘
-XLOG_STATE_DONE_SYNC   ← sync 完成，等待 callback
-XLOG_STATE_CALLBACK    ← 正在执行回调（解锁 log item）
-XLOG_STATE_DIRTY       ← 脏数据，可被重新使用
-```
-
-`xlog_state_release_iclog()` 推动状态转移：
+XFS 日志缓冲区（`struct xlog_in_core`，`xfs_log_priv.h:55`）是一个**固定数量的环形缓冲区**，每个 iclog 对应一块内存中的日志页。iclog 的状态机由 `enum xlog_iclog_state` 定义：
 
 ```c
-// xfs_log.c
-xlog_state_release_iclog()
-    if (ic_state == XLOG_STATE_WANT_SYNC)
-        xlog_state_shutdown_callbacks()
-    ic_state = XLOG_STATE_SYNCING   // → 唤醒 sync 线程
-    ...
+enum xlog_iclog_state {
+    XLOG_STATE_ACTIVE,       /* 当前正在写入的 iclog */
+    XLOG_STATE_WANT_SYNC,    /* 已写满，等待同步到磁盘 */
+    XLOG_STATE_SYNCING,      /* 正在执行磁盘同步（写盘 + FUA） */
+    XLOG_STATE_DONE_SYNC,    /* 同步完成，等待回调处理 */
+    XLOG_STATE_CALLBACK,     /* 正在执行回调（如 AIL 推送） */
+    XLOG_STATE_DIRTY,       /* 脏 iclog，需要重置为 ACTIVE */
+};
 ```
 
-`xlog_write_iclog()`（`xfs_log.c:1542`）负责将 iclog 内容写入磁盘块设备。
+**状态转换图**：
 
-### 3.4 CIL（Checkpoint Interval Log）
+```
+应用层写入 transaction
+         │
+         ▼
+    ┌─────────────┐
+    │XLOG_STATE   │◄───────────────┐
+    │ ACTIVE      │                │
+    └──────┬──────┘                │
+           │ xlog_ticket_reservation 满   │
+           │ 或 xlog_state_release_iclog()│
+           ▼                          │
+    ┌────────────────┐               │
+    │XLOG_STATE       │ 延迟写入磁盘    │
+    │WANT_SYNC        │               │
+    └──────┬──────────┘               │
+           │ xlog_sync()             │
+           ▼                         │
+    ┌────────────────┐               │
+    │XLOG_STATE       │───────────────┤
+    │SYNCING          │ 磁盘写入完成   │
+    └──────┬──────────┘               │
+           │ 中断回调                  │
+           ▼                          │
+    ┌────────────────┐               │
+    │XLOG_STATE       │               │
+    │DONE_SYNC/CALLBACK│─────────────┤
+    └──────┬──────────┘               │
+           │ 回调完成（AIE/bufflush）  │
+           ▼                          │
+    ┌────────────────┐               │
+    │XLOG_STATE       │──────────────►│ (回到 ACTIVE)
+    │DIRTY→ACTIVE    │               │
+    └────────────────┘               │
+```
 
-CIL 是 XFS 日志的核心机制（`xfs_log_cil.c`）：
+核心函数 `xlog_state_release_iclog()`（`xfs_log.c:469`）处理引用计数递减和状态跃迁：
 
-1. **事务提交**：`xfs_trans_commit()` 将修改的 log item 插入 CIL（`xlog_cil_insert_items()`）
-2. **空间预留**：每个 item 的空间使用在 `xc_ctx->ticket` 上预留
-3. **CIL 推进**：当 CIL 空间达到阈值（`XLOG_CIL_BLOCKING_SPACE_LIMIT`）或进程主动 `xfs_log_force()` 时，触发 CIL push
-4. **Push 流程**：
-   - 分配新的 CIL context（`xlog_cil_ctx_switch()`）
-   - 将旧 context 的 log record 格式化为 iclog
-   - 写 iclog 到磁盘（`xlog_write_iclog`）
-   - 更新 log tail（`xlog_assign_tail_lsn`）
+```c
+last_ref = atomic_dec_and_test(&iclog->ic_refcnt);
+if (!last_ref) return 0;  /* 还有引用者，等待 */
 
-CIL 的优势：**批量提交**——大量小事务被合并成一个大日志 record，一次 I/O 刷盘，显著减少磁盘 I/O 次数。
+/* 满足 WANT_SYNC 或 NEED_FUA 时，捕获 tail_lsn */
+if ((iclog->ic_state == XLOG_STATE_WANT_SYNC ||
+     (iclog->ic_flags & XLOG_ICL_NEED_FUA)) &&
+    !iclog->ic_header->h_tail_lsn)
+    iclog->ic_header->h_tail_lsn = cpu_to_be64(atomic64_read(&log->l_tail_lsn));
+
+iclog->ic_state = XLOG_STATE_SYNCING;
+/* 解锁后调用 xlog_sync(log, iclog, ticket) 执行实际磁盘写入 */
+```
+
+**FLAGS**：`XLOG_ICL_NEED_FLUSH`（需要 cache flush）和 `XLOG_ICL_NEED_FUA`（Force Unit Access，保证数据进入持久化存储）通过磁盘的 FUA 命令实现原子性。
+
+### 2.4 ticket 预留机制
+
+每个写日志的操作需要先申请 `struct xlog_ticket`（`xfs_log_priv.h:185`）：
+
+```c
+struct xlog_ticket {
+    xlog_tid_t      t_tid;          /* 事务 ID */
+    atomic_t        t_ref;          /* 引用计数 */
+    int             t_curr_res;     /* 当前剩余预留空间 */
+    int             t_unit_res;     /* 单位预留（每次操作递减） */
+    char            t_cnt;          /* 当前 unit 数 */
+    char            t_ocnt;         /* 原始 unit 数 */
+    uint8_t         t_flags;        /* XLOG_TIC_PERM_RESERV 等 */
+};
+```
+
+`xlog_ticket_reservation()` 计算当前需要的空间，`xlog_write()` 负责将 log vector 写入 iclog。
 
 ---
 
-## 4. 延迟分配（Delayed Allocation）
+## 3. 延迟分配——XFS delayed allocation
 
-### 4.1 机制
+### 3.1 核心思想
 
-当进程写入文件时，XFS **不立即分配磁盘块**，而是在 extent map 中记录为 `DELAYSTARTBLOCK`（`-1LL`），定义为 `xfs_bmap.h:128`：
+ext4 和 XFS 都支持延迟分配（delayed allocation），但 XFS 的实现尤为精妙。其核心思路：
+
+**写文件时，不立即分配物理块**。数据写入请求被推迟到**脏页回写**（writeback）时才真正分配块。从而实现以下优化：
+
+1. **合并相邻写**：多个小写操作合并为一个 extent 分配请求
+2. **减少碎片**：在 pagecache 中积累足够多的数据再分配，减少内部碎片
+3. **延长信息窗口**：在分配前知道文件最终大小（`i_size`），可以预分配对齐的 extent
+
+### 3.2 关键代码路径
+
+当应用程序执行 `write()` 时，最终路径为 `xfs_file_iomap_begin()` → `xfs_iomap_write_direct()`（`xfs_iomap.c:268`）：
 
 ```c
-#define DELAYSTARTBLOCK ((xfs_fsblock_t)-1LL)
+error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb,
+                         bmapi_flags, 0, imap, &nimaps);
 ```
 
-此时 extent 的 `wasdel = true`，表示这是一个"待分配"的延迟 extent。
+若满足延迟分配条件（`!XFS_IS_REALTIME_INODE(ip)` 且空间紧张或小写入），`xfs_bmapi_write()` 会返回一个起始块号为 **`DELAYSTARTBLOCK`**（`libxfs/xfs_bmap.c:3696`）的 `xfs_bmbt_irec`：
 
-内存中的 `i_delayed_blks`（`struct xfs_inode`）累计延迟分配的块数。
-
-### 4.2 延迟 extent 的生命周期
-
-```
-write(2)
-  → xfs_file_write_iter()
-    → xfs_iomap_write_direct()       // 分配路径
-      → 如果需要分配:
-        if (!need_alloc) {
-            // 有连续空闲 → 直接分配 extent
-        } else {
-            // 触发延迟分配
-            imap->br_startblock = DELAYSTARTBLOCK;
-            // 不刷盘，不写日志
-        }
-  → 页面 dirty → writeback
-    → xfs_bmapi_write()
-      → xfs_bmap_del_extent_delay()  // 真正分配
-        → xfs_alloc_fix_minleft()    // 查空闲空间
-        → 分配真实 extent
-        → 写日志（CIL）
+```c
+if (state == XFS_BMAPI_PREALLOC || prealloc)
+    irec->br_startblock = DELAYSTARTBLOCK;  /* 延迟分配标记 */
+else
+    mval->br_startblock = DELAYSTARTBLOCK;  /* 延迟分配 */
 ```
 
-### 4.3 为什么能提升性能？
+此时**没有发生任何磁盘分配**，只是在内存中的 inode ifork 里记录了"这段逻辑块号将来会分配物理块"。实际的块计数反映在 `ip->i_delayed_blks` 中。
 
-1. **合并写入**：多个相邻的延迟分配请求，在最终刷盘时可能合并为少量大 extent，减少碎片
-2. **减少 journal I/O**：延迟分配的 extent 变化不需要立即记录日志，只有在真实分配时才写 log
-3. **I/O 合并**：页面 writeback 时，文件系统可以看到更大范围的 dirty 区域，做最佳合并顺序写
+### 3.3 延迟分配转换为真实分配
 
-### 4.4 delayed allocation 与 unwritten extent
+延迟分配的 extent 在以下时机被"物化"：
 
-延迟分配的 extent 在真正分配时，可能处于两种状态：
+1. **脏页回写时**（`xfs_aops.c` 的 `xfs_vm_writepage`）：
+   ```c
+   error = xfs_bmapi_convert_delalloc(ip, whichfork, offset,
+                                      length, &imap, &ioend);
+   ```
+   调用 `__xfs_bmapi_write()` 中的延迟分配处理分支，实际分配物理块。
 
-- **真实分配，未初始化**：`br_state = XFS_EXT_UNWRITTEN`，表示分配了块但内容未定义（类似 ext4 的 unwritten extent）
-- **真实分配，已初始化**：直接标记为 `XFS_EXT_NORM`
+2. **MMAP 写时**：访问到尚未分配的页时触发。
 
-转换通过 `xfs_bmap_extent_to_bonus()` 或 `xfs_iomap_write_direct()` 中的逻辑处理。
+3. **`fsync()` / `fdatasync()`**：强制将延迟分配转换为真实分配后再同步。
+
+转换过程（`libxfs/xfs_bmap.c:1436`）调用 `xfs_bmap_delalloc_convert()`，将 `DELAYSTARTBLOCK` 替换为真实分配的块号，并从 `i_delayed_blks` 中减去对应数量。
+
+### 3.4 为什么提升性能
+
+| 场景 | 无延迟分配 | 延迟分配 |
+|------|-----------|---------|
+| 顺序写 4K page × 1000 次 | 1000 次小块分配 + 1000 次 journal 记录 | 合并为 1 次大 extent 分配 |
+| 多进程并发写同一文件 | 各自独立分配，产生碎片 | CIL 收集后统一分配策略 |
+| 写入覆盖（同一块多次写） | 第一次分配，第二次无意义重分配 | 延迟到最后一刻，只分配一次 |
+
+延迟分配还使 XFS 在高并发小文件场景下能够更好地控制**组空闲（AGFL）** 的使用效率。
 
 ---
 
-## 5. 目录组织
+## 4. 目录——shortform / linear / HTree 转换
 
-### 5.1 三种格式及其转换条件
+### 4.1 四种目录格式
 
-XFS 目录有四种格式，定义在 `libxfs/xfs_dir2_priv.h`：
+XFS 目录根据规模使用不同的磁盘格式（`enum xfs_dir2_fmt`，`libxfs/xfs_dir2.h:40`）：
 
 | 格式 | 触发条件 | 存储位置 |
-|---|---|---|
-| **shortform** | 条目数少（< `XFS_DIR2_SPACE_SIZE`） | inode data fork 内嵌 |
-| **block** | shortform 容纳不下，但不需 hash tree | 单个 directory data block |
-| **leaf** | block 容纳不下 | 多个 leaf block + hash table |
-| **node** | leaf 也容纳不下 | leaf + 中间 node B+tree（hash tree）|
+|------|---------|---------|
+| `XFS_DIR2_FMT_SF` | 目录项少（小目录） | 直接内嵌在 inode data fork（`di_format = LOCAL`） |
+| `XFS_DIR2_FMT_BLOCK` | 单块目录（块级目录） | 占用文件系统一个完整块 |
+| `XFS_DIR2_FMT_LEAF` | 小型 Btree 目录 | leaf-only Btree |
+| `XFS_DIR2_FMT_NODE` | 大型 Btree 目录（HTree） | 多层 Btree 节点 |
 
-### 5.2 shortform → block → leaf → node 的转换
+### 4.2 shortform 目录结构
 
-目录操作入口在 `libxfs/xfs_dir2.c:xfs_dir_lookup()`：
+`struct xfs_dir2_sf_hdr`（`xfs_da_format.h:214`）内嵌于 inode data fork：
 
 ```c
-switch (dp->i_d.di_format) {
-case XFS_DINODE_FMT_LOCAL:    → xfs_dir2_sf_lookup()
-case XFS_DINODE_FMT_EXTENTS:  → 判断 data fork 第一个 extent 是否为 block
-    → block 在 data fork 中作为 extent 存储
-    → 如果是 directory block magic: xfs_dir2_block_lookup()
-    → 否则可能是 leaf: xfs_dir2_leaf_lookup()
-}
+typedef struct xfs_dir2_sf_hdr {
+    uint8_t     count;     /* 条目数 */
+    uint8_t     i8count;   /* inode 号需要 8 字节的条目数（> 32 位）*/
+    uint8_t     parent[8]; /* 父目录 inode 号（如果是 32 位则后 4 字节为 0）*/
+} __packed xfs_dir2_sf_hdr_t;
 ```
 
-**shortform → block**：`xfs_dir2_block_to_sf()`（`libxfs/xfs_dir2_sf.c`）
+每个条目 `struct xfs_dir2_sf_entry` 结构：
+```c
+typedef struct xfs_dir2_sf_entry {
+    __u8        namelen;       /* 名称长度 */
+    __u8        offset[2];     /* 在目录块中的偏移（供块格式转换用）*/
+    __u8        name[];        /* 名称（变长）*/
+    /* 后面紧跟：inode 号（4 或 8 字节，取决于是否 i8）*/
+} __packed xfs_dir2_sf_entry_t;
+```
 
-**block → leaf**：`xfs_dir2_block_addname()` 检测到 block 空间不足，调用 `xfs_dir2_leaf_addname()`，同时创建 `xfs_dir2_leaf` 结构
+shortform 的空间限制是 inode 的 data fork 可用空间（`XFS_DFORK_DSIZE`），通常为 356 字节（256 字节 inode - 176 字节核心区）。
 
-**leaf → node**：`xfs_dir2_leaf_to_node()` 当 leaf 的 hash table 溢出时，转换为 `xfs_da_node_hdr`（B+tree node），通过 `xfs_da_btree.c` 的通用 B+tree 接口管理
+### 4.3 shortform → block 的转换条件
 
-### 5.3 HTree（B+tree Hash Tree）
-
-XFS 目录的 hash tree 使用 `xfs_da_btree.c` 的通用目录/属性 B+tree 实现：
+当向 shortform 目录添加新条目时（`libxfs/xfs_dir2_sf.c:405`），若以下任一条件满足则触发**到 BLOCK 格式的转换**：
 
 ```c
-struct xfs_da_node_hdr {
-    __be16  magic;      // XFS_DA_NODE_MAGIC
-    __be16  count;      // 有效 entry 数
-    __be16  level;     // B+tree 层高
-    struct xfs_da_node_entry {
-        __be32  hashval;  // hash 上界
-        __be64  before;   // 子 block 的磁盘地址
-    } entries[];
+new_isize = dp->i_disk_size + incr_isize;
+/* 条件1：新大小超过 data fork 可用空间 */
+if (new_isize > xfs_inode_data_fork_size(dp))
+    convert_to_block();
+
+/* 条件2：现有条目在目录块中位置分散，插入效率低 */
+pick = xfs_dir2_sf_addname_pick(args, objchange, &sfep, &offset);
+if (pick == 0)  /* 没有合适的插入位置 */
+    convert_to_block();
+```
+
+即：**空间不足** 或 **条目位置冲突导致需要分散插入** 时触发转换。
+
+### 4.4 HTree（node 格式）
+
+当目录从 BLOCK 格式增长到一定程度时，`xfs_dir2_block_addname()` 在块满时调用 `xfs_dir2_block_to_leaf()` → `xfs_dir2_leaf_to_node()`，构建 B+tree。
+
+HTree 的叶节点和内部节点都使用 `struct xfs_da_node_hdr`（`xfs_da_format.h`），内部节点包含 `struct xfs_da_node_entry` 数组，每个 entry 存储子节点的哈希范围和块指针：
+
+```c
+struct xfs_da_node_entry {
+    xfs_hash_name_t   hash;    /* 该子节点覆盖的哈希上界 */
+    __be32            before;  /* 子节点的磁盘块号 */
 };
 ```
 
-leaf node 中每个 entry 是 `(hash, inode#)` 对，按 hash 排序。查找时先在 B+tree 中定位 hash 范围，再在对应 leaf block 中线性搜索。
-
-### 5.4 目录名的存储格式
-
-XFS v3 inode 支持 `filetype`（`XFS_DIFLAG2_SIGNANT`），目录 entry 结构（`xfs_dir2_sf_entry`）包含 `name` + `inumber` + `ftype`，无需从 inode 获取文件类型，节省查找 I/O。
+XFS 目录 HTree 的**叶子节点**使用 `struct xfs_dir2_leaf_entry`，包含文件名哈希值和目录数据块中的实际条目指针。
 
 ---
 
-## 6. 配额（Quota）
+## 5. 配额机制——XFS quota
 
-### 6.1 XFS 配额的本质：独立 dquot 结构
+### 5.1 三类配额与两组限制
 
-XFS 配额**不依赖 inode 字段**（与 ext4 不同），使用独立的 `struct xfs_dquot`（`xfs_dquot.c`）：
+XFS 支持三种配额类型（`enum xfs_dqtype`，`xfs_quota.h`）：
+
+- **USRQUOTA**：用户配额
+- **GRPQUOTA**：组配额
+- **PRJQUOTA**：项目配额（基于 `di_projid`）
+
+每种配额有两组限制：
+
+- **硬限制（hard limit）**：绝对上限，达到后**拒绝**分配
+- **软限制（soft limit）**：宽限期上限，达到后**警告**但仍允许分配，超期后降级为硬限制
+
+### 5.2 磁盘配额结构
+
+`struct xfs_disk_dquot`（`libxfs/xfs_format.h:1438`）是配额的磁盘格式：
+
+```c
+struct xfs_disk_dquot {
+    __be16      d_magic;       /* XFS_DQUOT_MAGIC */
+    __u8        d_version;     /* 版本 */
+    __u8        d_type;       /* XFS_DQTYPE_USER/PROJ/GROUP */
+    __be32      d_id;         /* 用户/组/项目 ID */
+    __be64      d_blk_hardlimit; /* 磁盘块硬限制（字节）*/
+    __be64      d_blk_softlimit;
+    __be64      d_ino_hardlimit; /* inode 数硬限制 */
+    __be64      d_ino_softlimit;
+    __be64      d_bcount;      /* 当前磁盘块占用 */
+    __be64      d_icount;      /* 当前 inode 计数 */
+    __be32      d_itimer;      /* inode 软限制超期时间 */
+    __be32      d_btimer;       /* 磁盘块软限制超期时间 */
+    __be16      d_iwarns;      /* 警告计数 */
+    __be16      d_bwarns;
+    __be64      d_rtb_hardlimit; /* realtime 块限制 */
+    __be64      d_rtb_softlimit;
+    __be64      d_rtbcount;    /* 当前 rt 块占用 */
+    __be32      d_rtbtimer;
+    /* ... */
+};
+```
+
+### 5.3 内存中的 dquot
+
+`struct xfs_dquot`（`xfs_dquot.h:68`）是内存中的配额对象：
 
 ```c
 struct xfs_dquot {
-    struct xfs_qoff_entry *q_flags;  // quotachecked 标记
-    xfs_dqtype_t    q_type;           // USER / GROUP / PROJECT
-    xfs_ino_t       q_id;             // uid/gid/projid
-    struct xfs_dquot_res q_blk;      // 块资源
-    struct xfs_dquot_res q_ino;      // inode 资源
-    struct xfs_dquot_res q_rtb;       // realtime 块资源
-    struct list_head q_li_list;       // log item 链表
+    struct list_head    q_lru;        /* LRU 链表（未使用的 dquot）*/
+    xfs_dqtype_t         q_type;       /* 配额类型 */
+    uint16_t             q_flags;
+    xfs_dqid_t           q_id;         /* 对应 ID */
+    struct xfs_dquot_res q_blk;       /* 块资源 */
+    struct xfs_dquot_res q_ino;       /* inode 资源 */
+    struct xfs_dquot_res q_rtb;       /* realtime 块资源 */
+    struct xfs_dquot_pre q_blk_prealloc; /* 预分配宽限期跟踪 */
+    struct mutex         q_qlock;      /* dquot 锁 */
+    struct completion    q_flush;     /* 刷新完成同步 */
+    atomic_t             q_pincount;  /* pin 计数（日志中）*/
+    /* ... */
 };
 ```
 
-配额 inode 由 superblock 字段指定：
-- `sb_uquotino`：user quota inode
-- `sb_gquotino`：group quota inode
-- `sb_pquotino`：project quota inode
+### 5.4 配额初始化与检查流程
 
-dquot 存储在 **reserved data region**（非 AG0 空间），通过 `xfs_dquot_buf.c` 的专用 buffer ops 读写，保证 quota 信息永不和普通文件数据混用。
+挂载时 `xfs_qm_init()`（`xfs_qm.c:766`）完成：
+1. **分配 quota inode**（特殊 metafile inode，类型为 `XFS_METAFILE_USRQUOTA` 等）
+2. **初始化 quotainfo**：设置定时器、警告阈值
+3. **读取磁盘 quota**：将磁盘上的 dquot 加载到内存 hash cache
 
-### 6.2 quotacheck
-
-`xfs_qm_quotacheck()`（`xfs_qm.c:1457`）在配额启用时扫描所有 inode，建立准确的配额使用统计：
-
+写操作时的配额检查（`xfs_qm_dqattach()`）：
 ```c
-xfs_qm_quotacheck()
-    → xfs_qm_dquot_walk(mp, XFS_DQTYPE_USER, ...)
-    → xfs_qm_quotacheck_dqadjust(ip, type, nblks, ninos, ...)
-        → 遍历 data fork 的所有 extent，累加块数
-        → 比较 hardlimit/softlimit，更新计时器
-    → 将修正后的 dquot 写回磁盘
+error = xfs_qm_dqattach(ip);  /* 为 inode 绑定 dquot */
 ```
 
-### 6.3 与 ext4 配额的根本区别
-
-| | XFS quota | ext4 quota |
-|---|---|---|
-| 存储位置 | 独立 dquot inode（可跨 AG） | inode 内 `i_itime/i_dquot[]` 或 journaled dquot |
-| 精度 | 每个 dquot 独立计数器，原子更新 | 依赖 journal transaction |
-| recovery | dquot buffer 有 log item，crash 后精确恢复 | 需要 quotacheck 或 journal replay |
-| realtime quota | 支持（`q_rtb`） | 不支持 |
-| project quota | 原生支持（`sb_pquotino`） | 需要 project quota patch |
-
-### 6.4 dquot 的 journal 日志
-
-`xfs_dquot_item.c` 为 dquot 提供 log item：
-
+分配块时的检查（`xfs_bmap_alloc_account()`，`libxfs/xfs_bmap.c:3267`）：
 ```c
-struct xfs_dqtrx {   // dquot 在一个 transaction 中的增量
-    int64_t     qt_d_blk_id;    // 块 ID 在 dquot log item 中的位置
-    int64_t     qt_d_blk_res;   // 本事务预留块数
-};
+ap->ip->i_delayed_blks += ap->length;  /* 延迟块也计入配额 */
 ```
 
-dquot 的 `di_lsn` 跟踪其 dirty 状态，确保 recovery 时按正确顺序重放。
+配额超额时，`xfs_qm_dqput()` 触发写回和警告。
+
+### 5.5 日志中的配额记录
+
+dquot 的变更通过 `struct xfs_dq_logitem`（嵌入 `xfs_dquot`）记录到日志。`xfs_dquot_item_recover.c` 在恢复时重新应用 dquot 变更。
 
 ---
 
-## 7. 崩溃恢复（Crash Recovery）
+## 6. 崩溃恢复——xlog_recover_commit_trans
 
-### 7.1 recovery 入口
+### 6.1 恢复的整体流程
 
-`xfs_log_recover()`（`xfs_log_recover.c`）是 recovery 入口，分 **两个 pass**：
+XFS 崩溃恢复分为两个 pass（`xfs_log_recover.c`）：
 
+**Pass 1（`XLOG_RECOVER_PASS1`）**：扫描日志，验证所有 log item，执行只读操作（如检查 EFI/EFD 完整性）。
+
+**Pass 2（`XLOG_RECOVER_PASS2`）**：重放所有已提交事务，将元数据变更应用到文件系统。
+
+恢复入口 `xlog_recover()`（mount 时调用）：
 ```c
-xlog_do_recovery_pass()   // Pass 1: 扫描 log，识别 record 边界
-xlog_do_recovery_pass()   // Pass 2: 重放 log intent item
+if (xlog_recovery_needed(log))
+    error = xlog_recover(log);  /* → xlog_recover_finish() */
 ```
 
-### 7.2 Pass 1：扫描和 intent item 收集
+### 6.2 xlog_recover_commit_trans——事务提交的核心
 
-Pass 1 遍历整个日志（从 tail 到 head），识别每条 log record：
-
-```c
-xlog_do_recovery_pass(log, head_blk, tail_blk, ...)
-    → xlog_do_io()  // 读取物理 log 块
-    → xlog_recover_parse_buf() // 验证 record CRC
-    → 如果是 intent item（CREATE/ATTRIBMAP/BMAP/...）
-        → xlog_recover_intent_item()  // 收集到 trans->r_itemhead
-    → 如果是 commit record
-        → xlog_recover_reorder_trans() // 调整 item 顺序
-```
-
-intent item 记录了"将要做什么"的元数据操作（如分配 extent、创建 inode），而不是具体的块内容。XFS 使用 **deferred operation**（`xfs_defer.c`）机制，将复杂操作拆解为 intent + done pair。
-
-### 7.3 Pass 2：重做（Redo）
-
-Pass 2 按顺序重放 intent item：
+`xlog_recover_commit_trans()`（`xfs_log_recover.c:2025`）是恢复时重放每个已提交事务的关键函数：
 
 ```c
-xlog_recover_items_pass2()
-    → xlog_recover_commit_trans()
-        → xlog_recover_intent_item()
-            → xfs_defer_start_recovery()
-                // 调用具体 handler：
-                // xfs_agi_recover()       — 恢复 unlinked inode list
-                // xfs_bmap_recover()      — 恢复 extent 分配
-                // xfs_icreate_recover()   — 恢复 inode 分配
-                // xfs_attr_recover()      — 恢复 extended attribute
+STATIC int xlog_recover_commit_trans(
+    struct xlog     *log,
+    struct xlog_recover *trans,
+    int              pass,
+    struct list_head *buffer_list)
+{
+    /* 从全局恢复链表移除该事务 */
+    hlist_del_init(&trans->r_list);
+
+    /* 重新排序 log item（按依赖关系）*/
+    error = xlog_recover_reorder_trans(log, trans, pass);
+    if (error) return error;
+
+    list_for_each_entry_safe(item, next, &trans->r_itemq, ri_list) {
+        switch (pass) {
+        case XLOG_RECOVER_PASS1:
+            if (item->ri_ops->commit_pass1)
+                error = item->ri_ops->commit_pass1(log, item);
+            break;
+        case XLOG_RECOVER_PASS2:
+            /* 准备 pass2：计算需要的块和空间 */
+            if (item->ri_ops->ra_pass2)
+                item->ri_ops->ra_pass2(log, item);
+            list_move_tail(&item->ri_list, &ra_list);
+            items_queued++;
+            /* 批量处理，最多 100 个 item */
+            if (items_queued >= XLOG_RECOVER_COMMIT_QUEUE_MAX) {
+                error = xlog_recover_items_pass2(log, trans,
+                        buffer_list, &ra_list);
+                items_queued = 0;
+            }
+            break;
+        }
+    }
+    /* ... 剩余 item 处理 ... */
+}
 ```
 
-### 7.4 两阶段 recovery 的优势
+### 6.3 log item 的重放操作
 
-1. **Intent item 不需要完整块 image**：只记录"要在哪里分配 extent"，recovery 时重新执行分配逻辑，log size 更小
-2. **自然处理重排序**：如果同一个 extent 的分配和释放都记录在 log 中，reorder 阶段可以将它们排成正确顺序
-3. **并行 recovery**：intent item 之间无依赖时可以并行执行 done item
+每种元数据类型（inode、buf、dquot）都有对应的 `xlog_recover_item_ops`：
 
-### 7.5 unmount record 和 clean unmount 检测
+| 元数据类型 | `commit_pass1` | `ra_pass2` / `commit_pass2` |
+|-----------|---------------|---------------------------|
+| **inode item** | 无 | `xlog_recover_inode_commit_pass2()` — 恢复 inode 内容 |
+| **buf item** | 无 | `xfs_buf_item_recover()` — 恢复磁盘缓冲区内容 |
+| **dquot item** | 无 | `xfs_dquot_item_recover()` — 恢复配额信息 |
+| **efi/efd item** | `xfs_efi_item_recover()` | 无（Pass 2 直接跳过） |
 
-`xlog_check_unmount_rec()`（`xfs_log_recover.c:1133`）在 recovery 开始前检查日志头部是否有 unmount record：
+**inode 恢复**（`xfs_inode_item_recover.c:308`）：
+1. 从日志记录中提取 inode 的完整内容（`di_mode`、`di_size`、各 fork 数据）
+2. 在磁盘上定位该 inode（通过 `xfs_imap_to_bp()`）
+3. 调用 `xfs_inode_from_disk()` 将日志中的 dinode 写入磁盘
 
-- **有 unmount record**：上次 unmount 是 clean 的，跳过 recovery（除非 mount 指定 `norecovery`）
-- **无 unmount record**：上次 unmount dirty，必须 full recovery
+**buf item 恢复**（`xfs_buf_item_recover.c`）：
+- 直接将日志中记录的块内容覆盖磁盘上对应缓冲区
+- 处理块号到物理块的映射
 
-这避免了 ext4 中需要 `e2fsck` 判断是否需要 full replay 的开销。
+### 6.4 未链接链表的恢复
+
+XFS 使用 `di_next_unlinked` 字段维护一个 AG 级别的未链接 inode 链表（每个 AG 有自己的 bucket）。恢复时 `xlog_recover_process_iunlinks()` 遍历这些链表，将因系统崩溃而处于"已删除但未完成 unlink"状态的 inode 正确清理。
+
+### 6.5 恢复完成
+
+`xlog_recover_finish()` 执行最后步骤：
+1. **`xlog_recover_process_intents()`**：处理所有 intent item（EFI/EFD），撤销未完成的空间分配
+2. **`xlog_recover_process_iunlinks()`**：清理未链接 inode
+3. **`xfs_reflink_recover_cow()`**：恢复 COW 块（reflink 文件特有）
 
 ---
 
-## 8. 总结：XFS 与 ext4 的核心架构差异
+## 7. 核心数据结构索引
 
-| 维度 | XFS | ext4 |
-|---|---|---|
-| 日志方式 | record-based logical（CIL） | block-based physical（jbd2） |
-| inode 组织 | 每 AG 独立 inobt B+tree，inode 可跨 AG | 全局 inode table，inode 位置固定 |
-| extent 描述 | B+tree BMDR（large file）或 extent array | extent header + extent entry[] |
-| 延迟分配 | 真实存在，`DELAYSTARTBLOCK` + `i_delayed_blks` | 支持（extent hole punching + `delalloc`） |
-| 目录 hash | B+tree hash tree（`xfs_da_btree`） | HTree（固定 2 层 ext4_dir_entry 结构） |
-| 配额 | 独立 dquot 结构，精确计数器 | inode 内嵌或 journaled |
-| realtime | 原生支持 rt subvolume + rtbitmap | 不支持 |
-| 崩溃恢复 | 两阶段 intent item replay，速度快 | 块级重放，速度较慢 |
+| 结构 | 定义位置 | 用途 |
+|------|---------|------|
+| `struct xfs_dinode` | `libxfs/xfs_format.h:901` | 磁盘 inode 格式 |
+| `struct xfs_ifork` | `libxfs/xfs_inode_fork.h` | 内存中 data/attr fork |
+| `struct xfs_inode` | `xfs_inode.h:25`（内核态） | 内存 inode |
+| `struct xlog` | `xfs_log_priv.h` | 日志系统全局结构 |
+| `struct xlog_in_core` | `xfs_log_priv.h` | iclog（环形日志缓冲区） |
+| `enum xlog_iclog_state` | `xfs_log_priv.h:55` | iclog 状态机 |
+| `struct xfs_cil_ctx` | `xfs_log_cil.c` | CIL checkpoint 上下文 |
+| `struct xlog_ticket` | `xfs_log_priv.h:185` | 日志空间预留 ticket |
+| `struct xfs_disk_dquot` | `libxfs/xfs_format.h:1438` | 磁盘配额格式 |
+| `struct xfs_dquot` | `xfs_dquot.h:68` | 内存配额对象 |
+| `struct xfs_dir2_sf_hdr` | `xfs_da_format.h:214` | shortform 目录头 |
 
-XFS 的设计哲学是**面向大规模、高性能场景**——通过 B+tree 管理所有元数据（inode/extent/directory/realtime bitmap），通过 CIL 批量提交减少 I/O，通过独立 dquot 实现精确配额计数。理解这些核心数据结构之间的关系，是掌握 XFS 内部原理的关键。
+---
+
+## 8. 总结：XFS 的设计哲学
+
+1. **日志为逻辑而非物理**：XFS 日志记录的是元数据操作的语义（如"创建一个 extent"）而非物理块变更，使日志量更小，恢复更快
+2. **CIL 批量提交**：通过延迟批量提交策略，在高并发写入时显著提升吞吐量
+3. **inode 大空间预分配**：inode 本身可预分配大 extent，减少动态扩展开销
+4. **AG 级别的并发控制**：每个 AG 有独立的 inode 分配位图和块组，高并发下减少锁竞争
+5. **配额与日志深度集成**：dquot 变更同样记录日志，保证配额信息的崩溃一致性
