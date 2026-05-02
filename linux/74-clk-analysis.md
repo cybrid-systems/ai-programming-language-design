@@ -169,24 +169,63 @@ int clk_enable(struct clk *clk)
 
 **doom-lsp 确认**：`clk_prepare` @ `clk.c:1172`，`clk_enable` @ `clk.c:1394`。`prepare` 持 mutex（可睡眠），`enable` 持 spinlock（原子）。
 
-### 3.3 clk_set_rate @ clk.c:2576 — 设置频率
+### 3.3 clk_set_rate @ clk.c:2576 — 频率设置
+
+`clk_set_rate` 通过**自底向上计算 + 自顶向下执行**的三段路径完成频率变更：
 
 ```c
 int clk_set_rate(struct clk *clk, unsigned long rate)
 {
-    /* 1. 复制请求速率 */
-    core->req_rate = rate;
+    /* 阶段 1: 计算新频率 @ :2261 */
+    // clk_calc_new_rates(core, rate) 自底向上遍历：
+    //   - 如果此时钟可以 round_rate → 请求最佳频率
+    //   - 如果 CLK_SET_RATE_PARENT → 递归调父时钟
+    //   - clk_calc_subtree() 设置子树所有节点的新频率
+    //   - 返回最顶层需要调整的时钟
+    top = clk_calc_new_rates(core, rate);
 
-    /* 2. 遍历时钟树找到最优配置 */
-    ret = clk_core_set_rate_nolock(core, rate);
+    /* 阶段 2: 预变更通知 @ :1922 */
+    // clk_propagate_rate_change(top, PRE_RATE_CHANGE)
+    // 从 top 向下遍历子树，调用 clock notifier
+    // 任何 notifier 返回 NOTIFY_STOP_MASK → abort
+    fail_clk = clk_propagate_rate_change(top, PRE_RATE_CHANGE);
 
-    /* 3. 如果锁定 → 拒绝 */
-    if (core->protect_count)
-        return -EBUSY;
+    /* 阶段 3: 实际执行 @ :2386 */
+    // clk_change_rate(top) 从顶向下：
+    //   → 如果需要切换父时钟: ops->set_parent(core, p_index)
+    //   → 如果需要设新频率: ops->set_rate(core, new_rate, parent_rate)
+    //   → ops->recalc_rate(core, parent_rate) → core->rate
+    //   → 递归 children
+    clk_change_rate(top);
 
-    /* 4. 调用 clk_change_rate 自底向上改变频率 */
-    clk_change_rate(core);
+    /* 阶段 4: 完成通知 */
+    clk_propagate_rate_change(top, POST_RATE_CHANGE);
 }
+
+// clk_calc_new_rates @ :2261 的核心逻辑：
+// 1. 调用 clk_core_determine_round_nolock 请求最优频率
+// 2. 如果时钟不可调且 CLK_SET_RATE_PARENT → 递归父时钟
+// 3. clk_calc_subtree(core, new_rate, parent, p_index) 设置子树
+// 4. 返回最顶层时钟——clk_change_rate 从此开始
+
+// clk_change_rate @ :2386 的核心逻辑：
+// static void clk_change_rate(struct clk_core *core)
+// {
+//     // 如果需要切换父时钟
+//     if (core->new_parent && core->new_parent != core->parent)
+//         __clk_set_parent(core, ...);
+//
+//     // 设置频率
+//     if (core->new_rate != core->rate && ops->set_rate)
+//         ops->set_rate(core->hw, core->new_rate, best_parent_rate);
+//
+//     // 更新缓存
+//     core->rate = ops->recalc_rate(core->hw, best_parent_rate);
+//
+//     // 递归所有子时钟
+//     hlist_for_each_entry(child, &core->children, child_node)
+//         clk_change_rate(child);
+// }
 ```
 
 ### 3.4 clk_get_rate @ clk.c:1980
