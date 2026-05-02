@@ -273,3 +273,78 @@ bridge 通过 `br_handle_frame`（`br_input.c`）截获输入数据包 → `br_f
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 9. bridge 数据包处理路径详解
+
+```c
+// bridge 的数据包处理有两条路径：
+
+// 路径 A：从端口进入桥接处理（br_handle_frame_finish @ br_input.c:76）
+// 1. br_netif_receive_skb @ :26 — 接收 skb
+// 2. br_handle_frame_finish @ :76 — 桥转发决策：
+//    → 检查 STP 状态（必须 FORWARDING）
+//    → br_fdb_update() — 学习源 MAC
+//    → __br_fdb_get() — 查找目的 MAC
+//    → 找到 → br_forward() 单播
+//    → 未找到/多播 → br_flood() 洪泛
+
+// 路径 B：本机发送到桥接设备（br_dev_xmit @ br_device.c:30）
+// 1. dev_queue_xmit → br_dev_xmit()
+// 2. 直接洪泛所有端口（本机发送视为外部进入）
+// → netfilter 检查（nf_br_ops @ :26）
+```
+
+## 10. FDB 哈希和数据老化 @ br_fdb.c（65 符号）
+
+```c
+// FDB（Forwarding Database）使用 rhashtable 管理：
+
+// br_fdb_rht_params @ :27 — rhashtable 参数
+// br_fdb_cache @ :34 — FDB 缓存
+
+// 查找路径——__br_fdb_get(br, addr, vid)：
+// → rhashtable_lookup_fast(&br->fdb_hash, &key, br_fdb_rht_params)
+// → 找到 → 返回 fdb_entry（含 dst 端口和更新时间）
+
+// 老化（has_expired @ :68）：
+// → ageing_time（默认 300 秒）后
+// → 动态学习条目被删除
+// → 静态条目（bridge fdb add 添加）永不过期
+
+// hold_time @ :63 — 锁时（防止频繁更新）：
+// → 同一个 MAC 在 hold_time 内不更新
+// → 减少洪泛期间的 FDB 更新争用
+```
+
+## 11. bridge 与 netfilter 的交互
+
+```c
+// bridge 数据路径中有多个 netfilter 钩子点：
+// nf_br_ops @ br_device.c:26 — 桥接 netfilter 操作
+
+// 钩子点位置：
+// NF_BR_PRE_ROUTING  — 帧进入桥时
+// NF_BR_LOCAL_IN     — 帧交付本机时
+// NF_BR_FORWARD      — 帧桥转发时
+// NF_BR_LOCAL_OUT    — 本机发送帧时
+// NF_BR_POST_ROUTING — 帧从端口发出时
+
+// ebtables 利用这些钩子实现桥接防火墙
+// ebtables -A FORWARD -p IPv4 --ip-protocol tcp -j DROP
+// → 在内核桥转发的 NF_BR_FORWARD 点过滤
+```
+
+## 12. 关键函数索引
+
+| 文件 | 符号 | 作用 |
+|------|------|------|
+| `br_device.c` | 23 | 桥设备操作 |
+| `br_input.c` | 15 | 数据包接收处理 |
+| `br_forward.c` | 19 | 转发决策 |
+| `br_fdb.c` | 65 | FDB 学习和老化 |
+| `br_handle_frame_finish` | `:76` | 桥转发核心 |
+| `br_fdb_update` | — | MAC 学习 |
+| `br_fdb_find_rcu` | — | FDB 查找 |
+| `br_forward` | — | 单播转发 |
+| `br_flood` | — | 洪泛 |
+
