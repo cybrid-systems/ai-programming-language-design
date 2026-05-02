@@ -227,3 +227,105 @@ TUN/TAP 通过 `tun_get_user`（`:1131`）将用户空间写入的 skb 注入内
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 8. TUN 设备创建和销毁
+
+```c
+// TUN 设备的完整生命周期：
+
+// 创建：open("/dev/net/tun") + ioctl(TUNSETIFF)
+// → tun_chr_open() — 创建 tun_file，关联到 struct file
+// → __tun_set_iff() — 分配 tun_struct + net_device
+//   → tun_net_init(dev) — 设置 net_device_ops
+//   → register_netdevice(dev) — 注册网络接口
+//   → tun->tfiles[queue_index] = tfile
+
+// 销毁：
+// → tun_chr_close() — 关闭字符设备
+// → tun_detach_all() — 断开所有连接
+// → unregister_netdevice(dev) — 注销网络接口
+// → 等待所有 skb 释放
+
+// 多队列支持（IFF_MULTI_QUEUE）：
+// → tun->tfiles[MAX_TAP_QUEUES] 数组
+// → 每个 tfile 有独立的 rx/tx 队列
+// → 通过 flow_table 的 RSS 哈希分发
+```
+
+## 9. TUN 的 XDP 支持
+
+```c
+// TUN 支持 XDP（eXpress Data Path）：
+// tun_xdp_xmit() — 发送 XDP 帧到设备
+// → xdp_frame 转 skb → netif_receive_skb()
+
+// XDP 程序通过 tun_xdp_set() 注册：
+// → setsockopt(tun_fd, SOL_TUN, TUN_XDP, &prog_fd, sizeof(fd))
+// → 设置 tnl->xdp_prog
+
+// TUN 的 XDP 能力：
+// XDP_PASS — 正常接收
+// XDP_DROP — 丢弃
+// XDP_TX   — 从接收口回传
+
+// XDP 在容器网络中有重要应用（如 Flannel、Calico 加速）
+```
+
+## 10. TUN 的 tap_filter
+
+```c
+// TAP（L2 模式）支持多播过滤：
+
+struct tap_filter {
+    int count;                          // 过滤地址数
+    unsigned int mask;                   // 哈希位图
+    unsigned long addr[FILTER_ADDR_MAX]; // MAC 地址表
+};
+
+// tap_filter_add_addr() — 添加过滤 MAC
+// → 计算 MAC 哈希 → 设置 mask 位
+
+// tap_filter_match(skb, filter) — 检查是否匹配
+// → 广播/多播：检查哈希表
+// → 单播：精确匹配
+
+// 减少了不需要传递给用户空间的 L2 帧数量
+```
+
+## 11. 关键函数索引
+
+| 函数 | 符号数 | 作用 |
+|------|--------|------|
+| `tun.c` | 237 | TUN/TAP 驱动 |
+| `tun_get_user` | `:1131` | 写入路径（skb→网络栈）|
+| `tun_put_user` | `:2120` | 读取路径（skb→用户）|
+| `tun_do_read` | — | 从接收队列取 skb |
+| `tun_net_xmit` | — | 协议栈→TUN 队列 |
+| `tun_chr_open` | — | 字符设备打开 |
+| `tun_xdp_xmit` | — | XDP 发送 |
+| `tun_napi_init` | — | NAPI 初始化 |
+
+
+## 12. TUN 的特性标志
+
+```c
+// TUN 设备支持的特性标志：
+
+// IFF_TUN     — L3 隧道（接收/发送 IP 包）
+// IFF_TAP     — L2 隧道（接收/发送以太帧）
+// IFF_NO_PI   — 不携带包信息头（tun_pi）
+// IFF_ONE_QUEUE — 单队列模式（旧）
+// IFF_VNET_HDR — 虚拟网络头（virtio net header）
+// IFF_MULTI_QUEUE — 多队列模式
+// IFF_NAPI    — NAPI 模式（批量接收）
+// IFF_NAPI_FRAGS — NAPI 分段接收
+
+// VNET_HDR 用于 virtio 场景（KVM 虚拟化）：
+// → 在包前添加 struct virtio_net_hdr
+// → 包含校验和和 GSO 信息
+// → 使虚拟机内的 GSO 包可以穿透 TUN 设备
+
+// 查看当前标志：
+// ip -d link show tun0
+```
+
