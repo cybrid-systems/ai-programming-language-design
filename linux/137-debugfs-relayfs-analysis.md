@@ -1,249 +1,269 @@
-# Linux Kernel debugfs / relayfs 深度源码分析
+# 99-debugfs — Linux debugfs 文件系统深度源码分析
 
-> 基于 Linux 7.0-rc1 主线源码（`fs/debugfs/` + `kernel/relay.c`）
-> 工具：doom-lsp（clangd LSP）+ 原始源码对照
-> 关键词：debugfs_create_file、relay_open、ring buffer、ftrace
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
+> 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1
 
-## 1. debugfs — 调试文件系统
+---
 
-### 1.1 创建调试文件
+## 0. 概述
+
+**debugfs** 是 Linux 内核开发者向用户空间暴露调试信息的轻量级文件系统（挂载于 `/sys/kernel/debug/`）。与 procfs（以进程为中心）和 sysfs（单值、有严格 kobject 规则）不同，debugfs **没有格式约束**——任何内核代码可以通过 `debugfs_create_file()` + 自定义 `struct file_operations` 暴露任意格式的调试数据。
+
+**核心设计**：debugfs 的文件操作通过**分层代理**间接调用。所有文件初始时被设置为 `debugfs_open_proxy_file_operations`，在第一次 `open` 时通过 `open_proxy_open`（`file.c:285`）用 `replace_fops()` 替换为真实 fops。每次 `read`/`write` 前通过 `debugfs_file_get()`（`file.c:175`）获取引用——如果文件正在被移除，则拒绝新访问。这种两层的设计让 debugfs 可以在不持有模块引用计数的情况下**安全移除文件**。
+
+```
+文件创建：                       文件读写（代理层）：
+debugfs_create_file()             用户 read → full_proxy_read()
+  → alloc_fsd()                     → debugfs_file_get()  获取引用
+  → 创建 dentry                     如果 active_users==0 → 返回 -EIO
+  → d_fsdata = fsd                 → real_fops->read()   调用真实函数
+  → fops = proxy_fops              → debugfs_file_put()  释放引用
+
+文件移除：
+debugfs_remove()
+  → 标记 dentry 为 unlinked
+  → refcount_dec(&active_users)
+  → wait_for_completion(&active_users_drained)
+  → 删除 dentry
+```
+
+**doom-lsp 确认**：`fs/debugfs/inode.c`（103 符号）管理 inode/dentry 生命周期。`fs/debugfs/file.c`（284 符号）管理代理操作和引用计数。`__debugfs_file_get` @ `file.c:62`，`open_proxy_open` @ `file.c:285`。
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 struct debugfs_fsdata——文件元数据
 
 ```c
-// fs/debugfs/inode.c — debugfs_create_file
-struct dentry *debugfs_create_file(const char *name, umode_t mode,
-                  struct dentry *parent, void *data,
-                  const struct file_operations *fops)
+// fs/debugfs/internal.h
+struct debugfs_fsdata {
+    const struct file_operations *real_fops;   // 完整 fops（旧接口）
+    const struct file_operations *short_fops;  // 精简 fops（新接口）
+    refcount_t active_users;                    // 活跃用户计数
+    struct completion active_users_drained;     // 等待全部 I/O 完成
+    u16 methods;                                // HAS_READ/WRITE/LSEEK 等位掩码
+    struct list_head cancellations;             // 取消请求链表
+    struct mutex cancellations_mtx;             // 保护取消链表
+};
+```
+
+**设计要点**：
+- `active_users` 初始为 1，`debugfs_file_get()` 递增，`debugfs_file_put()` 递减
+- 移除文件时 `refcount_dec(&active_users)` → 等待降至 0（现有 I/O 完成后）
+- `real_fops` vs `short_fops`：旧接口传递完整 `struct file_operations`，新接口传递 `struct debugfs_short_fops`（精简版），在 `__debugfs_file_get` 中根据 `mode` 参数区分
+
+**doom-lsp 确认**：`__debugfs_file_get` @ `file.c:62`，`active_users_drained` 在 `file.c:112` 通过 `init_completion` 初始化。
+
+### 1.2 延迟初始化——cmpxchg 竞态处理
+
+```c
+// __debugfs_file_get @ file.c:62 中：
+// fsd 不在 dentry 上时延迟分配（首次 open 时）：
+d_fsd = READ_ONCE(dentry->d_fsdata);
+if (!d_fsd) {
+    // 首次访问——分配 fsd
+    fsd = kzalloc(sizeof(*fsd), GFP_KERNEL);
+    if (mode == DBGFS_GET_SHORT)
+        fsd->short_fops = DEBUGFS_I(inode)->short_fops;
+    else
+        fsd->real_fops = DEBUGFS_I(inode)->real_fops;
+
+    // cmpxchg——并发安全：只有一个线程的 fsd 被写入
+    d_fsd = cmpxchg(&dentry->d_fsdata, NULL, fsd);
+    if (d_fsd) {
+        // 另一个线程先写了 — 释放本地的
+        kfree(fsd);
+        fsd = d_fsd;
+    }
+}
+if (d_unlinked(dentry)) return -EIO;  // 文件已移除
+if (!refcount_inc_not_zero(&fsd->active_users)) return -EIO;
+```
+
+---
+
+## 2. 文件创建路径
+
+### 2.1 __debugfs_create_file @ inode.c:416
+
+```c
+static struct dentry *__debugfs_create_file(const char *name, umode_t mode,
+    struct dentry *parent, void *data,
+    const struct file_operations *proc_fops)
 {
-    // 1. 创建 dentry
-    dentry = d_alloc_name(parent, name);
+    // 1. 分配 fsd（此处只存 fops，不设置 active_users）
+    fsd = kzalloc(sizeof(*fsd), GFP_KERNEL);
+    fsd->real_fops = proc_fops;
+    if (proc_fops->read)   fsd->methods |= HAS_READ;
+    if (proc_fops->write)  fsd->methods |= HAS_WRITE;
+    // ...
+    // 注意：此时 active_users 未初始化！留给 __debugfs_file_get 延迟创建
 
-    // 2. 创建 inode
-    inode = debugfs_get_inode(parent->d_sb);
+    // 2. 创建 dentry 和 inode
+    dentry = debugfs_create_dentry(name, mode, parent, data, &debugfs_open_proxy_file_operations);
+    // inode->i_fop = proxy_fops（所有 debugfs 文件统一入口）
+    // dentry->d_fsdata = fsd
 
-    // 3. 设置文件操作
-    inode->i_fop = &debugfs_file_operations;
-    inode->i_private = data;  // 私有数据传给 fops
-
-    // 4. 注册
     d_instantiate(dentry, inode);
-
     return dentry;
 }
 ```
 
-### 1.2 常用 API
+### 2.2 debugfs_create_dir @ inode.c:570
 
 ```c
-// 创建各种类型的文件
-debugfs_create_file(name, mode, parent, data, &fops);
-debugfs_create_u32(name, mode, parent, value_ptr);
-debugfs_create_u64(name, mode, parent, value_ptr);
-debugfs_create_bool(name, mode, parent, value_ptr);
-debugfs_create_atomic_t(name, mode, parent, value_ptr);
-debugfs_create_blob(name, mode, parent, blob);
-```
-
-## 2. relayfs — 内核到用户高速通道
-
-### 2.1 relay_channel
-
-```c
-// kernel/relay.c — rchan
-struct rchan {
-    // 每 CPU 环形缓冲
-    struct rchan_buf   *buf[NR_CPUS];  // 行 52
-
-    // 每 CPU 缓冲大小
-    size_t              alloc_size;     // 行 55
-
-    // 子缓冲大小
-    size_t              subbuf_size;    // 行 58
-
-    // 子缓冲数量
-    size_t              n_subbufs;      // 行 61
-
-    // 消费位置
-    size_t              consumed_bytes; // 行 64
-
-    // 回调
-    const struct rchan_callbacks *cb;  // 行 67
-
-    // 用户空间可见
-    struct dentry       *parent;         // 行 70
-};
-```
-
-### 2.2 relay_open — 创建 channel
-
-```c
-// kernel/relay.c — relay_open
-struct rchan *relay_open(const char *filename, struct dentry *parent,
-                size_t subbuf_size, size_t n_subbufs, ...)
+struct dentry *debugfs_create_dir(const char *name, struct dentry *parent)
 {
-    // 1. 分配 rchan
-    chan = kzalloc(sizeof(*chan), GFP_KERNEL);
-
-    // 2. 为每个 CPU 分配环形缓冲
-    for_each_possible_cpu(cpu) {
-        chan->buf[cpu] = relay_create_buf(subbuf_size, n_subbufs);
-    }
-
-    // 3. 创建 debugfs 文件
-    chan->parent = debugfs_create_file(filename, ..., chan);
-
-    return chan;
+    // 创建目录 dentry
+    dentry = debugfs_create_dentry(name, S_IFDIR | 0755, parent, NULL, &simple_dir_operations);
+    inode->i_op = &debugfs_dir_inode_operations;   // 目录 inode 操作
+    return dentry;
 }
 ```
-
-### 2.3 relay_write — 写入数据
-
-```c
-// kernel/relay.c — relay_write
-void relay_write(struct rchan *chan, const void *data, size_t count)
-{
-    struct rchan_buf *buf = chan->buf[get_cpu()];
-
-    // 1. 检查空间
-    if (buf->offset + count > subbuf_size) {
-        // 子缓冲满，调用回调
-        chan->cb->buf_end(buf);
-        buf->offset = 0;
-    }
-
-    // 2. 复制数据
-    memcpy(buf->data + buf->offset, data, count);
-    buf->offset += count;
-
-    put_cpu();
-}
-```
-
-## 3. 参考
-
-| 文件 | 函数 |
-|------|------|
-| `fs/debugfs/inode.c` | `debugfs_create_file` |
-| `kernel/relay.c` | `relay_open`、`relay_write` |
-
 
 ---
 
-## doom-lsp 源码分析
+## 3. 代理层——四类代理函数
 
-> 以下分析基于 Linux 7.0 主线源码，使用 doom-lsp (clangd LSP) 进行深度符号分析
+### 3.1 open_proxy_open @ file.c:285
 
-### 文件分析摘要
+```c
+static int open_proxy_open(struct inode *inode, struct file *filp)
+{
+    // 1. 获取文件引用（触发 fsd 延迟初始化）
+    r = __debugfs_file_get(dentry, DBGFS_GET_REGULAR);
+    if (r) return r == -EIO ? -ENOENT : r;
 
-| 源文件 | 符号数 | 结构体 | 函数 | 变量 |
-|--------|--------|--------|------|------|
-| `include/linux/list.h` | 51 | 0 | 51 | 0 |
-| `include/linux/sched.h` | 567 | 70 | 134 | 7 |
-| `include/linux/mm.h` | 793 | 24 | 527 | 18 |
+    // 2. 锁定检查（lockdown / 模块状态）
+    r = debugfs_locked_down(inode, filp, real_fops);
+    if (r) goto out;
 
-### 核心数据结构
+    // 3. 检查模块是否存活（确保模块未卸载）
+    if (!fops_get(real_fops)) {
+        if (real_fops->owner->state == MODULE_STATE_GOING)
+            return -ENXIO;
+    }
 
-- **audit_context** `sched.h:58`
-- **bio_list** `sched.h:59`
-- **blk_plug** `sched.h:60`
-- **bpf_local_storage** `sched.h:61`
-- **bpf_run_ctx** `sched.h:62`
-- **bpf_net_context** `sched.h:63`
-- **capture_control** `sched.h:64`
-- **cfs_rq** `sched.h:65`
-- **fs_struct** `sched.h:66`
-- **futex_pi_state** `sched.h:67`
-- **io_context** `sched.h:68`
-- **io_uring_task** `sched.h:69`
-- **mempolicy** `sched.h:70`
-- **nameidata** `sched.h:71`
-- **nsproxy** `sched.h:72`
-- **perf_event_context** `sched.h:73`
-- **perf_ctx_data** `sched.h:74`
-- **pid_namespace** `sched.h:75`
-- **pipe_inode_info** `sched.h:76`
-- **rcu_node** `sched.h:77`
-- **reclaim_state** `sched.h:78`
-- **robust_list_head** `sched.h:79`
-- **root_domain** `sched.h:80`
-- **rq** `sched.h:81`
-- **sched_attr** `sched.h:82`
+    // 4. 替换 filp->f_op 为真正 fops
+    replace_fops(filp, real_fops);
 
-### 关键函数
+    // 5. 调真实 open
+    if (real_fops->open) r = real_fops->open(inode, filp);
+    debugfs_file_put(dentry);
+}
+```
 
-- **INIT_LIST_HEAD** `list.h:43`
-- **__list_add_valid** `list.h:136`
-- **__list_del_entry_valid** `list.h:142`
-- **__list_add** `list.h:154`
-- **list_add** `list.h:175`
-- **list_add_tail** `list.h:189`
-- **__list_del** `list.h:201`
-- **__list_del_clearprev** `list.h:215`
-- **__list_del_entry** `list.h:221`
-- **list_del** `list.h:235`
-- **list_replace** `list.h:249`
-- **list_replace_init** `list.h:265`
-- **list_swap** `list.h:277`
-- **list_del_init** `list.h:293`
-- **list_move** `list.h:304`
-- **list_move_tail** `list.h:315`
-- **list_bulk_move_tail** `list.h:331`
-- **list_is_first** `list.h:350`
-- **list_is_last** `list.h:360`
-- **list_is_head** `list.h:370`
-- **list_empty** `list.h:379`
-- **list_del_init_careful** `list.h:395`
-- **list_empty_careful** `list.h:415`
-- **list_rotate_left** `list.h:425`
-- **list_rotate_to_front** `list.h:442`
-- **list_is_singular** `list.h:457`
-- **__list_cut_position** `list.h:462`
-- **list_cut_position** `list.h:488`
-- **list_cut_before** `list.h:515`
-- **__list_splice** `list.h:531`
-- **list_splice** `list.h:550`
-- **list_splice_tail** `list.h:562`
-- **list_splice_init** `list.h:576`
-- **list_splice_tail_init** `list.h:593`
-- **list_count_nodes** `list.h:755`
+### 3.2  FULL/SHORT_PROXY_FUNC——宏生成器 @ file.c:355-390
 
-### 全局变量
+```c
+// FULL_PROXY_FUNC：为旧接口（full file_operations）生成代理
+#define FULL_PROXY_FUNC(name, ret_type, filp, proto, args, bit, ret)
+    static ret_type full_proxy_ ## name(proto) {
+        if (!(fsd->methods & bit)) return ret;       // 不支持→默认返回值
+        r = debugfs_file_get(dentry);                // 获取引用
+        if (unlikely(r)) return r;
+        r = fsd->real_fops->name(args);              // 调真实函数
+        debugfs_file_put(dentry);
+        return r;
+    }
 
-- **__tracepoint_sched_set_state_tp** `sched.h:350`
-- **__tracepoint_sched_set_need_resched_tp** `sched.h:352`
-- **def_root_domain** `sched.h:407`
-- **sched_domains_mutex** `sched.h:408`
-- **cad_pid** `sched.h:1749`
-- **init_stack** `sched.h:1964`
-- **class_migrate_is_conditional** `sched.h:2519`
-- **_totalram_pages** `mm.h:53`
-- **high_memory** `mm.h:74`
-- **sysctl_legacy_va_layout** `mm.h:86`
-- **mmap_rnd_bits_min** `mm.h:92`
-- **mmap_rnd_bits_max** `mm.h:93`
-- **mmap_rnd_bits** `mm.h:94`
-- **sysctl_user_reserve_kbytes** `mm.h:210`
-- **sysctl_admin_reserve_kbytes** `mm.h:211`
+// SHORT_PROXY_FUNC：为新接口（debugfs_short_fops）生成代理
+#define SHORT_PROXY_FUNC(name, ret_type, filp, proto, args, bit, ret)
+    static ret_type short_proxy_ ## name(proto) {
+        if (!(fsd->methods & bit)) return ret;
+        r = debugfs_file_get(dentry);
+        if (unlikely(r)) return r;
+        r = fsd->short_fops->name(args);              // 调精简 fops
+        debugfs_file_put(dentry);
+        return r;
+    }
 
-### 成员/枚举
+// 生成的 8 个代理函数：
+FULL_PROXY_FUNC(llseek, ...) → full_proxy_llseek
+FULL_PROXY_FUNC(read, ...)   → full_proxy_read
+FULL_PROXY_FUNC(write, ...)  → full_proxy_write
+FULL_PROXY_FUNC(mmap, ...)   → full_proxy_mmap
+SHORT_PROXY_FUNC(llseek, ...)→ short_proxy_llseek
+SHORT_PROXY_FUNC(read, ...)  → short_proxy_read
+SHORT_PROXY_FUNC(write, ...) → short_proxy_write
+```
 
-- **utime** `sched.h:366`
-- **stime** `sched.h:367`
-- **lock** `sched.h:368`
-- **seqcount** `sched.h:386`
-- **starttime** `sched.h:387`
-- **state** `sched.h:388`
-- **cpu** `sched.h:389`
-- **utime** `sched.h:390`
-- **stime** `sched.h:391`
-- **gtime** `sched.h:392`
-- **sched_priority** `sched.h:413`
-- **pcount** `sched.h:421`
-- **run_delay** `sched.h:424`
-- **max_run_delay** `sched.h:427`
-- **min_run_delay** `sched.h:430`
-- **last_arrival** `sched.h:435`
-- **last_queued** `sched.h:438`
-- **max_run_delay_ts** `sched.h:441`
-- **weight** `sched.h:461`
-- **inv_weight** `sched.h:462`
+---
 
+## 4. 文件移除——debugfs_remove
+
+```c
+// 移除文件路径：
+// debugfs_remove(dentry)
+// → simple_unlink + d_delete (debugfs 核心)
+// → 之后 d_fsdata->active_users 会阻止新 I/O
+// → 等待已有 I/O 完成
+
+// 关键在于：debugfs_remove 将 dentry 标记为 unlinked，
+// 而 __debugfs_file_get 会在 d_unlinked(dentry) 时返回 -EIO
+
+// 调用者通常不需要显式等待，debugfs_remove 内部通过
+// active_users_drained completion 同步
+```
+
+---
+
+## 5. 取消机制——debugfs_enter_cancellation @ file.c:206
+
+```c
+// 某些 debugfs 操作需要等待外部事件（如用户空间返回结果）
+// 取消机制允许在移除文件时中断等待：
+void debugfs_enter_cancellation(struct file *file,
+                                 struct debugfs_cancellation *canc)
+{
+    // 将 canc 添加到 fsd->cancellations 链表
+    // 移除时遍历链表 → complete() 所有等待者
+}
+
+void debugfs_leave_cancellation(struct file *file,
+                                 struct debugfs_cancellation *canc)
+{
+    // 从链表移除
+}
+```
+
+---
+
+## 6. debugfs 与 procfs/sysfs 的对比
+
+| 特性 | procfs | sysfs | debugfs |
+|------|--------|-------|---------|
+| 挂载点 | `/proc/` | `/sys/` | `/sys/kernel/debug/` |
+| 用途 | 进程信息 | 设备模型/驱动参数 | **任意调试数据** |
+| 数据模型 | 以进程为中心 | 单值属性(kobject) | **无约束** |
+| fops 机制 | 直接使用 | 通过 sysfs_ops 转发 | **代理层（proxy）+ active_users** |
+| 移除安全 | 模块引用计数 | 设备引用计数 | **active_users + completion** |
+| 取消机制 | 无 | 无 | **debugfs_enter_cancellation** |
+
+---
+
+## 7. 关键函数索引
+
+| 函数 | 文件:行号 | 作用 |
+|------|----------|------|
+| `__debugfs_create_file` | `inode.c:416` | 创建文件（分配 fsd + dentry）|
+| `debugfs_create_dir` | `inode.c:570` | 创建目录 |
+| `open_proxy_open` | `file.c:285` | open 代理（替换 fops + 检查状态）|
+| `full_proxy_read` | `file.c:378` | 完整 read 代理（get+call+put）|
+| `short_proxy_read` | `file.c:373` | 精简 read 代理 |
+| `__debugfs_file_get` | `file.c:62` | 懒初始化 fsd + 获取引用 |
+| `debugfs_file_put` | `file.c:175` | 释放引用 + complete 等待者 |
+| `debugfs_enter_cancellation` | `file.c:206` | 注册取消回调 |
+| `debugfs_leave_cancellation` | `file.c:242` | 注销取消回调 |
+
+---
+
+## 8. 总结
+
+debugfs 的核心设计是**代理层 + 引用计数安全移除**。`__debugfs_create_file`（`inode.c:416`）分配 `debugfs_fsdata` 并设置为 `proxy_fops`。每次 I/O 前的 `__debugfs_file_get`（`file.c:62`）使用 cmpxchg 实现 fsd 的延迟初始化，`refcount_inc_not_zero` 与 `d_unlinked` 双重检查保证移除安全。`FULL_PROXY_FUNC`/`SHORT_PROXY_FUNC` 宏生成器（`file.c:355-390`）为 `real_fops` 和 `short_fops` 两种接口生成对应的代理函数。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
