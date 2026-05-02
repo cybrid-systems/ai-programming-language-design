@@ -1,9 +1,12 @@
-# Linux Kernel 数据结构与同步原语 — 深度源码分析
+# 生产级代码库语义分析
+
+## Linux Kernel 数据结构与同步原语 — 深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 工具：doom-lsp（clangd LSP）+ 原始源码对照
 > 内核源码：`~/code/linux`
 > 编译数据库：`~/code/linux/compile_commands.json`
+> 分析位置：`codebases/`
 
 ---
 
@@ -47,6 +50,19 @@
 | `17-get-user-pages-analysis.md` | `get_user_pages` 用户页获取 | `follow_page_mask` / `faultin_page` / `FOLL_PIN` / `gup_fast_fallback` |
 
 ---
+
+## 文件位置
+
+所有分析文章在 `codebases/` 目录下，保持三位数编号：
+
+```
+codebases/
+├── 001-list_head-analysis.md
+├── 002-hlist-analysis.md
+├── 003-rbtree-analysis.md
+...
+└── 125-block-layer-analysis.md
+```
 
 ## 🔑 每篇核心速查
 
@@ -171,26 +187,7 @@ $SKILL_DIR/doom-query.sh $PROJECT sym symbolName
 $SKILL_DIR/doom-query.sh $PROJECT ping
 ```
 
-### completion
-```c
-struct completion { unsigned int done; struct swait_queue_head wait; }
-done = 0 → 未完成，done++ → 唤醒一个
-complete(): done++，swake_up_locked() 唤醒一个
-complete_all(): done = UINT_MAX，唤醒全部
-wait_for_completion(): 检查 done > 0，否则 schedule 睡眠
-swait_queue_head: RT 优先级继承版 wait_queue_head
-```
-
-### futex
-```c
-// 用户态：cmpxchg 抢锁，零系统调用
-// 内核：futex_hash[256] → futex_q（plist_node + task_struct）
-FUTEX_WAIT: 如果 uaddr == val 则睡眠
-FUTEX_WAKE: 唤醒 hash bucket 中等待者
-FUTEX_LOCK_PI: rt_mutex 优先级继承，防优先级反转
-FUTEX_REQUEUE: 移动等待者到另一个 futex，避免惊群
-union futex_key: {i_seq, pgoff, offset} 或 {ptr, word, bitshift}
-```
+更多细节见 [`codebases/README.md`](codebases/README.md)。
 
 ### wait_event
 ```c
