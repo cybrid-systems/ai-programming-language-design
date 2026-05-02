@@ -36,27 +36,81 @@
 
 ## 1. 核心数据结构
 
+### 1.1 Noise 密钥管理 @ noise.h
+
 ```c
-// drivers/net/wireguard/peer.h
-struct wg_peer {
-    struct wg_device *device;               // 所属 WireGuard 设备
-    struct crypt_key key;                     // 加密密钥
-    struct noise_handshake handshake;         // 握手状态
-    struct noise_keypairs keypairs;           // 有效密钥对
-    struct wg_endpoint endpoint;              // 对端 UDP 地址
-    struct sk_buff_head tx_queue;             // 待发送队列
-    struct work_struct transmit_handshake_work;
-    struct work_struct clear_peer_work;
+// 对称密钥（用于实际加解密）：
+struct noise_symmetric_key {
+    u8 key[32];                               // ChaCha20 密钥
+    u64 birthdate;                             // 创建时间（用于密钥轮换）
+    bool is_valid;
 };
 
-// drivers/net/wireguard/device.h
-struct wg_device {
-    struct net_device *dev;                   // 虚拟网络接口（wg0）
-    struct socket *sock;                      // UDP 监听 socket
-    struct crypt_key key;                     // 私钥
-    struct hlist_head peer_list;              // peer 列表
-    struct workqueue_struct *workqueue_cpu;   // per-CPU 工作队列
+// 密钥对（发送+接收方向）：
+struct noise_keypair {
+    struct noise_symmetric_key sending;        // 发送密钥
+    atomic64_t sending_counter;                // 发送 nonce 计数器
+    struct noise_symmetric_key receiving;      // 接收密钥
+    struct noise_replay_counter receiving_counter; // 重放保护
+    __le32 remote_index;
+    struct kref refcount;
 };
+
+// 三组密钥对（支持无缝轮换）：
+struct noise_keypairs {
+    struct noise_keypair __rcu *current_keypair;  // 当前使用
+    struct noise_keypair __rcu *previous_keypair; // 前一组（未过期）
+    struct noise_keypair __rcu *next_keypair;     // 预生成
+};
+
+// 握手状态（Noise IK 协议状态机）：
+struct noise_handshake {
+    enum noise_handshake_state state;           // ZEROED/CREATED/CONSUMED
+    u8 ephemeral_private[32];
+    u8 remote_static[32];
+    u8 hash[32];
+    u8 chaining_key[32];
+    u8 preshared_key[32];
+    struct rw_semaphore lock;
+};
+
+// 握手状态机：
+// ZEROED → CREATED_INITIATION → CONSUMED_RESPONSE → (数据通信)
+//        → CONSUMED_INITIATION → CREATED_RESPONSE → (数据通信)
+```
+
+### 1.2 struct wg_peer——peer 结构
+
+```c
+struct wg_peer {
+    struct noise_handshake handshake;           // 握手状态
+    struct noise_keypairs keypairs;             // 三组密钥对
+    struct allowedips_node *allowedips;          // 允许的 IP 范围
+    struct wg_endpoint endpoint;                 // 对端 UDP 地址
+    struct sk_buff_head staged_packet_queue;     // 排队数据包
+    struct work_struct transmit_handshake_work;
+    u64 last_sent_handshake_ns;
+};
+```
+
+### 1.3 AllowedIPs 路由表（trie 树）
+
+```c
+// wireguard 使用二进制 trie 树管理 allowed IP：
+struct allowedips_node {
+    struct allowedips_node __rcu *bit[2];        // 左右子树（0/1）
+    struct wg_peer *peer;                        // 所属 peer
+    u8 cidr, bit_at_a, bit_at_b;
+};
+
+struct allowedips {
+    struct allowedips_node __rcu *root4;         // IPv4 根
+    struct allowedips_node __rcu *root6;         // IPv6 根
+    struct rwlock lock;
+};
+
+// 路由查找：wg_allowedips_lookup_dst → O(key_length) trie 遍历
+// 每个数据包根据目的 IP 查找对应的 peer
 ```
 
 ---
@@ -173,7 +227,25 @@ static bool decrypt_packet(struct sk_buff *skb, struct wg_peer *peer)
 
 ---
 
-## 5. 关键函数索引
+## 5. 密钥轮换与计时器 @ timers.c
+
+```c
+// WireGuard 自动管理密钥轮换：
+// 1. 每个密钥对有一个 birthdate
+// 2. 定期触发密钥轮换（默认 2 分钟）
+// 3. 重握手机制：当发送 nonce 接近上限时触发
+
+// keep_key_fresh @ send.c:124 — 检查是否需要重握手
+static void keep_key_fresh(struct wg_peer *peer)
+{
+    // 如果密钥即将过期（< 1/3 时间剩余）→ 触发重握手
+    if (time_is_before_eq_jiffies(keypair->sending.birthdate +
+                                   REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT))
+        wg_packet_send_queued_handshake_initiation(peer, false);
+}
+```
+
+## 6. 关键函数索引
 
 | 函数 | 文件:行号 | 作用 |
 |------|----------|------|
