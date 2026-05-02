@@ -223,3 +223,125 @@ SocketCAN 通过 `can_rcv`（`af_can.c`）按 CAN ID 分发帧到匹配的 socke
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 6. CAN 过滤器匹配算法 @ af_can.c:340
+
+```c
+// can_rcv_list_find() — 计算最优过滤器列表：
+// 匹配规则（核心公式）：
+//   (<received_can_id> & mask) == (can_id & mask)
+
+// 四种过滤器列表：
+// RX_ERR — 错误帧过滤器（mask 含 CAN_ERR_FLAG）
+// RX_INV — 反向过滤器（can_id 含 CAN_INV_FILTER）
+// RX_ALL — 通配过滤器（mask == 0）
+// RX_FIL — 标准 mask/value 过滤器
+
+// 优化：对于单 CAN ID 非 RTR 订阅，使用哈希索引
+// rx_sff[] 或 rx_eff[] 直接索引（O(1) 匹配）
+// can_rcv() → can_rcv_list_find() 快速定位
+```
+
+## 7. CAN 协议注册 @ :82
+
+```c
+// CAN 协议族支持多个协议：
+static const struct can_proto __rcu *proto_tab[CAN_NPROTO];
+
+// 注册：can_proto_register(&can_raw_proto)
+// → proto_tab[CAN_RAW] = &can_raw_proto
+//   → can_raw_proto 含 .type = SOCK_RAW, .protocol = CAN_RAW
+
+// 已注册的 CAN 协议：
+// CAN_RAW (1) — 原始 CAN 帧（can_raw.c）
+// CAN_BCM  (2) — 广播管理（can_bcm.c）
+// CAN_ISOTP (7) — ISO TP 传输层
+// CAN_J1939 (9) — SAE J1939
+```
+
+## 8. CAN 设备接口
+
+```c
+// 硬件 CAN 驱动通过 net_device 注册：
+struct net_device *alloc_candev(sizeof_priv, echo_skb_max);
+// → 分配 can_priv 私有数据
+// → 设置 can_netdev_ops
+
+struct can_priv {
+    struct net_device *dev;
+    struct can_device_stats can_stats;
+    struct can_bittiming bittiming;           // 位时序
+    struct can_clock clock;                    // 时钟
+    enum can_state state;                      // ERROR_ACTIVE / ERROR_WARNING / ERROR_PASSIVE / BUS_OFF
+    struct can_berr_counter bec;              // 接收/发送错误计数
+};
+
+// CAN 状态管理：
+// → 错误计数超过阈值时自动转换状态
+// → BUS_OFF 状态需用户手动恢复
+```
+
+
+## 9. CAN 错误统计
+
+```c
+// 每个 CAN 设备维护错误统计：
+struct can_device_stats {
+    u32 bus_error;                  // 总线错误计数
+    u32 bus_warning;                // 警告状态次数
+    u32 bus_passive;                // 被动状态次数
+    u32 bus_off;                    // BUS_OFF 次数
+    u32 arbitration_lost;           // 仲裁丢失计数
+    u32 restarts;                   // 恢复次数
+};
+
+// 通过 /sys/class/net/can0/device/ 暴露
+// can-utils 中的 ip -details link show can0
+```
+
+## 10. CAN FD 支持
+
+```c
+// CAN FD（Flexible Data Rate）扩展：
+// struct canfd_frame {
+//     canid_t can_id;
+//     __u8 len;       // 0-64 字节
+//     __u8 flags;      // CANFD_BRS（波特率切换）
+//     __u8 data[64];
+// };
+// setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &on, 1)
+// → 启用 CAN FD 帧收发
+// → 驱动需支持 CAN_CTRLMODE_FD
+```
+
+
+## 11. Loopback 与本地回环
+
+```c
+// can_send() 支持本地回环：
+// → 如果 loop == 1（默认），skb 会克隆一份发送到本地 socket
+// → 用于 CAN 应用程序的自我接收（确认发送成功）
+
+// 回环处理：
+// can_send(skb, 1) → dev_queue_xmit(skb) → 硬件发送
+//                 → can_loopback_xmit(skb_clone) → can_rcv() → 本地 socket
+```
+
+
+## 12. 关键 doom-lsp 确认
+
+```c
+// af_can.c 关键函数：
+// can_send @ :202           — CAN 帧发送（含 loopback 选项）
+// can_rcv @ :?               — CAN 帧接收分发
+// can_rx_register @ :444     — 注册接收过滤器
+// can_rx_unregister @ :513   — 注销接收过滤器
+// can_rcv_list_find @ :366   — 最优过滤器列表计算
+// can_create @ :118          — CAN socket 创建
+
+// can_raw.c 关键函数：
+// raw_sendmsg — 发送原始 CAN 帧
+// raw_recvmsg — 接收原始 CAN 帧
+// raw_bind    — 绑定 CAN 接口+设置过滤器
+```
+
