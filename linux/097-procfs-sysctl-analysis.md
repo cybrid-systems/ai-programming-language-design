@@ -289,3 +289,74 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 // net/sysctl_net.c  — net.*     (net.ipv4.tcp_syncookies)
 // fs/proc/proc_sysctl.c — vm.* (vm.dirty_ratio, vm.swappiness)
 ```
+
+## 10. sysctl 目录树管理
+
+```c
+// /proc/sys/ 下的目录树通过 sysctl_lock 保护：
+
+// insert_links @ :93 — 插入目录链接：
+// → 在父目录的 dentry 树中创建符号链接
+// → 支持同一个 sysctl 表在多个路径下可见
+
+// put_links @ :94 — 移除链接：
+// → unregister_sysctl_table 时调用
+// → 清理所有相关符号链接
+
+// erase_entry @ :185 — 从红黑树删除条目：
+// → rb_erase(&node->node, &dir->root)
+// → 释放 ctl_node 和 ctl_table_header
+
+// drop_sysctl_table @ :90 — 释放表头：
+// → refcount 归零时释放
+// → 递归向上清理父目录（如果父目录空）
+```
+
+## 11. sysctl 的目录操作
+
+```c
+// /proc/sys 的目录文件操作：
+// var proc_sys_dir_file_operations @ :30
+// → .proc_iterate = proc_sys_readdir
+// → 遍历 sysctl 目录红黑树
+
+// var proc_sys_dir_operations @ :31
+// → .proc_lookup = proc_sys_lookup
+// → 在红黑树中按名称查找
+
+// var proc_sys_dentry_operations @ :27
+// → dentry 操作（用于路径解析）
+
+// sysctl 的 inode 操作：
+// var proc_sys_inode_operations @ :29
+// → .permission — 权限检查
+// → .getattr — 获取属性
+```
+
+## 12. proc_sys_poll_notify @ :62
+
+```c
+// sysctl 文件支持 poll（epoll 监听变化）：
+// proc_sys_poll_notify(struct ctl_table_poll *poll)
+// → poll_wait(file, &poll->wait, pt)
+// → 值变化时 wake_up(&poll->wait)
+
+// 使用场景：
+// → 监控内核参数变化
+// → 不频繁轮询 /proc/sys/ 文件
+// → 通过 epoll 等待参数变化通知
+```
+
+## 13. 关键函数索引
+
+| 函数 | 符号 | 作用 |
+|------|------|------|
+| `proc_sysctl.c` | 100 | sysctl 文件系统 |
+| `find_entry` | `:113` | 红黑树二分查找 |
+| `insert_entry` | `:146` | 红黑树插入 |
+| `erase_entry` | `:185` | 红黑树删除 |
+| `insert_links` | `:93` | 目录链接插入 |
+| `put_links` | `:94` | 目录链接移除 |
+| `drop_sysctl_table` | `:90` | 表头释放 |
+| `proc_sys_poll_notify` | `:62` | 文件变化通知 |
+
