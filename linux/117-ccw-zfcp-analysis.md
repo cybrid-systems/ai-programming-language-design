@@ -158,3 +158,59 @@ CCW 通过 `ccw_device_start` 提交 CCW 程序到通道子系统，硬件独立
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 6. zFCP 适配器结构
+
+```c
+// drivers/s390/scsi/zfcp_def.h
+struct zfcp_adapter {
+    struct ccw_device *ccw_device;              // CCW 设备
+    struct zfcp_fsf_req **req_list;             // FSF 请求表（按 req_id 索引）
+    u32 req_no;                                  // 下一个请求序号
+
+    struct fc_host_statistics *fc_stats;
+    struct Scsi_Host *scsi_host;                 // SCSI 主机
+    struct zfcp_adapter_mempool pool;             // 内存池
+    spinlock_t req_list_lock;
+};
+
+struct zfcp_fsf_req {                            // FSF 请求
+    struct list_head list;
+    struct zfcp_adapter *adapter;
+
+    struct ccw1 ccw;                             // CCW 命令
+    struct fsf_qtcb *qtcb;                       // 传输控制块
+    dma_addr_t qtcb_dma;                          // qtcb DMA 地址
+
+    void (*handler)(struct zfcp_fsf_req *);      // 完成回调
+    unsigned long status;                         // 状态标志
+    u32 req_id;                                   // 请求 ID
+};
+```
+
+## 7. FSF 请求生命周期
+
+```c
+// zfcp_fsf_fcp_cmnd() — 发送 SCSI 命令：
+// 1. zfcp_fsf_req_create(adapter, FSF_QTCB_FCP_CMND, ...)
+//    → 分配 fsf_req + qtcb（DMA 一致内存）
+//    → 初始化 fsf_qtcb_bottom_io（LUN、WWPN、cdb）
+// 2. 构造 CCW 程序（READ/WRITE）：
+//    ccw[0] = { cmd=WRITE, flags=CC, cda=qtcb_dma }
+//    ccw[1] = { cmd=READ,  flags=CC, ... }
+// 3. ccw_device_start(adapter->ccw_device, &ccw[0], ...)
+// 4. 完成时：
+//    → ccw_device_irq() → zfcp_fsf_req_complete()
+//    → fsf_req->handler() → 通知 SCSI 层
+```
+
+## 8. SCSI 命令提交
+
+```c
+// zfcp_scsi_queuecommand @ zfcp_scsi.c：
+// → SCSI 中层调用此函数下发 SCSI 命令
+// → zfcp_fsf_fcp_cmnd() — 构造 FCP_CMND IU
+// → 通过 CCW 程序发送到 FCP 适配器
+// → 适配器执行 FC 协议（发起到存储阵列的传输）
+```
+
