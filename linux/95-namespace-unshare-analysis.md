@@ -1,4 +1,4 @@
-# 95-namespace-unshare — Linux 命名空间（namespace）和 unshare 深度源码分析
+# 95-namespace-unshare — Linux 命名空间（namespace）系统深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -8,185 +8,261 @@
 
 ## 0. 概述
 
-**Linux 命名空间（namespace）** 是容器技术的核心——将全局系统资源（PID、网络、挂载点、UTS、IPC、用户、cgroup、时间）隔离为独立的视图。`unshare` 系统调用允许进程创建新的命名空间并加入其中。
+**Linux 命名空间（namespace）** 是容器技术的核心隔离机制——将全局系统资源（PID、网络、挂载点、主机名、IPC、时间、cgroup、用户）划分为独立视图。`unshare` 系统调用创建新命名空间，`setns` 加入已有命名空间，`clone` 在创建进程时指定新命名空间。
 
-**核心设计**：每个进程的 `task_struct->nsproxy`（`struct nsproxy` @ `include/linux/nsproxy.h`）指向一组命名空间指针。`unshare(CLONE_NEWNS|CLONE_NEWNET)` 创建新的命名空间并替换 `nsproxy`。
+**核心设计**：每个进程的 `task_struct->nsproxy` 指针（`struct nsproxy` @ `include/linux/nsproxy.h`）指向 8 种命名空间指针。`copy_namespaces`（fork 时@ `nsproxy.c:169`）和 `unshare_nsproxy_namespaces`（unshare 时 @ `:211`）通过 `create_new_namespaces`（`:88`）创建新的 `nsproxy`，逐个子命名空间调用 `copy_*_ns()` 克隆。
 
 ```
-task_struct
-  └── nsproxy (struct nsproxy) @ nsproxy.h
-        ├── uts_ns   → struct uts_namespace  (hostname)
-        ├── ipc_ns   → struct ipc_namespace  (SysV IPC)
-        ├── mnt_ns   → struct mnt_namespace  (mount table)
-        ├── pid_ns   → struct pid_namespace  (PID numbers)
-        ├── net_ns   → struct net_namespace  (network stack)
-        ├── time_ns  → struct time_namespace (timestamps)
-        └── cgroup_ns→ struct cgroup_namespace(cgroup root)
+fork() → copy_process()            unshare(CLONE_NEWNS)
+  → copy_namespaces(flags, tsk)      → unshare_nsproxy_namespaces()
+    → create_new_namespaces()          → create_new_namespaces()
+      → copy_mnt_ns(flags, ...)           → copy_mnt_ns(CLONE_NEWNS, ...)
+      → copy_utsname(flags, ...)          → copy_utsname(0, ...)
+      → copy_ipcs(flags, ...)             → copy_ipcs(0, ...)
+      → copy_pid_ns(flags, ...)          → copy_pid_ns(0, ...)
+      → copy_net_ns(flags, ...)           → copy_net_ns(0, ...)
+    → tsk->nsproxy = new_ns            → *new_nsp = new_ns
 ```
 
-**doom-lsp 确认**：`kernel/nsproxy.c`（613 行），`include/linux/nsproxy.h`（120 行）。
+**doom-lsp 确认**：`kernel/nsproxy.c`（613 行，28 符号）。`create_new_namespaces` @ `:88`，`copy_namespaces` @ `:169`，`unshare_nsproxy_namespaces` @ `:211`，`switch_task_namespaces` @ `:245`。
 
 ---
 
 ## 1. 核心数据结构 @ nsproxy.h
 
 ```c
+// include/linux/nsproxy.h
 struct nsproxy {
-    refcount_t count;                          // 引用计数
-    struct uts_namespace *uts_ns;
-    struct ipc_namespace *ipc_ns;
-    struct mnt_namespace *mnt_ns;
-    struct pid_namespace *pid_ns_for_children;
-    struct net *net_ns;                        // 网络命名空间
-    struct time_namespace *time_ns;
-    struct time_namespace *time_ns_for_children;
-    struct cgroup_namespace *cgroup_ns;
+    refcount_t count;                          // 引用计数（共享 nsproxy 的进程数）
+    struct uts_namespace *uts_ns;              // hostname/domainname
+    struct ipc_namespace *ipc_ns;              // SysV IPC / POSIX 消息队列
+    struct mnt_namespace *mnt_ns;              // 挂载表
+    struct pid_namespace *pid_ns_for_children;  // 子进程 PID 编号
+    struct net *net_ns;                        // 网络栈（接口、路由、iptables）
+    struct time_namespace *time_ns;            // 当前时间命名空间
+    struct time_namespace *time_ns_for_children; // 子进程时间命名空间
+    struct cgroup_namespace *cgroup_ns;        // cgroup 根目录
 };
+
+// 全局初始命名空间（init 进程使用）：
+extern struct nsproxy init_nsproxy;
 ```
 
-### 命名空间类型
+### 命名空间类型与标志
 
-| 类型 | flag | 隔离资源 | 内核文件 |
-|------|------|---------|----------|
-| **UTS** | `CLONE_NEWUTS` | hostname, domainname | `kernel/utsname.c` |
-| **IPC** | `CLONE_NEWIPC` | SysV IPC, POSIX msgqueue | `ipc/namespace.c` |
-| **Mount** | `CLONE_NEWNS` | 挂载表 | `fs/namespace.c` |
-| **PID** | `CLONE_NEWPID` | PID 编号 | `kernel/pid_namespace.c` |
-| **Net** | `CLONE_NEWNET` | 网络栈（接口/路由/iptables）| `net/core/net_namespace.c` |
-| **User** | `CLONE_NEWUSER` | UID/GID 映射 | `kernel/user_namespace.c` |
-| **Cgroup** | `CLONE_NEWCGROUP` | cgroup 根目录 | `kernel/cgroup/namespace.c` |
-| **Time** | `CLONE_NEWTIME` | 时间偏移 | `kernel/time_namespace.c` |
+| 类型 | flag | 隔离资源 | copy 函数 | 内核文件 |
+|------|------|---------|-----------|----------|
+| **Mount** | `CLONE_NEWNS` | 挂载表 | `copy_mnt_ns` | `fs/namespace.c` |
+| **UTS** | `CLONE_NEWUTS` | hostname, domainname | `copy_utsname` | `kernel/utsname.c` |
+| **IPC** | `CLONE_NEWIPC` | SysV IPC | `copy_ipcs` | `ipc/namespace.c` |
+| **PID** | `CLONE_NEWPID` | PID 编号 | `copy_pid_ns` | `kernel/pid_namespace.c` |
+| **Net** | `CLONE_NEWNET` | 网络栈 | `copy_net_ns` | `net/core/net_namespace.c` |
+| **User** | `CLONE_NEWUSER` | UID/GID 映射 | `copy_user_ns` | `kernel/user_namespace.c` |
+| **Cgroup** | `CLONE_NEWCGROUP` | cgroup 根 | `copy_cgroup_ns` | `kernel/cgroup/namespace.c` |
+| **Time** | `CLONE_NEWTIME` | 时间偏移 | `copy_time_ns` | `kernel/time_namespace.c` |
 
 ---
 
-## 2. copy_namespaces——fork 时的命名空间继承
+## 2. create_new_namespaces @ :88——核心创建函数
+
+```c
+static struct nsproxy *create_new_namespaces(u64 flags,
+    struct task_struct *tsk, struct user_namespace *user_ns,
+    struct fs_struct *new_fs)
+{
+    struct nsproxy *new_nsp;
+
+    // 1. 分配新的 nsproxy
+    new_nsp = create_nsproxy();                  // kmem_cache_alloc(nsproxy_cachep)
+    refcount_set(&new_nsp->count, 1);
+
+    // 2. 逐个子命名空间：如果 flags 中有对应 CLONE_NEW* 位
+    //    则创建新命名空间，否则共享（增加引用计数）
+    //
+    // 每个 copy_*_ns 的模式：
+    //   if (flags & CLONE_NEWXXX)
+    //       return clone_new_xxx(...)    // 创建新的独立实例
+    //   else
+    //       return get_xxx(old_ns)       // 增加引用（共享）
+
+    new_nsp->mnt_ns = copy_mnt_ns(flags, tsk->nsproxy->mnt_ns, user_ns, new_fs);
+    new_nsp->uts_ns = copy_utsname(flags, user_ns, tsk->nsproxy->uts_ns);
+    new_nsp->ipc_ns = copy_ipcs(flags, user_ns, tsk->nsproxy->ipc_ns);
+    new_nsp->pid_ns_for_children = copy_pid_ns(flags, user_ns, ...);
+    new_nsp->cgroup_ns = copy_cgroup_ns(flags, user_ns, ...);
+    new_nsp->net_ns = copy_net_ns(flags, user_ns, tsk->nsproxy->net_ns);
+    new_nsp->time_ns_for_children = copy_time_ns(flags, user_ns, ...);
+    new_nsp->time_ns = get_time_ns(tsk->nsproxy->time_ns);  // 共享
+
+    // 3. 错误回滚（goto out_* 逐层释放已分配的资源）
+    return new_nsp;
+}
+```
+
+---
+
+## 3. copy_namespaces @ :169——fork 时的命名空间继承
 
 ```c
 // fork() → copy_process() → copy_namespaces(flags, tsk)
-// → 根据 flags 决定是共享还是创建新命名空间
 
-int copy_namespaces(unsigned long flags, struct task_struct *tsk)
+int copy_namespaces(u64 flags, struct task_struct *tsk)
 {
     struct nsproxy *old_ns = tsk->nsproxy;
     struct nsproxy *new_ns;
-    int ret;
 
+    // 快速路径：没有新命名空间标志 → 直接共享
     if (likely(!(flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
                           CLONE_NEWPID | CLONE_NEWNET |
                           CLONE_NEWCGROUP | CLONE_NEWTIME)))) {
-        // 无新的命名空间标志 → 共享（增加引用计数）
-        get_nsproxy(old_ns);
+        get_nsproxy(old_ns);              // 引用计数 +1
         return 0;
     }
 
+    // 多线程不能 unshare 命名空间
     if (!thread_group_empty(tsk))
-        return -EINVAL;                      // 多线程不能 unshare
+        return -EINVAL;
 
-    // 创建新的 nsproxy（复制旧的，替换被请求的命名空间）
-    new_ns = create_new_namespaces(flags, old_ns, tsk, ...);
-    tsk->nsproxy = new_ns;                  // 替换
+    // 创建新的命名空间
+    new_ns = create_new_namespaces(flags, tsk, user_ns, tsk->fs);
+    if (IS_ERR(new_ns))
+        return PTR_ERR(new_ns);
+
+    // 替换进程的 nsproxy
+    tsk->nsproxy = new_ns;
     return 0;
 }
 ```
 
 ---
 
-## 3. unshare_nsproxy_namespaces——unshare 系统调用路径
+## 4. unshare_nsproxy_namespaces @ :211——unshare 系统调用
 
 ```c
 // sys_unshare(flags) → unshare_nsproxy_namespaces()
 
 int unshare_nsproxy_namespaces(unsigned long unshare_flags,
-                                struct nsproxy **new_nsp,
-                                struct cred *new_cred, struct fs_struct *new_fs)
+    struct nsproxy **new_nsp, struct cred *new_cred, struct fs_struct *new_fs)
 {
-    struct nsproxy *new_ns;
+    u64 flags = unshare_flags;
 
-    // 1. 复制当前 nsproxy
-    new_ns = create_new_namespaces(unshare_flags, current->nsproxy,
-                                    current, new_cred);
+    // 1. 检查是否需要操作命名空间
+    if (!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))
+        return 0;                            // 没有命名空间操作
 
-    // 2. 创建新的 UTS 命名空间
-    if (unshare_flags & CLONE_NEWUTS)
-        new_ns->uts_ns = clone_uts_ns(old_ns->uts_ns, ...);
+    // 2. 权限检查
+    user_ns = new_cred ? new_cred->user_ns : current_user_ns();
+    if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+        return -EPERM;
 
-    // 3. 创建新的 IPC 命名空间
-    if (unshare_flags & CLONE_NEWIPC)
-        new_ns->ipc_ns = create_ipc_ns(old_ns->ipc_ns, ...);
-
-    // 4. 创建新的 Mount 命名空间
-    if (unshare_flags & CLONE_NEWNS)
-        new_ns->mnt_ns = copy_mnt_ns(old_ns->mnt_ns, ...);
-
-    // 5. 创建新的 Net 命名空间
-    if (unshare_flags & CLONE_NEWNET)
-        new_ns->net_ns = copy_net_ns(...);
-
-    *new_nsp = new_ns;
+    // 3. 创建新的命名空间
+    *new_nsp = create_new_namespaces(flags, current, user_ns,
+                                     new_fs ? new_fs : current->fs);
     return 0;
 }
 ```
 
 ---
 
-## 4. switch_task_namespaces——切换命名空间
+## 5. switch_task_namespaces @ :245——切换进程的 nsproxy
 
 ```c
-// 在 exec 或 unshare 完成时调用
-void switch_task_namespaces(struct task_struct *tsk, struct nsproxy *new)
+// unshare/setns 完成后调用——替换进程的命名空间指针
+void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)
 {
-    task_lock(tsk);
-    // 保存旧 nsproxy → put_nsproxy(old)
-    // 设置新 nsproxy → tsk->nsproxy = new
-    task_unlock(tsk);
+    struct nsproxy *ns;
+
+    task_lock(p);                             // 保护 task_struct 修改
+    ns = p->nsproxy;
+    p->nsproxy = new;                         // 替换指针
+    task_unlock(p);
+
+    if (ns)
+        put_nsproxy(ns);                      // 释放旧 nsproxy
 }
 ```
 
 ---
 
-## 5. 用户命名空间（User Namespace）
+## 6. setns——加入已有命名空间
 
 ```c
-// CLONE_NEWUSER 是特权命名空间——非特权用户也可以创建
-// 创建时可以映射 UID/GID：
-// /proc/<pid>/uid_map
-// /proc/<pid>/gid_map
+// sys_setns(fd, nstype) — 通过 fd 加入已有命名空间
+SYSCALL_DEFINE2(setns, int, fd, int, nstype)
+{
+    // 1. proc_ns_file = fget(fd) 获取 fd 指向的 proc_ns 文件
+    //    → /proc/<pid>/ns/net, /proc/<pid>/ns/mnt 等
 
-// 用户命名空间中的特权：
-// 在用户命名空间内有 CAP_SYS_ADMIN
-// 可以创建其他命名空间（NEWNS/NEWNET 等）
-// 可以挂载文件系统（但在自己的 mount namespace 内）
+    // 2. struct ns_common *ns = proc_ns_file->private_data;
+
+    // 3. validate_nsset() 验证新命名空间的合法性
+
+    // 4. commit_nsset() → switch_task_namespaces(current, new_nsproxy)
+    //    → task_lock(current)
+    //    → current->nsproxy = new_ns
+    //    → task_unlock(current)
+}
 ```
 
 ---
 
-## 6. 关键函数索引
+## 7. 容器创建示例
 
-| 函数 | 文件名 | 作用 |
-|------|--------|------|
-| `copy_namespaces` | `nsproxy.c` | fork 时命名空间继承 |
-| `create_new_namespaces` | `nsproxy.c` | 创建新的 nsproxy |
-| `unshare_nsproxy_namespaces` | `nsproxy.c` | unshare 系统调用路径 |
-| `switch_task_namespaces` | `nsproxy.c` | 切换进程的 nsproxy |
-| `clone_uts_ns` | `utsname.c` | 克隆 UTS 命名空间 |
-| `copy_net_ns` | `net_namespace.c` | 克隆网络命名空间 |
-| `copy_mnt_ns` | `namespace.c` | 克隆挂载命名空间 |
+```c
+// clone(CLONE_NEWNS|CLONE_NEWUTS|CLONE_NEWIPC|CLONE_NEWPID|
+//       CLONE_NEWNET|CLONE_NEWUSER, ...)
+// → copy_process() → copy_namespaces()
+//   → create_new_namespaces()
+//     → copy_mnt_ns(CLONE_NEWNS, ...)  — 新的挂载表
+//     → copy_utsname(CLONE_NEWUTS, ...) — 新的主机名
+//     → copy_net_ns(CLONE_NEWNET, ...)  — 新的网络栈
+//     → copy_pid_ns(CLONE_NEWPID, ...)  — 新的 PID 空间
+//     → copy_user_ns(CLONE_NEWUSER, ...) — 新的 UID 映射
+```
 
 ---
 
-## 7. 性能
+## 8. 关键函数索引
 
-| 操作 | 延迟 | 说明 |
+| 函数 | 行号 | 作用 |
 |------|------|------|
-| `clone(CLONE_NEWNS)` | ~10μs | 拷贝挂载表 |
-| `clone(CLONE_NEWNET)` | ~50-200μs | 初始化网络栈 |
-| `unshare(CLONE_NEWNS)` | ~5μs | 挂载表 copy-on-write |
+| `create_nsproxy` | `:54` | 分配 nsproxy 对象 |
+| `create_new_namespaces` | `:88` | 逐子命名空间创建/共享 |
+| `copy_namespaces` | `:169` | fork 时调用 |
+| `unshare_nsproxy_namespaces` | `:211` | unshare 时调用 |
+| `switch_task_namespaces` | `:245` | 切换进程 nsproxy |
+| `exit_nsproxy_namespaces` | `:263` | 进程退出清理 |
+| `validate_nsset` | `:398` | setns 命名空间验证 |
+| `commit_nsset` | `:535` | setns 最终提交 |
 
 ---
 
-## 8. 总结
+## 9. 调试
 
-命名空间通过 `task_struct->nsproxy`（`nsproxy.h`）管理 8 种资源隔离视图。`copy_namespaces`（fork 时）和 `unshare_nsproxy_namespaces`（unshare 时）创建新的 `nsproxy`，`switch_task_namespaces` 替换当前进程的命名空间集合。
+```bash
+# 查看进程的命名空间
+ls -la /proc/self/ns/
+# total 0
+# lrwxrwxrwx ... cgroup -> 'cgroup:[4026531835]'
+# lrwxrwxrwx ... ipc    -> 'ipc:[4026531839]'
+# lrwxrwxrwx ... mnt    -> 'mnt:[4026531840]'
+# lrwxrwxrwx ... net    -> 'net:[4026532009]'
+# lrwxrwxrwx ... pid    -> 'pid:[4026531836]'
+# lrwxrwxrwx ... user   -> 'user:[4026531837]'
+# lrwxrwxrwx ... uts    -> 'uts:[4026531838]'
+
+# 命名空间个数
+cat /proc/self/status | grep NS
+
+# 加入命名空间
+nsenter -t <pid> -n -m /bin/bash
+```
+
+---
+
+## 10. 总结
+
+命名空间通过 `task_struct->nsproxy` 管理 8 种资源隔离视图。`create_new_namespaces`（`:88`）逐个子命名空间调用 `copy_*_ns`（按 `CLONE_NEW*` 标志判定创建或共享）。`copy_namespaces`（`:169`）在 fork 时调用，`unshare_nsproxy_namespaces`（`:211`）在 unshare 时调用，`switch_task_namespaces`（`:245`）最终替换进程的 `nsproxy` 指针。
 
 ---
 
