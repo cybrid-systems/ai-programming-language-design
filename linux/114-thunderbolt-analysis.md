@@ -225,3 +225,111 @@ Thunderbolt 驱动通过 `tb_scan_switch` 发现交换机拓扑，`tb_tunnel_all
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 8. tb.c 核心函数（115 符号）
+
+```c
+// drivers/thunderbolt/tb.c — 拓扑管理（115 符号）：
+
+// tb_scan_port @ :86 — 递归扫描端口：
+// → 读取端口配置寄存器
+// → 如果下游连接了交换机 → 分配 tb_switch
+// → tb_scan_switch(新 switch) 递归扫描
+// → 如果 PCIe 适配器端口 → 标记为可用端点
+
+// tb_handle_hotplug @ :87 — 热插拔处理：
+// → 收到热插拔事件 → tb_queue_hotplug()
+// → 检测到新设备 → tb_scan_port()
+// → 检测到设备移除 → tb_remove_dp_resources()
+
+// tb_enable_clx @ :184 — 启用 CLx（低功耗状态）：
+// → CL0s/CL1/CL2 省电模式
+// → 在隧道未使用时可降低功耗
+```
+
+## 9. ctl.c 核心函数（61 符号）
+
+```c
+// drivers/thunderbolt/ctl.c — 控制通道（61 符号）：
+
+struct tb_ctl {
+    struct tb_nhi *nhi;                      // NHI 接口
+    struct tb_ring *tx;                      // 发送 DMA 环
+    struct tb_ring *rx;                      // 接收 DMA 环
+    struct tb_cfg_request_queue *request_queue; // 请求队列
+};
+
+// ctl_tx() — 发送控制帧：
+// → 构造 cfg_request
+// → 写入 tx_ring（DMA 环形缓冲区）
+// → 硬件通过 NHI 发送到 Thunderbolt 线缆
+
+// ctl_rx() — 接收控制帧：
+// → 从 rx_ring 读取 DMA 缓冲区
+// → 解析 cfg_response
+// → 关联到等待的请求
+```
+
+## 10. tunnel.c 核心函数（110 符号）
+
+```c
+// drivers/thunderbolt/tunnel.c — 隧道管理（110 符号）：
+
+// tb_tunnel_alloc_pci @ — 创建 PCIe 隧道：
+// → 分配上下行路径（tb_path_alloc）
+// → 路径包含源/目的端口 + hopid
+// → 每个路径经过的交换机写入 hop 表
+
+// tb_tunnel_alloc_dp @ — 创建 DP 隧道：
+// → 分配 DisplayPort 通道
+// → 设置 DP 带宽分配（bw_alloc_mode）
+
+// tb_tunnel_activate @ — 激活隧道：
+// → 写入所有路径的 hop 表到每个交换机
+// → set tunnel->activated = true
+// → 数据开始传输
+
+// tunnel 参数：
+// dprx_timeout @ :85 — DP 接收超时（模块参数）
+// dma_credits @ :91   — DMA 信用数
+// bw_alloc_mode @ :96 — 带宽分配模式
+```
+
+## 11. 路径分配——tb_path @ path.c
+
+```c
+// 数据路径（tb_path）是 Thunderbolt 的核心抽象：
+struct tb_path {
+    struct tb_port *src_port;           // 源端口
+    struct tb_port *dst_port;           // 目的端口
+    int src_hopid;                      // 源 hop ID
+    int dst_hopid;                      // 目的 hop ID
+    int npaths;
+    struct tb_path_hop *hops;           // 路径跳数组
+
+    unsigned int priority;              // 优先级（DP > PCIe > DMA）
+};
+
+// 每个 tb_path_hop 是一条"跳"：
+struct tb_path_hop {
+    struct tb_port *in_port;            // 输入端口
+    struct tb_port *out_port;           // 输出端口
+    int in_hop_id;
+    int out_hop_id;
+    int next_hop_index;                 // 下一跳索引
+};
+```
+
+## 12. 关键函数索引
+
+| 函数 | 符号数 | 作用 |
+|------|--------|------|
+| `tb.c` | 115 | 拓扑管理、热插拔、CLx |
+| `ctl.c` | 61 | 控制通道、DMA 环 |
+| `tunnel.c` | 110 | 隧道创建、激活、带宽 |
+| `tb_scan_port` | `:86` | 递归扫描端口 |
+| `tb_handle_hotplug` | `:87` | 热插拔事件处理 |
+| `tb_tunnel_alloc_pci` | — | PCIe 隧道分配 |
+| `tb_tunnel_activate` | — | 隧道激活 |
+| `ctl_tx` | — | 控制帧发送 |
+
