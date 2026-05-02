@@ -1,597 +1,672 @@
-# btrfs 文件系统深度分析
+# 249 — Btrfs 文件系统深度分析
 
-**内核版本**: Linux 7.0-rc1  
-**源码路径**: `/home/dev/code/linux/fs/btrfs/`  
-**核心文件**: `ctree.c`, `extent_io.c`, `extent-tree.c`, `block-group.c`, `volumes.c`, `raid56.c`, `scrub.c`, `compression.c`
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）对 `fs/btrfs/ctree.c`、`fs/btrfs/extent_io.c` 进行符号级追踪
+> 内核版本：Linux 7.0-rc1
 
 ---
 
-## 一、Extent Tree 与 B-tree：btrfs 核心结构
+## 0. 概述
 
-### 1.1 多棵树共存
+**Btrfs（B-tree File System）** 是 Linux 内核中唯一一个将 COW B 树作为统一存储引擎的文件系统。与 ext4/XFS 的块组+日志架构不同，Btrfs 用一棵全局 B 树管理所有元数据——文件数据、目录项、extent 分配、chunk 映射、校验和全部纳入同一键空间。
 
-btrfs 不是一棵单一的树，而是由多棵 B-tree 组成，每棵树职责分明：
-
-| 树名 | objectid (root_key.objectid) | 职责 |
-|------|------------------------------|------|
-| **Tree Root** (`BTRFS_ROOT_TREE_OBJECTID = 1`) | 1 | 管理所有根节点，记录所有 subvolume/snapshot root |
-| **Extent Root** (`BTRFS_EXTENT_TREE_OBJECTID = 2`) | 2 | 管理所有 extent 分配，记录 block → extent 映射 |
-| **Fs Tree** (`BTRFS_FS_TREE_OBJECTID = 5`) | 5 | 真实文件系统树，存文件/目录 inode |
-| **Chunk Root** (`BTRFS_CHUNK_TREE_OBJECTID = 7`) | 7 | 管理 chunk 和设备信息 |
-| **Dev Root** (`BTRFS_DEV_TREE_OBJECTID = 8`) | 8 | 管理设备 extent |
-| **Csum Root** | 9 | 校验和树 |
-| **Reloc Root** | -10 (TREE_RELOC_OBJECTID) | 快照/平衡时用的迁移树 |
+**架构特点**：
 
 ```
-Super Block
-    ├── tree_root  (rootid=1)   → 管理所有根
-    │       └── [subvolume root entries]
-    ├── extent_root (rootid=2) → 管理 extent 分配
-    │       └── extent items: (bytenr, size) → {refs, flags, extent_inline_ref*}
-    ├── fs_root   (rootid=5)   → 真实文件树
-    │       └── INODE_ITEM / INODE_REF / DIR_ITEM / EXTENT_DATA ...
-    └── chunk_root (rootid=7)  → 管理 chunk 条目
-            └── chunk items: stripe 分布信息
+用户可见文件系统
+    └── fs_root（文件 B 树，每个子卷独立）
+        └── tree_root（全局元数据 B 树，所有根的根）
+            ├── extent-tree（空闲 extent 分配记录）
+            ├── chunk_root（chunk → 物理设备映射）
+            ├── dev_root（设备列表）
+            └── csum_root（数据校验和）
+
+块设备层
+    └── raid1/mirror / raid10 / dup（在 chunk_map 层实现）
 ```
 
-### 1.2 Extent Tree vs Fs Tree
+---
 
-**Extent Tree**（`BTRFS_EXTENT_TREE_OBJECTID = 2`）的核心职责是追踪"哪些磁盘空间已被分配"。
+## 1. 核心数据结构
 
-在 extent tree 中，每个 key 的格式为：
+### 1.1 extent_buffer — B 树节点
 
-```
-key.objectid = extent 的起始 bytenr
-key.type     = BTRFS_EXTENT_ITEM_KEY (= 168)
-key.offset   = extent 的长度
-```
-
-对应的 `struct btrfs_extent_item`（定义在 `btrfs_tree.h:792`）包含：
+每个 B 树节点在内存中是 `struct extent_buffer`，在磁盘上直接对应一个块设备扇区组：
 
 ```c
-struct btrfs_extent_item {
-    __u64 refs;        // 引用计数（多少个 owner 引用此 extent）
-    __u64 generation;   // 创建时的事务 generation
-    __u64 flags;       // BTRFS_EXTENT_FLAG_TREE_BLOCK | DATA | FULL_BACKREF 等
-    // 后面跟着 extent_inline_ref（如果 inline 不下）
-};
-```
-
-extent tree 中的 inline ref 类型（`btrfs_tree.h:845`）记录了这个 extent 被谁引用：
-
-- `BTRFS_TREE_BLOCK_REF_KEY (176)`: 引用者是另一个 tree block（子树的根节点）
-- `BTRFS_EXTENT_DATA_REF_KEY (178)`: 引用者是一个文件中的数据 extent
-- `BTRFS_SHARED_BLOCK_REF_KEY (179)`: 被多个 tree block 共享（通过 `FULL_BACKREF` flag）
-
-**Fs Tree**（`BTRFS_FS_TREE_OBJECTID = 5`）存储文件的实际内容布局：
-
-```
-key.objectid = inode 号
-key.type     = BTRFS_EXTENT_DATA_KEY (= 108)
-key.offset   = 文件内的逻辑偏移
-```
-
-对应 `struct btrfs_file_extent_item`，记录了数据在磁盘上的物理位置或压缩信息。
-
-**本质区别**：
-
-- **Extent Tree** 是"空间分配账本"，回答"磁盘上这块空间归谁用"
-- **Fs Tree** 是"文件系统视图"，回答"这个文件的数据存在哪"
-
-### 1.3 struct btrfs_path 工作方式
-
-`btrfs_search_slot()` 是所有树操作的入口（`ctree.c:2001`）：
-
-```c
-int btrfs_search_slot(struct btrfs_trans_handle *trans,
-                      struct btrfs_root *root,
-                      const struct btrfs_key *key,
-                      struct btrfs_path *p,
-                      int ins_len, int cow)
-```
-
-`struct btrfs_path`（`ctree.h:57`）维护搜索路径：
-
-```c
-struct btrfs_path {
-    struct extent_buffer *nodes[BTRFS_MAX_LEVEL]; // 每层节点
-    int slots[BTRFS_MAX_LEVEL];                    // 每层的槽位
-    u8 locks[BTRFS_MAX_LEVEL];                     // 锁级别
-    u8 lowest_level;                               // 最低起始层
-    // ... 搜索控制 flags
-};
-```
-
-搜索过程：
-1. `btrfs_search_slot_get_root()` 获取根节点（`ctree.c:1703`）
-2. 自顶向下遍历各层，对每个节点执行 `btrfs_bin_search()` 二分查找
-3. `btrfs_header_level() == 0` 时到达 leaf 层
-4. 记录每层的 `nodes[]` 和 `slots[]`，供后续插入/删除使用
-
-### 1.4 Leaf / Node 结构
-
-extent buffer 是 btrfs 在内存中的树节点抽象（`extent_io.h:86`）：
-
-```c
+// fs/btrfs/extent_io.h:86
 struct extent_buffer {
-    u64 start;          // 块起始地址
-    u32 len;            // 块长度（通常 = nodesize，4K~64K）
-    void *addr;         // 映射到内存的地址
-    refcount_t refs;    // 引用计数
-    struct rw_semaphore lock; // 读写锁
-    struct folio *folios[];   // 数据页面
+    u64 start;                          /* 磁盘起始字节偏移 */
+    u32 len;                            /* 节点长度（通常 16KB）*/
+    unsigned long bflags;               /* 标志位（WRITTEN, LOCKED 等）*/
+    struct btrfs_fs_info *fs_info;
+    void *addr;                         /* 内存映射地址 */
+
+    spinlock_t refs_lock;
+    refcount_t refs;                    /* 引用计数，用于缓存回收 */
+    int read_mirror;                    /* 读取使用的镜像号 */
+
+    struct rw_semaphore lock;           /* 读写信号量，锁住整个节点 */
+    struct folio *folios[INLINE_EXTENT_BUFFER_PAGES];
 };
 ```
 
-**Leaf（level = 0）** 结构（`btrfs_tree.h` 中 `btrfs_leaf`）：
-```
-struct btrfs_leaf {
-    struct btrfs_header {        // 固定头
-        u64 bytenr;
-        u64 generation;
-        u64 owner;              // root id
-        u32 nritems;            // item 数量
-        u64 flags;
-        u8 level;               // = 0
-    } header;
-    struct btrfs_item[] items;  // 可变长数组
-    // 数据区：item[0]的数据, item[1]的数据, ...
+**磁盘格式**（`struct btrfs_header`，每个 extent_buffer 头部都有）：
+
+```c
+struct btrfs_header {
+    u8 csum[BTRFS_CSUM_SIZE];           /* CRC32C 元数据校验和 */
+    u8 fsid[BTRFS_FSID_SIZE];           /* 文件系统 UUID */
+    __le64 bytenr;                      /* 自身磁盘地址 */
+    __le64 flags;
+    u8 chunk_tree_uuid[BTRFS_UUID_SIZE];
+    __le64 generation;                  /* 事务世代号（核心）*/
+    __le64 owner;                       /* 所属根的 objectid */
+    __le32 nritems;                     /* 条目数量 */
+    u8 level;                           /* 树层级（0=leaf）*/
 };
 ```
 
-**Node（level > 0）** 结构：
-```
-struct btrfs_node {
-    struct btrfs_header { ... } header;
-    struct btrfs_key_ptr[] ptrs; // 子节点指针数组
+**关键**：`generation` 字段使得 Btrfs 可以不通过日志就实现原子性——每次事务提交后 generation 递增，旧节点保留但 generation 不匹配，因此不可见。
+
+### 1.2 btrfs_path — B 树搜索路径
+
+Btrfs 的 B 树搜索路径记录从根到叶子的完整遍历状态：
+
+```c
+// fs/btrfs/ctree.h
+struct btrfs_path {
+    struct extent_buffer *nodes[BTRFS_MAX_LEVEL]; /* 每层节点（锁住）*/
+    int slots[BTRFS_MAX_LEVEL];                    /* 每层槽位 */
+    u8 locks[BTRFS_MAX_LEVEL];                      /* 锁状态 */
+    u8 lowest_level;                               /* 最低允许层级 */
+    bool skip_locking;                             /* 跳过加锁（只读搜索）*/
+    bool search_commit_root;                       /* 在已提交根中搜索 */
+    bool nowait;                                   /* 非阻塞模式 */
 };
 ```
 
-`btrfs_item` 包含 `offset`（数据在 leaf 中的偏移）和 `size`（数据长度）。这种 **items 和数据分离** 的设计使得 leaf 可以动态增长/收缩。
+使用模式：
+```c
+path = btrfs_alloc_path();
+btrfs_search_slot(trans, root, &key, path, ins_len, cow);
+// → 完成后 path->nodes[level] 持有每层锁住的 buffer
+//   path->slots[level] 记录每层位置
+btrfs_release_path(path);    // 释放锁和引用
+btrfs_free_path(path);
+```
 
-关键访问函数在 `accessors.h` 中定义：
-- `btrfs_item_nr()`: 获取第 N 个 item
-- `btrfs_item_key()`: 获取 item 的 key
-- `btrfs_item_data_end()`: item 数据结束位置
-- `btrfs_node_blockptr()`: 获取 node 中第 N 个子块指针
+### 1.3 btrfs_key — 全局统一键
+
+```c
+struct btrfs_key {
+    u64 objectid;      /* 对象 ID（inode 号、root ID 等）*/
+    u8 type;            /* 条目类型，区分元数据类型 */
+    u64 offset;         /* 偏移或子类型 */
+};
+```
+
+通过 `(objectid, type, offset)` 三元组定位所有对象：
+
+| type 值 | 含义 |
+|---------|------|
+| `BTRFS_INODE_ITEM_KEY` | inode 元数据 |
+| `BTRFS_DIR_ITEM_KEY` | 目录项 |
+| `BTRFS_EXTENT_DATA_KEY` | 文件数据 extent 引用 |
+| `BTRFS_EXTENT_ITEM_KEY` | extent 分配记录（extent-tree）|
+| `BTRFS_CHUNK_ITEM_KEY` | chunk 物理映射（chunk_root）|
+| `BTRFS_ROOT_ITEM_KEY` | 子卷根节点指针 |
 
 ---
 
-## 二、COW 机制：Copy-on-Write 深度解析
+## 2. Extent Tree 与 B-tree 的关系
 
-### 2.1 COW 的触发路径
+### 2.1 两套 B 树
 
-btrfs 的 COW 路径入口是 `btrfs_cow_block()`（`ctree.c:651`）：
-
-```c
-int btrfs_cow_block(struct btrfs_trans_handle *trans,
-                    struct btrfs_root *root,
-                    struct extent_buffer *buf,
-                    struct extent_buffer *parent, int parent_slot,
-                    struct extent_buffer **cow_ret,
-                    enum btrfs_lock_nesting nest)
-```
-
-触发条件（`should_cow_block()` at `ctree.c:606`）：
-1. `BTRFS_ROOT_FORCE_COW` flag 被设置
-2. 对 leaf 中的 item 做写入操作（`ins_len != 0`）
-3. 对 tree block 做修改且不在当前 transaction 的 commit root 中
-
-### 2.2 COW 实际执行：btrfs_force_cow_block
-
-`btrfs_force_cow_block()`（`ctree.c:465`）是真正的 COW 执行者：
+Btrfs 在 `fs_info` 中维护多个独立的 B 树根（`btrfs_root`）：
 
 ```c
-cow = btrfs_alloc_tree_block(trans, root, parent_start,
-                              btrfs_root_id(root), &disk_key, level,
-                              search_start, empty_size, reloc_src_root, nest);
-// ↑ 分配一个新块
-
-copy_extent_buffer_full(cow, buf);  // 复制原块内容到新块
-btrfs_set_header_generation(cow, trans->transid); // 写入新 generation
-
-// 更新父节点指针，指向新块
-if (parent)
-    btrfs_set_node_blockptr(parent, parent_slot, cow->start);
-```
-
-关键点：**父节点的更新也在同一个 transaction 内**，这是保证原子性的基础。
-
-### 2.3 分配新块：btrfs_alloc_tree_block
-
-`btrfs_alloc_tree_block()`（在 `extent-tree.c` 中）负责分配新块：
-1. 调用 `btrfs_find_free_extent()` 在 extent tree 中找可用空间
-2. 在 block group 中寻找合适的物理位置
-3. 更新 extent tree（`BTRFS_EXTENT_ITEM_KEY`）记录新分配
-
-### 2.4 旧块的释放：引用计数递减
-
-旧块不会立即释放，而是通过 **延迟引用**（delayed ref）机制处理：
-
-```c
-// delayed-ref.c 中的队列机制
-struct btrfs_delayed_ref_node {
-    u64 bytenr;
-    u64 num_bytes;
-    refcount_t refs;
-    // ...
+// fs/btrfs/fs.h
+struct btrfs_fs_info {
+    struct btrfs_root *tree_root;       /* 全局元数据 B 树（extent-tree 的载体）*/
+    struct btrfs_root *chunk_root;      /* chunk→物理设备映射树 */
+    struct btrfs_root *fs_root;         /* 当前文件系统的文件树根 */
+    struct btrfs_root *dev_root;        /* 设备列表树 */
+    struct btrfs_root *csum_root;       /* 数据校验和树 */
+    struct btrfs_root *free_space_root; /* 空闲空间管理树（V2）*/
 };
 ```
 
-当 `btrfs_inc_ref()` / `btrfs_dec_ref()` 被调用时，修改不会立即反映到 extent tree，而是先进入 delayed ref 队列。在 transaction commit 时，`__btrfs_run_delayed_refs()` 批量处理这些引用计数变更。
+**核心区分**：
 
-**旧 block 的实际释放时机**：当 `refs` 计数归零时，在 transaction commit 过程中通过 `__btrfs_free_extent()` 归还到 free space cache。
-
----
-
-## 三、Chunk 与 Extent：存储分配机制
-
-### 3.1 Chunk 的概念
-
-Chunk 是 btrfs 存储分配的**逻辑单位**，一个 chunk 有以下属性：
+- **tree_root**：管理所有其他 B 树根的元数据 B 树。其叶子中包含 `BTRFS_ROOT_ITEM_KEY`，指向各个子卷的根节点。快照的核心机制就在这里——两个 root_item 可以指向同一个根节点（COW 前共享）。
+- **fs_root（文件树）**：每个子卷/快照有一个独立的文件树。文件树中存储 `BTRFS_INODE_ITEM_KEY`、`BTRFS_DIR_ITEM_KEY`、`BTRFS_EXTENT_DATA_KEY` 等。
+- **extent-tree（extent_root）**：在 tree_root 中存储为 `BTRFS_EXTENT_ITEM_KEY` 条目，记录每个物理 extent 的分配状态（已用/空闲）。
 
 ```
-起始地址（chunk_root 中的 key.objectid）
-长度（通常 256MB~1GB）
-类型（DATA | METADATA | SYSTEM）
-profile（ SINGLE | DUP | RAID1 | RAID10 | RAID56 等）
-stripe 信息（设备号 + 物理偏移）
+tree_root B 树：
+  key = (objectid=某个根的ID, type=BTRFS_ROOT_ITEM_KEY, offset=0)
+    → value = btrfs_root_item（包含该根的根节点块号）
+
+  key = (objectid=X, type=BTRFS_EXTENT_ITEM_KEY, offset=Y)
+    → value = extent 分配记录（哪个物理范围、属于哪个根、引用计数）
+
+  key = (objectid=0, type=BTRFS_CHUNK_ITEM_KEY, offset=Z)
+    → value = chunk 条目（条带数、物理设备列表）
 ```
 
-Chunk 条目存储在 **Chunk Root** 中，格式为 `struct btrfs_chunk`（`volumes.c`）：
+### 2.2 extent tree 是怎么工作的
+
+当 btrfs 需要分配一个新的元数据块时：
 
 ```c
-struct btrfs_chunk {
-    __u64 length;          // chunk 长度
-    __u64 owner;           // = BTRFS Chunk tree objectid
-    __u64 stripe_len;      // stripe 长度（通常 64K）
-    __u64 type;            // DATA/METADATA/SYSTEM flags
-    __u16 num_stripes;     // stripe 数量
-    __u16 sub_stripes;     // RAID10 子条带数
-    __u32 io_align;         // IO 对齐
-    __u32 io_width;        // IO 宽度
-    __u32 sector_size;     // 扇区大小
-    struct btrfs_stripe[] stripes; // 各 stripe 设备/偏移
-};
-```
-
-### 3.2 btrfs_alloc_chunk 分配流程
-
-`btrfs_create_chunk()`（`volumes.c:6044`）的完整分配流程：
-
-```
-1. init_alloc_chunk_ctl()
-   - 根据 raid profile 初始化 ctl 参数
-   - 确定 devs_max, devs_min, ncopies, nparity 等
-
-2. gather_device_info()
-   - 遍历所有读写设备，收集可用空间信息
-   - 对每个设备调用 find_free_dev_extent() 找孔洞
-
-3. decide_stripe_size()
-   - 计算 chunk 大小（受 max_chunk_size 限制）
-   - 确定 num_stripes 和 stripe_len
-
-4. create_chunk() → 分配设备 extent
-   - 对每个 stripe 设备调用 find_free_dev_extent()
-   - 更新 dev_tree（记录设备 extent）
-   - 创建 block_group 结构体
-
-5. btrfs_chunk_alloc_add_chunk_item()
-   - 在 chunk_root 中插入 chunk item（BTRFS_CHUNK_ITEM_KEY）
-   - 更新 super block 中的 sys_chunk_array
-```
-
-Block Group 是 chunk 的内存抽象，通过 `btrfs_get_chunk_map()` 可以从 chunk 起始地址获取其 stripe 映射。
-
-### 3.3 Extent Tree 记录已分配 Extent
-
-当分配一个新的 data extent 时（`extent-tree.c`）：
-
-```c
-// btrfs_inode.c 中的 extent 分配
-ins.objectid = start;    // 逻辑地址
-ins.type = BTRFS_EXTENT_ITEM_KEY;
-ins.offset = num_bytes;  // 长度
-
-// 在 extent_root 中插入 item
-btrfs_insert_empty_item(trans, extent_root, path, &ins, ...);
-
-// 插入 inline ref 说明谁拥有这个 extent
-// type = BTRFS_EXTENT_DATA_REF_KEY 或 TREE_BLOCK_REF_KEY
-add_extent_mapping(extent_root, &ins, &extent_ref);
-```
-
-读取文件数据时，通过 `btrfs_lookup_data_extent()` 在 extent tree 中查找对应的 extent item。
-
----
-
-## 四、RAID1 / RAID10：镜像层面
-
-### 4.1 btrfs RAID 的实现层级
-
-**重要**：btrfs 的 RAID 镜像**发生在块设备分配层面**，不是文件系统逻辑层面。
-
-```
-应用写入文件数据
-    ↓
-btrfs 根据 extent 位置，确定 block_group 的 profile
-    ↓
-block_group 为 RAID1/RAID10 时
-    ↓
-在 btrfs_get_chunk_map() 获取 stripe 映射
-    ↓
-bio 会被拆分，镜像写入所有 stripe 设备
-```
-
-### 4.2 RAID1 实现
-
-`struct btrfs_raid_array`（`volumes.h:38`）定义了 RAID1 参数：
-
-```c
-[BTRFS_RAID_RAID1] = {
-    .bg_flag    = BTRFS_BLOCK_GROUP_RAID1,
-    .devs_max   = 2,
-    .devs_min   = 2,
-    .devs_increment = 1,
-    .ncopies    = 2,         // 2 份拷贝
-    .nparity    = 0,
-    .mindev_error = BTRFS_ERROR_DEV_RAID10_MIN_NOT_MET,
-}
-```
-
-当分配一个 RAID1 extent 时：
-1. `decide_stripe_size()` 从多个设备各分配一个 stripe
-2. `create_chunk()` 为每个 stripe 调用 `find_free_dev_extent()` 分别在不同设备上分配
-3. 写入时，同一 bio 会被 **btrfs_rmw（Read-Modify-Write）** 处理（`raid56.c` 中 `rmw_rbio()`）
-
-### 4.3 RAID10 实现
-
-```c
-[BTRFS_RAID_RAID10] = {
-    .bg_flag    = BTRFS_BLOCK_GROUP_RAID10,
-    .devs_max   = 0,       // 无限制
-    .devs_min   = 4,
-    .sub_stripes = 2,      // 每个"子条带"镜像对
-    .ncopies    = 2,
-}
-```
-
-RAID10 = 条带化（Stripe）+ 镜像。数据被分成 `num_stripes / sub_stripes` 个条带，每个条带内部做镜像。
-
-### 4.4 RAID56（RMW 问题）
-
-RAID5/6 的写入因为部分条带更新需要 Read-Modify-Write（`raid56.c:1439` 的 `rmw_assemble_write_bios`）：
-
-```
-读取整个 stripe（所有数据盘 + P/Q 盘）
-计算新的 P/Q
-写回数据盘 + P/Q
-```
-
-这就是 RAID56 的"写放大"问题根源。btrfs 在 `raid56.c` 中实现了 `raid56_parity_write()` 和 `raid56_parity_recover()` 来处理这些逻辑。
-
----
-
-## 五、快照与子卷：COW 的应用
-
-### 5.1 快照的本质
-
-btrfs 的快照本质上是**对一个 subvolume root 的引用**。
-
-`struct btrfs_root_item`（`ctree.h`）中的关键字段：
-```c
-struct btrfs_root_item {
-    u64 bytenr;           // 根节点的物理地址
-    u8 level;             // 根节点层级
-    u64 generation;       // 创建时的 generation
-    u64 root_dirid;       // 根目录的 inode id
-    u32 refs;             // 引用计数（快照数量）
-    u64 flags;
-    // ...
-};
-```
-
-快照创建（`ioctl.c:704` 的 `create_snapshot`）：
-1. 分配一个新的 root item（`pending_snapshot->root_item`）
-2. 复制原始 subvolume 的 root item，但 **bytenr 指向原始的 root node**
-3. 写入 `BTRFS_ROOT_ITEM_KEY` 到 tree_root 中
-4. 设置 `BTRFS_ROOT_SUBVOL_RDONLY` 为只读快照
-
-### 5.2 COW 对快照的影响
-
-当原始 subvolume 修改数据时：
-1. 假设要修改 leaf L，COW 后得到新的 leaf L'
-2. 原始 subvolume 的路径变为：`root → ... → L'`
-3. 快照的路径仍然是：`root_snapshot → ... → L`（指向未修改的旧 leaf）
-
-**快照和原始 subvolume 共享未修改的 tree block**，这就是 btrfs 快照"秒建"的秘密——不需要复制任何数据，只需要复制路径上的 tree node。
-
-### 5.3 子卷（Subvolume）与 Shareable Root
-
-`BTRFS_ROOT_SHAREABLE` flag（`ctree.h:92`）标识的 root 可以被快照：
-
-```c
-// ctree.c:531 在 btrfs_copy_root 中
-if (test_bit(BTRFS_ROOT_SHAREABLE, &root->state)) {
-    ret = btrfs_inc_ref(trans, root, cow, true);
-} else {
-    ret = btrfs_inc_ref(trans, root, cow, false);
-}
-```
-
-只有设置了 `BTRFS_ROOT_SHAREABLE` 的 root 才会被 `btrfs_copy_root()` 增加引用计数。Fs Tree 和 Reloc Tree 是 shareable 的，而其他系统树不是。
-
-### 5.4 Reloc Root（快照/平衡时的特殊处理）
-
-`btrfs_copy_root()` 当 `new_root_objectid == BTRFS_TREE_RELOC_OBJECTID` 时会设置 `BTRFS_HEADER_FLAG_RELOC`，表示这是一个 reloc root。在快照创建和平衡过程中，btrfs 会创建 reloc root 来处理被移动的 tree block。
-
----
-
-## 六、压缩：zlib vs zstd
-
-### 6.1 压缩的启用方式
-
-btrfs 支持三种压缩算法（`compression.c:39`）：
-```c
-static const char* const btrfs_compress_types[] = {
-    "", "zlib", "lzo", "zstd"
-};
-```
-
-### 6.2 Compressed Data Extent 的读取
-
-文件 extent 的类型（`BTRFS_FILE_EXTENT_INLINE = 0` 或 `BTRFS_FILE_EXTENT_REG = 1`）决定了数据是否压缩。
-
-`struct btrfs_file_extent_item`（`btrfs_tree.h`）中的压缩信息：
-
-```c
-__u8 type;                    // REG 或 INLINE
-__u64 disk_bytenr;            // 压缩数据在磁盘上的起始位置
-__u64 disk_num_bytes;         // 压缩后的大小
-__u64 offset;                 // 在 extent 内的逻辑偏移
-__u64 num_bytes;              // 解压后的大小
-__u8 compression;             // 0=无压缩, zlib=1, lzo=2, zstd=3
-```
-
-**读取压缩 extent 的流程**（`compression.c`）：
-
-```c
-int compression_decompress_bio(struct list_head *ws,
-                               struct compressed_bio *cb)
+// fs/btrfs/extent-tree.c:4871
+int btrfs_reserve_extent(..., struct btrfs_key *ins, ...)
 {
-    switch (cb->compress_type) {
-    case BTRFS_COMPRESS_ZLIB: return zlib_decompress_bio(ws, cb);
-    case BTRFS_COMPRESS_LZO:  return lzo_decompress_bio(ws, cb);
-    case BTRFS_COMPRESS_ZSTD: return zstd_decompress_bio(ws, cb);
+    // 找空闲空间 → 更新 extent tree（写入 tree_root B 树）
+    ret = find_free_extent(root, ins, &ffe_ctl);
+
+    // 为已分配 extent 创建 delayed ref
+    // 这会插入 tree_root 中的 BTRFS_EXTENT_ITEM_KEY 条目
+}
+```
+
+extent tree 的条目描述了每个物理 extent 的归属和引用计数。当一个 block 被多个 root 共享时（如快照），extent 条目中记录 `ref_count > 1`，只有 `ref_count==0` 时才真正释放。
+
+### 2.3 btrfs_search_slot 的工作方式
+
+`btrfs_search_slot` 是所有 B 树操作的入口：
+
+```c
+// fs/btrfs/ctree.c:2001
+int btrfs_search_slot(struct btrfs_trans_handle *trans,
+    struct btrfs_root *root, const struct btrfs_key *key,
+    struct btrfs_path *p, int ins_len, int cow)
+{
+    // 1. 获取根节点（根据 search_commit_root / skip_locking 决定加锁模式）
+    b = btrfs_search_slot_get_root(root, p, write_lock_level);
+
+    // 2. 逐层下降
+    while (b) {
+        slot = btrfs_bin_search(b, key, &slot_ret); // 二分查找
+
+        if (level == 0) break; // 到了叶子层
+
+        // 3. 如果需要 COW（cow=1 且 ins_len≠0）
+        if (cow && should_cow_block(trans, root, b)) {
+            ret2 = btrfs_cow_block(trans, root, b, ...);
+            p->nodes[level] = cow;
+        }
+
+        // 4. 下降到子节点
+        b = btrfs_read_node_slot(b, slot);
+        level--;
+    }
+    return ret;
+}
+```
+
+`btrfs_search_slot_get_root` 根据路径模式有不同的根获取方式：
+
+```c
+// fs/btrfs/ctree.c:1703
+static struct extent_buffer *btrfs_search_slot_get_root(...)
+{
+    if (p->search_commit_root) {
+        // 只读搜索：从 root->commit_root 开始，不加锁
+        b = root->commit_root;
+        refcount_inc(&b->refs);
+        goto out;
+    }
+    if (p->skip_locking) {
+        // 跳过加锁（内部操作）
+        b = btrfs_root_node(root);
+        goto out;
+    }
+    // 正常读写：从 root->node 开始，需要 rw 锁
+    b = btrfs_read_lock_root_node(root);
+}
+```
+
+---
+
+## 3. COW 机制详解
+
+### 3.1 should_cow_block — 判断是否需要 COW
+
+```c
+// fs/btrfs/ctree.c:606
+static inline bool should_cow_block(struct btrfs_trans_handle *trans,
+    const struct btrfs_root *root, struct extent_buffer *buf)
+{
+    // 条件1：块不是本事务创建的
+    if (btrfs_header_generation(buf) != trans->transid)
+        return true;
+
+    // 条件2：块已经被写过（不是新建的）
+    if (btrfs_header_flag(buf, BTRFS_HEADER_FLAG_WRITTEN))
+        return true;
+
+    // 条件3：根被强制 COW（快照创建期间）
+    if (test_bit(BTRFS_ROOT_FORCE_COW, &root->state))
+        return true;
+
+    // 条件4：RELOC 根不需要 COW
+    if (btrfs_root_id(root) == BTRFS_TREE_RELOC_OBJECTID)
+        return false;
+
+    // 条件5：RELOC 标记的块需要 COW
+    if (btrfs_header_flag(buf, BTRFS_HEADER_FLAG_RELOC))
+        return true;
+
+    return false;
+}
+```
+
+这意味着：**每个事务中，对同一个 block 的第一次修改就需要 COW**。这保证了快照创建时，所有被快照共享的节点都自动获得独立的副本。
+
+### 3.2 btrfs_cow_block — COW 执行路径
+
+```c
+// fs/btrfs/ctree.c:651
+int btrfs_cow_block(struct btrfs_trans_handle *trans,
+    struct btrfs_root *root, struct extent_buffer *buf,
+    struct extent_buffer *parent, int parent_slot,
+    struct extent_buffer **cow_ret, enum btrfs_lock_nesting nest)
+{
+    // 0. 必须在活跃事务中
+    if (trans->transaction != fs_info->running_transaction ||
+        trans->transid != fs_info->generation)
+        return -EUCLEAN;
+
+    // 1. 判断是否真的需要 COW（内联检查）
+    if (!should_cow_block(trans, root, buf)) {
+        *cow_ret = buf;
+        return 0;
+    }
+
+    // 2. 委托给 btrfs_force_cow_block 执行实际 COW
+    return btrfs_force_cow_block(trans, root, buf, parent, parent_slot,
+                                 cow_ret, search_start, 0, nest);
+}
+```
+
+### 3.3 btrfs_force_cow_block — 真正的 COW 操作
+
+```c
+// fs/btrfs/ctree.c:465
+int btrfs_force_cow_block(struct btrfs_trans_handle *trans,
+    struct btrfs_root *root, struct extent_buffer *buf, ...)
+{
+    level = btrfs_header_level(buf);
+
+    // 1. 从 extent 分配器申请新块
+    cow = btrfs_alloc_tree_block(trans, root, parent_start,
+        btrfs_root_id(root), &disk_key, level, search_start, 0, ...);
+
+    // 2. 将旧节点内容完整复制到新节点
+    copy_extent_buffer_full(cow, buf);
+
+    // 3. 设置新节点的元数据
+    btrfs_set_header_generation(cow, trans->transid); // 新 generation
+    btrfs_clear_header_flag(cow, BTRFS_HEADER_FLAG_WRITTEN |
+                                  BTRFS_HEADER_FLAG_RELOC);
+    btrfs_set_header_owner(cow, btrfs_root_id(root));
+
+    // 4. 更新旧节点的引用计数（update_ref_for_cow）
+    ret = update_ref_for_cow(trans, root, buf, cow, &last_ref);
+    // → tree_root 中的 extent 条目引用计数变化
+    // → 如果 last_ref=1（旧节点不再被任何东西引用），可被释放
+
+    // 5. RELOC 根特殊处理
+    if (test_bit(BTRFS_ROOT_SHAREABLE, &root->state))
+        btrfs_reloc_cow_block(trans, root, buf, cow);
+
+    // 6. 更新父节点指针
+    if (buf == root->node) {
+        // 根节点 COW：原子切换根指针
+        rcu_assign_pointer(root->node, cow);
+        add_root_to_dirty_list(root);
+    } else {
+        // 非根：更新父节点的子指针
+        btrfs_set_node_blockptr(parent, parent_slot, cow->start);
+        btrfs_set_node_ptr_generation(parent, parent_slot, trans->transid);
+        btrfs_mark_buffer_dirty(trans, parent);
+    }
+
+    // 7. 释放旧块
+    btrfs_free_tree_block(trans, btrfs_root_id(root), buf, ...);
+}
+```
+
+**核心**：COW 后旧块通过 `update_ref_for_cow` 更新 extent 树中的引用计数。当引用计数归零，旧块才成为空闲空间。这正是快照可以"零成本共享"的原因——快照不复制数据，只增加引用计数。
+
+### 3.4 btrfs_copy_root — 快照中的整树复制
+
+快照不只是 COW 单个块，而是复制从当前根到被修改路径上所有块的完整链：
+
+```c
+// fs/btrfs/ctree.c:243
+int btrfs_copy_root(struct btrfs_trans_handle *trans,
+    struct btrfs_root *root, struct extent_buffer *buf,
+    struct extent_buffer **cow_ret, u64 new_root_objectid)
+{
+    level = btrfs_header_level(buf);
+
+    // 分配新块
+    cow = btrfs_alloc_tree_block(trans, root, 0, new_root_objectid,
+        &disk_key, level, buf->start, 0, reloc_src_root, ...);
+
+    // 完整复制
+    copy_extent_buffer_full(cow, buf);
+    btrfs_set_header_generation(cow, trans->transid);
+    btrfs_set_header_owner(cow, new_root_objectid); // 新根的 ID
+
+    // 更新 extent 树中的引用计数
+    ret = btrfs_inc_ref(trans, new_root, cow, 1, &qgroup_transac);
+}
+```
+
+快照过程：
+1. 读取原子的根节点 → COW 复制为 `snap_root`
+2. 递归复制所有子节点（如果需要）
+3. 在 `tree_root` 中插入新的 `ROOT_ITEM` 条目，指向 `snap_root`
+
+---
+
+## 4. Chunk 分配与 Extent 管理
+
+### 4.1 btrfs_alloc_tree_block — 分配元数据块
+
+```c
+// fs/btrfs/extent-tree.c:5335
+struct extent_buffer *btrfs_alloc_tree_block(
+    struct btrfs_trans_handle *trans, struct btrfs_root *root,
+    u64 parent, u64 root_objectid,
+    const struct btrfs_disk_key *key, int level,
+    u64 hint, u64 empty_size, u64 reloc_src_root, ...)
+{
+    // 1. 预留块组空间
+    block_rsv = btrfs_use_block_rsv(trans, root, blocksize);
+
+    // 2. 从空闲空间寻找可用 extent
+    ret = btrfs_reserve_extent(root, blocksize, blocksize, blocksize,
+        empty_size, hint, &ins, false, false);
+
+    // 3. 初始化新的 extent_buffer
+    buf = btrfs_init_new_buffer(trans, root, ins.objectid, level, ...);
+
+    // 4. 记录分配操作到 delayed ref
+    // → 创建 delayed extent op → 稍后写入 tree_root 的 extent B 树
+}
+```
+
+### 4.2 btrfs_reserve_extent — 空闲空间查找
+
+```c
+// fs/btrfs/extent-tree.c:4871
+int btrfs_reserve_extent(..., struct btrfs_key *ins, ...)
+{
+    // 根据根的类型（data/meta）选择分配 profile（raid1/single/dup 等）
+    flags = get_alloc_profile_by_root(root, is_data);
+
+    // 在 block_group 链表中寻找足够的空闲空间
+    ret = find_free_extent(root, ins, &ffe_ctl);
+
+    // 如果空间不足，尝试折半分配
+    if (ret == -ENOSPC && !final_tried) {
+        num_bytes >>= 1;
+        goto again;
     }
 }
 ```
 
-### 6.3 zlib vs zstd 对比
+### 4.3 chunk_root 与 chunk_map
+
+chunk 信息存储在 `chunk_root` 的 B 树中，key 是 `(objectid=0, type=BTRFS_CHUNK_ITEM_KEY, offset=chunk_start)`：
+
+```c
+// fs/btrfs/volumes.c
+struct btrfs_chunk_map {
+    u64 start;              /* chunk 逻辑起始 */
+    u64 len;                 /* chunk 长度 */
+    u64 type;                /* BTRFS_BLOCK_GROUP_* 类型（RAID 级别）*/
+    int num_stripes;         /* 条带数 */
+    int sub_stripes;         /* 子条带数（RAID10 用）*/
+    struct btrfs_chunk_stripe stripes[];
+};
+```
+
+每个条带记录物理设备偏移。当 `map_blocks_raid1` 被调用时：
+
+```c
+// fs/btrfs/volumes.c:6904
+static void map_blocks_raid1(struct btrfs_fs_info *fs_info,
+    struct btrfs_chunk_map *map, struct btrfs_io_geometry *io_geom, ...)
+{
+    if (io_geom->op != BTRFS_MAP_READ) {
+        // 写操作：所有条带都写
+        io_geom->num_stripes = map->num_stripes;
+        return;
+    }
+    // 读操作：选择第一个活镜像
+    io_geom->stripe_index = find_live_mirror(fs_info, map, ...);
+}
+```
+
+---
+
+## 5. RAID1 冗余的层面
+
+Btrfs 的 RAID1 在 **chunk map 层**实现，而非在块设备层。这带来一个重要特性：**写操作同时发往所有镜像设备**。
+
+### 5.1 write 时 RAID1 行为
+
+写数据到 RAID1 chunk 时：
+
+```c
+// fs/btrfs/volumes.c:6904 map_blocks_raid1
+// 写操作 → io_geom->num_stripes = map->num_stripes
+// 所有 num_stripes 个条带都会被写入
+```
+
+Btrfs 为每个条带构造独立的 bio，提交到块设备层。由于块设备层（如 md raid1）也可能做自己的镜像，Btrfs 的 RAID1 和底层块设备 RAID 可以形成嵌套（不推荐）。
+
+### 5.2 read 时 RAID1 行为
+
+```c
+// fs/btrfs/volumes.c:6904 map_blocks_raid1
+// 读操作：find_live_mirror() 选择一个健康设备
+io_geom->stripe_index = find_live_mirror(fs_info, map, 0, dev_replace_is_ongoing);
+io_geom->mirror_num = io_geom->stripe_index + 1;
+```
+
+读取失败时，bio 层会通过 `REQ_FAILFAST` 标志尝试其他镜像。
+
+### 5.3 raid1 与 raid10 的差异
+
+```c
+// raid1: 所有条带都写，读选择其中一个
+// num_stripes = map->num_stripes（= 2 for raid1）
+
+// raid10: 条带化写入，子条带数决定写并发数
+// num_stripes = map->sub_stripes
+// factor = map->num_stripes / map->sub_stripes
+```
+
+---
+
+## 6. 快照与子卷的关系
+
+### 6.1 create_snapshot 流程
+
+```c
+// fs/btrfs/ioctl.c:704
+static int create_snapshot(struct btrfs_root *root, struct inode *dir, ...)
+{
+    // 1. 分配 pending_snapshot 和临时 block_rsv
+    pending_snapshot = kzalloc(...);
+    block_rsv = &pending_snapshot->block_rsv;
+    btrfs_init_block_rsv(block_rsv, BTRFS_BLOCK_RSV_TEMP);
+
+    // 2. 预留子卷元数据空间
+    trans_num_items = create_subvol_num_items(inherit) + 3;
+    btrfs_subvolume_reserve_metadata(..., block_rsv, trans_num_items, ...);
+
+    // 3. 启动事务
+    trans = btrfs_start_transaction(root, 0);
+
+    // 4. 设置 pending_snapshot，在事务提交时执行实际复制
+    trans->pending_snapshot = pending_snapshot;
+
+    // 5. 提交事务
+    ret = btrfs_commit_transaction(trans);
+    // → commit 时调用 create_pending_snapshots()
+}
+```
+
+### 6.2 COW 对快照的影响
+
+快照的核心是 **COW 路径上的所有节点**：
+
+```
+快照前：fs_root 的根节点 A 被两个 root_item 引用
+  tree_root: root_item_A → node_A
+
+快照后：创建新的 root_item_B，指向 COW 后的 node_A'
+  tree_root: root_item_A → node_A（不再被新快照引用）
+             root_item_B → node_A'（COW 自 node_A）
+
+node_A 与 node_A' 的内容相同（完整复制）
+node_A 保留在磁盘上，node_A' 成为新快照的根
+```
+
+因此：
+- **快照本身不复制数据**，只复制路径上的节点
+- 被多个快照共享的节点（未修改）保持单副本，extent 条目 `ref_count > 1`
+- 一旦某个快照修改了共享节点，该节点被 COW，新副本只属于该快照
+
+### 6.3 子卷 vs 快照
+
+```c
+// 子卷 = 独立的 btrfs_root（有自己的文件树）
+// 快照 = 子卷的只读副本（COW 后共享未修改的节点）
+// 两者在 tree_root 中都是 ROOT_ITEM 条目，区别在于：
+//   - 子卷：可读写，创建时无 COW
+//   - 快照：只读（root_item 置 BTRFS_ROOT_SUBVOL_RDONLY），创建时 COW 根节点
+```
+
+---
+
+## 7. 压缩机制
+
+### 7.1 支持的压缩算法
+
+```c
+// fs/btrfs/compression.c:39
+static const char* const btrfs_compress_types[] = { "", "zlib", "lzo", "zstd" };
+
+// 调用分发：
+switch (cb->compress_type) {
+case BTRFS_COMPRESS_ZLIB: return zlib_decompress_bio(ws, cb);
+case BTRFS_COMPRESS_LZO:  return lzo_decompress_bio(ws, cb);
+case BTRFS_COMPRESS_ZSTD: return zstd_decompress_bio(ws, cb);
+}
+```
+
+### 7.2 zlib vs zstd
 
 | 特性 | zlib | zstd |
 |------|------|------|
-| 压缩速度 | 较慢 | 快 3~5x |
-| 解压速度 | 中等 | 快 |
-| 压缩比 | 高 | 略低于 zlib |
-| CPU 占用 | 高 | 低 |
-| 内核实现 | 标准 zlib | libzstd |
+| 算法 | DEFLATE（LZ77 + Huffman）| Zstandard（ANS + 匹配finder）|
+| 压缩速度 | 慢 | 快（类似 lzo）|
+| 解压速度 | 中等 | 非常快 |
+| 压缩比 | 较高 | 与 zlib 相当或更好 |
+| 内存需求 | 低 | 略高 |
+| 使用场景 | 通用 | 虚拟机镜像、日志、数据库 |
 
-zlib 是传统的 DEFLATE 算法（huffman + LZ77），zstd（Zstandard）是 Facebook 开源的新算法，提供了更好的速度/压缩比 trade-off。
+zstd 在 Btrfs 中作为默认推荐算法，因为它在解压速度和压缩比之间取得了良好平衡。zlib 则在极端低内存环境下更可靠。
 
-### 6.4 压缩extent 的写入
+### 7.3 压缩流程
 
-当文件写入时（`delalloc` 机制），`btrfs_submit_compressed_write()` 会：
-1. 收集未压缩的数据
-2. 调用对应算法的压缩函数
-3. 创建 compressed extent item
-4. bio 写入压缩后的数据
+```
+写入：btrfs_bio_endio_write() → btrfs_compress_bio()
+  → 尝试压缩数据
+  → 压缩有效：存储 compressed extent（inline 或分离 extent）
+  → 压缩无效：存储原始数据（compress_type=BTRFS_COMPRESS_NONE）
 
-读取时 `btrfs_submit_compressed_read()` 会解压后返回给上层。
+读取：btrfs_readpage() → check_extent_item()
+  → 如果 extent 标记为压缩 → decompress_bio()
+  → 否则直接返回 page
+```
 
 ---
 
-## 七、Scrub 与 Balance
+## 8. tree_mod_log — 写入前日志
 
-### 7.1 Scrub：错误检测机制
-
-`btrfs_scrub_dev()`（`scrub.c:3072`）是 scrub 的入口：
+Btrfs 在 COW 机制之外还实现了 `tree_mod_log`，用于在原子操作前回滚关键修改：
 
 ```c
-int btrfs_scrub_dev(struct btrfs_fs_info *fs_info, u64 devid, u64 start,
-                    u64 end, struct btrfs_scrub_progress *progress,
-                    bool readonly, bool is_dev_replace)
+// fs/btrfs/ctree.c
+// 在修改节点前记录操作日志（用于 CRS（Concurrent Raid Scanner）场景）
+
+btrfs_tree_mod_log_insert_root(root->node, cow, true);    // 根替换
+btrfs_tree_mod_log_insert_key(parent, slot, BTRFS_MOD_LOG_KEY_REPLACE); // 键替换
+btrfs_tree_mod_log_free_eb(buf);                           // 块释放
+btrfs_tree_mod_log_eb_copy(dst, src, ...);                // 块复制
 ```
 
-Scrub 的核心是 `scrub_recheck_block_csum()` 和 `scrub_repair_block()`：
-
-```
-1. 读取每个 extent 的数据
-2. 计算 csum（从 csum_root 读取期望值）
-3. 与实际读取数据的 csum 对比
-4. 如果不匹配：
-   - 如果有镜像（RAID1/RAID10），从其他副本读取修复
-   - 否则记录错误（ECC / 媒体错误）
-5. 写回修复后的数据（如果可修复）
-```
-
-Scrub 工作在 metadata extent 和 data extent 两个层面：
-- Metadata extent：`scrub_stripe()` 处理
-- Data extent：`scrub_page` 级别的逐页验证
-
-### 7.2 Balance：重新分配 Chunk
-
-Balance 的目标是**将数据从一个 chunk 迁移到另一个 chunk**，以优化空间使用或改变 RAID profile。
-
-Balance 入口在 `volumes.c` 中的 `btrfs_balance()` 函数族：
-
-```c
-// volumes.c:3750 - 将磁盘格式的参数转换为 CPU 格式
-static void btrfs_disk_balance_args_to_cpu(...)
-```
-
-Balance 的完整流程（`btrfs_balance` at `volumes.c`）：
-
-```
-1. 解析 balance 参数（data/meta/sys profile filter）
-2. 扫描所有 chunk，找出符合 filter 的 chunk
-3. 对每个需要重新分配的 chunk：
-   a. 创建 reloc_root
-   b. 标记 chunk 为 RO（block_group::ro）
-   c. 扫描 chunk 中的所有 extent
-   d. 将 extent 移动到新 chunk
-   e. 更新 extent tree 中的引用
-   f. 释放旧 chunk
-4. 提交 transaction
-```
-
-Balance 中的块移动由 **relocation.c** 处理（6122 行），核心函数：
-
-```c
-// relocation.c: relocate_file_extent_cluster()
-// 移动一个文件 cluster 的所有 extent
-// 1. 读原始数据
-// 2. 分配新位置
-// 3. 写新位置
-// 4. 更新 extent tree
-// 5. 释放旧位置
-```
-
-### 7.3 Scrub 与 Balance 的协同
-
-Scrub 期间如果发现不可修复的错误，会标记 chunk 为只读（`BTRFS_DISCARD_ITEM_SCRUB_ERROR`），阻止进一步写入。Balance 可以选择只平衡有效数据，跳过损坏的 extent。
+这些日志在事务提交时被清除（如果事务成功）。如果系统崩溃，可以从 tree_mod_log 恢复未完成的操作。
 
 ---
 
-## 八、总结：btrfs 架构要点
+## 9. extent_io — 块设备 I/O 抽象
+
+`extent_io.c` 实现了 Btrfs 的块设备 I/O 抽象层：
+
+```c
+// fs/btrfs/extent_io.c
+struct btrfs_bio_ctrl {
+    u64 start;              /* 逻辑地址 */
+    u64 len;                /* 长度 */
+    blk_opf_t opf;          /* REQ_OP_READ / WRITE */
+    struct bio *bio;        /* 底层 bio */
+    struct btrfs_device *devices[BTRFS_MAX_MIRRORS];
+    int mirror_num;
+    compress_type;
+    // ...
+};
+```
+
+extent_io 负责：
+1. **合并相邻的 I/O 请求**（减少 bio 数量）
+2. **校验和计算和验证**（`btrfs_csum_one_bio`）
+3. **镜像选择和重试**（`find_live_mirror`）
+4. **压缩 I/O 集成**
+
+---
+
+## 10. 总结：Btrfs 的设计哲学
 
 ```
-btrfs 核心设计哲学：
-
-1. 一切皆 B-tree
-   - 所有元数据和数据索引都存储在 B-tree 中
-   - extent tree 管理空间分配，fs tree 管理文件逻辑布局
-
-2. COW 保证一致性
-   - 写入永远不覆盖已存在的数据
-   - transaction commit 时一次性持久化
-   - 快照的"零复制"建立在 COW 之上
-
-3. Chunk 是物理分配的桥梁
-   - RAID profile 在 chunk 分配层面实现
-   - block group 是 chunk 的内存抽象
-   - stripe 映射由 chunk_root 管理
-
-4. 延迟引用减少锁竞争
-   - 引用计数变更进入 delayed ref 队列
-   - transaction commit 时批量处理
-   - 避免了大量随机写 extent tree
-
-5. 多棵树协同
-   - tree_root: 根节点管理
-   - extent_root: 空间账本
-   - chunk_root: 物理布局
-   - fs_root: 文件系统视图
-   - 各司其职，互相引用
+CoW B 树 = 原子性 + 快照内建
+extent tree = 统一的空间管理
+chunk map = RAID 在文件系统层
+校验和 = 静默损坏检测
+tree_mod_log = 崩溃恢复保证
 ```
+
+**与其他文件系统的关键区别**：
+
+| | ext4 | XFS | Btrfs |
+|--|------|-----|-------|
+| 元数据架构 | 块组+位图 | AG+B+树 | 全局 COW B 树 |
+| 数据一致性 | JBD2 日志 | CIL 延迟日志 | COW + generation |
+| 快照 | 需要 LVM | 需要 LVM | 内建（零成本共享）|
+| RAID | 需要 mdadm | 需要 mdadm | 文件系统内建（chunk map）|
+| 校验和 | 无 | 无 | 全数据+元数据 CRC32C |
+| 压缩 | 无 | 无 | zlib/zstd/lzo |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
