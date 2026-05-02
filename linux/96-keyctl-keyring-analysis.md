@@ -254,3 +254,26 @@ cat /proc/sys/kernel/keys/maxbytes
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 8. 密钥权限管理
+
+```c
+// 每个密钥有 16 位权限掩码 struct key->perm：
+// Possessor:  0x0f000000 — 拥有者（拥有密钥的用户）
+// User:       0x00f00000 — 指定用户
+// Group:      0x0000f000 — 指定组
+// Other:      0x0000000f — 其他
+
+// 权限位：
+// KEY_POS_VIEW   = 0x01  — 查看密钥属性
+// KEY_POS_READ   = 0x02  — 读取 payload
+// KEY_POS_WRITE  = 0x04  — 更新 payload
+// KEY_POS_SEARCH = 0x08  — 搜索密钥环
+// KEY_POS_LINK   = 0x10  — 链接到 keyring
+// KEY_POS_SETATTR= 0x20  — 设置属性
+
+// key_permission() 检查：
+// → 比较当前进程的 uid/gid 与 key->uid/gid
+// → 选择对应的 4 位权限组
+// → 检查请求的操作是否在位图中
+```

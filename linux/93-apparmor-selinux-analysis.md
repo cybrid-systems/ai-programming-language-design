@@ -249,3 +249,27 @@ LSM 框架（`include/linux/lsm_hooks.h`）提供约 200 个钩子点，通过 `
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 8. LSM 初始化顺序
+
+```c
+// LSM 模块通过 security_add_hooks() 注册到全局钩子链表：
+// 启动时的初始化顺序：
+// 1. SELinux: selinux_init() → security_add_hooks(selinux_hooks, "selinux")
+// 2. AppArmor: apparmor_init() → security_add_hooks(apparmor_hooks, "apparmor")
+// 3. Smack, TOMOYO, ...
+
+// 通过 CONFIG_LSM 内核参数控制顺序：
+// lsm=selinux,apparmor,smack,tomoyo
+
+// call_int_hook 遍历顺序决定了钩子优先级：
+// 第一个返回非零的模块决定结果
+#define call_int_hook(HOOK, ...) ({
+    struct security_hook_list *hp;
+    hlist_for_each_entry(hp, &security_hook_heads.HOOK, list) {
+        rc = hp->hook.HOOK(__VA_ARGS__);
+        if (rc) break;
+    }
+    rc;
+})
+```

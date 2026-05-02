@@ -264,3 +264,37 @@ I2C（`i2c_transfer` → `adap->algo->master_xfer`）和 SPI（`spi_sync` → `c
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 7. I2C 重试与超时
+
+```c
+// __i2c_transfer @ i2c-core-base.c
+// 失败时自动重试（最多 adapter->retries 次）：
+int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
+{
+    for (ret = 0, try = 0; try <= adap->retries; try++) {
+        ret = adap->algo->master_xfer(adap, msgs, num);
+        if (ret != -EAGAIN) break;
+        if (try != adap->retries)
+            msleep(adap->retry_delay);     // 重试间隔
+    }
+    return ret;
+}
+```
+
+## 8. SPI 异步传输
+
+```c
+// spi_async 允许 DMA 传输，完成后回调通知：
+// struct spi_message {
+//     struct list_head transfers;       // transfer 链表
+//     void (*complete)(void *context);  // 完成回调
+//     void *context;
+//     int status;                        // 传输状态
+// };
+
+// spi_async(spi, &msg)
+// → __spi_async() → 加入控制器队列 → 硬件处理
+// → 完成后 → msg->complete(msg->context)
+// spi_sync 基于 spi_async 实现：complete 中调用 completion
+```
