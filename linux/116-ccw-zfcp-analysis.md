@@ -214,3 +214,114 @@ struct zfcp_fsf_req {                            // FSF 请求
 // → 适配器执行 FC 协议（发起到存储阵列的传输）
 ```
 
+
+## 9. CCW 命令码
+
+```c
+// CCW 命令码常量：
+#define CCW_CMD_READ        0x02  // 设备→内存（读数据）
+#define CCW_CMD_WRITE       0x01  // 内存→设备（写数据）
+#define CCW_CMD_READ_ID     0xE4  // 读设备 ID
+#define CCW_CMD_SENSE       0x04  // 读设备感知数据
+#define CCW_CMD_SENSE_ID    0xE4  // 感知设备 ID
+#define CCW_CMD_TIC         0x03  // 转移指令链
+
+// CCW 程序的典型组织：
+// CCW 0: SENSE_ID (获取设备参数)
+// CCW 1: READ (读 FCP 响应)
+// CCW 2: WRITE (写 FCP 命令)
+// CCW 3: TIC (循环转移，用于连续数据传输)
+```
+
+## 10. zFCP SCSI 命令提交路径
+
+```c
+// zfcp_scsi_queuecommand @ zfcp_scsi.c：
+// → SCSI 中层调用下发 SCSI 命令
+// → 1. zfcp_fsf_fcp_cmnd() — 构造 FCP_CMND IU
+//    → 填充 fsf_qtcb_bottom_io：
+//      - fcp_lun（SCSI LUN）
+//      - cdbsize（SCSI CDB 大小）
+//      - scsi_cdb（SCSI 命令描述块）
+// → 2. zfcp_fsf_req_send() — 发送 FSF 请求
+//    → 分配 req_no → 写入 req_list
+//    → ccw_device_start() — 提交 CCW 程序
+// → 3. 完成中断 → zfcp_fsf_req_complete()
+//    → 解析 FCP_RSP IU
+//    → scsi_done() — 通知 SCSI 层
+
+// 超时处理：
+// → zfcp_fsf_start_timer(fsf_req, timeout)
+// → 超时 → zfcp_fsf_req_timeout_handler()
+// → 触发错误恢复（ERP）
+```
+
+## 11. zFCP 错误恢复（ERP）
+
+```c
+// ERP（Error Recovery Procedure）：
+// → 链路/端口/设备三级恢复
+// → zfcp_erp_adapter_reopen() — 重新打开适配器
+// → zfcp_erp_port_reopen() — 重新打开端口
+// → zfcp_erp_lun_reopen() — 重新打开 LUN
+
+// ERP 策略：
+// 1. 清除所有未完成的 FSF 请求
+// 2. 重置 CCW 设备状态
+// 3. 重新初始化 FCP 适配器
+// 4. 重新登录 FC 端口
+// 5. 恢复 SCSI 设备
+```
+
+## 12. 关键 doom-lsp 确认
+
+```c
+// drivers/s390/cio/device.c:
+// ccw_device_start @ ?       — 提交 CCW 程序
+// ccw_device_set_online @ :348 — 启用 CCW 设备
+// ccw_device_irq @ ?          — I/O 中断处理
+
+// drivers/s390/scsi/zfcp_fsf.c:
+// zfcp_fsf_fcp_cmnd @ ?       — 发送 FCP SCSI 命令
+// zfcp_fsf_req_send @ ?       — 发送 FSF 请求
+// zfcp_fsf_req_complete @ ?   — FSF 请求完成处理
+
+// drivers/s390/scsi/zfcp_erp.c:
+// zfcp_erp_adapter_reopen    — ERP 适配器恢复
+```
+
+
+## 13. 通道子系统发现
+
+```c
+// s390 I/O 通道子系统（CSS）在启动时枚举所有 CCW 设备：
+// → css_init() → crw_register_handler() — 注册 CRW 处理
+// → chsc_determine_css_version() — 确定 CSS 版本
+// → for_each_subchannel() — 枚举所有子通道
+//   → css_probe_device() — 探测设备
+//   → ccw_device_probe() — 初始化 CCW 设备
+
+// CRW（Channel Report Word）：
+// → 硬件状态变化时发送 CRW（设备添加/移除/错误）
+// → crw_handler → css_process_crw() → 更新设备状态
+
+// 子通道类型：
+// SUBCHANNEL_TYPE_IO     — 标准 I/O 子通道
+// SUBCHANNEL_TYPE_CHSC   — 通道子通道
+// SUBCHANNEL_TYPE_SCH    — 服务子通道
+```
+
+## 14. I/O 中断处理——ccw_device_irq
+
+```c
+// CCW 程序完成时产生 I/O 中断：
+// → do_IRQ() → irq_handler → ccw_device_irq()
+// → 检查中断响应码（IRQ_*）：
+//    IRQ_OK        — 正常完成
+//    IRQ_PROG      — 程序检查错误
+//    IRQ_PROT      — 保护检查错误
+//    IRQ_OP        — 操作异常
+// → 更新 I/O 统计
+// → 调用设备驱动的中断回调（zfcp 中的完成处理）
+```
+
