@@ -8,141 +8,161 @@
 
 ## 0. 概述
 
-**inotify** 和 **fanotify** 是 Linux 文件系统事件监控机制——inotify 是轻量级文件/目录事件监视（`inotify_add_watch`），fanotify 是更强大的文件系统级事件监听（支持详细信息和访问控制）。
+**inotify** 和 **fanotify** 是 Linux 文件系统事件监控机制——inotify 提供每 inode 粒度的事件监视，fanotify 提供文件系统级监控并支持**访问控制**（允许/拒绝文件操作）。两者均构建于 **fsnotify 框架**之上。
 
-**核心设计**：两者均基于**fsnotify 框架**（`fs/notify/fsnotify.c`）。inotify 通过 `inotify_read` 从 `/dev/inotify` 读取事件，fanotify 通过到 `fanotify_read` 从 `/dev/fanotify` 读取。
-
+**核心架构**：
 ```
-VFS 操作（create/unlink/write/close）
-     ↓
-fsnotify() → fsnotify_handle_event()
-     ↓
-标记组（inotify_group / fanotify_group）
-     ↓
-   inotify_handle_event()    fanotify_handle_event()
-   → inotify_add_to_idr()    → fanotify_merge()
-   → copy_event_to_user()      → fanotify_get_response()
-     ↓                          ↓
-   inotify_read()             fanotify_read()
+VFS: vfs_create/unlink/open/write
+  ↓
+fsnotify() @ fs/notify/fsnotify.c:492
+  ↓
+send_to_group() @ :331    遍历标记组
+  ↓
+group->ops->handle_event()  根据 group 类型分发
+  ├── inotify_handle_event()
+  │     → 构造 inotify_event
+  │     → 加入 group->notification_list
+  │     → wake_up(&group->notification_waitq)
+  │     → inotify_read() 消费
+  │
+  └── fanotify_handle_event()
+        → fanotify_merge() 尝试合并
+        → 加入 group->notification_list
+        → fanotify_get_response() 等待（PERM 事件）
+        → fanotify_read() 消费
 ```
 
-**doom-lsp 确认**：inotify 核心 `fs/notify/inotify/inotify_user.c`（55 符号），fanotify 核心 `fs/notify/fanotify/fanotify.c`（39 符号），fsnotify 框架 `fs/notify/fsnotify.c`（33 符号）。
+**doom-lsp 确认**：inotify 在 `fs/notify/inotify/inotify_user.c`（55 符号），fanotify 在 `fs/notify/fanotify/fanotify.c`（39 符号），fsnotify 框架在 `fs/notify/fsnotify.c`（33 符号）。
 
 ---
 
-## 1. fsnotify 框架 @ fs/notify/fsnotify.c
+## 1. fsnotify 框架
 
-### 1.1 fsnotify @ :492——事件入口
+### 1.1 struct fsnotify_group @ backend.h:213
 
 ```c
-// VFS 在关键路径调用 fsnotify() 通知文件事件：
-//   vfs_create()  → fsnotify_create()
-//   vfs_unlink()  → fsnotify_unlink()
-//   vfs_write()   → fsnotify_modify()
-//   finish_open() → fsnotify_open()
+// include/linux/fsnotify_backend.h:213-280
+struct fsnotify_group {
+    const struct fsnotify_ops *ops;              // handle_event/free_group 等
 
-int fsnotify(struct inode *to_tell, __u32 mask, struct inode *dir,
-             const struct qstr *name, u32 cookie)
+    refcount_t refcnt;
+
+    spinlock_t notification_lock;
+    struct list_head notification_list;          // 待发送给用户空间的事件
+    wait_queue_head_t notification_waitq;        // read() 阻塞于此
+    unsigned int q_len;                          // 队列中事件数
+    unsigned int max_events;                     // 最大事件数
+
+    struct mutex mark_mutex;                     // 保护 marks_list
+    struct list_head marks_list;                 // 此组的所有 mark
+
+    union {                                      // inotify / fanotify 私有数据
+        struct inotify_group_private_data {
+            spinlock_t idr_lock;
+            struct idr idr;                      // inotify 的 watch 描述符 IDR
+        };
+        struct fanotify_group_private_data { ... };
+    };
+};
+```
+
+### 1.2 send_to_group @ fsnotify.c:331——事件分发核心
+
+```c
+// VFS 调用 fsnotify() → 最终到达 send_to_group()
+static int send_to_group(__u32 mask, ...)
 {
-    // 1. 获取 inode 和 mount 上的标记组
-    marks = fsnotify_first_mark(inode);
-    if (!marks)
-        return 0;                           // 无人监控 → 快速返回
+    // 1. 收集此 inode/mount 上所有标记组的事件掩码
+    fsnotify_foreach_iter_mark_type(iter_info, mark, type) {
+        marks_mask |= mark->mask;
+        marks_ignore_mask |= fsnotify_effective_ignore_mask(mark, ...);
+    }
 
-    // 2. 遍历所有标记组，发送事件
-    send_to_group(to_tell, inode, dir, name, mask, cookie,
-                  marks, &iter_info);
-    // → 每个标记组根据自己的事件掩码决定是否处理
-    // → inotify_group → inotify_handle_event()
-    // → fanotify_group → fanotify_handle_event()
+    // 2. 检查事件是否匹配任何标记
+    if (!(test_mask & marks_mask & ~marks_ignore_mask))
+        return 0;                                // 无匹配 → 忽略
+
+    // 3. 调用组特定的 handle_event
+    if (group->ops->handle_event)
+        return group->ops->handle_event(group, ...);
+    // → inotify: inotify_handle_event (inotify_user.c)
+    // → fanotify: fanotify_handle_event (fanotify.c)
 }
 ```
 
 ---
 
-## 2. inotify @ fs/notify/inotify/inotify_user.c
+## 2. inotify
 
-### 2.1 核心数据结构
+### 2.1 struct inotify_inode_mark
 
 ```c
-// inotify_device 的等待队列（inotify_fops）：
-static const struct file_operations inotify_fops = {
-    .read       = inotify_read,              // @ :249
-    .poll       = inotify_poll,              // @ :139
-    .release    = inotify_release,           // @ :301
-    .unlocked_ioctl = inotify_ioctl,         // @ :313
+struct inotify_inode_mark {
+    struct fsnotify_mark fsn_mark;               // fsnotify 基础 mark
+    int wd;                                      // watch descriptor
 };
 ```
 
-### 2.2 inotify_add_watch
+### 2.2 inotify_add_watch——注册监控
 
 ```c
-// inotify_add_watch(fd, pathname, mask) → sys_inotify_add_watch
+// sys_inotify_add_watch(fd, pathname, mask)
+// → inotify_update_watch()
 
 static int inotify_add_to_idr(struct inotify_inode_mark *i_mark,
                                struct fsnotify_group *group, struct inode *inode)
 {
-    // idr_alloc → 分配 watch descriptor（wd）
+    // 使用 IDR 分配 watch descriptor（wd）
     idr_preload(GFP_KERNEL);
     ret = idr_alloc(&group->inotify_data.idr, i_mark, 0, 0, GFP_NOWAIT);
     idr_preload_end();
-    // wd 返回给用户空间
+
+    // → fsnotify_add_mark(&i_mark->fsn_mark, group, inode)
+    // → 将 mark 添加到 inode 的标记连接器
+    // → 建立 inode→group 的关联
 }
 ```
 
-### 2.3 inotify_read @ :249——读取事件
+### 2.3 inotify_read @ :249——事件读取
 
 ```c
 static ssize_t inotify_read(struct file *file, char __user *buf,
                             size_t count, loff_t *pos)
 {
-    struct fsnotify_group *group = file->private_data;
-
-    // 循环读取事件（可能阻塞）
+    // 循环读取事件
     while (1) {
-        // 从 group 的 event 链表取事件
-        // → copy_event_to_user() 复制到用户空间
-        // → inotify_event 结构 = {wd, mask, cookie, len, name}
+        // 从 group->notification_list 取一个事件
+        // → copy_event_to_user() → inotify_event {wd, mask, cookie, len, name}
         ret = copy_event_to_user(group, buf, count);
-        if (ret)
-            break;
+        if (ret > 0) break;
 
-        // 阻塞等待
+        // 阻塞等待事件到达
         ret = wait_event_interruptible(group->notification_waitq,
-                                        !list_empty(&group->notification_list));
+                    !list_empty(&group->notification_list) || group->shutdown);
     }
+    return ret;
 }
-```
-
-### 2.4 inotify 事件格式
-
-```c
-struct inotify_event {
-    __s32 wd;               // watch descriptor
-    __u32 mask;             // IN_CREATE/IN_DELETE/IN_MODIFY/...
-    __u32 cookie;           // 用于 rename 事件关联
-    __u32 len;              // name 长度
-    char name[];            // 文件名（变长）
-};
 ```
 
 ---
 
-## 3. fanotify @ fs/notify/fanotify/fanotify.c
+## 3. fanotify
 
-### 3.1 事件合并 @ :182
+### 3.1 fanotify_merge @ :182——事件合并优化
 
 ```c
-// fanotify 支持事件合并——同一文件连续事件合并为一条
-// fanotify_merge() → fanotify_should_merge()
+// 当多个同类事件排队时，fanotify 可以合并它们
+// 例如：同一文件被连续打开多次 → 合并为一次
 
-static int fanotify_merge(struct fsnotify_group *group, struct fsnotify_event *event)
+static int fanotify_merge(struct fsnotify_group *group,
+                           struct fsnotify_event *event)
 {
-    list_for_each_entry_reverse(last_event, ...) {
+    // 从后向前遍历队列
+    list_for_each_entry_reverse(last_event, &group->notification_list, list) {
         if (fanotify_should_merge(last_event, event)) {
-            // 合并事件（mask 取或）
+            // 合并：mask 取 OR
             last_event->mask |= event->mask;
-            return 1;                       // 合并成功
+            return 1;
         }
     }
     return 0;
@@ -152,36 +172,34 @@ static int fanotify_merge(struct fsnotify_group *group, struct fsnotify_event *e
 ### 3.2 fanotify_get_response @ :224——访问控制
 
 ```c
-// fanotify 支持 FAN_OPEN_PERM / FAN_ACCESS_PERM
-// 允许用户空间决定是否允许文件访问
-// → send_to_group() 发送事件后阻塞
-// → fanotify_get_response() 等待用户返回 ALLOW/DENY
-// → 用户通过 read() 获取事件后 write() 回复
+// FAN_OPEN_PERM / FAN_ACCESS_PERM 事件：
+// 用户在收到事件后必须 write(ALLOW) 或 write(DENY)
+// 在此期间，触发事件的进程阻塞在 fanotify_get_response() 中：
 
 int fanotify_get_response(struct fsnotify_group *group,
-                          struct fanotify_perm_event_info *event)
+                           struct fanotify_perm_event_info *event)
 {
-    // 等待用户空间的响应
-    wait_event(group->notification_waitq, event->state == FAN_EVENT_RESPONSE);
+    // 等待用户空间通过 write() 回复
+    wait_event(group->notification_waitq,
+                event->state == FAN_EVENT_RESPONSE);
 
     if (event->response & FAN_ALLOW)
-        return 0;                            // 允许
-    return -EPERM;                           // 拒绝
+        return 0;                                // 允许操作
+    return -EPERM;                               // 拒绝操作
 }
 ```
 
-### 3.3 事件读取
+### 3.3 事件结构
 
 ```c
-// fanotify_read() → 返回 fanotify_event_metadata 结构：
+// 用户通过 read() 获得：
 struct fanotify_event_metadata {
-    __u32 event_len;     // 事件长度
-    __u8 vers;           // 版本
-    __u8 reserved;
-    __u16 metadata_len;  // 元数据长度
-    __aligned_u64 mask;  // 事件掩码
-    __s32 fd;            // 文件描述符
-    __s32 pid;           // 事件进程 PID
+    __u32 event_len;
+    __u8 vers;
+    __u16 metadata_len;
+    __aligned_u64 mask;         // FAN_OPEN/FAN_ACCESS/FAN_MODIFY/...
+    __s32 fd;                   // 可操作的文件 fd（用于 FAN_OPEN_PERM）
+    __s32 pid;                  // 事件触发进程 PID
 };
 ```
 
@@ -189,37 +207,38 @@ struct fanotify_event_metadata {
 
 ## 4. inotify vs fanotify
 
-| 特性 | inotify | fanotify |
+| 维度 | inotify | fanotify |
 |------|---------|----------|
-| 引入 | Linux 2.6.13 | Linux 5.1 |
-| 事件范围 | per-inode 监控 | per-filesystem 监控 |
-| 控制 | 允许/拒绝访问 | **不支持** | **支持 FAN_*_PERM** |
-| fd 传递 | 不提供 | 事件中携带打开的文件 fd |
-| pid 信息 | 不提供 | 事件中携带 PID |
-| 事件合并 | 不支持 | 支持（`fanotify_merge`）|
-| 上限 | `/proc/sys/fs/inotify/max_user_watches` | `/proc/sys/fs/fanotify/max_user_groups` |
+| 启动 | `inotify_init()` | `fanotify_init()` |
+| 监控范围 | per-inode 粒度 | per-filesystem 范围 |
+| 事件掩码 | `IN_CREATE\|IN_DELETE\|...` | `FAN_OPEN\|FAN_ACCESS\|...` |
+| 访问控制 | 不支持 | 支持 `FAN_*_PERM` |
+| fd 传递 | 不传递 | 事件中包含打开的 fd |
+| PID 信息 | 不提供 | 事件中包含 PID |
+| 事件合并 | 不支持 | 支持 `fanotify_merge` |
+| 限制 | `max_user_watches` | `max_user_groups` |
+| 通知方式 | read() 事件结构体 | read() 事件结构体 + fd |
+| 返回事件 | `struct inotify_event` | `struct fanotify_event_metadata` |
+
+**doom-lsp 确认函数索引**：
+
+| 函数 | 文件:行号 | 作用 |
+|------|----------|------|
+| `fsnotify` | `fsnotify.c:492` | VFS 事件入口 |
+| `send_to_group` | `fsnotify.c:331` | 事件分发（掩码匹配）|
+| `inotify_read` | `inotify_user.c:249` | inotify 事件读取 |
+| `inotify_poll` | `inotify_user.c:139` | inotify poll |
+| `inotify_add_to_idr` | `inotify_user.c:394` | watch 注册 |
+| `inotify_handle_event` | `inotify_fsnotify.c` | inotify 事件处理 |
+| `fanotify_merge` | `fanotify.c:182` | fanotify 事件合并 |
+| `fanotify_get_response` | `fanotify.c:224` | fanotify 访问控制 |
+| `fanotify_handle_event` | `fanotify.c` | fanotify 事件处理 |
 
 ---
 
-## 5. 调试
+## 5. 总结
 
-```bash
-# inotify 当前监控数
-cat /proc/sys/fs/inotify/max_user_watches
-cat /proc/sys/fs/inotify/max_queued_events
-
-# fanotify 限制
-cat /proc/sys/fs/fanotify/max_user_groups
-
-# strace 跟踪
-strace -e inotify_init,inotify_add_watch,fanotify_init,fanotify_mark -p <pid>
-```
-
----
-
-## 6. 总结
-
-inotify（`inotify_read` @ `inotify_user.c:249`）和 fanotify（`fanotify_get_response` @ `fanotify.c:224`）基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492`）——VFS 操作调用 `fsnotify()`，通过标记组遍历将事件发送到 inotify 或 fanotify 的事件队列，用户通过 fd read 消费。
+inotify 和 fanotify 基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492` → `send_to_group` @ `:331` → `group->ops->handle_event`）。inotify 通过 `inotify_read` @ `:249` 读取 `struct inotify_event`，fanotify 通过 `fanotify_get_response` @ `:224` 支持访问控制，通过 `fanotify_merge` @ `:182` 支持事件合并。
 
 ---
 
