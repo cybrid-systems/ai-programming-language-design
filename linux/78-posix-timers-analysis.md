@@ -215,9 +215,55 @@ void posix_timer_queue_signal(struct k_itimer *timr)
 
 ---
 
-## 6. 总结
+## 5. 通知机制——SIGEV_THREAD
 
-POSIX 定时器通过 `hrtimer_init` + `hrtimer_start` 实现纳秒级精度定时。`timer_create` → `do_timer_create`（`:458`）→ `alloc_posix_timer`（`:415`）分配 `k_itimer` 并插入哈希表，`timer_settime` → `common_timer_set` → `hrtimer_start` 启动，到期后 `posix_timer_fn`（`:367`）→ `posix_timer_queue_signal`（`:349`）→ `send_sigqueue` 投递信号。
+```c
+// struct sigevent 的 sigev_notify 决定到期通知方式：
+// SIGEV_SIGNAL     → 发送信号（默认，通过 send_sigqueue）
+// SIGEV_THREAD     → 启动线程执行 handler（用户空间 libc 实现）
+// SIGEV_THREAD_ID  → 发送信号到特定线程
+// SIGEV_NONE       → 不通知
+
+// 内核侧统一通过 posix_timer_queue_signal() → posixtimer_send_sigqueue()
+// → send_sigqueue(&timr->sigq, timr->it_pid, PIDTYPE_TASK)
+```
+
+## 6. Interval 定时器——common_hrtimer_rearm @ :291
+
+```c
+// 当定时器到期且 it_interval > 0（interval 定时器）时：
+// → hrtimer_forward(timer, now, timr->it_interval) 推进到期时间
+// → hrtimer_restart(timer) 重新启动定时器
+// → 通过 overrun 计数跟踪丢掉的到期事件
+
+// Overrun 计数：
+// i.e. 如果定时器每 10ms 到期，但处理延迟了 35ms → overrun = 3
+// 用户通过 timer_getoverrun() 获取
+```
+
+## 7. struct k_itimer 完整字段
+
+```c
+struct k_itimer {
+    struct hrtimer ktimer;                 // 底层 hrtimer
+    clockid_t it_clock;                    // 时钟源
+    struct pid *it_pid;                    // 通知目标进程
+    struct sigqueue sigq;                   // 信号队列条目
+    struct signal_struct *it_signal;
+
+    int it_pid_type;                        // PID/PGID/SID
+    int it_status;                          // POSIX_TIMER_DISARMED / ...
+    struct itimerspec64 it;                 // interval + value
+    struct list_head list;                   // 哈希桶链表
+
+    const struct k_clock *kclock;           // 时钟操作表
+    struct rcu_head rcu;
+};
+```
+
+## 8. 总结
+
+POSIX 定时器通过 `hrtimer_init` + `hrtimer_start` 实现纳秒级精度定时。`timer_create` → `do_timer_create`（`:458`）→ `alloc_posix_timer`（`:415`）分配 `k_itimer` 并插入哈希表，`timer_settime` → `common_timer_set` → `hrtimer_start` 启动，到期后 `posix_timer_fn`（`:367`）→ `posix_timer_queue_signal`（`:349`）→ `send_sigqueue` 投递信号。Interval 定时器通过 `common_hrtimer_rearm`（`:291`）重新加载。
 
 ---
 
