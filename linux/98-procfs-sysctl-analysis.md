@@ -271,3 +271,21 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 10. sysctl 热插拔注册
+
+```c
+// 动态加载模块时的 sysctl 注册：
+// 模块 init → register_sysctl("net/ipv4", ipv4_table)
+// → __register_sysctl_table() → insert_header()
+// → 在 /proc/sys/net/ipv4/ 下创建文件
+
+// 模块 exit → unregister_sysctl_table(header)
+// → erase_header() → 从红黑树移除条目
+// → 删除 /proc/sys/ 下的对应文件
+
+// 常用注册位置：
+// kernel/sysctl.c   — kernel.*  (kernel.hostname, kernel.panic)
+// net/sysctl_net.c  — net.*     (net.ipv4.tcp_syncookies)
+// fs/proc/proc_sysctl.c — vm.* (vm.dirty_ratio, vm.swappiness)
+```

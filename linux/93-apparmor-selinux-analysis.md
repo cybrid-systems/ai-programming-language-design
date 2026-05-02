@@ -273,3 +273,21 @@ LSM 框架（`include/linux/lsm_hooks.h`）提供约 200 个钩子点，通过 `
     rc;
 })
 ```
+
+## 9. LSM 钩子完整调用示例——file_open
+
+```c
+// 完整的安全钩子调用链（以文件打开为例）：
+// vfs_open(path, file)
+//   → security_file_open(file)
+//     → call_int_hook(file_open, file)
+//       → SELinux: selinux_file_open(file)
+//         → inode_security(inode)->sid 与 current_sid() 比较
+//         → avc_has_perm(sid, isid, SECCLASS_FILE, FILE__OPEN, &ad)
+//           → AVC 缓存查找或策略查询
+//       → AppArmor: apparmor_file_open(file)
+//         → aa_file_perm(profile, file, AA_MAY_READ|AA_MAY_WRITE)
+//           → aa_path_perm(profile, path, request)
+//             → 遍历 profile 路径规则
+//     → 如果返回值非零 → open 被拒绝 → -EACCES
+```

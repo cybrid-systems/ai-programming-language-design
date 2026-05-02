@@ -268,3 +268,19 @@ int do_brk_flags(..., unsigned long addr, unsigned long len, ...)
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 10. brk vs mmap 在 glibc malloc 中的选择
+
+```c
+// glibc malloc 根据分配大小选择底层实现：
+// 1. < 128KB → brk/sbrk 分配（堆扩展）
+// 2. > 128KB → mmap 分配（新 VMA）
+
+// 原因：
+// brk：线性扩展，碎片少，但不适合大块（堆必须连续）
+// mmap：可以分配任意大小，释放时直接 munmap，但 VMA 会碎片化
+
+// mp_.mmap_threshold 决定切换点（默认 128KB，可动态调整）
+// 当 mmap 分配过多时，kernel 会通过 /proc/sys/vm/max_map_count 限制
+// cat /proc/sys/vm/max_map_count  # 默认 65530
+```

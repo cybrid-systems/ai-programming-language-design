@@ -234,3 +234,32 @@ cgroup v1 通过 `struct cgroup` 层级树 + `struct cgroup_subsys` 控制器插
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 9. cgroup 文件系统接口
+
+```c
+// cgroup 文件系统类型（v1 多个挂载）：
+// mount -t cgroup -o cpu none /sys/fs/cgroup/cpu
+// → cgroup_v1_get_tree() → cgroup1_get_tree()
+//   → 创建 cgroup_root，关联 cpu_cgroup_subsys
+//   → 挂载到 /sys/fs/cgroup/cpu/
+
+// cgroup 控制文件的读写：
+// struct cftype cgroup_files[] = {
+//     {
+//         .name = "cgroup.procs",
+//         .write_u64 = cgroup_procs_write,  // 写入 PID
+//         .read_u64 = cgroup_procs_read,
+//     },
+// };
+
+// 每个控制器注册自己的文件：
+// memory_cgroup_subsys 添加 memory.limit_in_bytes：
+// struct cftype mem_cgroup_files[] = {
+//     {
+//         .name = "memory.limit_in_bytes",
+//         .write_u64 = mem_cg_write,
+//         .seq_show = mem_cg_show,
+//     },
+// };
+```

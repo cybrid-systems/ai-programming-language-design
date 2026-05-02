@@ -248,3 +248,26 @@ VFIO 通过 `vfio_dma_do_map`（`iommu_type1.c`）→ `iommu_map`（`iommu.c`）
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 8. VFIO 迁移——设备状态保存与恢复
+
+```c
+// VFIO 支持虚拟机迁移时的设备状态迁移：
+// 状态机：
+// VFIO_DEVICE_STATE_RUNNING → SAVING → STOPPED → RESUMING → RUNNING
+
+// 迁移数据通过 VFIO_MIG_GET_REGION_INFO 获取：
+// → ioctl(device_fd, VFIO_DEVICE_FEATURE, &feature)
+//   → feature.flags = VFIO_DEVICE_FEATURE_MIG_DEVICE_STATE
+//   → 获取迁移区域 fd（mmap 可读）
+
+// 迁移区域包含设备寄存器状态、DMA 映射状态等
+// 用户空间 QEMU 负责迁移数据的传输
+
+// VFIO_IOMMU_DIRTY_PAGES — 脏页跟踪
+// → ioctl(container_fd, VFIO_IOMMU_DIRTY_PAGES, &dirty)
+//   → VFIO_IOMMU_DIRTY_PAGES_FLAG_START — 开始记录
+//   → VFIO_IOMMU_DIRTY_PAGES_FLAG_GET — 获取脏页位图
+//   → VFIO_IOMMU_DIRTY_PAGES_FLAG_STOP — 停止记录
+// 配合 vfio_dma->bitmap 实现迁移期间的增量同步
+```

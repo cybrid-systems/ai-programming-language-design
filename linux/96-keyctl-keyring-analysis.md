@@ -277,3 +277,27 @@ cat /proc/sys/kernel/keys/maxbytes
 // → 选择对应的 4 位权限组
 // → 检查请求的操作是否在位图中
 ```
+
+## 9. keyctl 常用命令
+
+```c
+// keyctl 子命令功能一览：
+// KEYCTL_GET_KEYRING_ID      — 获取 keyring ID
+// KEYCTL_JOIN_SESSION_KEYRING — 加入 session keyring
+// KEYCTL_UPDATE              — 更新密钥 payload
+// KEYCTL_REVOKE              — 吊销密钥
+// KEYCTL_SEARCH              — 递归搜索密钥环
+// KEYCTL_LINK                — 链接密钥到 keyring
+// KEYCTL_UNLINK              — 解除链接
+// KEYCTL_READ                — 读取密钥数据
+// KEYCTL_INSTANTIATE         — 实例化未完成的密钥
+// KEYCTL_NEGATE              — 否定密钥（标记为不可用）
+// KEYCTL_SET_PERM            — 设置权限
+// KEYCTL_GET_PERSISTENT      — 获取持久 keyring
+// KEYCTL_SESSION_TO_PARENT   — 将 session keyring 传递给父进程
+// KEYCTL_REJECT              — 拒绝密钥（带错误码）
+// KEYCTL_INVALIDATE          — 使密钥无效
+// KEYCTL_GET_NONCE           — 获取一次性 nonce
+// KEYCTL_WATCH_KEY           — 监控密钥变化
+// KEYCTL_MOVE                — 在 keyring 间移动密钥
+```
