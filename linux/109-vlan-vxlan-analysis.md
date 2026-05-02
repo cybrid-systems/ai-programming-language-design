@@ -129,6 +129,47 @@ void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb)
 
 ---
 
+
+## 3. VXLAN FDB 管理
+
+```c
+// FDB（Forwarding Database）将内层 MAC 地址映射到远端 VTEP（UDP 端点）
+// 条目结构：
+struct vxlan_fdb {
+    struct hlist_node fdb_node;                // 哈希表节点
+    unsigned char eth_addr[ETH_ALEN];          // 内层 MAC
+    __be32 vni;                                 // VNI
+    struct list_head remotes;                  // 远端 VTEP 列表
+    unsigned long updated;                     // 最后更新
+    u8 state;
+};
+
+// MAC 学习（@ :1421）：
+// vxlan_snoop(dev, skb, vni)
+//   → 提取 skb 源 MAC + 远端 UDP 地址
+//   → 查找 FDB：vxlan_fdb_find_uc() @ :443
+//   → 未找到：vxlan_fdb_create() 创建新条目 @ :855
+//   → 找到：更新远端地址和时间戳
+
+// FDB 老化：age_timer 定时器定期扫描
+// → 超时未更新的条目删除
+// → 类似 bridge FDB 的 ageing 机制
+```
+
+## 4. VXLAN GRO/GSO
+
+```c
+// VXLAN 支持 GRO（Generic Receive Offload）——合并接收：
+// vxlan_gro_receive @ :705 — GRO 回调
+// → 查找 VNI 匹配的 VXLAN 设备
+// → skb_gro_receive() 合并多个 VXLAN 包
+// → 减少协议栈处理次数
+
+// VXLAN GSO（Generic Segmentation Offload）——分段发送：
+// → 大 TCP 段分割为 MTU 大小的 VXLAN 包
+// → 硬件 TSO 卸载或软件 GSO
+```
+
 ## 3. VLAN vs VXLAN
 
 | 特性 | VLAN | VXLAN |
