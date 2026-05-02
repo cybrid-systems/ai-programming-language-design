@@ -1,790 +1,529 @@
-# ext4 文件系统深度分析
+# 247-ext4-filesystem-analysis — ext4 文件系统深度分析
 
-## 概述
-
-ext4（Fourth Extended Filesystem）是 Linux 最主流的文件系统，从 ext2/ext3 演化而来，提供了 extent 映射、大分配组（flex_bg）、延迟分配（delayed allocation）、日志校验和（journal checksums）、在线调整大小等关键特性。代码位于 `fs/ext4/`。
-
-本文从 **inode/extent 树**、**块分配器（mballoc）**、**日志机制（jbd2）**、**目录组织**、**配额**、**快速 fsck**、**在线调整大小** 七条逻辑线深度串联剖析，并画出 inode 读取的完整路径图。
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行符号解析与代码追踪
+> 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1
 
 ---
 
-## 一、inode 和 extent 树串联
+## 0. 概述
 
-### 1.1 ext4 inode 结构
+ext4（第四扩展文件系统）是 Linux 最主流的通用文件系统，从 ext3 演进而来，2006 年合并入主线内核。ext4 在 ext3 基础上引入了**extent 映射**（替代传统的间接块映射）、**延迟分配**（delayed allocation）、**块组descriptor校验**、**快速 fsck** 等关键改进，在性能、可扩展性和可靠性上全面提升。
+
+本文以 `fs/ext4/inode.c`（6,826 行）、`fs/ext4/mballoc.c`（7,283 行）、`fs/ext4/super.c`（7,606 行）为核心，结合 `ext4_extents.h` 和 `fs/ext4/extents.c`，逐模块深度解析 ext4 的核心设计。
+
+---
+
+## 1. inode 与 extent——数据存储的组织方式
+
+### 1.1 ext4 inode 的 i_data 结构
+
+ext4 inode 大小默认为 256 字节（在 super block 的 `s_inode_size` 字段），包含一个 60 字节的 `i_data[60]` 数组。对于使用 extent 的普通文件，这 60 字节的结构如下：
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ i_data[60]                                               │
+├──────────────────┬───────────────────────────────────────┤
+│ ext4_extent_header (12B)  │  ext4_extent[4] (48B)          │
+└──────────────────┴───────────────────────────────────────┘
+```
+
+即前 12 字节存储 `struct ext4_extent_header`，后 48 字节（4 个 extent 条目）用于直接存储小文件的 extent 信息——**无需任何间接块**，在 inode 自身内部即可定位最多 4 个 extent。
+
+对于更大的文件，extent 信息存储在专门的 extent block 中，inode 的 `i_data` 变为 extent 树的第一层索引节点。
+
+**doom-lsp 确认**：`ext_inode_hdr()` 将 `EXT4_I(inode)->i_data` 转换为 `struct ext4_extent_header *`。
+
+### 1.2 核心数据结构
+
+**ext4_extent（12 字节）**——磁盘上的 extent 条目：
 
 ```c
-// fs/ext4/ext4.h:794
-struct ext4_inode {
-    __le16  i_mode;          // 文件类型 + 权限位
-    __le16  i_uid;           // 低16位 UID
-    __le32  i_size_lo;       // 文件大小（低32位）
-    __le32  i_atime, i_ctime, i_mtime; // 时间戳
-    __le32  i_dtime;         // 删除时间
-    __le16  i_gid;           // 低16位 GID
-    __le16  i_links_count;   // 硬链接计数
-    __le32  i_blocks_lo;     // 块数（以 512 字节为单位）
-    __le32  i_flags;         // 文件标志（EXT4_EXTENTS_FL 等）
-    __le32  i_block[EXT4_N_BLOCKS]; // 块指针数组
-    // ...
-    __le32  i_size_high;     // 大文件高32位
-    // osd2: i_uid_high, i_gid_high, i_checksum_lo
-    __le16  i_extra_isize;   // 扩展字段大小
-    __le32  i_projid;       // Project ID（配额）
+// ext4_extents.h
+struct ext4_extent {
+    __le32  ee_block;    /* 覆盖的起始逻辑块号 */
+    __le16  ee_len;      /* 覆盖的块数（最大 32768） */
+    __le16  ee_start_hi; /* 物理块号高 16 位 */
+    __le32  ee_start_lo; /* 物理块号低 32 位 */
 };
 ```
 
-**关键点**：`i_block[EXT4_N_BLOCKS]` — 在 ext4 中它不再是直接/间接块号数组，而存储 extent 树的根（当 `i_flags & EXT4_EXTENTS_FL` 时）。这是 extent 替换间接块映射的标志。
+物理块号由 `ee_start_lo`（低 32 位）和 `ee_start_hi`（高 16 位）拼接而成，最大支持 48 位物理块号（理论上支持 1EB 文件系统）。
 
-### 1.2 extent 树的三层数据结构
+**MSB 标记 unwritten extent**：如果 `ee_len` 的最高位被设置（即 `ee_len > 0x8000`），则为 unwritten extent（预分配但未写入数据的extent）。`EXT_INIT_MAX_LEN = 0x8000` 是这个分界线的值。
 
-extent 树由三种结构组成：
+**ext4_extent_idx（12 字节）**——extent 树中间节点索引：
 
 ```c
-// fs/ext4/ext4_extents.h:75
+struct ext4_extent_idx {
+    __le32  ei_block;     /* 此索引覆盖的起始逻辑块号 */
+    __le32  ei_leaf_lo;   /* 下一层物理块号（低 32 位） */
+    __le16  ei_leaf_hi;   /* 下一层物理块号（高 16 位） */
+    __le16  ei_unused;
+};
+```
+
+**ext4_extent_header（12 字节）**——每个 extent block 的头部：
+
+```c
 struct ext4_extent_header {
-    __le16  eh_magic;    // 0xf30a (EXT4_EXT_MAGIC)
-    __le16  eh_entries;  // 有效条目数
-    __le16  eh_max;      // 容量
-    __le16  eh_depth;    // 树的深度（0=叶子）
+    __le16  eh_magic;    /* 0xf30a，magic 验证 */
+    __le16  eh_entries;  /* 有效条目数 */
+    __le16  eh_max;      /* 最大条目容量 */
+    __le16  eh_depth;    /* 树的深度（0=叶子，1+=索引层） */
     __le32  eh_generation;
 };
 ```
 
-**叶子节点** — `struct ext4_extent`（存储在extent树叶子层）：
+### 1.3 extent 树组织——为什么用 extent？
+
+ext4 用 extent 替代 ext2/3 的间接块映射，核心优势是**减少元数据开销**并**加速顺序读写**。
+
+**间接块的问题**：假设文件占用 100,000 个块，ext3 需要分配数百个间接块来记录所有块号，每个间接块 4KB 可记录 1024 个块号。元数据块数量庞大，随机访问和磁盘布局都很糟糕。
+
+**extent 的解决方案**：一个 extent 描述一段连续物理块，一个 `ee_len` 字段就能覆盖最多 32,768 个连续块（16KB 起始块号 + 128MB 长度）。对于大多数连续文件，**一个 extent 就能覆盖整个文件**。
+
+extent 树是一棵 B-tree-like 结构：
+
+- **叶子节点**：存储 `struct ext4_extent`，每个 extent 描述一段连续物理块
+- **索引节点**：存储 `struct ext4_extent_idx`，指向下一层节点
+- **深度限制**：`EXT4_MAX_EXTENT_DEPTH = 5`，足够覆盖任何文件大小
+- **叶子节点extent block校验**：`struct ext4_extent_tail` 在 extent block 末尾存储 CRC32C 校验码
+
+extent 树根节点可以直接存在 inode 的 `i_data[60]` 中（深度 0），无需额外的间接块。
+
+### 1.4 ext4_ext_path——extent 查找路径
 
 ```c
-// fs/ext4/ext4_extents.h:56
-struct ext4_extent {
-    __le32  ee_block;      // 逻辑块号（覆盖的起始块）
-    __le16  ee_len;        // 覆盖的块数（MSB=1表示unwritten extent）
-    __le16  ee_start_hi;   // 物理块号高16位
-    __le32  ee_start_lo;   // 物理块号低32位
-};
-// 物理块号 = (ee_start_hi << 32) | ee_start_lo
-```
-
-**索引节点** — `struct ext4_extent_idx`（存储在 extent 树的中间层/根层）：
-
-```c
-// fs/ext4/ext4_extents.h:67
-struct ext4_extent_idx {
-    __le32  ei_block;      // 此索引覆盖的逻辑块号
-    __le32  ei_leaf_lo;     // 指向下一层物理块号（低32位）
-    __le16  ei_leaf_hi;     // 物理块号高16位
-    __u16   ei_unused;
-};
-```
-
-**遍历路径** — `struct ext4_ext_path`（extent 树遍历的内存结构）：
-
-```c
-// fs/ext4/ext4_extents.h:105
 struct ext4_ext_path {
-    ext4_fsblk_t         p_block;    // 物理块号（解析后）
-    __u16                 p_depth;     // 此路径层深度
-    __u16                 p_maxdepth;  // 分配的最大深度
-    struct ext4_extent   *p_ext;      // 指向找到的 extent（叶子）
-    struct ext4_extent_idx *p_idx;    // 指向找到的索引（中间层）
-    struct ext4_extent_header *p_hdr; // 指向层的 ext4_extent_header
-    struct buffer_head   *p_bh;       // 层的 buffer_head
+    ext4_fsblk_t         p_block;    /* 该节点所在的物理块号 */
+    __u16                p_depth;    /* 该节点的深度 */
+    __u16                p_maxdepth;
+    struct ext4_extent   *p_ext;     /* 指向当前覆盖范围的 extent（叶子层） */
+    struct ext4_extent_idx *p_idx;   /* 指向当前索引（索引层） */
+    struct ext4_extent_header *p_hdr;/* 指向该节点的 extent_header */
+    struct buffer_head   *p_bh;      /* 该节点对应的 buffer_head */
 };
 ```
 
-**为什么用 extent 而不是间接块：**
+`ext4_find_extent()` 是核心查找函数：从 inode 出发，逐层沿索引节点下降到叶子，找到覆盖指定逻辑块号的 extent。返回的 `ext4_ext_path[]` 数组记录了从根到叶子的完整路径。
 
-| 特性 | ext2/3（间接块） | ext4（extent） |
-|------|-----------------|--------------|
-| 大文件映射 | 块号指针链→多次磁盘IO | 一个 extent 描述连续的大范围→1次IO |
-| 存储开销 | 1GB文件需 1MB 指针空间 | 1GB文件可由1个 extent 描述 |
-| 碎片化 | 任意块→复杂映射 | 连续块→简单映射 |
-| 深度 | 3级间接→最多 4KB*4K*4K | 4级 extent 树（eh_depth=0~4） |
-
-### 1.3 extent 树的查找过程
-
+路径数组的使用模式：
 ```c
-// fs/ext4/extents.c:886 — ext4_find_extent
-ext4_find_extent(inode, block, path, flags)
-  eh = ext_inode_hdr(inode)          // 从 inode->i_data 取 extent_header
-  depth = ext_depth(inode)           // eh->eh_depth
-
-  // path[0] 是 inode 自身（eh 已在 i_data 中，无 bh）
-  path[0].p_hdr = eh
-  path[0].p_bh  = NULL
-
-  // 从根向下遍历：每层读一个块
-  i = depth
-  while (i--) {                      // i 从 depth 降到 1
-    ext4_ext_binsearch_idx(path+ppos, block)  // 在当前索引层二分查找
-    path[ppos].p_block = ext4_idx_pblock(p_idx)  // 下一层物理块号
-    bh = read_extent_tree_block(inode, p_idx, --i, flags)  // 读下一层块
-    eh = ext_block_hdr(bh)            // 解码子节点的 header
-    ppos++
-    path[ppos].p_bh = bh
-    path[ppos].p_hdr = eh
-  }
-
-  // 叶子层：在叶子块中二分查找 extent
-  ext4_ext_binsearch(path+ppos, block)
-  path[ppos].p_ext = found_extent
-  path[ppos].p_block = ext4_ext_pblock(found_extent)  // 物理块号
-  return path
+path = ext4_find_extent(inode, map->m_lblk, NULL, flags);
+// ... 使用 path 中每层的 p_hdr/p_idx/p_ext 进行操作 ...
+ext4_ext_release_path(path);
 ```
 
-### 1.4 extent 插入与树分裂
+extent 树分裂（split）是最复杂的操作：当叶子节点已满需要插入新 extent 时，沿路径逐层分裂，重构路径中的索引节点，并可能增加树的深度。
 
-当插入新 extent 超出叶子节点容量时，发生**树分裂**：
+### 1.5 extent 与 i_disksize
 
+`EXT4_I(inode)->i_disksize` 记录文件的逻辑大小（已分配并确认写入的字节数）。extent 树的 `ee_block + ee_len` 反映的是实际分配的物理块范围，而 `i_disksize` 是文件截断/写入时的权威边界。
+
+在 `ext4_ext_insert_extent()` 成功后，会更新 `i_disksize`：
 ```c
-// fs/ext4/extents.c:1986 — ext4_ext_insert_extent
-ext4_ext_insert_extent(handle, inode, path, newext, gb_flags)
-  depth = ext_depth(inode)
-
-  if (path[depth].p_hdr->eh_entries < path[depth].p_hdr->eh_max)
-    // 叶子有空间：直接插入 extent
-    // 可能需要合并相邻 extent
-  else
-    // 叶子满：需要分裂
-    // ext4_ext_split() — 从叶子到根一路分裂
-    // 需要 journal handle（因为修改索引层）
-    // 需要更新所有父节点的索引条目
+EXT4_I(inode)->i_disksize = inode->i_size;
 ```
-
-**extent 插入的 journal credits**：由于可能触发从叶子到根的路径上所有索引块的修改，credits 需求通过 `ext4_ext_calc_credits_for_single_extent` 计算：
-
-```c
-// fs/ext4/extents.c:2373
-// 最坏情况：depth 层都需要分裂
-// depth=4 时，需要 (depth*2)+2 个 metadata 块 + bitmap 块 + group descriptor
-// 即 ext4_chunk_trans_blocks() 返回较大值
-```
+对于延迟分配（delayed allocation）场景，`i_disksize` 的更新和 extent 的实际分配可以分开进行。
 
 ---
 
-## 二、块分配器（mballoc）串联
+## 2. mballoc——多级块分配器
 
-### 2.1 核心数据结构
+ext4 的块分配器（mballoc）是其性能优势的核心来源之一，采用**Buddy算法的变体**配合**预分配机制**，支持延迟分配和流式分配等多种优化策略。
 
-ext4 的 mballoc 使用 **buddy bitmap** 算法，以**分配组（block group）** 为单位管理。每个 block group 的结构：
-
-```
-┌─────────────────────────────────────────────┐
-│  group descriptor (ext4_group_desc)         │
-│    bg_block_bitmap_lo/hi  → 块位图块号       │
-│    bg_inode_bitmap_lo/hi  → inode位图块号    │
-│    bg_inode_table_lo/hi   → inode表起始块    │
-│    bg_free_blocks_count   → 可用块数         │
-│    bg_checksum            → 校验和            │
-├─────────────────────────────────────────────┤
-│  block bitmap  (块位图，每位=1个块)           │
-├─────────────────────────────────────────────┤
-│  inode bitmap  (inode位图)                   │
-├─────────────────────────────────────────────┤
-│  inode table   (inode 数组)                 │
-├─────────────────────────────────────────────┤
-│  data blocks   (数据块)                     │
-└─────────────────────────────────────────────┘
-```
-
-### 2.2 ext4_mb_new_blocks 完整路径
+### 2.1 入口：ext4_mb_new_blocks
 
 ```c
-// fs/ext4/mballoc.c:6229
+// mballoc.c:6229
 ext4_fsblk_t ext4_mb_new_blocks(handle_t *handle,
-                                 struct ext4_allocation_request *ar, int *errp)
-  // 1. 检查 quota，分配 reserved blocks
-  while (ar->len && ext4_claim_free_clusters(sbi, ar->len, ar->flags))
-    ar->len >>= 1   // 减半直到有足够空间
-
-  // 2. 尝试重用预分配空间
-  ac = ext4_mb_initialize_context(ac, ar)
-  if (!ext4_mb_use_preallocated(ac))
-    // 3. 归一化请求（extents 边界对齐等）
-    ext4_mb_normalize_request(ac, ar)
-    // 4. 分配预分配结构
-    ext4_mb_pa_alloc(ac)
-    // 5. 调用 Buddy 分配器
-    ext4_mb_regular_allocator(ac)
-      // a. ext4_mb_find_by_goal — 优先在目标位置附近查找
-      // b. CR_GOAL_LEN_FAST → CR_GOAL_LEN_SLOW → CR_BEST_AVAIL
-      //    ext4_mb_scan_groups() 遍历 group
-      //    对每个 group 调用 mb_find_extent()（buddy 算法）
-      //    ext4_mb_try_best_found() — 找不到最优时用次优
-  // 6. 标记磁盘空间已用
-  ext4_mb_mark_diskspace_used(ac, handle)
-    gdp = ext4_get_group_desc(sb, group, &gdp_bh)
-    bitmap_bh = ext4_read_block_bitmap(sb, group)
-    ext4_lock_group(sb, group)
-    mb_set_bits(bitmap_bh->b_data, blkoff, len)        // 置位位图
-    ext4_free_group_clusters_set(sb, gdp,
-        ext4_free_group_clusters(sb, gdp) - changed) // 更新 gd 空块数
-    ext4_group_desc_csum_set(sb, group, gdp)          // 重新计算校验和
-    ext4_unlock_group(sb, group)
-    percpu_counter_sub(&sbi->s_freeclusters_counter, len) // 更新全局计数器
-    ext4_handle_dirty_metadata(handle, NULL, bitmap_bh)  // 日志化位图修改
-    ext4_handle_dirty_metadata(handle, NULL, gdp_bh)     // 日志化 group descriptor
+                struct ext4_allocation_request *ar, int *errp)
 ```
 
-### 2.3 bg_free_blocks_count 更新链条
+分配流程分四个阶段：
 
-```
-用户请求块
-    ↓
-ext4_mb_mark_diskspace_used()
-    ↓
-mb_set_bits(bitmap_bh->b_data, ...)    // 内存中置位
-    ↓
-ext4_free_group_clusters_set(sb, gdp,
-    old - changed)                      // gdp->bg_free_blocks_count_lo/hi 写回
-    ↓
-ext4_group_desc_csum_set()              // 为 gdp 计算 checksum 写回
-    ↓
-ext4_handle_dirty_metadata(handle, NULL, gdp_bh)  // 通过 jbd2 journal 持久化
-    ↓
-percpu_counter_sub(&sbi->s_freeclusters_counter, ...) // 非持久化，快速路径计数
-```
-
-**group descriptor 的写入**：每个 block group 的 `ext4_group_desc` 先被 `ext4_journal_get_write_access` 保护，再被 `ext4_handle_dirty_metadata` 标记为待写入 journal 的缓冲区。在 `jbd2_journal_commit_transaction` 的 metadata 提交阶段（第 620 行附近），所有 dirty 的 group descriptors 才真正写入磁盘。
-
-### 2.4 预分配和延迟回收
-
-ext4 支持**组级预分配（group preallocation）** 和**大块预分配（large preallocation）**：
-
+**阶段一：配额检查和预留空间验证**
 ```c
-// fs/ext4/mballoc.c:5935
-ext4_mb_discard_lg_preallocations(sb, lg, order, total_entries)
-  // 从 lg_prealloc_list[order] 遍历
-  // pa（prealloc_space）如果引用计数为0，标记为 deleted
-  // ext4_mb_release_group_pa(&e4b, pa) → mb_free_blocks()
-  // 更新 group descriptor 的 bg_free_blocks_count
+while (ar->len && ext4_claim_free_clusters(sbi, ar->len, ar->flags))
+    cond_resched(), ar->len = ar->len >> 1;  // 减半重试
+```
+配额通过 dquot 写入，不是 mballoc 自身的逻辑。
+
+**阶段二：尝试使用预分配空间（PA）**
+```c
+ac = ext4_mb_initialize_context(ac, ar);
+if (!ext4_mb_use_preallocated(ac)) {
+    // 预分配未命中，走常规分配
+    ext4_mb_normalize_request(ac, ar);   // 范围对齐、拆分
+    ext4_mb_regular_allocator(ac);        // Buddy 算法分配
+}
 ```
 
-预分配机制：`ext4_mb_use_preallocated()` 在 `ext4_mb_new_blocks` 开头检查是否有可复用的预分配块。如果有，直接用它而跳过 buddy 搜索。
+**阶段三：Buddy 分配器 `ext4_mb_regular_allocator`**
+
+`mballoc.c:3001` 的核心分配逻辑，按优先级尝试：
+
+1. **`CR_GOAL_LEN_FAST`**：先尝试目标组（goal group），查找接近目标地址的最佳匹配
+2. **`CR_GOAL_LEN_SLOW`**：放宽限制，扫描更多组
+3. **`CR_BEST_AVAIL`**：贪心策略，扫描所有组找最大可用块
+4. **`CR_ALIGNED`**：已对齐模式，寻找完全对齐的块
+
+每个组内用 **Buddy 算法**：将空闲块按 2^n 大小的块组（buddy chunk）管理，用位图标记每个块的分配状态。
+
+**阶段四：标记磁盘空间使用**
+```c
+if (ac->ac_status == AC_STATUS_FOUND)
+    ext4_mb_mark_diskspace_used(ac, handle);  // 修改块组位图 + 日志
+```
+
+### 2.2 预分配与回收机制
+
+**预分配（Preallocation，PA）**
+
+ext4 支持延迟分配的预分配：写入数据时先分配extent但不完全使用，剩余部分作为 PA 保留供后续写入使用。
+
+关键数据结构：
+- **per-inode PA rbtree**（`struct ext4_inode_info::i_prealloc_lock`）：每个文件维护自己的预分配树，以 `pa_lstart`（逻辑起始块）排序
+- **per-group PA list**：每个块组的 `bb_prealloc_list`
+
+`ext4_mb_use_preallocated()` 的查找逻辑：
+1. 先在 inode 的 PA rbtree 中查找逻辑地址相邻的预分配块
+2. 再在块组的 PA list 中查找
+3. 检查物理地址连续性（`pa_pstart + offset` 与请求的 `ac_g_ex` 对齐）
+
+预分配块的回收在以下时机触发：
+- `ext4_mb_discard_preallocations_should_retry()`：分配失败时丢弃部分 PA 重试
+- `ext4_mb_pa_put_free()`：PA 使用后剩余部分放回 buddy
+- inode 销毁时：所有关联 PA 归还 buddy
+
+### 2.3 块组结构（Block Group）
+
+ext4 将磁盘划分为块组（block group），每个块组大小通常为 128MB（`s_blocks_per_group * block_size`）。每个块组有：
+
+```
+┌────────────────────────────────────────────┐
+│  Super Block (副本)   ← 只在块组 0 或 sparse_super 激活的组  │
+├────────────────────────────────────────────┤
+│  Group Descriptors (备份)                   │
+├────────────────────────────────────────────┤
+│  Data Block Bitmap                          │
+├────────────────────────────────────────────┤
+│  Inode Bitmap                               │
+├────────────────────────────────────────────┤
+│  Inode Table                                │
+├────────────────────────────────────────────┤
+│  Data Blocks                               │
+└────────────────────────────────────────────┘
+```
+
+块组 descriptor 存储在 `struct ext4_group_desc` 中，包含：
+- `bg_block_bitmap`：数据块位图的块号
+- `bg_inode_bitmap`：inode 位图的块号
+- `bg_inode_table`：inode 表的起始块号
+- `bg_free_blocks_count`、`bg_free_inodes_count`、`bg_used_dirs_count`
+
+从 Linux 4.5 起，支持 **meta block group**，将元数据（位图、inode表）放在同一个块组内，进一步减少寻道。
 
 ---
 
-## 三、日志机制（jbd2）串联
+## 3. JBD2 日志——原子性与一致性保证
 
-### 3.1 ext4 的 journal 配置
+ext4 的日志机制由独立的 JBD2 层实现，inode.c 中通过 `ext4_journal_start()` / `ext4_journal_stop()` 对 `jbd2_journal_start()` / `jbd2_journal_stop()` 的调用嵌入到每个元数据写操作中。
 
-ext4 默认开启 journal（通过 `EXT4_MOUNT_JOURNAL_DATA` 或 `mount -o journal`），日志 inode 编号记录在 superblock 的 `s_journal_inum` 中。
-
-### 3.2 ext4_writepage → journal 数据流
-
-```
-用户写文件（write(2) 或 mmap → page cache dirty）
-    ↓
-ext4_writepages()  [fs/ext4/inode.c:3025]
-    ↓
-ext4_bmap() 或 ext4_map_blocks()
-    ↓
-延迟分配：ext4_da_map_blocks()
-    ↓
-__ext4_journal_start_sb() → jbd2_journal_start()
-    ↓
-ext4_journal_get_write_access(handle, bh)    // 对元数据块
-ext4_handle_dirty_metadata(handle, NULL, bh) // 标记到当前 transaction
-```
-
-对于 **data=ordered 模式**（默认）：
-
-```
-ext4_writepages()
-    ↓
-handle = ext4_journal_start(inode, HT_WRITE_PAGE, needed_blocks)
-    ↓
-遍历 dirty pages：
-  ext4_block_write_begin()  →  分配块 ext4_map_blocks()
-    ↓
-  ext4_journal_ensure_extent_credits()  // 确保 journal credit 足够
-    ↓
-  ext4_dirty_journalled_data()  →  jbd2_inode_add_write()
-    ↓
-ext4_journal_stop(handle)  →  等待 jbd2 commit
-```
-
-### 3.3 jbd2 日志提交流程（commit 阶段）
-
-`jbd2_journal_commit_transaction`（`fs/jbd2/commit.c:377`）是核心：
-
-```
-commit phase 1：锁定当前 transaction（t_running_transaction → NULL）
-    ↓
-commit phase 2a：journal_submit_data_buffers()
-    遍历 t_inode_list 中的每个 jbd2_inode
-    对 JI_WRITE_DATA 标志的 inode 调用：
-      journal->j_submit_inode_data_buffers(jinode)
-    → ext4_normal_submit_inode_data_buffers()
-    → 将 inode 的 dirty pages 提交到磁盘（不是 journal）
-    ↓
-commit phase 2b：jbd2_journal_write_revoke_records()
-    ↓
-commit phase 3：遍历 t_buffers（metadata buffer 链表）
-    对每个 buffer：
-      journal_descriptor = get_write_access()
-      copy_buffer_to_journal()
-      journal_csum_set()
-    ↓
-commit phase 4：写 descriptor block（描述刚才写的所有 metadata 块）
-    ↓
-commit phase 5：更新 superblock 的 journal tail
-    jbd2_journal_update_sb_log_tail()
-    ↓
-jbd2_journal_stop() — 通知 transaction 完成
-```
-
-**metadata 和 data 的顺序保证**：在 data=ordered 模式下，ext4 **先提交 data buffers 到磁盘**（通过 `journal_submit_data_buffers` → `jbd2_submit_inode_data`），然后在同一个 commit 过程中写 metadata 到 journal。这保证了元数据的journal记录永远指向已刷到磁盘的数据块。
-
-### 3.4 ext4_journal_start / ext4_journal_stop
+### 3.1 handle——事务句柄
 
 ```c
-// fs/ext4/ext4_jbd2.c:92
-handle_t *__ext4_journal_start_sb(struct inode *inode, int type, int blocks)
-  return jbd2_journal_start(sb, blocks)
-
-handle_t *ext4_journal_start(struct inode *inode, int type, int blocks)
-  // 从 sb 或 inode 推断 super_block
-  __ext4_journal_start_sb(inode, type, blocks)
+struct handle_s {
+    int h_ref;
+    int h_err;
+    unsigned int h_sync:1;        // 需要同步等待
+    unsigned int h_jdata:1;      // 日志数据（非仅元数据）
+    unsigned int h_aborted:1;
+    struct transaction_s *h_transaction;
+    int h_buffer_credits;        // 本 handle 预分配的 buffer 修改名额
+    int h_revoke_credits;
+};
 ```
 
-`ext4_journal_stop(handle)` 最终调用 `jbd2_journal_stop()`：
+每次 ext4 元数据操作（如 `ext4_write_begin`）调用 `ext4_journal_start()` 创建一个 handle，handle 与当前事务（transaction）绑定。`h_buffer_credits` 是关键：预分配了可修改的 buffer 数量上限，保证事务不会超出日志空间。
 
+### 3.2 ext4_writepage 与 jbd2 的协作
+
+`ext4_writepage()` 在 `inode.c:1351`：
 ```c
-jbd2_journal_stop(handle)
-  if (handle->h_err)
-    jbd2_journal_abort()    // 出错时触发快速 abort
-  else
-    jbd2_journal_end()      // 将 buffer 添加到 t_updates，等待 commit
+handle = ext4_journal_start(inode, EXT4_HT_WRITE_PAGE, needed_blocks);
+if (IS_ERR(handle))
+    return PTR_ERR(handle);
+ret = ext4_block_write_begin(page, pos, len, __ext4_journalled_writepage);
+if (ret)
+    unlock_page(page);
+else
+    ret = ext4_journal_stop(handle);
 ```
+
+注意 `ext4_journal_stop()` 的语义：它**不立即提交事务**，只是释放 handle 对当前事务的引用，将 buffer 标记为已加入待提交列表。事务的真正提交（`jbd2_journal_commit_transaction()`）由独立的 `kjournald2` 内核线程定期执行，或在以下时机触发：
+- handle 的 `h_sync` 标志置位（fsync 时）
+- 日志区域即将写满时
+
+### 3.3 日志三阶段提交
+
+JBD2 使用严格的三阶段提交协议：
+
+**阶段一：缓冲写入选中**（Handle 开始）
+- `jbd2_journal_start()` → 获取 handle，加入当前 `RUNNING` 状态的事务
+- 元数据 buffer 通过 `jbd2_journal_get_write_access()` 和 `jbd2_journal_dirty_metadata()` 加入事务的 `t_buffers` 链表
+
+**阶段二：日志块写入**（事务提交）
+- `jbd2_journal_commit_transaction()` 在 `kjournald2` 上下文中执行
+- 扫描 `t_buffers` 链表，将每个修改过的 metadata buffer 写入日志区域（journal log）
+- 所有日志块写完后，写入**提交块**（commit block，`JBD2_COMMIT_BLOCK`），内含事务 ID（tid）
+- 提交块写入完成 = 事务已持久化到日志
+
+**阶段三：回写（Checkpoint）**
+- 后续 `jbd2_log_do_checkpoint()` 将日志中的元数据块写回最终磁盘位置
+- checkpoint 完成后，这些日志块即可被后续事务覆盖
+
+### 3.4 崩溃恢复流程
+
+重启时 `jbd2_recover()` 读取日志区域：
+1. 找到最后一个有效的提交块
+2. 按事务 ID 顺序重放（replay）每个已提交但未 checkpoint 的事务
+3. 重放操作是幂等的——如果数据已写回，重复应用不会有问题
+
+**ext4 vs ext3 的关键差异**：ext3 日志和数据可以并发写入，而 ext4 在 `data=ordered` 模式下保证元数据日志条目对应的数据块**先于元数据本身写入磁盘**（通过 `jbd2_journal_flush()` 机制）。这个顺序保证使得崩溃后日志回放时不会读到部分写入的数据。
 
 ---
 
-## 四、目录组织串联
+## 4. 目录与 htree 索引
 
-### 4.1 目录项结构
+ext4 的目录使用 **htree（扩展目录索引）**，是 B-tree 的变体，专门为目录场景优化，提供 `O(log n)` 的文件名查找而非线性扫描。
 
-ext4 的目录项（directory entry）是变长结构：
+### 4.1 htree 的启用条件
 
+`is_dx_dir()` 检查目录是否启用 htree（磁盘格式上通过 inode 的 `EXT4_INDEX_FL` 标志）：
+- 新建目录默认启用 htree
+- `mount -o noextent` 时以线性格式创建目录
+- 小目录（block 数内可容纳所有条目）可能退化为线性扫描
+
+### 4.2 htree 的两层结构
+
+htree 目录实际使用两种节点：
+
+**根节点（dx_root）**：存储在目录文件的第一个 block 中
 ```c
-// fs/ext4/namei.c:216
-struct fake_dirent {        // 兼容旧 VFS 层，name_len 在这里
-    __le32  inode;
-    __le16  rec_len;
-    u8      name_len;
-    u8      file_type;
-};
-// ext4_dir_entry_2 包含实际文件名（可变长）
-struct ext4_dir_entry_2 {
-    __le32  inode;          // 0 表示未使用
-    __le16  rec_len;        // 此项总长度（含文件名）
-    __u8    name_len;       // 文件名字节数
-    __u8    file_type;      // EXT4_FT_REG_FILE 等
-    char    name[0];        // 可变长文件名
+struct dx_root {
+    __le32 dot_gen_bitfield;  // dotdot + hash algorithm info
+    char bullet[12];           // ".";
+    struct ext4_dir_entry_2 dot;
+    char bullet2[12];          // "..";
+    struct ext4_dir_entry_2 dotdot;
+    struct dx_entry entries[...];  // 第一层 hash → block 映射
+    char dummy[12];
+    struct dx_tail info;       // 含 hash 版本信息
 };
 ```
 
-目录块（dirblock）组织：一个 block（如 4KB）内填充多个 `ext4_dir_entry_2`，通过 `rec_len` 串联。最后一个条目用 `EXT4_DIRENT_TAIL` 填充以支持校验。
-
-### 4.2 线性目录 vs HTree 目录
-
-小目录（`< 2^15 entries`）使用**线性数组**组织。`ext4_test_inode_flag(dir, EXT4_INDEX_FL)` 判断目录是否启用了 hash-indexed（htree）方式。
-
-当目录变得更大时，ext4 使用 **HTree（扩散树）** — 基于 dirhash 的 B+树变种：
-
+**内部节点（dx_node）**：存储 hash 范围到子 block 的映射
 ```c
-// fs/ext4/namei.c:235
-struct dx_entry {            // HTree 索引条目
-    __le32  hash;             // 此节点覆盖的哈希范围上限
-    __le32  block;            // 指向子节点块号
-};
-struct dx_countlimit {        // dx_root/dx_node 的头部
-    __le16  limit;            // 最多 dx_entry 数
-    __le16  count;            // 实际 dx_entry 数
-};
-struct dx_root {              // HTree 根节点（存储在目录的第一个块）
-    struct fake_dirent        dot;
-    struct dx_root_info {     // dx_root 专用
-        __le32  reserved_zero;
-        u8      hash_version;  // DX_HASH_LEGACY / DX_HASH_HALF_MD4 / DX_HASH_TEA
-        u8      info_length;   // 固定 8
-        u8      indirect_levels;
-        u8      unused_flags;
-    } info;
-    struct dx_entry  entries[];
-};
-struct dx_node {              // HTree 中间/叶子节点
-    struct fake_dirent  fake;
-    struct dx_entry     entries[];
-};
-struct dx_frame {             // 遍历栈
-    struct buffer_head *bh;
-    struct dx_entry    *entries;
-    struct dx_entry    *at;    // 当前 entry 指针
+struct dx_node {
+    __le32 fake;
+    struct ext4_dir_entry_2 fake_dot;
+    struct dx_entry entries[...];  // hash → block 映射
+    struct dx_tail info;
 };
 ```
+
+**叶子节点**：就是普通的目录 block，包含 `struct ext4_dir_entry_2` 条目，每个条目存储文件 inode 号、名称、文件类型等。
 
 ### 4.3 ext4_find_entry 查找路径
 
+`ext4_find_entry()` 在 `dir.c` 中的查找路径：
 ```c
-// fs/ext4/namei.c:1668
-ext4_find_entry(inode, name, res_dir)
-  __ext4_find_entry(dir, &fname, res_dir, NULL)
-
-__ext4_find_entry(dir, fname, res_dir, inlined)
-  // 检查是否是 inline data 目录
-  if (ext4_test_inode_flag(dir, EXT4_INLINE_DATA_FL))
-    return ext4_search_inline_data()
-
-  // 计算 name 的 hash
-  ext4_fname_setup_ci(fname, name)
-  ext4_fname_hash(fname, &hinfo)
-
-  // 判断使用 htree 还是线性查找
-  if (ext4_test_inode_flag(dir, EXT4_INDEX_FL))
-    return ext4_dx_find_entry(dir, fname, res_dir)
-  else
-    // 线性扫描目录块
-    for each block in dir:
-      scan directory entries linearly
-      compare name hash (for case-insensitive)
+if (is_dx_dir(inode)) {
+    err = ext4_dx_readdir(file, ctx);
+    // → ext4_htree_fill_tree() → 遍历 htree
+} else {
+    // 线性扫描目录 block，找到返回 struct ext4_dir_entry_2
+    ret = search.dir = ext4_find_entry(...);
+}
 ```
 
-### 4.4 ext4_dx_find_entry（HTree 查找）
+`ext4_dx_readdir()` 使用 `ctx->pos` 作为 htree 遍历的状态：
+- `pos = 0`：从头开始（第一个叶子 block）
+- `pos = htree_eof`：遍历结束
+- 中间值：hash 树中的当前 hash 位置
 
-```c
-// fs/ext4/namei.c:294
-ext4_dx_find_entry(dir, fname, res_dir)
-  // 读根块（第一个块）
-  bh = ext4_bread(NULL, dir, 0, 0)
-  root = (struct dx_root *)bh->b_data
+`ext4_htree_fill_tree()` 内部使用 `htree_hash` 计算文件名 hash，然后在 htree 的索引节点中二分查找目标 block，最后在叶子 block 中线性搜索文件名。
 
-  // 在 root->entries 中二分查找 hash
-  frames[0].entries = root->entries
-  frames[0].at = dx_trace()  // dx_match：找 hash 最近匹配项
+### 4.4 hash 算法演进
 
-  // 如果还有中间层（indirect_levels > 0）
-  while (frames[depth].bh is not leaf):
-    // 从 frame 取 block 号
-    block = dx_get_block(frames[depth].at)
-    bh = ext4_bread(dir, block)
-    node = (struct dx_node *)bh->b_data
-    dx_binsearch()  // 在 node->entries 中找
-    frames[depth+1].entries = node->entries
-    frames[depth+1].at = dx_match()
-
-  // 到达叶子：是一个普通目录块
-  // 在目录块中线性查找 entry
-  return search_dir_block(dx_frame_leaf)
-```
+ext4 支持多种目录 hash 算法（通过 `dx_tail.info` 中的 hash 版本标识）：
+- **legacy**：初始算法（hash 碰撞较多）
+- **half_md4**：改进的 MD4 变体
+- **tea**：柯克-麦卡勒斯特算法（已被发现存在弱点）
+- **siphash**：现代算法，从 Linux 4.20 起使用，更强的抗碰撞性
 
 ---
 
-## 五、配额（Quota）机制
+## 5. 配额（Quota）与 inode 关联
 
-### 5.1 ext4 与配额系统的关联
+ext4 原生支持 POSIX quota，inode 通过 `struct ext4_inode_info` 中的 `i_dquot[EXT4_MAXQUOTAS]` 数组关联配额信息。
 
-ext4 通过 Linux VFS 的通用配额层（`linux/quota.h`）支持 user quota、group quota 和 project quota。配额信息通过以下 inode 关联：
+### 5.1 核心数据结构
 
 ```c
-// fs/ext4/ext4.h
-struct ext4_sb_info {
-    // ...
-    struct ext4_super_block *s_es;
-    // quota 文件名（可变）
-    const char __rcu *s_qf_names[EXT4_MAXQUOTAS];
-    // quota 格式 (QFMT_VFS_V0 / QFMT_VFS_V1)
-    int s_jquota_fmt;
-    // quota inode（通过 s_es 中 s_usr_quota_inum / s_grp_quota_inum）
+// super.c:1633
+static const struct dquot_operations ext4_quota_operations = {
+    .write_dquot     = ext4_write_dquot,
+    .acquire_dquot   = ext4_acquire_dquot,
+    .release_dquot   = ext4_release_dquot,
+    .mark_dirty      = ext4_mark_dquot_dirty,
+    .alloc_dquot     = dquot_alloc,
+    .destroy_dquot   = dquot_destroy,
+    .get_next_id     = dquot_get_next_id,
 };
 
-// fs/ext4/ext4.h:1030 — ext4_inode_info
-struct ext4_inode_info {
-    // ...
-    struct jbd2_inode *jinode;         // 日志关联
-    struct rw_semaphore i_data_sem;     // 数据修改序列化
-    qsize_t i_reserved_quota;           // 预分配的配额预留
-    u64     i_es_seq;                  // extent status 序列号
-};
+// super.c:1628
+static struct dquot __rcu **ext4_get_dquots(struct inode *inode)
+{
+    return EXT4_I(inode)->i_dquot;
+}
 ```
 
-**配额写入流程**（以块分配为例）：
+`EXT4_MAXQUOTAS = 2`（user quota + group quota），`i_dquot[2]` 数组分别存储两种配额的 dquot 指针。
 
-```
-ext4_mb_new_blocks()
-    ↓
-dquot_alloc_block(inode, len)      // 检查 inode 所属 user/group 的配额
-    ↓
-如果配额超限：返回 -EDQUOT，ar->len 被减半重试
-    ↓
-配额允许：写入磁盘后
-ext4_mb_mark_diskspace_used()
-    ↓
-dquot_claim_block()                // 从预留转为实际使用
+### 5.2 配额操作流程
+
+**分配块时的配额检查**：
+```c
+// mballoc.c 分配路径
+dquot_alloc_block(ar->inode, EXT4_C2B(sbi, ar->len));
 ```
 
-**配额释放**（文件删除或 truncate）：
+**日志集成**：配额修改通过 `jbd2_journal_start()` 的 `EXT4_HT_QUOTA` 类型 handle 保护，确保配额变更本身被原子地记录到日志。
+
+**配额文件**：配额信息不存储在 ext4 元数据中，而是存储在独立的 quota 文件（通过 `quota_on` 挂载选项指定）。`ext4_quota_read()` / `ext4_quota_write()` 通过 VFS 层访问这些文件。
+
+**orphan inode 与配额恢复**：`super.c` 中的 orphan list（未完整关闭的 inode 链表）在 `ext4_orphan_cleanup()` 时也会触发相关 dquot 释放。
+
+### 5.3 ext4_quota_enable 与配额初始化
 
 ```c
-ext4_evict_inode(inode)
-    ↓
-ext4_truncate()  →  ext4_ext_remove_space()
-    ↓
-ext4_mb_free_blocks()
-    ↓
-dquot_free_block(inode, released_blocks)
+// super.c:1625
+static int ext4_quota_enable(struct super_block *sb, int type,
+                             int format_id, unsigned int flags)
 ```
 
-### 5.2 mbcache 和 dqopt 的关系
-
-- **mbcache**（metadata block cache）：是 ext4 的页缓存层，用于缓存目录项查找结果、xattr 等元数据块。它通过 `struct mbcache_entry` 用 (block_device, blocknr) 作为 key 进行缓存查找，加速频繁访问的元数据块。
-- **dqopt**（disk quota operations）：是 VFS quota 代码的磁盘布局操作结构，定义了如何读、写 quota 文件块。`s_qf_names` 指向 quota 文件路径（如果是文件型配额）。
-
-两者独立：mbcache 缓存**任意元数据块**（包括 quota 文件块），dqopt 定义**如何解释 quota 文件内容**。
+配额子系统在 mount 时通过 `ext4_fill_super()` 中的 `ext4_quotas_on()` 初始化，将 quota 文件 inode 与 quota 类型关联。
 
 ---
 
-## 六、快速 fsck（e2fsck）串联
+## 6. 快速 fsck——ext4 vs ext3 的核心差异
 
-### 6.1 ext4 的 fsck 为什么快
+ext4 的 fsck 速度比 ext3 快 2~10 倍，原因是多方面的设计改进，并非单一优化。
 
-ext3 的 fsck 需要逐块扫描所有 inode 和块位图，确认一致性。ext4 的关键优化：
+### 6.1 super.c 中的快速 fsck 相关特性
 
-**1. block group descriptor checksums**
+**1. Sparse Super（稀疏超级块）**
 
-```c
-// fs/ext4/ext4.h:402 — ext4_group_desc
-struct ext4_group_desc {
-    __le32  bg_block_bitmap_lo;
-    __le32  bg_inode_bitmap_lo;
-    __le32  bg_inode_table_lo;
-    __le16  bg_free_blocks_count_lo;
-    __le16  bg_free_inodes_count_lo;
-    __le16  bg_used_dirs_count_lo;
-    __le16  bg_flags;
-    // ...
-    __le16  bg_checksum;  // crc16(sb_uuid+group+desc)
-};
-```
+ext4 的 super block 副本只存储在少数块组（0, 1, 以及 3^k、5^k、7^k 幂次块组），而非每个块组都备份。相比 ext3 的每个块组备份，极大减少了需要读取的 super block 副本数量。
 
-`bg_checksum` 在 `ext4_group_desc_csum_set()` 计算。e2fsck 通过校验和快速识别哪些 group descriptor 损坏，从而只检查那些块而不是全部。
+**2. 元数据校验（Metadata Checksums）**
 
-**2. extent-status tree（es cache）**
+ext4 使用 CRC32C 对元数据进行校验：
+- extent block 的 `ext4_extent_tail.et_checksum`
+- block group descriptor 的 `bg_block_csum` / `bg_inode_csum`
+- journal super block 的 s_checksum
 
-`ext4_es_cachep`（`fs/ext4/extents_status.c:194`）是 extent_status 的 radix-tree 缓存，记录了哪些逻辑块已被分配、哪些是 unwritten、哪些是延迟分配。它帮助 e2fsck 快速重建 bitmaps 而不需要全量扫描。
+`e2fsck` 可以利用这些校验码**跳过已知正确的块**，而无需完整扫描验证每个块的内容。ext3 没有这个特性，所有元数据必须逐块读取和验证。
 
-**3. flex_bg 增大 group 粒度**
+**3. 延迟 inode 表初始化（Lazy ITB Init）**
 
-flex_bg 将多个连续 block group 合并为一个更大的分配组，块位图合成一个大位图，e2fsck 处理更少的大块。
+ext4 支持 `lazy_itable_init` 选项，在格式化时只初始化 inode 位图而不初始化 inode 表内容。`e2fsck` 可以**只检查已分配的 inode**（从 inode 位图可知），忽略未使用的 inode 表块——这在创建大文件系统时效果显著。
 
-**4. s_free_blocks_count vs group descriptor**
+### 6.2 ext3 fsck 必须做什么
 
-superblock 中的 `s_free_blocks_count_lo/hi` 是**全局汇总**：
+ext3 的 fsck 在崩溃恢复时必须：
+1. 逐块扫描所有数据块位图，确认每个块组的状态
+2. 验证每个 inode 的链接计数（directory entry → inode 遍历）
+3. 对 orphan inode 链表逐项追踪
+4. 检查所有 directory entry 的一致性（父目录引用等）
 
-```c
-// fs/ext4/ext4.h:1399
-ext4_free_blocks_count_set(sb, es, blk)
-  es->s_free_blocks_count_lo = cpu_to_le32((u32)blk)
-  es->s_free_blocks_count_hi = cpu_to_le32(blk >> 32)
-```
+### 6.3 ext4 的 e2fsck 额外优化
 
-而每个 group descriptor 的 `bg_free_blocks_count_lo/hi` 是**分组的精确计数**。
+**Pass 1 优化**：ext4 的 extent 树结构使 `e2fsck` 能更快地遍历文件的所有块——extent 链表比 ext3 的间接块链短得多。
 
-两者关系：
-```
-s_free_blocks_count = Σ(每 group 的 bg_free_blocks_count) + overhead_clusters
-```
+**Pass 4 优化**：链接计数的修正，ext4 的 inode 编号更紧凑（extent 文件的 inode 空间连续性更好）。
 
-e2fsck **不信任** s_free_blocks_count，而是遍历所有 group descriptor 重新求和来验证。如果不匹配说明有元数据损坏。
-
-### 6.2 bg_block_bitmap_csum 和 bg_inode_bitmap_csum
-
-ext4 还在 group descriptor 中对每个 bitmap 块计算独立的 CRC32C 校验和（`bg_block_bitmap_csum_lo/hi`、`bg_inode_bitmap_csum_lo/hi`），通过 `ext4_block_bitmap_csum_set()` 写入。这些校验和让 e2fsck 在读取位图前就能发现位图块本身的腐化。
+**orphan inode 优化**：`super.c:1163` 的 orphan list 机制使 e2fsck 只需遍历 orphan 链表而非全量 inode 扫描。对于 large sparse 文件，这个差异尤为明显。
 
 ---
 
-## 七、resize2fs 和在线调整大小
+## 7. 逻辑串联——从写文件到磁盘的完整路径
 
-### 7.1 ext4_resize_fs 过程
-
-```c
-// fs/ext4/resize.c:1996
-int ext4_resize_fs(struct super_block *sb, ext4_fsblk_t n_blocks_count)
-  // 1. 验证新大小不超过设备边界
-  bh = ext4_sb_bread(sb, n_blocks_count - 1, 0)  // 尝试读最后一块
-  // 2. 计算新的 group 数量
-  n_group = ext4_get_group_number(sb, n_blocks_count - 1)
-  // 3. 计算需要的 group descriptor blocks 数量
-  n_desc_blocks = num_desc_blocks(sb, n_group + 1)
-  // 4. 如果需要更多 descriptor blocks（resize inode 或 meta_bg）
-  if (n_desc_blocks > o_desc_blocks + le16_to_cpu(es->s_reserved_gdt_blocks))
-    // 需要分配新 descriptor blocks → 分配它们
-  // 5. 初始化新 group's descriptor（BG_BLOCK_UNINIT 标志）
-  // 6. 更新 superblock
-  ext4_free_blocks_count_set(sbi->s_es, n_blocks_count)
-  // 7. 更新 sbi->s_groups_count
-  // 8. 写回 superblock 和 所有 group descriptors
-```
-
-**struct ext4_super_block 的更新**：`s_blocks_count_lo/hi` → `s_free_blocks_count_lo/hi` 都需要更新。superblock 通过 `ext4_handle_dirty_metadata()` 写入日志。
-
-### 7.2 GPT 与 2TB+ 文件系统
-
-MBR（DOS）分区表最大支持 2TB（2^32 × 512B）。超过 2TB 的文件系统必须使用 GPT 分区表，GPT 支持到 8ZB。
-
-ext4 本身支持 48-bit block count（`s_blocks_count_hi`），通过 `ext4_has_feature_64bit(sb)` 表示。在 Linux 6.19 下，ext4 最大文件系统大小约 1EB（取决于页面大小和块大小）。
-
----
-
-## 八、ext4 inode 读取完整路径图
-
-从用户进程 `open(2)` 到磁盘块读取的完整路径：
+理解 ext4 的关键是将以上模块串联成完整的 I/O 路径：
 
 ```
-用户空间
-======
-open("/mnt/file", O_RDONLY)
-    ↓
-VFS 层
-======
-sys_open()
-    → do_filp_open()
-    → dentry_open()
-    → ext4_file_open()
-    → ext4_file_read_iter()
-        → generic_file_read_iter()
-            → ext4_read_folio()
-                → ext4_bread()
-                    → ext4_getblk()
-                        → _ext4_get_block()
-                            → ext4_map_blocks()
-                                [核心：extent 查找或分配]
-    ↓
-extent 查找路径（ext4_map_blocks 内部）
-==========================================
-ext4_map_blocks(inode, map, flags)
-    ↓
-    ┌─ 如果是 extent inode（EXT4_EXTENTS_FL 置位）
-    │    ext4_ext_map_blocks()
-    │        → ext4_find_extent(inode, lblk, NULL, flags)
-    │            ┌─ 读取 inode 的 i_data（extent_header）
-    │            │    eh = ext_inode_hdr(inode)
-    │            │    depth = ext_depth(inode)
-    │            ├─ while (i = depth; i-- > 0):
-    │            │    ext4_ext_binsearch_idx(path+ppos, block)
-    │            │    block = ext4_idx_pblock(p_idx)
-    │            │    bh = read_extent_tree_block(inode, ...)
-    │            │    eh = ext_block_hdr(bh)
-    │            ├─ ext4_ext_binsearch(path+ppos, block)   // 叶子层
-    │            └─ return path  // p_ext 指向找到的 extent
-    │        → ext4_ext_pblock(p_ext)   // 解析物理块号
-    │        → return map->m_pblk, map->m_len
-    │
-    └─ 如果是非 extent inode（间接块映射）
-         ext4_ind_map_blocks()
-              // 跟随 i_block[] 中的间接指针
-    ↓
-块分配（如果块不存在且需要分配）
-===================================
-ext4_mb_new_blocks(handle, ar, errp)
-    → ext4_mb_use_preallocated()      // 尝试预分配
-    → ext4_mb_normalize_request(ar)
-    → ext4_mb_regular_allocator(ac)
-        → ext4_mb_find_by_goal()      // Buddy: 在目标附近找
-        → ext4_mb_scan_groups()       // Buddy: 遍历所有 group
-        → mb_find_extent()            // 核心 buddy 搜索
-    → ext4_mb_mark_diskspace_used(ac, handle)
-        → ext4_get_group_desc()       // 加载 group descriptor
-        → ext4_read_block_bitmap()    // 读块位图
-        → ext4_lock_group()
-        → mb_set_bits()               // 置位位图
-        → ext4_free_group_clusters_set() // 更新 gdp->bg_free_blocks_count
-        → ext4_group_desc_csum_set()  // 校验和
-        → ext4_unlock_group()
-        → percpu_counter_sub()        // 更新 sbi->s_freeclusters_counter
-        → ext4_handle_dirty_metadata() // → journal 化修改
-    ↓
-buffer I/O 层
-==============
-ext4_bread() → ext4_getblk() → sb_bread()
-    → __bread() → bio_read_page()
-        → Submit bio to block layer
-            → scsi/nvme/ata 驱动
-                → DMA 到磁盘
-                    → IRQ 中断
-                        → buffer_head 标记 Uptodate
-    ↓
-folio Uptodate
-==============
-ext4_read_folio() 回调完成
-    → unlock_folio()
-        → wake_up_bit(&folio->flags, PG_locked)
-    ↓
-VFS 返回文件描述符
-===================
-do_filp_open() 返回 struct file *
-→ fd_install() → 进程打开文件表
+应用 write()
+  → VFS generic_file_write_iter()
+    → ext4_da_write_begin()           # 延迟分配路径
+         ↘ ext4_journal_start()        # 获取 handle
+    → ext4_da_map_blocks()             # extent 树查找 + 新块分配请求
+         ↘ ext4_find_extent()         # 在 extent 树中定位逻辑块
+         ↘ ext4_mb_new_blocks()        # 调用 mballoc
+              ↘ ext4_mb_use_preallocated()  # 尝试 PA
+              ↘ ext4_mb_regular_allocator() # Buddy 分配
+         ↘ ext4_ext_insert_extent()    # 更新 extent 树（可能触发分裂）
+    → ext4_da_write_end()              # 更新 i_disksize，标记 dirty
+         ↘ ext4_journal_stop()        # 释放 handle（buffer 加入待提交）
 ```
 
-**ASCII 简化视图**：
-
+**后台提交线程（kjournald2）**定期执行：
 ```
-User open(2)
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│  VFS: do_filp_open()                    │
-│  → dentry lookup (dentry cache)        │
-└────────────┬────────────────────────────┘
-             ▼
-┌─────────────────────────────────────────┐
-│  ext4_file_open()                      │
-│  → ext4_read_folio()                  │
-└────────────┬────────────────────────────┘
-             ▼
-┌─────────────────────────────────────────┐
-│  ext4_bread()                          │
-│  → ext4_getblk() → sb_bread()          │
-└────────────┬────────────────────────────┘
-             ▼
-┌─────────────────────────────────────────┐
-│  _ext4_get_block()                     │
-│  → ext4_map_blocks()                   │
-│      ├─ ext4_ext_map_blocks()         │
-│      │   └─ ext4_find_extent()        │
-│      │       ├─ ext_inode_hdr()         │
-│      │       ├─ ext4_ext_binsearch_idx()│
-│      │       └─ read_extent_tree_block() │
-│      └─ ext4_mb_new_blocks() (if new)  │
-│          ├─ ext4_mb_regular_allocator() │
-│          ├─ mb_find_extent()            │
-│          └─ ext4_mb_mark_diskspace_used()│
-│              ├─ ext4_lock_group()        │
-│              ├─ mb_set_bits()            │
-│              ├─ gdp->bg_free_blocks     │
-│              └─ ext4_handle_dirty_meta() │
-└────────────┬────────────────────────────┘
-             ▼
-┌─────────────────────────────────────────┐
-│  sb_bread() → submit_bio()             │
-│  → block device / NVMe / SCSI         │
-│  → buffer_head up-to-date             │
-└────────────┬────────────────────────────┘
-             ▼
-       folio unlocked
-       file descriptor returned
+jbd2_journal_commit_transaction()
+  → 将 dirty buffer 写入日志区
+  → 写入 commit block（事务 ID）
+  → jbd2_log_do_checkpoint() 回写到最终位置
+```
+
+**文件系统同步（fsync）**时：
+```
+ext4_sync_file()
+  → jbd2_journal_wait_commpletion()   # 等待本文件相关事务提交
+  → ext4_write_inode()                # 强制 inode 写入
 ```
 
 ---
 
-## 总结：七条逻辑线的交织
+## 8. 关键数据结构速查
 
-| 逻辑线 | 核心结构 | 核心操作 | 交织点 |
-|--------|---------|---------|--------|
-| inode/extent | ext4_extent, ext4_ext_path | ext4_find_extent, ext4_ext_insert_extent | 所有文件读写必经之路 |
-| mballoc | ext4_group_desc, buddy bitmap | ext4_mb_new_blocks, ext4_mb_mark_diskspace_used | ext4_map_blocks 触发分配时 |
-| jbd2 日志 | jbd2_inode, transaction | journal_submit_data_buffers, jbd2_journal_commit_transaction | 元数据修改必须日志化 |
-| 目录组织 | ext4_dir_entry_2, dx_root | ext4_find_entry, ext4_dx_find_entry | namei 操作入口 |
-| Quota | ext4_sb_info.s_qf_names, i_reserved_quota | dquot_alloc_block, dquot_claim_block | mballoc 分配前检查 |
-| 快速 fsck | bg_checksum, s_free_blocks_count | e2fsck 校验vs 扫描 | superblock/group descriptor |
-| resize | ext4_super_block, flex_bg | ext4_resize_fs, num_desc_blocks | superblock 更新 + 新 group 初始化 |
+| 结构 | 文件 | 用途 |
+|------|------|------|
+| `struct ext4_extent` | ext4_extents.h | 叶子 extent，描述连续物理块 |
+| `struct ext4_extent_idx` | ext4_extents.h | 索引节点，跳转到下层 |
+| `struct ext4_extent_header` | ext4_extents.h | 每个 extent block 头部 |
+| `struct ext4_ext_path` | ext4_extents.h | extent 树遍历路径 |
+| `struct ext4_prealloc_space` | mballoc.c | 预分配空间条目 |
+| `struct ext4_allocation_context` | mballoc.c | 分配请求上下文 |
+| `struct handle_s` | jbd2.h | 日志事务句柄 |
+| `struct transaction_s` | jbd2.h | 日志事务 |
+| `struct ext4_dir_entry_2` | ext4.h | 目录条目 |
+| `struct dx_root/dx_node` | dir.c | htree 目录索引节点 |
 
-ext4 的设计哲学是**层次清晰、交代价低**：每个子系统（extent、mballoc、jbd2）都是独立的算法模块，通过 VFS 和 buffer_head 的薄胶水层组合在一起。最精妙的设计是 extent 树——它把原来 ext2/3 的三级间接块指针链压缩成了一个最多 5 层的 B+树变种，使得大文件的块映射从 O(n) 降到了 O(log n)。
+---
+
+## 9. 源码位置总结
+
+| 模块 | 核心函数 | 源码位置 |
+|------|---------|---------|
+| extent 查找 | `ext4_find_extent()` | extents.c:886 |
+| extent 插入 | `ext4_ext_insert_extent()` | extents.c:1992 |
+| extent 分裂 | `ext4_split_convert_extents()` | extents.c:3816 |
+| 块分配入口 | `ext4_mb_new_blocks()` | mballoc.c:6229 |
+| Buddy 分配器 | `ext4_mb_regular_allocator()` | mballoc.c:3001 |
+| 预分配查找 | `ext4_mb_use_preallocated()` | mballoc.c:4876 |
+| 写页 | `ext4_writepage()` → `ext4_block_write_begin()` | inode.c:1170+ |
+| 目录查找 | `ext4_find_entry()` / `ext4_dx_readdir()` | dir.c:557 |
+| 日志 handle | `jbd2_journal_start/stop()` | jbd2/transaction.c |
+| 配额获取 | `ext4_get_dquots()` | super.c:1628 |
