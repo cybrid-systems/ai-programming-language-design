@@ -280,3 +280,79 @@ ADD && wc -c 92-seccomp-landlock-analysis.md
 // → 否则执行 seccomp_run_filters()
 // 缓存失效：新过滤器添加时清空
 ```
+
+## 10. seccomp 过滤器缓存
+
+```c
+// seccomp 为高频系统调用提供缓存加速：
+
+// seccomp_cache_check_allow @ :177
+// → 在 seccomp_run_filters 之前调用
+// → 如果缓存中有 ALLOW 结果 → 跳过 BPF 执行
+// → 缓存键：系统调用号 + 架构 + 参数特征
+// → 缓存值：ALLOW（只有允许被缓存）
+
+// seccomp_cache_prepare @ :183
+// → 在添加新过滤器时初始化缓存
+// → 清空所有缓存条目
+
+// 缓存失效：
+// → seccomp_attach_filter() 时清空
+// → 因为新过滤器可能改变旧决策
+```
+
+## 11. 过滤器同步——seccomp_sync_threads
+
+```c
+// 多线程进程中一个线程设置 seccomp 时同步到所有线程：
+
+// seccomp_sync_threads() — 同步过滤器到所有线程：
+// → 遍历线程组中所有线程
+// → 为每个线程复制过滤器指针
+// → 确保所有线程共享同一套过滤器
+
+// is_ancestor @ :467 — 检查过滤器层级：
+// → 判断一个过滤器是否是另一个的祖先
+// → 用于过滤器继承检查
+
+// seccomp_release() — 进程退出时释放过滤器：
+// → 递减引用计数
+// → 归零时释放 BPF 程序和过滤器结构
+```
+
+## 12. Landlock 内核接口
+
+```c
+// Landlock 通过系统调用暴露安全策略：
+
+// landlock_create_ruleset(attr, size, flags)
+// → 创建空规则集
+// → 返回文件描述符
+
+// landlock_add_rule(ruleset_fd, type, rule_attr, flags)
+// → 添加路径访问规则
+//   type = LANDLOCK_RULE_PATH_BENEATH
+//   rule_attr = { parent_fd, allowed_access }
+// → 检查 parent_fd 的访问权限
+
+// landlock_restrict_self(ruleset_fd, flags)
+// → 应用规则集到当前进程
+// → 不可逆转（规则只能增加）
+
+// ABI 版本：
+// LANDLOCK_ABI_1 (5.13) — 基础文件访问
+// LANDLOCK_ABI_2 (5.19) — TCP 绑定/连接控制
+```
+
+## 13. 关键函数索引
+
+| 函数 | 符号数 | 作用 |
+|------|--------|------|
+| `seccomp.c` | 125 | seccomp 框架 |
+| `seccomp_run_filters` | `:404` | 过滤器执行链 |
+| `seccomp_cache_check_allow` | `:177` | 缓存检查 |
+| `seccomp_sync_threads` | — | 线程间同步 |
+| `landlock_create_ruleset` | — | 创建规则集 |
+| `landlock_add_rule` | — | 添加路径规则 |
+| `landlock_restrict_self` | — | 应用规则集 |
+
