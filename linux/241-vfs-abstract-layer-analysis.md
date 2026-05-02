@@ -1,361 +1,484 @@
 # vfs_deep — VFS 抽象层与系统调用桥梁深度分析
 
-## 1. 从 open() 系统调用到具体文件系统的完整调用链
+> 基于 Linux 7.0-rc1 源码，结合 doom-lsp 静态分析 `fs/namei.c`、`fs/open.c`、`include/linux/fs.h`
+
+---
+
+## 1. open() 到文件系统的完整 ASCII 调用链
 
 ```
-用户空间: open("/etc/passwd", O_RDONLY)
-          │
-          ▼
-SYSCALL_DEFINE3(open)          [fs/open.c:1374]
-  → do_sys_open()              [fs/open.c:1367]
-    → do_sys_openat2()          [fs/open.c:1355]
-      → build_open_flags()      构建 open_flags
-      → do_file_open()          [fs/namei.c:4867]
-          │
-          ▼
-    filename_lookup()            [fs/namei.c:2830]
-      → set_nameidata()
-      → path_lookupat()          [fs/namei.c:2797]
-          │                      (RCU 模式优先)
-          ▼
-      link_path_walk()           [fs/namei.c:2574]
-        path_init()              初始化 nd->path
-        循环: 解析每一层路径分量
-        lookup_hash()            查 dentry hash 表
-        follow_symlink()         处理符号链接
-          │
-          ▼
-      complete_walk()            完成路径解析，验证最终 dentry
-      返回: struct path { dentry, vfsmount }
-          │
-          ▼
-    path_openat()                [fs/namei.c:4838]
-      alloc_empty_file()         分配 struct file
-      path_init()                重新初始化（重走路径解析）
-      link_path_walk()           解析到最后一层
-      open_last_lookups()        处理 open 特有的 lookup
-      do_open()                  [fs/namei.c:4655]
-          │
-          ▼
-      vfs_open()                 [fs/open.c:1074]
-        → do_dentry_open()       [fs/open.c:885]
-          │                      ★ 关键: 绑定 file 到具体 fs
-          ▼
-      [具体文件系统: ext4_file_operations.open /
-                    xfs_file_operations.open]
-```
-
-## 2. path_lookupat 串联：open("/etc/passwd", O_RDONLY) 完整路径解析
-
-### 2.1 调用链总览
-
-```
-filename_lookup(AT_FDCWD, "/etc/passwd", flags, &path, NULL)
-  ├─ set_nameidata(&nd, AT_FDCWD, filename, NULL)
-  ├─ path_lookupat(&nd, flags | LOOKUP_RCU, path)  ← 首次尝试 RCU
-  │     ├─ path_init(nd, flags)        → 设置 nd->path = { current->fs->pwd, root }
-  │     │                               处理绝对/相对路径，区分 ROOT/PARENT/DOTDOT
-  │     ├─ link_path_walk("/etc/passwd", nd)      ← 核心解析循环
-  │     │     ├─ 遇到 "/" → 跳过，连续 "/" 只算一个
-  │     │     ├─ 解析第一分量 "etc" → hash_name() 计算 qstr
-  │     │     ├─ lookup_hash(parent, &name)       查 dentry_hashtable
-  │     │     │     └─ d_lookup(parent, &name)    先查 DCACHE_OP_HASH
-  │     │     │         └─ 命中 → 验证 seq
-  │     │     │         └─ 未命中 → ->lookup() 回调具体 fs
-  │     │     ├─ follow_one_link()   处理符号链接（嵌套跟踪）
-  │     │     ├─ 解析第二分量 "passwd"
-  │     │     ├─ lookup_hash(dir, &name)
-  │     │     └─ 若 "." 或 ".." → 特殊处理
-  │     ├─ lookup_last(nd)           最后分量特殊处理（可不查找）
-  │     ├─ complete_walk(nd)        RCU unlock + 权限验证 + 重解析
-  │     └─ *path = nd->path          返回 { dentry, mnt }
+open("/etc/passwd", O_RDONLY)
   │
-  ├─ if (-ECHILD) retry without RCU
-  ├─ if (-ESTALE) retry with LOOKUP_REVAL
-  └─ audit_inode(name, path->dentry, 0)
+  ├─ SYSCALL_DEFINE3(open)                          [fs/open.c:1374]
+  │     └─ do_sys_open()                            [fs/open.c:1367]
+  │           ├─ do_sys_openat2()                   [fs/open.c:1355]
+  │           │     ├─ build_open_flags()            将 flags 转换为 open_flags
+  │           │     └─ do_file_open()               [fs/namei.c:4867]
+  │           │
+  │           └─ do_file_open()                      [fs/namei.c:4867]
+  │                 ├─ set_nameidata()              初始化 nameidata
+  │                 └─ path_openat(nd, op, flags)  [fs/namei.c:4838]
+  │                       │
+  │                       ├─ alloc_empty_file()    分配 struct file
+  │                       ├─ path_init(nd, flags)  初始化路径起点
+  │                       ├─ link_path_walk(s, nd) 循环解析每个路径分量
+  │                       │     ├─ 解析 "etc"  → lookup_hash() → d_lookup()
+  │                       │     │                      ├─ 命中 → hashtable hit
+  │                       │     │                      └─ 未命中 → ext4_lookup()
+  │                       │     └─ 解析 "passwd" → 同上
+  │                       ├─ open_last_lookups()   open 特有的 lookup
+  │                       ├─ do_open(nd, file, op) [fs/namei.c:4655]
+  │                       │     └─ vfs_open(&nd->path, file)  [fs/open.c:1074]
+  │                       └─ terminate_walk(nd)
+  │                             │
+  │                             └─ vfs_open() → do_dentry_open()  [fs/open.c:885]
+  │                                   │
+  │                                   ├─ f->f_inode = dentry->d_inode
+  │                                   ├─ f->f_op   = inode->i_fop        ★ 从 inode 获取
+  │                                   ├─ security_file_open(f)
+  │                                   └─ inode->i_op->open(inode, f)    ★ 调用 fs 实现的 open
+  │                                         │
+  │                                         └─ ext4_file_operations.open
+  │                                               ext4_file_open()
 ```
 
-### 2.2 link_path_walk 内部循环
+---
+
+## 2. path_lookupat：open("/etc/passwd") 路径解析每步做什么
+
+### 2.1 核心数据结构 `struct nameidata`
+
+```c
+// fs/namei.c:723
+struct nameidata {
+    struct path     path;         // 当前解析到的 {mnt, dentry}
+    struct qstr     last;         // 最后一个分量（名字 + hashlen）
+    struct path     root;         // 进程根目录（/）
+    struct inode    *inode;       // 当前 path 的 inode
+    unsigned int   flags;        // LOOKUP_xxx 标志
+    unsigned        seq;          // RCU seqcount（验证 dentry 有效性）
+    unsigned        m_seq;        // mount_lock seqcount
+    unsigned        r_seq;         // rename_lock seqcount
+    enum { LAST_ROOT, LAST_DOTDOT, LAST_DOT, LAST_NORM } last_type;
+    int             depth;        // 符号链接嵌套深度
+    const char      *pathname;    // 原始路径字符串
+    ...
+};
+```
+
+### 2.2 path_init：确定搜索起点
+
+```c
+// fs/namei.c:2673
+static const char *path_init(struct nameidata *nd, unsigned flags)
+{
+    const char *s = nd->pathname;  // e.g. "/etc/passwd"
+
+    // 处理 LOOKUP_ROOT：若路径以 "/" 开头，nd->path = current->fs->root
+    if (*s == '/') {
+        nd->path = nd->root;       // 从进程的根目录开始（跨 mount 传播）
+        nd->state |= ND_ROOT_PRESET;
+    } else if (IS_ERR(s)) {
+        return s;
+    } else {
+        // 相对路径：从当前工作目录开始
+        nd->path = current->fs->pwd;
+    }
+
+    nd->inode = nd->path.dentry->d_inode;
+
+    // 若开启 RCU 模式，加锁
+    if (flags & LOOKUP_RCU)
+        rcu_read_lock();
+
+    return s;
+}
+```
+
+**关键**：绝对路径从 `nd->root`（`/`）开始解析；相对路径从 `current->fs->pwd` 开始。`nd->root` 在进程创建时从 init_task 继承，指向系统根文件系统。
+
+### 2.3 link_path_walk：逐分量解析循环
 
 ```c
 // fs/namei.c:2574
 static int link_path_walk(const char *name, struct nameidata *nd)
 {
-    for(;;) {
-        // 1. 权限检查
-        err = may_lookup(idmap, nd);
+    nd->last_type = LAST_ROOT;
+    nd->flags |= LOOKUP_PARENT;  // 解析父目录模式
 
-        // 2. 计算分量 hash
+    // 跳过前导 "/"
+    if (*name == '/') {
+        do { name++; } while (*name == '/');
+    }
+
+    for (;;) {
+        struct mnt_idmap *idmap = mnt_idmap(nd->path.mnt);
+
+        // ★ 权限检查：may_lookup 检查进程是否有权限遍历该目录
+        err = may_lookup(idmap, nd);
+        if (unlikely(err)) return err;
+
+        // hash_name：将 "etc" 转为 qstr { name, len, hashlen }
         nd->last.name = name;
         name = hash_name(nd, name, &lastword);
 
-        // 3. 处理 DOTDOT / DOT / 普通分量
-        switch(lastword) {
-        case LAST_WORD_IS_DOTDOT: nd->last_type = LAST_DOTDOT; break;
-        case LAST_WORD_IS_DOT:    nd->last_type = LAST_DOT;    break;
-        default:
+        switch (lastword) {
+        case LAST_WORD_IS_DOTDOT:
+            nd->last_type = LAST_DOTDOT;
+            nd->state |= ND_JUMPED;   // 发生了目录跨越
+            break;
+        case LAST_WORD_IS_DOT:
+            nd->last_type = LAST_DOT;
+            break;
+        default: {
             nd->last_type = LAST_NORM;
-            // 调用 DCACHE_OP_HASH（若有）做特殊 hash
-            if (parent->d_flags & DCACHE_OP_HASH)
-                parent->d_op->d_hash(parent, &nd->last);
+            nd->state &= ~ND_JUMPED;
+
+            // 若 d_op->d_hash 存在，调用它做自定义 hash
+            struct dentry *parent = nd->path.dentry;
+            if (unlikely(parent->d_flags & DCACHE_OP_HASH)) {
+                err = parent->d_op->d_hash(parent, &nd->last);
+                if (err < 0) return err;
+            }
         }
 
-        // 4. 若已无更多分量，跳出
+        // 如果 name 已为空（末尾），说明这个分量就是最后一个
         if (!*name) goto OK;
 
-        // 5. 查 dentry（先 d_lookup 缓存，未命中调 ->lookup）
-        dentry = lookup_hash(parent, &nd->last);
-
-        // 6. 符号链接跟踪
-        if (d_is_symlink(dentry))
-            err = follow_link(&dentry, nd);
-
-        // 7. 更新 parent = 当前 dentry，继续循环
-        parent = dentry;
-    }
+        // 跳过后续的 "/" 继续解析
+        do { name++; } while (*name == '/');
+        if (!*name) {
 OK:
-    // 处理最终分量
+            // 路径结束或末尾只有 "/"
+            if (likely(!depth)) {
+                nd->dir_vfsuid = i_uid_into_vfsuid(idmap, nd->inode);
+                nd->dir_mode   = nd->inode->i_mode;
+                nd->flags &= ~LOOKUP_PARENT;  // 不再解析父目录
+                return 0;
+            }
+            // 最后分量是嵌套符号链接的末端
+            name = nd->stack[--depth].name;
+            link = walk_component(nd, 0);
+        } else {
+            // 非最后分量
+            link = walk_component(nd, WALK_MORE);
+        }
+
+        if (unlikely(link)) {
+            // 符号链接：压栈后继续循环跟踪
+            nd->stack[depth++].name = name;
+            name = link;
+            continue;
+        }
+
+        // 检查当前是否为目录（非目录无法继续解析子路径）
+        if (unlikely(!d_can_lookup(nd->path.dentry))) {
+            if (nd->flags & LOOKUP_RCU) {
+                if (!try_to_unlazy(nd)) return -ECHILD;
+            }
+            return -ENOTDIR;
+        }
+    }
 }
 ```
 
-### 2.3 dentry 和 vfsmount 的串联关系
-
-```
-struct path {
-    struct vfsmount *mnt;    ← 挂载点命名空间
-    struct dentry  *dentry;  ← 目录项（指向 inode）
-}
-```
-
-- **dentry** 是路径中每一个分量的"目录项缓存对象"，包含：
-  - `d_inode`：指向该分量对应的 inode
-  - `d_parent`：指向父目录 dentry（构成树结构）
-  - `d_flags`：缓存操作标志（DCACHE_OP_HASH、DCACHE_OP_COMPARE 等）
-  - `d_hash`：缓存的 hash 链（用于加速同目录查找）
-
-- **vfsmount** 代表一个挂载点，所有从同一挂载点出发的路径共享同一个 mnt
-- 跨文件系统访问（如 `/mnt/tmp/file`）时，`path->mnt` 发生变化但 `dentry` 仍指向该mnt根下的子树
-
-### 2.4 RCU 路径解析的退化机制
+### 2.4 walk_component：单个分量的查找和符号链接处理
 
 ```c
-int filename_lookup(int dfd, struct filename *name, unsigned flags,
-                    struct path *path, const struct path *root)
+// fs/namei.c:2261
+static const char *walk_component(struct nameidata *nd, int flags)
 {
-    set_nameidata(&nd, dfd, name, root);
-    retval = path_lookupat(&nd, flags | LOOKUP_RCU, path);  // 快速路径
-    if (unlikely(retval == -ECHILD))                      // RCU 冲突
-        retval = path_lookupat(&nd, flags, path);         // 退到 Blocking
-    if (unlikely(retval == -ESTALE))                       // dentry 失效
-        retval = path_lookupat(&nd, flags | LOOKUP_REVAL, path);
-    ...
+    struct inode *inode;
+
+lookup:
+    // 1. 查 dentry 缓存（lookup_fast）
+    dentry = lookup_fast(nd);
+    if (IS_ERR(dentry))
+        return ERR_CAST(dentry);
+
+    if (likely(dentry))
+        goto found;
+
+    // 2. 缓存未命中，调用具体文件系统的 ->lookup()
+    dentry = lookup_slow(&nd->last, nd->path.dentry, nd->flags);
+    if (IS_ERR(dentry))
+        return ERR_CAST(dentry);
+
+found:
+    inode = d_inode(dentry);
+
+    // 3. 符号链接跟踪
+    if (d_is_symlink(dentry) && !(flags & WALK_NOFOLLOW)) {
+        if (nd->flags & LOOKUP_RCU) {
+            if (!try_to_unlazy(nd)) return ERR_PTR(-ECHILD);
+        }
+        return d_op->d_follow_link(dentry, nd);  // 返回链接目标
+    }
+
+    // 4. 更新当前 path
+    nd->path.dentry = dentry;
+    nd->inode = inode;
+    return NULL;  // 无链接继续
 }
 ```
 
-RCU 模式不使用锁，通过 seqcount 验证 dentry 有效性；冲突时整体退化为 Blocking 模式。
-
-## 3. dentry 缓存逻辑：为何 open 第二次很快
-
-### 3.1 dentry_hashtable 与 dentry_unused 的关系
+### 2.5 dentry 和 vfsmount 的关系
 
 ```
-dentry_hashtable [哈希表]
-  ├─ slot[hash("/etc")] → [ dentry("/etc"), dentry("/etc") ... ]
-  │                           ↓
-  │                       串成 hlist（冲突链）
-  └─ slot[hash("/var")] → [ dentry("/var") ]
-
-dentry_unused [双向链表，LRU 队列]
-  所有 "未在使用"（d_flags = DCACHE_LRU_LIST）的 dentry 按最近访问排序
-  │recently used│←←←LRU←←←←│older│
+path { mnt, dentry } ——
+  │
+  │ mnt: struct vfsmount*，代表一个挂载点。
+  │      所有在该挂载点下的文件共享同一个 mnt。
+  │      访问 /mnt/tmp/file 时，mnt 指向 /mnt 的挂载信息。
+  │
+  │ dentry: struct dentry*，代表路径中的一个分量。
+  │         - d_inode：指向该分量对应的 inode
+  │         - d_parent：指向父目录的 dentry（构成树）
+  │         - d_flags：缓存操作标志
+  │         - d_hash：hashtable 冲突链节点
+  │         - d_lru：LRU 链表节点
+  │         - d_children：该目录的所有子项
+  │
+  │ 示例 "/etc/passwd":
+  │   nd->path.dentry = dentry("passwd")
+  │   dentry("passwd")->d_parent = dentry("etc")
+  │   dentry("etc")->d_parent = dentry("/")  (根目录)
+  │   dentry("/")->d_inode = inode(/)        (根 inode)
+  │   dentry("passwd")->d_inode = inode(/etc/passwd)
+  │
+  │ 跨文件系统示例 "/mnt/disk/file":
+  │   解析 /     → mnt = root_mnt, dentry = root_dentry
+  │   解析 mnt  → mnt = /mnt 的 vfsmount, dentry = mnt 的根 dentry
+  │   解析 disk → mnt 不变, dentry = disk 的 dentry
 ```
 
-**关键数据结构**（dcache.c）：
+**关键点**：同一个 `path` 中，`mnt` 和 `dentry` 必须属于同一个挂载空间。跨 `mnt` 的路径解析由 `handle_lookup_down` 处理。
+
+---
+
+## 3. dentry 缓存：dentry_hashtable 加速原理
+
+### 3.1 核心数据结构
 
 ```c
-// 全局哈希表，size = dentry_hashtable_size
-static struct hlist_bl_head *dentry_hashtable;
+// fs/dcache.c
+static unsigned int d_hash_shift __ro_after_init;
+static struct hlist_bl_head *dentry_hashtable;   // 全局哈希表
 
-// 每个 CPU 的未使用 dentry 计数（用于快速判断 shrink 时机）
+// 按 {parent_dentry, name} 哈希，查找同目录下的文件
+static inline struct hlist_bl_head *d_hash(unsigned long hashlen)
+{
+    return dentry_hashtable + runtime_const_shift_right_32(hashlen, d_hash_shift);
+}
+
+// CPU 本地计数器，用于快速判断 shrink 压力
 static DEFINE_PER_CPU(long, nr_dentry_unused);
 
-// 实际 LRU 链表头
+// LRU 链表：所有"未在使用"的 dentry 按最近访问排序
 static struct list_head dentry_unused[NR_LRU_LISTS];
 ```
 
-### 3.2 加速原理：缓存命中减少文件系统 lookup
+**dentry_hashtable** 是一个大小为 `2^d_hash_shift` 的哈希表，每个槽是一个 `hlist_bl_head`（双向链表头）。冲突时同一槽内多个 dentry 通过 `d_hash` 串成冲突链。
+
+### 3.2 d_lookup：缓存命中查找
+
+```c
+// fs/dcache.c
+static struct dentry *d_lookup(const struct dentry *parent,
+                                const struct qstr *name)
+{
+    unsigned int hash = name->hashlen_hashlen(name->hash);
+    struct hlist_bl_head *b = d_hash(hash);
+    struct hlist_bl_node *n;
+
+    // RCU 遍历（lockless）
+    hlist_bl_for_each_entry_rcu(dentry, n, b, d_hash) {
+        if (dentry->d_parent != parent)
+            continue;
+        if (dentry->d_name.hash_len != name->hash_len)
+            continue;
+        // 比较名字（可stadt 比较）
+        if (dentry_cmp(dentry, name))
+            continue;
+        // 验证 seqcount（RCU 模式）
+        if (!lockref_get_not_dead(&dentry->d_lockref))
+            continue;
+        return dentry;  // ★ 命中
+    }
+    return NULL;  // 未命中
+}
+```
+
+### 3.3 缓存加速效果
 
 ```
 第一次 open("/etc/passwd"):
+
   link_path_walk("etc")
-    lookup_hash("/")             → 查 dentry_hashtable → 未命中
-      → ext4_lookup()            → 磁盘 I/O，读 inode
-      → d_add(dentry, inode)    → 加入 hashtable + dentry_unused LRU
+    hash_name("etc") → hash = 0x5a3c...
+    d_hash(hash) → slot = dentry_hashtable[xxx]
+    hlist_bl_for_each_entry_rcu: 槽为空 ← 未命中
+    → ext4_lookup(parent=/, name="etc")
+      → 磁盘 I/O: 读 / 的 inode 和 data block
+      → 遍历 / 下所有目录项
+      → 找到 "etc" 对应的 inode
+      → d_add(dentry, inode)    ★ 加入 hashtable 和 LRU
+
   link_path_walk("passwd")
-    lookup_hash("/etc")          → 查 hashtable → 未命中
-      → ext4_lookup()            → 磁盘 I/O
-      → d_add(dentry, inode)
+    同上，第二次磁盘 I/O
 
 第二次 open("/etc/passwd"):
+
   link_path_walk("etc")
-    lookup_hash("/")             → hashtable 命中！
-      → d_lookup()               → 验证 seq（RCU 模式）
-      → 命中！返回已有 dentry     ★ 完全跳过 ext4_lookup()
+    d_lookup("/", "etc")  → hashtable 命中！ ✓
+    → 验证 seq，refcount++  → 零磁盘 I/O！  ★
+
   link_path_walk("passwd")
-    lookup_hash("/etc")          → hashtable 命中！
-      → 命中！                   ★ 第二次也跳过了磁盘 I/O
+    d_lookup("/etc", "passwd") → 命中！ ✓
+    → 零磁盘 I/O！  ★
 
-结论：dentry_hashtable 按 {parent, name} 做哈希，同一路径第二次命中率极高
+性能差距: 内存查找 ~50ns vs 磁盘 I/O ~0.5~30ms → 5~6 个数量级
 ```
 
-### 3.3 hashtable 查找 vs 磁盘 I/O 的性能差距
-
-| 操作 | 耗时 |
-|------|------|
-| 内存 hashtable 查找 | ~10-50 ns |
-| ext4_lookup()（磁盘读 inode） | ~0.5-5 ms（SSD） / ~10-30 ms（HDD） |
-| ext4_lookup() + 目录缓冲未命中 | ~10-50 ms（HDD 寻道） |
-
-**差距：4~6 个数量级**。这就是为何 `open("/etc/passwd")` 第一次几毫秒、第二次几纳秒。
-
-### 3.4 LRU 回收机制
+### 3.4 LRU 回收
 
 ```c
-// dcache shrink 时，从 dentry_unused 尾部驱逐
-static void prune_dcache_sb(struct super_block *sb, struct shrink_control *sc)
-{
-    while (sc->nr_to_scan--) {
-        dentry = list_entry(dentry_unused.prev, struct dentry, d_lru);
-        list_del_init(&dentry->d_lru);
-        // 调用 d_iput() 释放（若计数为 0）
-        shrink_dentry_list(&dispose);
-    }
-}
+// dentry_unused 是全局 LRU 链表
+// DCACHE_LRU_LIST 标记表示 dentry 在 LRU 上
+// 页面回收时从 LRU 尾驱逐最少使用的 dentry
+
+// 加入 LRU（dentry 被释放时）
+dentry->d_flags |= DCACHE_LRU_LIST;
+list_add(&dentry->d_lru, &dentry_unused[sb->s_nr_dentry_unused]);
+this_cpu_inc(nr_dentry_unused);
+
+// 从 LRU 移除（dentry 被使用时）
+list_del_init(&dentry->d_lru);
+dentry->d_flags &= ~DCACHE_LRU_LIST;
+this_cpu_dec(nr_dentry_unused);
 ```
 
-## 4. struct file 和 struct dentry 的关系
+---
 
-### 4.1 struct file 的核心字段
+## 4. struct file 和 dentry：从 path_openat 创建到 do_dentry_open
 
-```c
-struct file {
-    fmode_t                 f_mode;       // FREAD | FWRITE 等
-    const struct file_operations *f_op;   // ★ 操作函数表（来自 inode）
-    struct address_space    *f_mapping;   // 页缓存 address_space
-    struct inode            *f_inode;     // 指向 inode（不是从 dentry 派生）
-    unsigned int            f_flags;       // O_RDONLY | O_WRONLY 等
-
-    union {
-        const struct path   f_path;        // ★ 来自 path（mnt + dentry）
-        struct path         __f_path;
-    };
-    loff_t                  f_pos;         // 当前文件偏移
-    void                   *private_data; // 文件句柄私有数据
-    ...
-}
-```
-
-### 4.2 path_openat 如何创建 struct file
+### 4.1 path_openat：分配 struct file 并重走路径解析
 
 ```c
 // fs/namei.c:4838
 static struct file *path_openat(struct nameidata *nd,
-                                const struct open_flags *op, unsigned flags)
+                                 const struct open_flags *op, unsigned flags)
 {
-    // 1. 分配一个空的 struct file
+    // 1. 分配空 struct file（引用计数 = 1）
     file = alloc_empty_file(op->open_flag, current_cred());
     if (IS_ERR(file))
         return file;
 
-    // 2. O_PATH 和 O_TMPFILE 特殊处理
-    if (unlikely(file->f_flags & __O_TMPFILE)) ...
-    else if (unlikely(file->f_flags & O_PATH)) ...
+    // 2. O_TMPFILE 处理
+    if (unlikely(file->f_flags & __O_TMPFILE))
+        return do_tmpfile(nd, flags, op, file);
 
-    // 3. 重走路径解析（path_openat 会再次调用 path_init + link_path_walk）
+    // 3. O_PATH 处理（只解析路径，不真正打开）
+    if (unlikely(file->f_flags & O_PATH))
+        return do_o_path(nd, flags, file);
+
+    // 4. 重走路径解析（注意：path_openat 内部再次调用 path_init + link_path_walk）
     const char *s = path_init(nd, flags);
     while (!(error = link_path_walk(s, nd)) &&
            (s = open_last_lookups(nd, file, op)) != NULL)
         ;
 
-    // 4. 执行最终打开
+    // 5. 执行最终打开
     if (!error)
         error = do_open(nd, file, op);
 
     terminate_walk(nd);
-    return file;
+
+    if (likely(!error)) {
+        if (likely(file->f_mode & FMODE_OPENED))
+            return file;
+    }
+
+    fput_close(file);
+    return ERR_PTR(error);
 }
 ```
 
-### 4.3 f_path.dentry 和 f_inode 的区别
+**关键**：`path_openat` 内部再次调用 `path_init + link_path_walk`，这看起来是重复的——因为 `filename_lookup` 已经做过一次路径解析。实际原因是 `path_openat` 需要用 `nameidata` 来跟踪解析状态，并在打开文件时可能需要重新解析（如 O_CREAT 场景）。
 
-```
+### 4.2 struct file 的关键字段
+
+```c
+// include/linux/fs.h:1260
 struct file {
+    fmode_t                     f_mode;          // FMODE_READ | FMODE_WRITE 等
+    const struct file_operations *f_op;          // ★ 文件操作函数表（来自 inode->i_fop）
+    struct address_space        *f_mapping;      // inode->i_mapping（页缓存）
+    struct inode                *f_inode;        // 指向 inode（派生自 f_path.dentry->d_inode）
+    unsigned int                f_flags;        // O_RDONLY | O_WRONLY | O_DIRECT 等
+    loff_t                      f_pos;           // 当前文件偏移
+    void                        *private_data;   // 文件句柄私有数据
+
     union {
-        const struct path f_path;   // 路径信息：{ mnt, dentry }
-        struct path       __f_path;
+        const struct path       f_path;          // { mnt, dentry }
+        struct path             __f_path;
     };
-    struct inode *f_inode;          // 直接指向 inode
+    ...
 }
 ```
 
-| 字段 | 来源 | 用途 |
-|------|------|------|
-| `f_path.dentry` | path_lookupat 返回 | 用于 VFS 层操作（权限检查、路径展示、dnotify） |
-| `f_inode` | `f_path.dentry->d_inode` | 用于获取 `f_op`，直接 I/O 操作 |
+### 4.3 file->f_path.dentry vs file->f_inode
 
-**两者在 `do_dentry_open` 中被同时赋值**：
+```
+同一个 file 对象中：
+
+  f_path.dentry → d_inode  ← 这是同一个 inode！
+                  (同一个物理 inode，dentry 是缓存的目录项视图)
+
+  f_inode       ← 直接指向 inode（绕过了 dentry 查找）
+
+何时用 f_path.dentry：
+  - 路径解析（path_put、path_get）
+  - 审计（audit_inode）
+  - 权限检查（may_open）
+  - fsnotify 事件
+
+何时用 f_inode：
+  - 获取 f_op（file_operations）
+  - 获取 i_mapping（address_space）
+  - 直接 inode I/O
+```
+
+**两者在 `do_dentry_open` 中同时赋值，指向同一个 inode**：
 
 ```c
 // fs/open.c:895
-static int do_dentry_open(struct file *f, ...)
+static int do_dentry_open(struct file *f, int (*open)(struct inode *, struct file *))
 {
     struct inode *inode = f->f_path.dentry->d_inode;
 
-    f->f_inode = inode;             // 派生自 dentry
-    f->f_mapping = inode->i_mapping; // 也来自 inode
-
-    f->f_op = fops_get(inode->i_fop); // ★ 从 inode 获取文件系统操作函数表
-    ...
+    f->f_inode   = inode;
+    f->f_mapping = inode->i_mapping;
+    f->f_op      = fops_get(inode->i_fop);   // ★ 从 inode 获取 f_op
 }
 ```
 
-### 4.4 f_mode 和 f_flags 的传递路径
+---
+
+## 5. do_dentry_open：如何根据 dentry 找到 file_operations
+
+### 5.1 完整调用序列
 
 ```
-用户: open("/etc/passwd", O_RDONLY)
-       ↓
-SYSCALL_DEFINE3(open)
-  → do_sys_open() → do_sys_openat2()
-      → build_open_flags()          将 flags 转换为 open_flag + acc_mode
-      → do_file_open()
-          → path_openat()
-              → do_open(nd, file, op)
-                  → vfs_open(&nd->path, file)
-                      → do_dentry_open(file, NULL)
-                          ↓
-                          // f->f_flags = file->f_flags（来自 alloc_empty_file）
-                          // f->f_mode 从 alloc_empty_file(op->open_flag, ...) 设置
+用户 open()
+  → do_file_open()
+    → path_openat()
+      → do_open()
+        → vfs_open()              [fs/open.c:1074]
+          → do_dentry_open()     [fs/open.c:885]
 ```
 
-```c
-// fs/open.c:4855
-static struct file *path_openat(...)
-{
-    file = alloc_empty_file(op->open_flag, current_cred());  // ← f_flags 在此设置
-    ...
-    error = do_open(nd, file, op);
-}
-
-// do_dentry_open 中根据 f_flags 决定读/写权限
-if ((f->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
-    i_readcount_inc(inode);        // 记录 inode 读取计数
-else if (f->f_mode & FMODE_WRITE && !special_file(inode->i_mode))
-    file_get_write_access(f);
-```
-
-## 5. do_dentry_open：file 与具体文件系统绑定
-
-### 5.1 完整流程
+### 5.2 do_dentry_open 逐行分析
 
 ```c
 // fs/open.c:885
@@ -363,36 +486,40 @@ static int do_dentry_open(struct file *f,
                           int (*open)(struct inode *, struct file *))
 {
     struct inode *inode = f->f_path.dentry->d_inode;
+    int error;
 
     // 1. 增加路径引用
     path_get(&f->f_path);
 
     // 2. 建立 file ↔ inode 的双向关联
-    f->f_inode = inode;
+    f->f_inode   = inode;
     f->f_mapping = inode->i_mapping;
 
-    // 3. O_PATH 快速路径（不需要真正的文件系统操作）
+    // 3. O_PATH 快速路径（不调用文件系统）
     if (unlikely(f->f_flags & O_PATH)) {
         f->f_mode = FMODE_PATH | FMODE_OPENED;
         f->f_op = &empty_fops;
         return 0;
     }
 
-    // 4. 读计数管理
-    if ((f->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ) {
+    // 4. 读写计数（用于强制锁等场景）
+    if ((f->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
         i_readcount_inc(inode);
-    } else if (f->f_mode & FMODE_WRITE && !special_file(inode->i_mode)) {
+    else if (f->f_mode & FMODE_WRITE && !special_file(inode->i_mode)) {
         error = file_get_write_access(f);
         if (unlikely(error)) goto cleanup_file;
         f->f_mode |= FMODE_WRITER;
     }
 
-    // 5. ★ 关键步骤：从 inode 获取文件操作函数表
+    // 5. ★ 从 inode 获取文件操作函数表
     f->f_op = fops_get(inode->i_fop);
-    if (WARN_ON(!f->f_op)) { error = -ENODEV; goto cleanup_all; }
+    if (WARN_ON(!f->f_op)) {
+        error = -ENODEV;
+        goto cleanup_all;
+    }
 
     // 6. 安全检查
-    error = security_file_open(f);         // SELinux / AppArmor
+    error = security_file_open(f);
     if (unlikely(error)) goto cleanup_all;
 
     error = fsnotify_open_perm_and_set_mode(f);
@@ -404,15 +531,15 @@ static int do_dentry_open(struct file *f,
     // 7. 设置默认操作标志
     f->f_mode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
 
-    // 8. 调用文件系统的 ->open()（若无自定义则用 f_op->open）
+    // 8. ★ 调用具体文件系统的 open() 回调
     if (!open)
-        open = f->f_op->open;
+        open = f->f_op->open;           // 优先用 inode->i_fop->open
     if (open) {
-        error = open(inode, f);
+        error = open(inode, f);         // ext4_file_open() 在这里被调用
         if (error) goto cleanup_all;
     }
 
-    // 9. 设置读写能力标志
+    // 9. 设置能力标志（运行时检测）
     f->f_mode |= FMODE_OPENED;
     if ((f->f_mode & FMODE_READ) &&
         likely(f->f_op->read || f->f_op->read_iter))
@@ -420,323 +547,396 @@ static int do_dentry_open(struct file *f,
     if ((f->f_mode & FMODE_WRITE) &&
         likely(f->f_op->write || f->f_op->write_iter))
         f->f_mode |= FMODE_CAN_WRITE;
-    ...
+
+    // 10. O_DIRECT 校验
+    if ((f->f_flags & O_DIRECT) && !(f->f_mode & FMODE_CAN_ODIRECT))
+        return -EINVAL;
+
+    return 0;
+
+cleanup_all:
+    fops_put(f->f_op);
+    put_file_access(f);
+cleanup_file:
+    path_put(&f->f_path);
+    f->__f_path.mnt = NULL;
+    f->__f_path.dentry = NULL;
+    f->f_inode = NULL;
+    return error;
 }
 ```
 
-### 5.2 inode → file_operations 的查找链
+### 5.3 inode → file_operations 的传递链
 
 ```
 struct inode {
-    const struct inode_operations *i_op;   // inode 级别操作（create/unlink/mkdir等）
+    const struct inode_operations *i_op;   // inode 级操作（create/unlink/mkdir）
     const struct file_operations  *i_fop;  // ★ 文件操作函数表
-    struct super_block            *i_sb;    // 指向超级块
+    struct super_block            *i_sb;   // 所属超级块
+    struct address_space          *i_mapping;
 }
 
 struct super_block {
-    struct file_system_type   *s_type;      // 文件系统类型 (ext4/xfs/btrfs)
-    const struct super_operations *s_op;    // 超级块操作
-}
-```
-
-**inode->i_fop 的来源**：
-1. 目录项被解析时，`ext4_lookup()` / `xfs_lookup()` 找到 inode 后，设置 `inode->i_fop`
-2. 不同文件类型可能有不同的 fop（例如：ext4_file_operations 用于常规文件，ext4_dir_file_operations 用于目录）
-
-```c
-// ext4 中设置 i_fop 示例
-ext4_new_inode_start_handle()
-  → inode->i_fop = &ext4_file_operations;  // 常规文件
-
-// 目录则用
-inode->i_fop = &ext4_dir_file_operations;
-```
-
-## 6. VFS 和具体文件系统的分层边界
-
-### 6.1 核心抽象结构
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                         用户空间进程                                 │
-│                    open() / read() / write()                       │
-└────────────────────────────┬─────────────────────────────────────┘
-                             ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  SYSCALL 层 (fs/open.c, fs/read_write.c)                           │
-│  __arm64_sys_open → do_sys_open → do_file_open                    │
-│  __arm64_sys_read  → ksys_read → do_sys_read_...                  │
-└────────────────────────────┬─────────────────────────────────────┘
-                             ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  VFS 核心层 (fs/namei.c, fs/open.c, fs/internal.h)                  │
-│                                                                    │
-│  path_lookupat() / link_path_walk()    ← 路径解析，dentry 管理      │
-│  do_dentry_open()                      ← file 与 fs 绑定            │
-│  vfs_open() / vfs_read() / vfs_write() ← 文件操作 dispatch         │
-│                                                                    │
-│  关键数据结构：                                                      │
-│    struct file    { f_op, f_path, f_mode, f_flags }                │
-│    struct path    { mnt, dentry }                                  │
-│    struct dentry  { d_inode, d_parent, d_hash, d_op }             │
-│    struct inode   { i_fop, i_op, i_mapping, i_sb }                 │
-│    struct super_block { s_type, s_op, s_root }                     │
-└────────────────────────────┬─────────────────────────────────────┘
-                             ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  具体文件系统实现                                                   │
-│                                                                    │
-│  ext4:                                                            │
-│    ext4_file_operations { .open=ext4_file_open,                    │
-│                            .read=ext4_file_read_iter,             │
-│                            .write=ext4_file_write_iter,            │
-│                            .mmap=ext4_file_mmap }                 │
-│                                                                    │
-│  xfs:                                                             │
-│    xfs_file_operations  { .open=xfs_file_open,                      │
-│                            .read=xfs_file_read_iter,               │
-│                            .write=xfs_file_write_iter,            │
-│                            .mmap=xfs_file_mmap }                  │
-│                                                                    │
-│  btrfs:                                                           │
-│    btrfs_file_operations { ... }                                   │
-└────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 ext4_read_iter vs xfs_file_read_iter（VFS 视角）
-
-**相同点（VFS 看到的一致性）**：
-
-两者都实现 `ssize_t (*read_iter)(struct kiocb *, struct iov_iter *)`，接受 kiocb 和 iov_iter。VFS 通过统一的 `file->f_op->read_iter` 调用，无论底层是 ext4 还是 xfs。
-
-```c
-// VFS 统一调用路径（fs/read_write.c）
-ssize_t __kernel_read_iter(struct file *file, struct iov_iter *iter)
-{
-    if (file->f_op->read_iter)
-        ret = file->f_op->read_iter(iocb, iter);
-    else if (file->f_op->read)
-        ret = file->f_op->read(file, buf, len, &file->f_pos);
-}
-```
-
-**不同点（VFS 看不到的实现差异）**：
-
-| 方面 | ext4_file_read_iter | xfs_file_read_iter |
-|------|---------------------|-------------------|
-| I/O 路径 | ext4 直接 I/O 或 ext4_dax_read_iter（Dax） | xfs_dax_read_iter |
-| 块分配 | ext4_map_blocks()（延迟分配 + extent） | xfs_bmapi()（延迟分配） |
-| 页缓存 | filemap_read() → do_generic_file_read() | 同上（共享通用路径） |
-| 锁粒度 | inode->i_rwmutex | xfs inode ilock（读写分离） |
-| 日志 | 读操作不记录日志 | 同上（读不记日志） |
-
-**VFS 视角的抽象**：对 VFS 而言，`read_iter` 函数指针可以指向任何实现，只要签名为 `ssize_t (*read_iter)(struct kiocb *, struct iov_iter *)`。ext4 和 xfs 的内部逻辑完全封装在各自的实现中。
-
-### 6.3 分层原则
-
-1. **VFS 负责"是什么"（What）**：路径解析、权限检查、file/dentry/inode 管理、操作分发
-2. **文件系统负责"怎么做"（How）**：块寻址、extent 管理、日志、缓存策略
-
-```
-open() 用户语义
-    ↓
-VFS: "找到这个路径对应的 inode，创建一个 file 对象"      ← 通用协议
-    ↓
-具体 fs: "根据我的磁盘布局，找到这个文件的物理块"          ← 各不相同
-```
-
-## 7. Writeback 机制：脏页如何写回磁盘
-
-### 7.1 数据结构串联
-
-```
-struct inode {
-    struct address_space    i_mapping;    ← 所有页缓存页归于 inode
-    struct address_space_operations *i_aops;
+    struct file_system_type      *s_type;  // 文件系统类型 (ext4/xfs/btrfs)
+    const struct super_operations *s_op;
 }
 
-struct address_space {
-    const struct address_space_operations *a_ops;  ← writepage/writepages
-    struct radix_tree_root  page_tree;    ← 缓存页的 radix tree
-    struct backing_dev_info *backing_dev_info;
-    pgoff_t                 writeback_index; // writeback 继续位置
-    ...
-}
-
-struct writeback_control {
-    long     nr_to_write;         ← 本次需写多少页
-    loff_t   range_start/end;     ← 限定字节范围
-    enum writeback_sync_modes sync_mode;  ← WB_SYNC_ALL（同步）/ WB_SYNC_NONE
-    unsigned for_background:1;    ← 后台刷脏
-    unsigned for_sync:1;          ← sync(2) 触发
-    ...
-}
-```
-
-### 7.2 完整调用链
-
-```
-用户 write()
-  → file->f_op->write_iter()      (ext4_file_write_iter / xfs_file_write_iter)
-    → ext4_dio_write_iter() / xfs_file_write_iter()
-      → iomap_write_iter()
-        → generic_perform_write()        [fs/iov_iter.c]
-          → address_space_operations.write_begin()  分配页
-          → copy_from_user()             拷贝数据
-          → address_space_operations.write_end()     标记脏页
-
-[页变为脏，加入 address_space 的 radix tree，置 PG_dirty]
-```
-
-**触发 writeback 的路径**：
-
-```
-路径 A: 用户主动调用 fsync() / sync()
-  → do_sys_sync()
-    → iterates super_blocks
-      → sync_filesystem()
-        → writeback_sb_inodes()         ← 遍历该 sb 所有 inode
-            → __writeback_single_inode(inode, wbc)
-                → address_space_operations.writepages()
-                    → ext4_writepages() / xfs_writepages()
-
-路径 B: 内存压力触发的后台回写
-  → wb_writeback()                      [fs/fs-writeback.c]
-    → writeback_sb_inodes()
-        → __writeback_single_inode()
-            → ext4_writepages() / xfs_writepages()
-
-路径 C: 页回收前检查（try_to_free_pages）
-  → shrink_inode()
-    → address_space_operations.writepage()
-```
-
-### 7.3 writeback_control 的作用
-
-```c
-// fs/fs-writeback.c:1934 注释
- *          writeback_sb_inodes()       <== called only once
- *              write_cache_pages()     <== called once for each inode
- *                  ext4_writepages() / xfs_writepages()  ← 具体 fs 实现
-```
-
-`writeback_control` 携带同步模式、范围限制、剩余页数等信息，使文件系统能够：
-- `WB_SYNC_ALL`：等待所有页 I/O 完成（`sync(2)`）
-- `WB_SYNC_NONE`：只发起 I/O，不等待（后台回写）
-- `nr_to_write`：控制本次回写的页数上限
-- `range_start/end`：只回写特定字节范围
-
-### 7.4 关键操作函数对应关系
-
-```
-writepages()  ← inode 上的回调，由具体文件系统实现
-  ext4_writepages()    [fs/ext4/inode.c]
-  xfs_writepages()     [fs/xfs/xfs_aops.c]
-
-writepage()   ← 单页回写（用于内存回收）
-  ext4_writepage()
-  xfs_vm_writepage()
-
-write_begin/write_end  ← 读时分配+延迟分配的写
-  ext4_write_begin()
-  xfs_write_write()
-
-direct_IO     ← 绕过页缓存的直接 I/O
-  ext4_direct_IO
-  xfs_direct_IO
-```
-
-## 8. ASCII 流程图：从 open() 到具体文件系统
-
-```
-                                open("/etc/passwd", O_RDONLY)
-                                        │
-                         ┌──────────────┴──────────────┐
-                         │  SYSCALL_DEFINE3(open)      │
-                         │  fs/open.c:1374             │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ do_sys_open()              │
-                         │   → do_sys_openat2()       │
-                         │   → build_open_flags()     │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ do_file_open()             │
-                         │   filename_lookup()         │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ filename_lookup()           │
-                         │   set_nameidata()          │
-                         │   path_lookupat(RCU)        │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ path_lookupat()            │
-                         │   path_init()               │
-                         │     → 初始化 nd->path       │
-                         │   link_path_walk()         │
-                         │     → 循环解析 "etc"        │
-                         │       lookup_hash()        │
-                         │       (hashtable hit ✓)    │
-                         │     → 循环解析 "passwd"    │
-                         │       lookup_hash()        │
-                         │       (hashtable hit ✓)    │
-                         │   complete_walk()           │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ path_openat()              │
-                         │   alloc_empty_file()       │
-                         │   path_init() + link_walk()│
-                         │   open_last_lookups()      │
-                         │   do_open()                 │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ do_open()                   │
-                         │   complete_walk()           │
-                         │   may_open()                │
-                         │   vfs_open(&nd->path, file) │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ vfs_open()                 │
-                         │   file->__f_path = *path   │
-                         │   do_dentry_open(file)     │
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌────────────────────────────┐
-                         │ do_dentry_open()            │
-                         │   inode = dentry->d_inode  │
-                         │   f->f_inode = inode       │
-                         │   f->f_op = inode->i_fop  │
-                         │   → inode->i_op->open()    │
-                         │   (若无自定义用 f_op->open)│
-                         └──────────────┬──────────────┘
-                                        ▼
-                         ┌──────────────────────────────────────────┐
-                         │  具体文件系统操作                         │
-                         │  ext4_file_operations.open()            │
-                         │    ext4_file_open()                     │
-                         │    (设置 ext4 特有的 file 状态)         │
-                         └──────────────────────────────────────────┘
+inode->i_fop 的来源：
+  ext4_lookup() 找到 inode 后：
+    inode->i_fop = &ext4_file_operations;     // 常规文件
+    inode->i_fop = &ext4_dir_file_operations;   // 目录
+    inode->i_fop = &ext4_symlink_file_operations;  // 符号链接
 ```
 
 ---
 
-**关键函数索引**（基于 Linux 7.0-rc1 源码）：
+## 6. VFS 和具体文件系统：分层边界
+
+### 6.1 四大核心抽象结构
+
+```
+┌─────────────────────────────────────────────────┐
+│              struct super_block                  │
+│  s_type (ext4/xfs/btrfs)                         │
+│  s_op (alloc_inode/read_inode/write_inode...)    │
+│  s_root (文件系统根目录的 dentry)                │
+│  s_bdev (底层块设备)                             │
+└────────────────────┬────────────────────────────┘
+                     ▼
+┌─────────────────────────────────────────────────┐
+│                 struct inode                    │
+│  i_fop (file_operations: read/write/mmap...)    │
+│  i_op  (inode_operations: create/unlink...)      │
+│  i_mapping (address_space: 页缓存)              │
+│  i_sb → super_block                              │
+└────────────────────┬────────────────────────────┘
+                     ▼
+┌─────────────────────────────────────────────────┐
+│                 struct dentry                    │
+│  d_inode → inode（同一个 inode）                 │
+│  d_parent → 父目录 dentry（构成目录树）          │
+│  d_op → dentry_operations (d_hash/d_compare...) │
+│  d_hash → hashtable 冲突链节点                   │
+│  d_lru  → LRU 链表节点                           │
+└────────────────────┬────────────────────────────┘
+                     ▼
+┌─────────────────────────────────────────────────┐
+│                 struct file                     │
+│  f_op  (file_operations: read/write/mmap...)    │
+│  f_path { mnt, dentry }                         │
+│  f_inode → inode                                │
+│  f_mapping → address_space (页缓存)             │
+└─────────────────────────────────────────────────┘
+```
+
+### 6.2 VFS 和 ext4/xfs 的职责划分
+
+```
+职责            │ VFS 做了什么              │ 具体 fs 做了什么
+────────────────┼───────────────────────────┼────────────────────────────
+路径解析        │ link_path_walk + dcache   │ 提供 ->lookup() 补充未命中
+权限检查        │ may_open / inode_permission │ 通常不干预
+文件名操作     │ vfs_create/unlink/mkdir   │ 实现 inode 级 create/unlink
+文件内容读写   │ 统一调用 f_op->read/write │ ext4/xfs 各自的 I/O 路径
+内存管理(页缓存)│ address_space + radix_tree│ ext4/xfs 提供 aops
+元数据持久化   │ 不涉及                    │ ext4 inode/extents，xfs btree
+日志/事务      │ 不涉及                    │ ext4 journal，xfs log
+```
+
+### 6.3 文件操作函数表实例对比
+
+```c
+// ext4
+const struct file_operations ext4_file_operations = {
+    .open    = ext4_file_open,           // ext4 特有初始化
+    .read    = new_sync_read,             // 复用 VFS 通用实现
+    .read_iter = ext4_file_read_iter,     // ext4 自己的 iter 版本
+    .write   = new_sync_write,
+    .write_iter = ext4_file_write_iter,
+    .mmap    = ext4_file_mmap,
+    .fsync   = ext4_sync_file,
+    .lock    = ext4_lock_file,
+    ...
+};
+
+// xfs
+const struct file_operations xfs_file_operations = {
+    .open    = xfs_file_open,
+    .read    = new_sync_read,
+    .read_iter = xfs_file_read_iter,
+    .write   = new_sync_write,
+    .write_iter = xfs_file_write_iter,
+    .mmap    = xfs_file_mmap,
+    .fsync   = xfs_file_fsync,
+    .lock    = xfs_file_lock,
+    ...
+};
+```
+
+**VFS 视角**：无论 `f_op` 指向 `ext4_file_operations` 还是 `xfs_file_operations`，VFS 都通过同一个接口调用——`file->f_op->read_iter(iocb, iter)`。这就是"无需知道底层实现"的分层意义。
+
+---
+
+## 7. Writeback：address_space 和 writeback_control 如何把脏页写回磁盘
+
+### 7.1 address_space：页缓存的核心
+
+```c
+// include/linux/fs.h:473
+struct address_space {
+    struct inode           *host;          // 所属 inode
+    struct xarray          i_pages;       // ★ 缓存页的 xarray（原 radix_tree）
+    struct rb_root_cached  i_mmap;         // 映射的 vma 集合
+    unsigned long          nrpages;       // 缓存页数量
+    pgoff_t                writeback_index; // writeback 恢复位置
+    const struct address_space_operations *a_ops;  // ★ 关键操作表
+    ...
+}
+```
+
+### 7.2 address_space_operations
+
+```c
+// include/linux/fs.h:401
+struct address_space_operations {
+    int    (*read_folio)(struct file *, struct folio *);
+    int    (*writepages)(struct address_space *, struct writeback_control *);
+    bool   (*dirty_folio)(struct address_space *, struct folio *);
+    int    (*write_begin)(const struct kiocb *, struct address_space *,
+                           loff_t pos, unsigned len,
+                           struct folio **, void **);
+    int    (*write_end)(const struct kiocb *, struct address_space *,
+                         loff_t pos, unsigned len, unsigned copied,
+                         struct folio *, void *);
+    ssize_t(*direct_IO)(struct kiocb *, struct iov_iter *);
+    // ...
+}
+```
+
+### 7.3 writeback_control
+
+```c
+// include/linux/writeback.h:43
+struct writeback_control {
+    long        nr_to_write;      // 本次写回的页数（递减）
+    long        pages_skipped;    // 跳过（写失败）的页数
+
+    loff_t      range_start;     // 字节范围起始
+    loff_t      range_end;        // 字节范围结束
+
+    enum writeback_sync_modes sync_mode;  // WB_SYNC_ALL(同步) / WB_SYNC_NONE(后台)
+
+    unsigned    for_kupdate:1;   // kupdate 后台回写
+    unsigned    for_background:1; // 内存压力后台回写
+    unsigned    tagged_writepages:1; // 打标签防 livelock
+    unsigned    range_cyclic:1;   // 循环回写（从 writeback_index 继续）
+    unsigned    for_sync:1;       // sync(2) 触发
+
+    struct bdi_writeback *wb;     // 所属 writeback 线程
+    struct inode         *inode;  // 被回写的 inode
+
+    pgoff_t   index;              // 当前回写位置
+#ifdef CONFIG_CGROUP_WRITEBACK
+    int       wb_id;              // bdi_writeback ID
+    size_t    wb_bytes;           // 本次已写字节数
+#endif
+};
+```
+
+### 7.4 脏页写回完整路径
+
+```
+进程 write() 写入 /etc/passwd:
+  → ext4_file_write_iter()
+    → ext4_dio_write_iter() / generic_perform_write()
+      → address_space_operations.write_begin()
+        ext4_write_begin()       // 分配页/映射块
+      → copy_from_user()         // 拷贝数据
+      → address_space_operations.write_end()
+        ext4_write_end()         // 标记页为脏（PG_dirty）
+
+此时：page 被加入 address_space->i_pages (xarray)
+      page->flags |= PG_dirty
+
+
+触发回写的三种路径：
+
+路径 A: sync(2) 系统调用
+  → do_sys_sync()
+    → iterate_supers_sync()
+      → sync_filesystem(sb)
+        → writeback_sb_inodes(sb, &wbc)
+          → __writeback_single_inode(inode, &wbc)
+            → write_cache_pages(inode->i_mapping, &wbc, writepages)
+              → ext4_writepages() / xfs_writepages()
+                ★ 这是具体文件系统实现的 writepages
+
+路径 B: 后台回写（wb_writeback / flush 线程）
+  → wb_writeback(wb, &work)
+    → writeback_sb_inodes()
+      → __writeback_single_inode()
+        → ext4_writepages() / xfs_writepages()
+
+路径 C: 内存回收（try_to_free_pages）
+  → shrink_inode(inode)
+    → address_space_operations.writepage()
+      → ext4_writepage() / xfs_vm_writepage()
+```
+
+### 7.5 writeback_control 参数对文件系统的影响
+
+```
+WB_SYNC_ALL  mode:
+  wbc.sync_mode = WB_SYNC_ALL
+  → 等待所有页的 I/O 完成（fsync 语义）
+  → ext4_writepages 会等待 journal commit
+
+WB_SYNC_NONE mode:
+  wbc.sync_mode = WB_SYNC_NONE
+  → 只发起 I/O，不等待完成（后台回写）
+  → 更低的延迟，但数据可能未持久化
+
+nr_to_write:
+  控制本次最多写回多少页
+  后台回写通常设一个较大值，sync(2) 设 LONG_MAX
+
+range_start / range_end:
+  限制回写字节范围
+  用于 fsync(fd) 只回写该文件相关脏页
+```
+
+### 7.6 ext4_writepages vs xfs_writepages 核心差异
+
+```
+ext4_writepages:
+  1. 检查是否使用 journal 或 wbc->for_sync
+  2. 调用 ext4_da_writepages()（延迟分配 + mpage_da_submit_io）
+  3. ext4_da_write_begin() 分配 ext4 块（延迟分配）
+  4. 通过 mpage_submit_page() 提交 bio
+
+xfs_writepages:
+  1. 调用 xfs_bmap_flush_pages() 处理 extent 映射
+  2. xfs_alarm_ranges() 处理不连续块
+  3. 调用 xfs_writepages_map() 遍历所有 dirty extents
+  4. xfs_buf_submit() 提交 I/O
+```
+
+**VFS 层完全不知道这些差异**：它只调用 `a_ops->writepages(inode->i_mapping, wbc)`，剩下的由文件系统自行决定。
+
+---
+
+## 8. 完整 open() 流程图（整合版）
+
+```
+open("/etc/passwd", O_RDONLY)
+═══════════════════════════════════════════════════════════════
+
+  [用户空间]
+  libc: open("/etc/passwd", O_RDONLY)
+    → arm64_sys_open  (syscall entry)
+
+  [SYSCALL 层 — fs/open.c]
+  ┌────────────────────────────────────────┐
+  │  __arm64_sys_open()                     │
+  │    → do_sys_open()                      │
+  │      → do_sys_openat2()                 │
+  │            build_open_flags()           │  flags → open_flags + acc_mode
+  │            do_file_open()               │
+  └────────────────────┬───────────────────┘
+                        ▼
+  [路径解析 — fs/namei.c]
+  ┌────────────────────────────────────────────────────────┐
+  │  do_file_open()                                        │
+  │    → set_nameidata(&nd, dfd, pathname, NULL)          │
+  │    → path_openat(&nd, op, flags)  [namei.c:4838]       │
+  │                                                        │
+  │  path_openat:                                          │
+  │    1. alloc_empty_file(open_flag, cred) → struct file │
+  │    2. path_init(nd, flags)                            │
+  │       ├─ 绝对路径 → nd->path = current->fs->root      │
+  │       └─ RCU 模式 rcu_read_lock()                     │
+  │    3. link_path_walk(s, nd)                           │
+  │       ├─ hash_name("etc") → qstr{name:"etc", len:3}   │
+  │       ├─ lookup_hash(nd->path.dentry="/", &qstr)       │
+  │       │     ├─ d_lookup() → hashtable hit?            │
+  │       │     │   └─ 命中 → 返回现有 dentry（零 I/O）     │
+  │       │     └─ 未命中 → ext4_lookup() 读磁盘 inode    │
+  │       ├─ walk_component() 验证 dentry                 │
+  │       ├─ 更新 nd->path.dentry = dentry("etc")         │
+  │       │                          nd->inode = inode("etc") │
+  │       ├─ hash_name("passwd") → qstr{name:"passwd"}    │
+  │       ├─ lookup_hash(dentry("etc"), &qstr)             │
+  │       │     └─ hashtable hit / ext4_lookup()          │
+  │       └─ 更新 nd->path.dentry = dentry("passwd")       │
+  │    4. open_last_lookups(nd, file, op)                 │
+  │       └─ finish_open() / lookup_open() 处理 O_CREAT    │
+  │    5. do_open(nd, file, op)                           │
+  │       ├─ complete_walk(nd)   验证路径                  │
+  │       ├─ may_open()          权限检查                   │
+  │       └─ vfs_open(&nd->path, file)                    │
+  └────────────────────┬───────────────────────────────────┘
+                        ▼
+  [VFS 打开 — fs/open.c]
+  ┌────────────────────────────────────────────────────────┐
+  │  vfs_open(path, file)                                 │
+  │    → do_dentry_open(file, NULL)  [open.c:885]         │
+  │                                                        │
+  │  do_dentry_open:                                       │
+  │    1. inode = file->f_path.dentry->d_inode            │
+  │    2. file->f_inode = inode                           │
+  │    3. file->f_mapping = inode->i_mapping              │
+  │    4. file->f_op = inode->i_fop  ★ 从 inode 获取     │
+  │    5. security_file_open(file)   安全框架             │
+  │    6. break_lease(inode, flags)  锁文件                │
+  │    7. inode->i_op->open(inode, file)  ★ ext4 的 open  │
+  │       └─ ext4_file_open()  ext4 特有初始化            │
+  │    8. file->f_mode |= FMODE_OPENED | FMODE_CAN_READ   │
+  └────────────────────┬───────────────────────────────────┘
+                        ▼
+  [具体文件系统 — fs/ext4/file.c]
+  ┌────────────────────────────────────────────────────────┐
+  │  ext4_file_open(inode, file)                          │
+  │    ├─ 设置 file 私有数据                               │
+  │    ├─ 配置 DAX 或 pagecache 模式                       │
+  │    └─ 返回 0（成功）                                  │
+  └────────────────────────────────────────────────────────┘
+
+  返回 struct file* 给用户进程
+═══════════════════════════════════════════════════════════════
+
+后续 read(file, buf, len) 调用链：
+  → __arm64_sys_read()
+    → ksys_read()
+      → do_sys_read()
+        → vfs_read(file, buf, len, &file->f_pos)
+          → file->f_op->read_iter(iocb, iter)
+               ↓
+            ext4_file_read_iter()  /  xfs_file_read_iter()
+               ↓
+            (共享 VFS 的通用路径：generic_file_read_iter → filemap_read)
+```
+
+---
+
+## 附录：关键源码索引（Linux 7.0-rc1）
 
 | 函数 | 文件:行 | 作用 |
 |------|---------|------|
-| `link_path_walk` | fs/namei.c:2574 | 逐分量路径解析循环 |
-| `path_lookupat` | fs/namei.c:2797 | 路径查找主入口（带 RCU 支持） |
-| `filename_lookup` | fs/namei.c:2830 | 路径查找封装（处理 ECHILD/ESTALE） |
-| `path_openat` | fs/namei.c:4838 | 打开文件时的路径查找 |
-| `do_open` | fs/namei.c:4655 | 最终执行 vfs_open |
-| `vfs_open` | fs/open.c:1074 | VFS 打开文件 |
-| `do_dentry_open` | fs/open.c:885 | 将 file 绑定到具体文件系统 |
-| `build_open_flags` | fs/open.c:1179 | 将 flags 转换为 open_flags |
-| `do_sys_openat2` | fs/open.c:1355 | openat2 系统调用入口 |
+| `link_path_walk` | `fs/namei.c:2574` | 逐分量路径解析循环 |
+| `path_init` | `fs/namei.c:2673` | 初始化路径起点（根目录/当前目录） |
+| `path_lookupat` | `fs/namei.c:2797` | 路径查找主入口（RCU + blocking fallback） |
+| `filename_lookup` | `fs/namei.c:2830` | path_lookupat 封装，处理 ECHILD/ESTALE |
+| `lookup_fast` | `fs/namei.c:1838` | dentry_hashtable 命中查找 |
+| `lookup_slow` | `fs/namei.c:1888` | 未命中时调用具体 fs 的 ->lookup() |
+| `walk_component` | `fs/namei.c:2261` | 单个分量的查找+符号链接跟踪 |
+| `path_openat` | `fs/namei.c:4838` | 文件打开时的路径查找入口 |
+| `open_last_lookups` | `fs/namei.c:4563` | open 特有的最后分量处理（O_CREAT 等） |
+| `do_open` | `fs/namei.c:4655` | 最终执行 vfs_open + 权限检查 |
+| `vfs_open` | `fs/open.c:1074` | VFS 打开文件入口 |
+| `do_dentry_open` | `fs/open.c:885` | 将 struct file 绑定到具体文件系统 |
+| `build_open_flags` | `fs/open.c:1179` | 将用户 flags 转换为内部 open_flags |
+| `do_sys_openat2` | `fs/open.c:1355` | openat2 系统调用入口 |
+| `d_lookup` | `fs/dcache.c` | dentry_hashtable 查找 |
+| `d_add` | `fs/dcache.c` | 添加 dentry 到缓存 |
+| `ext4_lookup` | `fs/ext4/namei.c` | ext4 的目录项查找 |
+| `ext4_file_open` | `fs/ext4/file.c` | ext4 文件打开实现 |
