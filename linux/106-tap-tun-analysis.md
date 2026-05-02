@@ -1,11 +1,229 @@
-# 106 — 深度源码分析
+# 106-tap-tun — Linux TUN/TAP 虚拟网络设备深度源码分析
 
-> Linux 7.0-rc1 | 使用 doom-lsp（clangd LSP）进行逐行符号解析
-
----
-
-**tun/tap** 虚拟网络设备。tun（L3）+tap（L2），用户空间通过 /dev/net/tun 读写数据包。
+> 基于 Linux 7.0-rc1 主线源码
+> 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
+> 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1
 
 ---
 
-*分析工具：doom-lsp（clangd LSP）| 分析日期：2026-05-01*
+## 0. 概述
+
+**TUN**（网络层虚拟设备）和 **TAP**（链路层虚拟设备）是 Linux 的用户空间网络隧道接口。用户空间程序通过 `/dev/net/tun` 打开一个文件描述符，读写该 fd 即可从内核网络栈收发数据包。
+
+**核心设计**：TUN/TAP 设备表现为一个虚拟网络接口（`struct net_device`），用户空间侧通过字符设备（`struct miscdevice`）访问。`tun_get_user()`（`tun.c:1131`）从用户空间读取数据包并注入内核算协议栈，`tun_put_user()`（`:2120`）从协议栈抓取数据包写入用户空间。
+
+```
+用户空间程序                   内核
+───────────                  ────
+open("/dev/net/tun") → tun_chr_open()
+  ↓
+ioctl(TUNSETIFF, "tun0") → 创建 tun0 接口
+  ↓                         ↓
+write(fd, pkt, len)      tun0 接口
+  → tun_chr_write_iter()    ↑  tun_get_user() → 注入网络栈
+    → tun_get_user()        │  → netif_rx(skb)
+      → alloc_skb()         │
+      → copy_from_user()     │
+      → netif_rx(skb)       │
+                            │
+read(fd, buf, len)         │
+  → tun_chr_read_iter()     │  tun_put_user() ← 从协议栈抓取
+    → tun_do_read()         │  → 从接收队列取 skb
+      → skb_copy_to_iter()  │  → copy_to_user()
+```
+
+**doom-lsp 确认**：`drivers/net/tun.c`（3,740 行，237 个符号）。`tun_get_user` @ `:1131`，`tun_put_user` @ `:2120`。
+
+---
+
+## 1. 核心数据结构
+
+```c
+// tun.c
+struct tun_struct {                              // TUN 网络设备
+    struct net_device *dev;                       // 虚拟网络接口
+    struct tun_file __rcu *tfiles[MAX_TAP_QUEUES]; // 打开的文件（多队列）
+    struct socket socket;                         // 内核 socket
+    unsigned int flags;                           // IFF_TUN / IFF_TAP / IFF_NO_PI
+    struct fasync_struct *fasync;
+    struct flow_table flow;
+};
+
+struct tun_file {                                // TUN 文件句柄
+    struct sock sk;                               // 内核 socket
+    struct socket socket;
+    struct tun_struct __rcu *tun;                 // 指向所属设备
+    struct napi_struct napi;                     // NAPI 结构（多队列接收）
+    struct xdp_rxq_info xdp_rxq;                  // XDP 接收队列
+    u16 queue_index;
+};
+
+// 设备类型标志：
+// IFF_TUN  — L3 隧道（读/写 IP 包）
+// IFF_TAP  — L2 隧道（读/写以太帧）
+// IFF_NO_PI — 不包含额外包头信息
+```
+
+---
+
+## 2. 写入路径——tun_get_user @ :1131
+
+```c
+// 用户 write → tun_chr_write_iter → tun_get_user
+
+static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
+                             void *msg_control, struct iov_iter *from,
+                             int noblock, bool more)
+{
+    struct sk_buff *skb;
+    int len = iov_iter_count(from);
+
+    // 1. 分配 skb
+    if (tun->flags & IFF_TUN) {
+        // L3 隧道——分配最大长度 LL_MAX_HEADER + len
+        skb = tun_alloc_skb(tfile, ...);
+    } else {
+        // L2 隧道
+        skb = sock_alloc_send_pskb(sk, len, ...);
+    }
+
+    // 2. 复制用户数据到 skb
+    skb_put(skb, len);
+    copy_from_iter(skb->data, len, from);
+
+    // 3. 解析包头信息（如果 IFF_NO_PI 未设置）
+    if (!(tun->flags & IFF_NO_PI)) {
+        // struct tun_pi { flags, proto } 位于 skb 头部
+        skb->protocol = pi->proto;
+    }
+
+    // 4. XDP 处理（如果启用了 XDP）
+    if (tun_xdp_xmit(tun, skb))
+        goto drop;
+
+    // 5. 注入网络栈——区分 TUN/TAP
+    if (tun->flags & IFF_TUN) {
+        // L3：直接调用 netif_rx(skb)
+        netif_rx(skb);
+    } else {
+        // L2：eth_type_trans 后调用 netif_receive_skb
+        skb->protocol = eth_type_trans(skb, dev);
+        netif_receive_skb(skb);
+    }
+}
+```
+
+---
+
+## 3. 读取路径——tun_put_user @ :2120
+
+```c
+// 用户 read → tun_chr_read_iter → tun_do_read → tun_put_user
+
+static ssize_t tun_do_read(struct tun_struct *tun, struct tun_file *tfile,
+                            struct iov_iter *to, int noblock)
+{
+    // 1. 从接收队列取 skb
+    skb = skb_recv_datagram(tfile->socket.sk, noblock ? MSG_DONTWAIT : 0, &err);
+    if (!skb) return err;
+
+    // 2. 复制到用户空间
+    ret = tun_put_user(tun, tfile, skb, to);
+    kfree_skb(skb);
+    return ret;
+}
+
+static ssize_t tun_put_user(struct tun_struct *tun, struct tun_file *tfile,
+                             struct sk_buff *skb, struct iov_iter *to)
+{
+    int total = 0;
+
+    // 1. 写入包信息头（如果 IFF_NO_PI 未设置）
+    if (!(tun->flags & IFF_NO_PI)) {
+        struct tun_pi pi = { .flags = 0, .proto = ntohs(skb->protocol) };
+        copy_to_iter(&pi, sizeof(pi), to);
+        total += sizeof(pi);
+    }
+
+    // 2. 复制 skb 数据到用户空间
+    skb_copy_datagram_iter(skb, 0, to, skb->len);
+    total += skb->len;
+    return total;
+}
+```
+
+---
+
+## 4. 创建 TUN/TAP 设备
+
+```c
+// 用户空间配置：
+// fd = open("/dev/net/tun", O_RDWR);
+// struct ifreq ifr = { .ifr_name = "tun0", .ifr_flags = IFF_TUN | IFF_NO_PI };
+// ioctl(fd, TUNSETIFF, &ifr);
+// → tun_chr_ioctl() → __tun_set_iff()
+//   → tun_net_init(dev) 初始化 net_device 操作
+//   → register_netdevice(dev) 注册网络接口
+
+// 网络设备操作：
+static const struct net_device_ops tun_netdev_ops = {
+    .ndo_start_xmit   = tun_net_xmit,          // 发送数据包
+    .ndo_open         = tun_net_open,           // 接口启用
+    .ndo_stop         = tun_net_close,          // 接口停用
+    .ndo_set_rx_mode  = tun_net_mclist,         // 多播设置
+};
+```
+
+---
+
+## 5. 多队列与 NAPI
+
+```c
+// TUN 支持多队列（通过 TUNSETIFF 的 IFF_MULTI_QUEUE 启用）：
+// 每个队列对应一个 tun_file，有独立的 NAPI 实例
+// 接收时通过 flow_table 的 RSS 哈希分配到不同队列
+
+// tfiles[MAX_TAP_QUEUES] — 最多 MAX_TAP_QUEUES 个队列
+// 每个队列有 napi_struct，允许 busy poll 和 GRO
+```
+
+---
+
+## 6. 关键函数索引
+
+| 函数 | 行号 | 作用 |
+|------|------|------|
+| `tun_get_user` | `:1131` | 写入路径——用户数据→skb→网络栈 |
+| `tun_put_user` | `:2120` | 读取路径——skb→用户空间 |
+| `tun_do_read` | — | 从接收队列取 skb |
+| `tun_net_xmit` | — | 协议栈→TUN 设备（送入接收队列）|
+| `__tun_set_iff` | — | 创建设备 |
+| `tun_chr_open` | — | 打开 /dev/net/tun |
+| `tun_chr_ioctl` | — | ioctl 控制（TUNSETIFF 等）|
+
+---
+
+## 7. 调试
+
+```bash
+# 创建 TUN 设备
+ip tuntap add dev tun0 mode tun
+ip link set tun0 up
+ip addr add 10.0.0.1/24 dev tun0
+
+# /dev/net/tun 操作
+ls -l /dev/net/tun
+
+# 查看 TUN 统计
+cat /sys/class/net/tun0/statistics/tx_packets
+```
+
+---
+
+## 8. 总结
+
+TUN/TAP 通过 `tun_get_user`（`:1131`）将用户空间写入的 skb 注入内核网络栈（`netif_rx`/`netif_receive_skb`），通过 `tun_put_user`（`:2120`）从接收队列抓取 skb 复制到用户空间。`IFF_TUN` 处理 IP 包（L3），`IFF_TAP` 处理以太帧（L2）。多队列通过 `tfiles[]` 数组和 NAPI 实现并行处理。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
