@@ -8,33 +8,34 @@
 
 ## 0. 概述
 
-**POSIX 定时器**（`timer_create`/`timer_settime`）是 Linux 提供给用户空间的**高精度定时器 API**。与 `setitimer`（每个进程仅一个）不同，POSIX 定时器允许进程创建任意数量的定时器（受 `RLIMIT_SIGPENDING` 限制），支持 `CLOCK_REALTIME`/`CLOCK_MONOTONIC` 等多种时钟源。
+**POSIX 定时器**（`timer_create`/`timer_settime`/`timer_gettime`）是 Linux 用户空间的高精度定时器 API。与 `setitimer`（每进程仅 1 个，jiffy 精度）不同，POSIX 定时器允许任意数量（受 `RLIMIT_SIGPENDING`），底层由 **hrtimer** 驱动，精度达到纳秒级。
 
-**核心设计**：内核通过 `struct k_itimer` 管理每个 POSIX 定时器，底层使用 `hrtimer`（高精度定时器）实现。定时器到期时通过 `struct sigevent` 指定的方式通知（signal/thread/eventfd）。
+**核心设计**：`struct k_itimer` 管理每个定时器——哈希表快速 ID 查找、`hrtimer` 底层定时、到期时 `posix_timer_fn` → `posix_timer_queue_signal` → `posixtimer_send_sigqueue` 信号投递。
 
 ```
-用户空间                          内核
-─────────                       ──────
-timer_create(clockid, evp, &id)
-  → sys_timer_create()         → posix_timer_create()
-    → kzalloc(k_itimer)         → @ kernel/time/posix-timers.c
-    → idr_alloc() 分配 ID       → 加入 timer_hash_bucket
-    → 绑定时钟源操作表
+用户空间                   内核                hrtimer 框架
+─────────                ──────              ────────────
+timer_create(CLOCK,...)
+  └─ do_timer_create()
+    └─ alloc_posix_timer()
+    └─ posix_timer_add()    → ID 插入哈希表
+    └─ kc->timer_create()   → hrtimer_init()
 
-timer_settime(id, flags, new, old)
-  → sys_timer_settime()        → common_timer_set()
-    → k_itimer->ktimer          → hrtimer_start(timer, expires, mode)
-      → 插入 hrtimer 红黑树
-
-定时器到期:
-  → hrtimer_interrupt()        → hrtimer 框架
-    → posix_timer_fn()          → @ posix-timers.c
-      → sigqueue_alloc()        → 构造 sigevent
-      → send_sigqueue()         → 发送信号
-      → 或 wakeup 线程
+timer_settime(id, flags, new, NULL)
+  └─ lock_timer(id)         → posix_timer_by_id() 哈希查找
+  └─ common_timer_set()
+    └─ hrtimer_start()      → 插入 hrtimer 红黑树
+                                        ↓
+                                hrtimer_interrupt()
+                                     ← 到期
+                                        ↓
+  posix_timer_fn() ← hrtimer 回调
+    └─ posix_timer_queue_signal()
+      └─ posixtimer_send_sigqueue()
+        → send_sigqueue()   → 信号投递
 ```
 
-**doom-lsp 确认**：`kernel/time/posix-timers.c`（**1,567 行**，**207 个符号**）。`include/linux/posix-timers.h`（265 行）。
+**doom-lsp 确认**：`kernel/time/posix-timers.c`（**1,567 行**，**207 个符号**）。核心结构 `struct k_itimer` 在 `include/linux/posix-timers.h`。底层 hrtimer 在 `kernel/time/hrtimer.c`。
 
 ---
 
@@ -45,192 +46,178 @@ timer_settime(id, flags, new, old)
 ```c
 // include/linux/posix-timers.h
 struct k_itimer {
-    struct list_head list;                   // timer_hash_bucket 链表
-    struct hrtimer ktimer;                   // 底层 hrtimer
+    struct hrtimer ktimer;                   // 底层高精度定时器
     clockid_t it_clock;                      // 时钟类型
     struct pid *it_pid;                      // 通知目标进程
-    struct sigqueue *sigq;                   // 信号队列
-    struct signal_struct *it_signal;         // 目标信号
+    struct sigqueue sigq;                    // 信号队列条目
+    struct signal_struct *it_signal;         // 目标信号结构体
 
-    int it_pid_type;                         // PID 类型（PID/PGID/SID）
-    int it_status;                           // 状态
-
-    struct itimerspec64 it;                  // interval + value
-    struct rcu_head rcu;
+    int it_pid_type;                         // PID 类型
+    int it_status;                           // POSIX_TIMER_DISARMED / ...
+    struct itimerspec64 it;                  // interval + value 时间规格
+    struct list_head list;                   // 哈希桶链表
 
     const struct k_clock *kclock;            // 时钟操作表
-    struct timer_list *it_timer;             // wheel timer（旧）
+    struct rcu_head rcu;
 };
 ```
 
-### 1.2 哈希桶——timer_hash_bucket
+### 1.2 哈希表——timer_hash_bucket @ :42
 
 ```c
-// @ posix-timers.c:42
+// @ :42
 struct timer_hash_bucket {
     spinlock_t lock;
-    struct list_head head;                   // 定时器链表
+    struct list_head head;
 };
 
 // 全局哈希表（@ :47）：
-// static struct {
-//     struct timer_hash_bucket buckets[POSIX_TIMER_HASH_SIZE];
-//     unsigned int mask;
-//     struct kmem_cache *cache;
-// } __timer_data;
+//  size = POSIX_TIMER_HASH_SIZE
+//  哈希函数: (timer_id * 0x9e370001) & mask
+//
+// 查找函数 @ :89：
 
-// 哈希函数（@ :84）：
-// hash = (timer_id * 0x9e370001) & mask
-// 快速 id→定时器查找
+static struct k_itimer *posix_timer_by_id(timer_t id)
+{
+    struct signal_struct *sig = current->signal;
+    struct timer_hash_bucket *bucket = hash_bucket(sig, id);
+
+    scoped_guard (spinlock_irqsave, &bucket->lock) {
+        list_for_each_entry(timer, &bucket->head, list) {
+            if (timer->it_id == id && timer->it_signal == sig)
+                return timer;
+        }
+    }
+    return NULL;
+}
 ```
+
+**doom-lsp 确认**：`posix_timer_by_id` @ `:89`。`posix_timer_add` @ `:157`。哈希表 `__timer_data` @ `:47`。
 
 ---
 
-## 2. 主要 API
-
-### 2.1 timer_create——创建定时器 @ syscall
+## 2. 创建——do_timer_create @ :458
 
 ```c
-SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock,
-                struct sigevent __user *, timer_event_spec,
-                timer_t __user *, created_timer_id)
+static int do_timer_create(clockid_t which_clock, struct sigevent *event,
+                           timer_t __user *created_timer_id)
 {
-    struct k_itimer *new_timer;
-    struct sigevent *event = NULL;
-
-    /* 1. 时钟源验证 */
-    kc = clockid_to_kclock(which_clock);
+    // 1. 获取时钟操作表
+    kc = clockid_to_kclock(which_clock);     // @ :58
     if (!kc) return -EINVAL;
 
-    /* 2. 分配 k_itimer */
+    // 2. 分配 k_itimer @ :415
     new_timer = alloc_posix_timer();
-    new_timer->it_clock = which_clock;
-    new_timer->kclock = kc;
+    // → kmem_cache_zalloc(posix_timers_cache, ...)
+    // → posixtimer_init_sigqueue(&tmr->sigq) 初始化信号队列
+    // → rcuref_init(&tmr->rcuref, 1)
 
-    /* 3. 初始化 hrtimer */
-    hrtimer_init(&new_timer->ktimer, which_clock,
-                 HRTIMER_MODE_REL_SOFT);
-    new_timer->ktimer.function = posix_timer_fn;
+    // 3. 验证 sigevent @ good_sigevent()
+    //    SIGEV_SIGNAL / SIGEV_THREAD / SIGEV_THREAD_ID / SIGEV_NONE
+    new_timer->it_pid = get_pid(good_sigevent(event));
+    new_timer->it_signal = current->signal;
 
-    /* 4. 复制 sigevent */
-    if (timer_event_spec) {
-        copy_from_user(&event, timer_event_spec, sizeof(event));
-        // sigev_notify: SIGEV_SIGNAL / SIGEV_THREAD / SIGEV_NONE
-    }
+    // 4. ID 分配 + 插入哈希表 @ :157
+    error = posix_timer_add(new_timer, ...);
 
-    /* 5. ID 分配 */
-    id = posix_timer_add(new_timer);
-    put_user(id, created_timer_id);
-}
-```
+    // 5. 时钟特定初始化
+    kc->timer_create(new_timer);
+    // → common_timer_create @ :451
+    //   → hrtimer_init(&new_timer->ktimer, clock, mode)
+    //   → new_timer->ktimer.function = posix_timer_fn
 
-### 2.2 timer_settime——启动/设置定时器
-
-```c
-SYSCALL_DEFINE4(timer_settime, timer_t, timer_id, int, flags,
-                const struct __kernel_itimerspec __user *, new,
-                struct __kernel_itimerspec __user *, old)
-{
-    struct k_itimer *timr = lock_timer(timer_id);
-    // → posix_timer_by_id() 哈希查找 @ :89
-
-    /* 复制时间规格 */
-    copy_from_user(&new_spec, new, sizeof(new_spec));
-
-    /* 调用时钟特定的 set 函数 */
-    timr->kclock->timer_set(timr, flags, &new_spec, &old_spec);
-    // → common_timer_set()
-    //   → hrtimer_start(timr->ktimer, timr->it->value, mode)
-
-    unlock_timer(timr);
+    // 6. 返回 ID 给用户空间
+    put_user(new_timer->it_id, created_timer_id);
 }
 ```
 
 ---
 
-## 3. 定时器到期回调——posix_timer_fn
+## 3. 启动——common_timer_set
 
 ```c
-// @ posix-timers.c
-// hrtimer 到期时调用此函数
-static enum hrtimer_restart posix_timer_fn(struct hrtimer *timer)
-{
-    struct k_itimer *timr = container_of(timer, struct k_itimer, ktimer);
+// timer_settime → lock_timer(id) → kc->timer_set()
+// CLOCK_REALTIME/MONOTONIC 使用 common_timer_set：
 
-    /* 1. 重新加载定时器（如果是 interval 定时器）*/
-    if (timr->it_interval) {
-        // 计算下一次到期时间
-        hrtimer_forward(timer, now, timr->it_interval);
-        // 返回 HRTIMER_RESTART
-    }
-
-    /* 2. 发送通知 */
-    switch (timr->sigq->info.si_code) {
-    case SI_TIMER:
-        // 发送 SIGALRM 或其他定时器信号
-        send_sigqueue(timr->sigq, timr->it_pid, PIDTYPE_TASK);
-        break;
-    }
-
-    return timr->it_interval ? HRTIMER_RESTART : HRTIMER_NORESTART;
-}
-```
-
----
-
-## 4. 支持的时钟类型 @ posix_clocks
-
-```c
-// @ :57
-// 注册的时钟类型（posix_clocks 数组）：
-// CLOCK_REALTIME           — 墙上时间（可被 settimeofday 调整）
-// CLOCK_MONOTONIC          — 单调递增（不受 settimeofday 影响）
-// CLOCK_PROCESS_CPUTIME_ID — 进程 CPU 时间
-// CLOCK_THREAD_CPUTIME_ID  — 线程 CPU 时间
-// CLOCK_BOOTTIME           — 单调+挂起时间
-// CLOCK_REALTIME_ALARM     — 挂起时可唤醒（需 CAP_WAKE_ALARM）
-// CLOCK_BOOTTIME_ALARM     — 挂起时可唤醒（单调版）
-
-// 每种时钟通过 struct k_clock 定义操作：
-struct k_clock {
-    int (*clock_getres)(...);
-    int (*clock_set)(...);
-    int (*clock_get)(...);
-    int (*timer_create)(struct k_itimer *);
-    int (*timer_set)(struct k_itimer *, int, struct itimerspec64 *, ...);
-    int (*timer_del)(struct k_itimer *);
-    void (*timer_get)(struct k_itimer *, struct itimerspec64 *);
-    unsigned long (*timer_forward)(struct k_itimer *, ktime_t now);
+struct k_clock clock_realtime = {
+    .timer_create = common_timer_create,
+    .timer_set    = common_timer_set,
+    .timer_del    = common_timer_del,
+    .timer_get    = common_timer_get,
+    .timer_forward = common_hrtimer_forward,
 };
 ```
 
 ---
 
-## 5. 调试
+## 4. 到期路径
 
-```bash
-# 查看 POSIX 定时器
-cat /proc/<pid>/timers
-# ID: 1
-# signal: 10/SIGALRM
-# notify: signal/pid.1234
-# Clockid: 0 (CLOCK_REALTIME)
-# flags: 0
-# (it_value: 0.500000000 sec, it_interval: 0.500000000 sec)
+### 4.1 posix_timer_fn @ :367——hrtimer 回调
 
-# 定时器限制
-cat /proc/sys/kernel/timer_max
-ulimit -a | grep pending
+```c
+static enum hrtimer_restart posix_timer_fn(struct hrtimer *timer)
+{
+    struct k_itimer *timr = container_of(timer, struct k_itimer, it.real.timer);
 
-# strace 跟踪
-strace -e timer_create,timer_settime,timer_gettime -p <pid>
+    scoped_guard(spinlock_irqsave, &timr->it_lock) {
+        posix_timer_queue_signal(timr);   // 发送信号
+    }
+    return HRTIMER_NORESTART;
+    // 注意：不再返回 HRTIMER_RESTART！
+    // interval 定时器的重新加载由 posixtimer_send_sigqueue 完成
+}
 ```
+
+### 4.2 posix_timer_queue_signal @ :349——信号投递
+
+```c
+void posix_timer_queue_signal(struct k_itimer *timr)
+{
+    // 更新状态
+    timr->it_status = timr->it_interval ?
+        POSIX_TIMER_REQUEUE_PENDING :    // interval 定时器 → 等待重新加载
+        POSIX_TIMER_DISARMED;            // 一次性定时器 → 已完成
+
+    // 发送信号
+    posixtimer_send_sigqueue(timr);
+    // → send_sigqueue(&timr->sigq, timr->it_pid, PIDTYPE_TASK)
+}
+
+// interval 定时器的重新加载：
+// 在 posixtimer_send_sigqueue 内部（@ :331）：
+// 如果 timr->it_interval 非零 → common_hrtimer_rearm()
+//   → hrtimer_forward(timer, now, timr->it_interval)
+//   → hrtimer_restart(timer)
+```
+
+### 4.3 posix_timer_del——停止定时器
+
+```c
+// kc->timer_del(timr) → common_timer_del → hrtimer_cancel()
+```
+
+---
+
+## 5. 关键函数索引
+
+| 函数 | 行号 | 作用 |
+|------|------|------|
+| `posix_timer_by_id` | `:89` | ID 哈希查找 |
+| `posix_timer_add` | `:157` | ID 分配+哈希插入 |
+| `do_timer_create` | `:458` | 创建定时器主逻辑 |
+| `alloc_posix_timer` | `:415` | k_itimer 分配 |
+| `common_timer_create` | `:451` | 初始 hrtimer |
+| `posix_timer_fn` | `:367` | hrtimer 到期回调 |
+| `posix_timer_queue_signal` | `:349` | 信号投递 |
+| `common_hrtimer_rearm` | `:291` | interval 重新加载 |
+| `good_sigevent` | — | sigevent 验证 |
+| `lock_timer` | `:596` | 加锁+哈希查找 |
 
 ---
 
 ## 6. 总结
 
-POSIX 定时器通过 `timer_create` → `hrtimer_init` + `timer_settime` → `hrtimer_start` 管理高精度定时。到期时 `posix_timer_fn`（@ `posix-timers.c`）通过 `send_sigqueue` 发送信号。底层基于 `hrtimer` 框架（红黑树），支持纳秒精度。
+POSIX 定时器通过 `hrtimer_init` + `hrtimer_start` 实现纳秒级精度定时。`timer_create` → `do_timer_create`（`:458`）→ `alloc_posix_timer`（`:415`）分配 `k_itimer` 并插入哈希表，`timer_settime` → `common_timer_set` → `hrtimer_start` 启动，到期后 `posix_timer_fn`（`:367`）→ `posix_timer_queue_signal`（`:349`）→ `send_sigqueue` 投递信号。
 
 ---
 
