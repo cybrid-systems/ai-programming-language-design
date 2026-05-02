@@ -147,16 +147,68 @@ ip addr add 10.0.0.1/24 dev veth0
 
 ---
 
-## 5. XDP 支持
+## 5. XDP 支持 @ :503
 
 ```c
-// veth 支持 XDP（eXpress Data Path）：
-// 在 veth_xmit 中运行 XDP 程序，支持：
-//   XDP_PASS  — 正常转发
-//   XDP_DROP  — 丢弃
-//   XDP_TX    — 回传（从收到的 peer 回传）
+// veth 在 veth_xmit 中运行 XDP 程序（`:365`）：
+// XDP_PASS — 正常转发
+// XDP_DROP — 丢弃
+// XDP_TX   — 回传（从 peer 返回发送端）
 
-// 用途：容器网络的 XDP 加速
+// veth_xdp_xmit @ :503——XDP 程序的 ndo_xdp_xmit 回调
+static int veth_xdp_xmit(struct net_device *dev, int n,
+    struct xdp_frame **frames, u32 flags, bool ndo)
+{
+    for (i = 0; i < n; i++) {
+        struct xdp_frame *frame = frames[i];
+        skb = xdp_frame_to_skb(frame);    // XDP → skb
+        __skb_queue_tail(&rq->xdp_ring, skb); // 入队
+        rxq->stats->xdp_bytes += skb->len;
+    }
+    __veth_xdp_flush(rq);
+}
+
+// __veth_xdp_flush @ :301——NAPI 调度
+static void __veth_xdp_flush(struct veth_rq *rq)
+{
+    if (rq->rx_notify_masked) {          // 检查是否需要 NAPI 调度
+        rq->rx_notify_masked = false;
+        napi_schedule_irqoff(&rq->xdp_napi);
+    }
+}
+
+// XDP 启用：veth_enable_xdp_range @ :1110
+// → 为每个队列创建 NAPI 实例（xdp_napi）
+// → 设置 ndo_xdp_xmit 和 ndo_bpf
+
+// XDP 加速效果：DPDK/Cilium 容器网络使用 veth XDP 减少延迟
+```
+
+## 6. 多队列与 NAPI
+
+```c
+// veth 的设备操作表：
+static const struct net_device_ops veth_ops = {
+    .ndo_open            = veth_open,
+    .ndo_stop            = veth_close,
+    .ndo_start_xmit      = veth_xmit,
+    .ndo_get_stats64     = veth_get_stats64,
+    .ndo_xdp_xmit        = veth_ndo_xdp_xmit,
+    .ndo_bpf             = veth_xdp_set,
+};
+
+// veth_rq_stats——per-queue 统计 @ :56
+struct veth_rq_stats {
+    u64 rx_packets;
+    u64 rx_bytes;
+    u64 xdp_packets;
+    u64 xdp_bytes;
+    u64 xdp_redirect;
+    u64 xdp_drops;
+    u64 xdp_tx;
+    u64 xdp_tx_errors;
+    struct u64_stats_sync syncp;
+};
 ```
 
 ---
