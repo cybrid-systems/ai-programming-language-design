@@ -391,4 +391,166 @@ XFS 的设计体系围绕**可扩展性**展开：
 
 ---
 
+## 9. xfs_buf 缓存层深度分析
+
+### 9.1 查找路径——xfs_buf_find
+
+```c
+// fs/xfs/xfs_buf.c
+// xfs_buf_find() 是 buffer 缓存的核心查找函数
+// 使用 rhashtable 实现 O(1) 查找
+
+static int
+xfs_buf_find(struct xfs_buftarg *btp, struct xfs_buf_map *map,
+             xfs_buf_flags_t flags, struct xfs_buf **bpp)
+{
+    /* 1. rhashtable 查找 */
+    rcu_read_lock();
+    bp = rhashtable_lookup(&btp->bt_hash, map, xfs_buf_hash_params);
+    if (bp && !lockref_get_not_dead(&bp->b_lockref))
+        bp = NULL;
+    rcu_read_unlock();
+
+    if (bp) {
+        /* 2. 缓存命中 → 获取锁 */
+        error = xfs_buf_find_lock(bp, flags);
+        if (error) {
+            xfs_buf_rele(bp);
+            return error;
+        }
+        *bpp = bp;
+        return 0;
+    }
+
+    /* 3. 缓存未命中 → 分配新 buffer */
+    error = xfs_buf_alloc(btp, map, nmaps, flags, &new_bp);
+    // 插入哈希表（原子操作，防止并发重复分配）
+    bp = rhashtable_lookup_get_insert_fast(&btp->bt_hash, ...);
+    if (bp) {
+        // 其他线程已经插入了 → 释放新建的、返回已有的
+        xfs_buf_free(new_bp);
+        error = xfs_buf_find_lock(bp, flags);
+    }
+}
+```
+
+**doom-lsp 确认**：`xfs_buf_find` 在 `xfs_buf.c`。使用 `lockref_get_not_dead` 原子操作获取引用——这是 `struct lockref` 的 DMA 友好设计（cmpxchg + spinlock fallback）。
+
+### 9.2 延迟写队列——delwri
+
+```c
+// fs/xfs/xfs_buf.c:1806
+// xfs_buf_delwri_queue() 将 buffer 加入延迟写队列
+// 同一 buffer 多次入队会被判重（_XBF_DELWRI_Q 标志）
+
+bool xfs_buf_delwri_queue(struct xfs_buf *bp, struct list_head *list)
+{
+    if (bp->b_flags & _XBF_DELWRI_Q)
+        return false;            // 已在队列中，判重
+
+    bp->b_flags |= _XBF_DELWRI_Q;
+    if (list_empty(&bp->b_list)) {
+        xfs_buf_hold(bp);        // 增加引用防回收
+        list_add_tail(&bp->b_list, list);
+    }
+    return true;
+}
+
+// 批量提交（用工作队列异步执行）：
+int xfs_buf_delwri_submit(struct list_head *list)
+{
+    LIST_HEAD(io_list);
+    struct xfs_buf *bp;
+
+    /* 1. 按块号排序（减少寻道）*/
+    list_sort(NULL, &io_list, xfs_buf_cmp);
+
+    /* 2. 逐个提交 */
+    list_for_each_entry_safe(bp, n, &io_list, b_list) {
+        if (!(bp->b_flags & _XBF_DELWRI_Q)) {
+            // 已被其他线程同步写过 → 跳过
+            xfs_buf_list_del(bp);
+            xfs_buf_relse(bp);
+            continue;
+        }
+        bp->b_flags &= ~_XBF_DELWRI_Q;
+        xfs_buf_submit(bp);
+    }
+}
+
+/* 提交后的 IO 完成链 */
+xfs_buf_submit → submit_bio → bio 完成 → xfs_buf_ioend()
+    → xfs_buf_ioend_handle_error()  // 错误处理：重试或报错
+    → b_ops->verify_write(bp)        // 写验证
+    → b_iodone(bp)                    // 通知上层（如 AIL）
+    → xfs_buf_rele(bp)               // 释放引用
+```
+
+### 9.3 LRU 淘汰与内存回收
+
+```c
+// 当 xfs_buf_rele() 将引用归零时，buffer 进入 LRU 列表
+// 内核内存回收时，xfs_buf_shrink() 扫描 LRU 并释放最久未使用的 buffer
+// 被 pin 的 buffer（b_pin_count > 0）不能被回收
+
+// 主动释放：
+void xfs_buf_free(struct xfs_buf *bp)
+{
+    // 释放 backing memory
+    xfs_buf_free_maps(bp);
+    if (bp->b_flags & _XBF_KMEM)
+        kmem_free(bp->b_addr);
+    else
+        free_pages(...);
+
+    // RCU 延迟释放结构体
+    call_rcu(&bp->b_rcu, xfs_buf_free_callback);
+}
+```
+
+## 10. 日志恢复
+
+XFS mount 时自动执行日志恢复（若有未完成的提交）：
+
+```c
+// fs/xfs/xfs_log_recover.c
+// xfs_log_mount() → xlog_do_recovery_pass()
+
+int xlog_do_recovery_pass(struct xlog *log, xfs_daddr_t head_blk,
+                          xfs_daddr_t tail_blk)
+{
+    /* 1. 扫描日志，找到最后一个完整提交 */
+    // 从 tail 到 head 扫描日志块
+    // 找到每个日志向量的 LSN
+
+    /* 2. 验证校验和 */
+    // 校验 crc32 检查每个日志块的完整性
+
+    /* 3. 回放日志向量到文件系统元数据位置 */
+    for (each record) {
+        o = item->ri_ops->iop_recover(item, &trans);
+    }
+
+    /* 4. 清除陈旧的日志块 */
+    xlog_clear_stale_blocks(log, tail_lsn);
+}
+```
+
+## 11. 错误处理
+
+```c
+// fs/xfs/xfs_buf.c:996
+// xfs_buf_ioend_handle_error() 处理 IO 错误：
+//
+// 1. 首次失败 → 重试（最多 XFS_BUF_RETRIES 次）
+// 2. 重试超时 → 根据错误类型决定是否 retry
+// 3. 不可恢复错误 → 标记文件系统错误（xfs_force_shutdown）
+//    → 后续操作返回 EFSCORRUPTED 或 EIO
+//
+// 这种设计使 XFS 能在出现瞬时 IO 错误时重试
+// 而非立即 panic（与 ext4 的区别之一）
+```
+
+---
+
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
