@@ -158,7 +158,34 @@ LANDLOCK_ACCESS_FS_MAKE_FILE   // 创建
 
 ---
 
-## 6. 构建沙盒示例
+## 6. 模式设置路径——seccomp_set_mode_filter
+
+```c
+// 两种方式设置 seccomp 过滤器：
+// 方式 1：prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)
+// → seccomp_set_mode_filter(prog)
+//
+// 方式 2：seccomp(SECCOMP_SET_MODE_FILTER, flags, prog)
+// → seccomp_set_mode_filter(prog)
+
+// seccomp_set_mode_filter() 内部：
+// 1. seccomp_check_filter() — 验证 BPF 程序合法性
+//    → 检查指令数 ≤ BPF_MAXINSNS
+//    → 检查所有跳转目标在合法范围内
+//    → 检查没有越界访问 seccomp_data
+//
+// 2. bpf_prog_create_from_user() — 编译 BPF 字节码
+//    → 分配 bpf_prog 结构
+//    → 验证器检查
+//    → JIT 编译或解释器准备
+//
+// 3. seccomp_attach_filter() — 链接到进程
+//    → 创建 seccomp_filter {.prog, .prev = current->seccomp.filter}
+//    → current->seccomp.filter = new_filter
+//    → seccomp_assign_mode(FILTER)
+```
+
+## 7. 构建沙盒示例
 
 ```c
 // seccomp: 限制系统调用

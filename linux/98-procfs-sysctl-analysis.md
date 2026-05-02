@@ -212,9 +212,61 @@ find /proc/sys/ -type f | head -20
 
 ---
 
-## 7. 总结
+## 6. 文件操作表
 
-sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113`）二分查找、`insert_entry`（`:146`）排序插入。读写通过 `proc_handler` 回调访问内核变量。`register_sysctl` → `__register_sysctl_table` → `insert_header` + 逐条目 `insert_entry` 注册键值对。
+```c
+// /proc/sys/ 文件的 file_operations：
+static const struct proc_ops proc_sys_file_operations = {
+    .proc_read     = proc_sys_read,
+    .proc_write    = proc_sys_write,
+    .proc_poll     = proc_sys_poll,
+    .proc_ioctl    = proc_sys_ioctl,
+    .proc_mmap     = proc_sys_mmap,
+};
+
+// 目录操作：
+static const struct proc_ops proc_sys_dir_file_operations = {
+    .proc_read     = proc_sys_readdir,
+    .proc_iterate  = proc_sys_readdir,
+    .proc_llseek   = default_llseek,
+};
+```
+
+## 7. proc_sys_make_inode——inode 创建
+
+```c
+// 每次 open /proc/sys/kernel/xxx 时调用
+// → proc_sys_make_inode(sb, head, entry)
+//   → new_inode(sb) + inode->i_ino = get_next_ino()
+//   → inode->i_mtime = current_time(inode)
+//   → inode->i_mode = entry->mode | S_IFREG (或 S_IFDIR)
+//   → inode->i_private = (void *)entry (用于 proc_sys_read/write 查找)
+```
+
+## 8. 常用 sysctl 表注册示例
+
+```c
+// kernel/sysctl.c 中的注册：
+static struct ctl_table kern_table[] = {
+    {
+        .procname   = "hostname",
+        .data       = &init_uts_ns.name.nodename,
+        .maxlen     = __NEW_UTS_LEN,
+        .proc_handler = proc_dostring,
+    },
+    {
+        .procname   = "panic",
+        .data       = &panic_timeout,
+        .maxlen     = sizeof(int),
+        .proc_handler = proc_dointvec,
+    },
+};
+register_sysctl("kernel", kern_table);
+```
+
+## 9. 总结
+
+sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113`）二分查找、`insert_entry`（`:146`）排序插入。`proc_sys_make_inode` 创建 inode，`proc_sys_read`/`write` 通过 `proc_handler` 回调访问内核变量。`register_sysctl` → `__register_sysctl_table` → `insert_header` + 逐条目 `insert_entry` 注册键值对。
 
 ---
 
