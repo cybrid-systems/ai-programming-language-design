@@ -7,8 +7,8 @@ AI 时代的语言，为 AI Agent 设计。
 ```
 docs/
 ├── philosophy/DESIGN_PHILOSOPHY.md     ← 唯一的设计哲学
-├── racket/                              ← Racket 学习笔记、DSL 实验文档
-└── cpp26/                               ← C++26 标准跟踪
+├── racket/                              ← 语言层的三篇核心
+└── cpp26/                               ← 编译器基础设施
 
 code-learn/linux/                        ← 代码库源码分析
 ```
@@ -19,11 +19,11 @@ code-learn/linux/                        ← 代码库源码分析
 
 ### `docs/racket/`
 
-Racket 学习系列（Day 01-14）及 AI 语言前端相关的文档。
+语言层的三篇核心：代码即数据、语言生长、可编程编程。
 
 ### `docs/cpp26/`
 
-C++26 标准演进跟踪。
+编译器基础设施：Modules（增量编译基座）、std::meta + consteval（编译期代码能力）、Contracts（编译器自检）。
 
 ### `docs/philosophy/`
 
