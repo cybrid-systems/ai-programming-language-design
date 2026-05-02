@@ -214,3 +214,88 @@ relay 通过 `relay_open`（`:474`）创建 per-CPU 子缓冲区通道，`relay_
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 9. relay 回调接口
+
+```c
+// relay_open() 的回调参数（struct rchan_callbacks）：
+
+struct rchan_callbacks {
+    int (*subbuf_start)(struct rchan_buf *buf, void *subbuf,
+                         void *prev_subbuf);
+    // → 子缓冲区切换时调用
+    // → 可以初始化子缓冲区（如写入时间戳）
+    // → 返回 0 表示跳过此子缓冲区
+
+    struct dentry *(*create_buf_file)(const char *filename,
+        struct dentry *parent, umode_t mode,
+        struct rchan *chan, int *is_global);
+    // → 在 debugfs 中创建缓冲区文件
+    // → 返回 dentry 指针
+
+    int (*remove_buf_file)(struct dentry *dentry);
+    // → 移除缓冲区文件
+};
+
+// 使用示例（blktrace）：
+// rchan_callbacks.create_buf_file = blk_create_buf_file_callback
+// rchan_callbacks.remove_buf_file = blk_remove_buf_file_callback
+// rchan_callbacks.subbuf_start = blk_subbuf_start_callback
+```
+
+## 10. relay 数据流详解
+
+```c
+// relay 的完整数据流：
+
+// 内核侧写入（relay_write）：
+// 1. buf = per_cpu_ptr(chan->buf, smp_processor_id())
+// 2. if (buf->offset + len > chan->subbuf_size)
+//       relay_switch_subbuf(chan, buf, padding)  // 切换子缓冲区
+// 3. memcpy(buf->data + buf->offset, data, len)
+// 4. buf->offset += len
+
+// 子缓冲区切换（relay_switch_subbuf @ :554）：
+// 1. buf->subbufs_produced++
+// 2. wake_up_all(&buf->read_wait)  // 唤醒读取者
+// 3. 更新 data 指针到下一个子缓冲区：
+//    buf->data = buf->start +
+//       (buf->subbufs_produced % chan->n_subbufs) * chan->subbuf_size
+
+// 用户侧读取（mmap）：
+// sk = relay_file_mmap_ops.mmap → relay_mmap()
+// → remap_vmalloc_range(vma, buf->start)
+// → 用户直接 mmap 访问子缓冲区（零拷贝）
+```
+
+## 11. relay 关键函数索引
+
+| 函数 | 符号 | 作用 |
+|------|------|------|
+| `relay.c` | 68 | relay 核心实现 |
+| `relay_open` | `:474` | 创建 relay 通道 |
+| `relay_close` | — | 关闭通道 |
+| `relay_write` | macro | 写入数据 |
+| `relay_switch_subbuf` | `:554` | 子缓冲区切换 |
+| `relay_alloc_buf` | `:108` | 分配 per-CPU 缓冲区 |
+| `relay_buf_fault` | `:32` | mmap 缺页处理 |
+| `relay_subbuf_start` | `:250` | 子缓冲区启动回调 |
+
+## 12. relay 与 ftrace 的集成
+
+```c
+// relay 最广泛的使用场景是 ftrace 的 trace_pipe：
+
+// kernel/trace/trace.c 中：
+// struct trace_array {
+//     struct trace_buffer trace_buffer;  // per-CPU ring buffer
+//     // ...
+// };
+
+// 虽然 ftrace 使用自己的 ring buffer（不是 relay），
+// 但 blktrace 等工具使用 relay 传输数据：
+// blktrace.c → relay_open("blktrace", ...)
+// → block 层写入 relay channel
+// → btrace 通过 relay 文件读取
+```
+
