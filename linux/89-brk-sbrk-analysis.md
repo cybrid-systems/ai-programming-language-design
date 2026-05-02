@@ -206,6 +206,65 @@ cat /proc/sys/kernel/randomize_va_space
 
 `brk`（@ `mm/mmap.c:116`）扩展堆时调用 `do_brk_flags`（`:1205`）创建/合并匿名 VMA，收缩时调用 `do_vmi_align_munmap` 释放页面。物理内存采用懒分配——缺页时才通过 `do_anonymous_page` 分配零页。
 
+### brk 系统调用完整路径 @ mmap.c:116
+
+```c
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+    // 1. 不能低于 start_brk
+    if (brk < min_brk) goto out;
+
+    // 2. RLIMIT_DATA 检查
+    if (check_data_rlimit(RLIMIT_DATA, brk, mm->start_brk, ...))
+        goto out;
+
+    newbrk = PAGE_ALIGN(brk);
+    oldbrk = PAGE_ALIGN(mm->brk);
+
+    // 3. 收缩
+    if (brk <= mm->brk) {
+        mm->brk = brk;
+        do_vmi_align_munmap(&vmi, ..., newbrk, oldbrk, ...);
+        goto success_unlocked;
+    }
+
+    // 4. 扩展（check_brk_limits → do_brk_flags）
+    check_brk_limits(oldbrk, newbrk - oldbrk);
+    do_brk_flags(&vmi, brkvma, oldbrk, newbrk - oldbrk, EMPTY_VMA_FLAGS);
+    mm->brk = brk;
+    return mm->brk;
+}
+```
+
+### do_brk_flags @ :1205——扩展实现
+
+```c
+int do_brk_flags(..., unsigned long addr, unsigned long len, ...)
+{
+    // 优先合并到前一个 VMA
+    if (brkvma && brkvma->vm_end == addr && can_vma_merge_after(...)) {
+        brkvma->vm_end = addr + len;        // 合并
+    } else {
+        vma = vm_area_alloc(mm);            // 新 VMA
+        vma->vm_start = addr;
+        vma->vm_end = addr + len;
+        vma->vm_flags = VM_READ|VM_WRITE|VM_MAYREAD|VM_MAYWRITE;
+        vma->vm_page_prot = PAGE_SHARED;
+        vma_link(mm, vma, prev, rb_link, rb_parent);
+    }
+    mm->total_vm += len >> PAGE_SHIFT;
+}
+```
+
+### 懒分配——缺页时分配物理页
+
+```c
+// brk 只修改 VMA 边界，不分配物理页
+// 进程首次访问 → 缺页 → do_anonymous_page()
+// → alloc_zeroed_user_highpage() 从伙伴系统分配零页
+// → set_pte_at() 建立页表映射
+```
+
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
