@@ -8,226 +8,242 @@
 
 ## 0. 概述
 
-**VFIO（Virtual Function I/O）** 是 Linux 中**用户态设备直通**框架，允许用户空间驱动程序直接控制物理硬件设备。**IOMMU**（I/O Memory Management Unit）提供 DMA 重映射和隔离，使设备只能访问被授权的内存区域。
+**VFIO** 是 Linux 用户态设备直通框架，允许 QEMU/DPDK 等用户空间程序直接控制物理硬件设备。**IOMMU（I/O MMU）** 提供 DMA 重映射和隔离——将设备 DMA 请求的 IOVA 地址转换为物理地址，防止设备访问未授权的内存。
 
-**核心设计**：VFIO 将物理设备通过 `/dev/vfio/` 暴露给用户空间。用户空间程序通过 ioctl 获取设备的 PCI 配置空间访问、MMIO 映射、中断注册和 DMA 地址管理。IOMMU 在底层保证设备 DMA 不会访问未经授权的内存。
+**核心架构**：
 
 ```
-用户空间                         内核                         硬件
-  QEMU/DPDK                      │                              │
-    │                            │                              │
-  /dev/vfio/vfio ── ioctl ──→   VFIO 核心                      │
-    │                            │                              │
-  /dev/vfio/N ──→  IOMMU 组 ──→ vfio_iommu_type1              │
-    │                            │   vfio_dma_map()              │
-    │                            │   iommu_map() ← IOMMU API    │
-    │                            │       ↓                      │
-    │                            │   调用 IOMMU 驱动             │
-    │                            │   写 IOMMU 页表              │
-    │                            │       ↓                      │
-    │                            │  设备 DMA 到用户地址          │
+用户空间                          内核驱动栈                        硬件
+─────────────────               ──────────                       ──────
+QEMU/SPDK/DPDK                                                    
+  │                                                               
+  open("/dev/vfio/vfio")                                           
+  ioctl(VFIO_SET_IOMMU, ...)                                       
+  open("/dev/vfio/group-N")                                        
+  ioctl(VFIO_GROUP_SET_CONTAINER)   → vfio_main.c                 
+  ioctl(VFIO_IOMMU_MAP_DMA)         → vfio_iommu_type1.c          │
+    {iova, vaddr, size}               → vfio_dma_do_map()          │
+                                        → vfio_pin_pages_remote()  pin 用户页
+                                        → iommu_map(domain)        │
+                                          → intel_iommu_map_pages() → DMAR 页表
+                                          → arm_smmu_map_pages()   → SMMU 页表
+  ioctl(VFIO_GROUP_GET_DEVICE_FD)    → vfio_device_fops_open()     │
+  mmap(device bar)                   → vfio_pci_mmap()             → PCI BAR
+  ioctl(VFIO_DEVICE_SET_IRQS)        → vfio_pci_set_irqs()         → MSI/MSI-X
 ```
 
-**doom-lsp 确认**：VFIO 核心在 `drivers/vfio/vfio_main.c`（**1,856 行**）。IOMMU type1 后端在 `vfio_iommu_type1.c`（**3,284 行**）。IOMMU 核心 API 在 `drivers/iommu/iommu.c`（4,137 行）。
+**doom-lsp 确认**：VFIO 核心在 `drivers/vfio/vfio_main.c`（1,856 行）。IOMMU type1 后端在 `vfio_iommu_type1.c`（3,284 行）。IOMMU API 在 `drivers/iommu/iommu.c`（4,137 行）。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 IOMMU 组（iommu_group）
-
-IOMMU 将设备分组——同一组中的设备共享 IOMMU 地址空间：
+### 1.1 IOMMU 组和域
 
 ```c
 // drivers/iommu/iommu.c
 struct iommu_group {
-    struct kobject kobj;
-    struct kobject *devices_kobj;
-    struct list_head devices;            // 组内设备列表
-    struct iommu_domain *default_domain;  // 默认 DMA 域
-    struct iommu_domain *blocked_domain;  // 阻塞域
-    struct mutex mutex;
-    int id;                              // 组 ID
-    struct iommu_domain *owner;          // 当前所有者
+    struct list_head devices;                 // 组内设备
+    struct iommu_domain *default_domain;      // 默认域
+    struct iommu_domain *blocked_domain;      // 阻止域
+    int id;                                   // 组 ID（对应 /dev/vfio/N）
+    struct iommu_domain *owner;               // 当前 owner
 };
 
-// IOMMU 域（DMA 地址空间）：
 struct iommu_domain {
-    unsigned type;                        // UNMANAGED/DMA/F_UNMANAGED
-    const struct iommu_domain_ops *ops;   // 域操作
-    unsigned long pgsize_bitmap;          // 支持的页大小
-    struct iommu_domain *next;
+    unsigned type;                             // UNMANAGED/DMA
+    const struct iommu_domain_ops *ops;        // 域操作
+    unsigned long pgsize_bitmap;               // 支持的页大小
     void *priv;
 };
 ```
 
-### 1.2 VFIO 设备
+### 1.2 vfio_dma——DMA 映射条目 @ iommu_type1.c:87
 
 ```c
-// include/linux/vfio.h
-struct vfio_device {
-    struct device *dev;                    // 物理设备
-    const struct vfio_device_ops *ops;     // 操作表
-    struct vfio_group *group;              // 所属 IOMMU 组
-    refcount_t refcount;
-    unsigned int open_count;
-    struct completion comp;
-
-    /* 迁移状态 */
-    struct vfio_device_migration_info *mig;
-    u8 *migration_data;
+struct vfio_dma {
+    struct rb_node node;                       // iommu->dma_list 红黑树节点
+    dma_addr_t iova;                           // 设备可见的 DMA 地址
+    unsigned long vaddr;                       // 用户空间虚拟地址
+    size_t size;                               // 映射大小
+    int prot;                                  // IOMMU_READ/WRITE
+    bool iommu_mapped;                         // 已映射到 IOMMU
+    struct task_struct *task;
+    struct rb_root pfn_list;                   // pin 的页帧列表
+    unsigned long *bitmap;                     // 脏页位图
+    size_t locked_vm;                          // 锁定的 VM 数
 };
+
+struct vfio_pfn {                              // @ :358
+    struct rb_node node;
+    dma_addr_t iova;
+    unsigned long pfn;                          // 物理页帧号
+    unsigned int ref_count;
+};
+```
+
+**doom-lsp 确认**：`struct vfio_dma` @ `iommu_type1.c:87`。DMA 映射通过红黑树 `iommu->dma_list` 管理，按 `iova` 排序。
+
+---
+
+## 2. VFIO 容器/组管理 @ vfio_main.c
+
+```c
+// VFIO 三级结构：
+// 容器 (container) — IOMMU 实例，管理 DMA 映射
+//   ↓ 包含多个 IOMMU 组
+// 组 (group) — IOMMU 隔离单元，一组共享页表的设备
+//   ↓ 包含多个设备
+// 设备 (device) — 物理设备，通过 device_fd 控制
+
+// 用户空间操作流程：
+
+// 1. 打开 VFIO 容器
+container_fd = open("/dev/vfio/vfio", O_RDWR);
+ioctl(container_fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+// → vfio_container_ioctl() → iommu->ops->attach_group() 初始化 IOMMU
+
+// 2. 打开 IOMMU 组设备
+group_fd = open("/dev/vfio/23", O_RDWR);  // group ID=23
+
+// 3. 组绑定到容器
+ioctl(group_fd, VFIO_GROUP_SET_CONTAINER, &container_fd);
+// → vfio_group_set_container():
+//     = 检查组内所有设备未被使用
+//     = group->container = container
+//     = 如果容器中所有组就绪 → vfio_iommu_type1_attach_group()
+//       → iommu_attach_group(domain, iommu_group)
+
+// 4. 获取设备 fd
+device_fd = ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD, "0000:01:00.0");
+// → vfio_device_fops_open() 创建设备 fd
 ```
 
 ---
 
-## 2. VFIO 核心路径
+## 3. DMA 映射——vfio_iommu_type1
 
-### 2.1 打开流程
-
-```c
-// 用户空间：
-// fd = open("/dev/vfio/vfio", O_RDWR);
-// ioctl(fd, VFIO_GET_API_VERSION);
-// ioctl(fd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
-// group_fd = open("/dev/vfio/N", O_RDWR);
-// ioctl(group_fd, VFIO_GROUP_SET_CONTAINER, &container_fd);
-// device_fd = ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD, "0000:00:1f.0");
-```
-
-```c
-// VFIO_GROUP_SET_CONTAINER — 将 IOMMU 组绑定到容器
-// → vfio_group_set_container()
-//   → 检查组内所有设备未使用
-//   → group->container = container
-//   → 如果所有组都绑定 → 打开 IOMMU
-
-// VFIO_IOMMU_MAP_DMA — 注册 DMA 映射
-// → vfio_iommu_type1_ioctl(VFIO_IOMMU_MAP_DMA)
-//   → vfio_dma_do_map()
-//     → iommu_map(domain, iova, phys_addr, size, prot)
-//     → 写入 IOMMU 页表
-```
-
-### 2.2 DMA 映射——vfio_iommu_type1
+### 3.1 vfio_dma_do_map——创建 DMA 映射
 
 ```c
 // drivers/vfio/vfio_iommu_type1.c
-// 管理用户空间到设备 DMA 地址的映射
-
-struct vfio_iommu {
-    struct list_head domain_list;        // IOMMU 域列表
-    struct vfio_domain *external_domain;  // 外部域
-    struct list_head iova_list;           // IOVA 区间
-    u64 pgsize_bitmap;
-    struct mutex lock;
-};
-
-struct vfio_domain {
-    struct iommu_domain *domain;          // IOMMU 域
-    struct list_head next;
-    struct list_head group_list;           // 组列表
-    unsigned int prot;                     // 保护位
-};
-
-// vfio_dma_do_map() — 创建 DMA 映射
 static int vfio_dma_do_map(struct vfio_iommu *iommu, struct vfio_iommu_type1_dma_map *map)
 {
-    // 1. 创建 vfio_dma 条目
-    struct vfio_dma *dma = kzalloc(sizeof(*dma), GFP_KERNEL_ACCOUNT);
-    dma->iova = map->iova;                 // IOVA 地址（设备看到的地址）
-    dma->vaddr = map->vaddr;               // 用户空间虚拟地址
-    dma->size = map->size;
+    struct vfio_dma *dma;
 
-    // 2. 调用 IOMMU API 建立映射
-    for_each_domain(iommu, domain) {
-        iommu_map(domain->domain, dma->iova, phys_pfn, npage, prot);
-        // → IOMMU 驱动写页表
-    }
+    /* 1. 检查重叠 */
+    dma = vfio_find_dma(iommu, iova, size);
+    if (dma) return -EEXIST;
+
+    /* 2. 分配 vfio_dma 条目，插入红黑树 */
+    dma = kzalloc(sizeof(*dma), GFP_KERNEL_ACCOUNT);
+    dma->iova = map->iova;                     // 设备端 IOVA
+    dma->vaddr = map->vaddr;                   // 用户空间 vaddr
+    dma->size = map->size;
+    dma->prot = map->flags & IOMMU_READ ? IOMMU_READ : 0;
+    vfio_link_dma(iommu, dma);                 // → rb_insert
+
+    /* 3. pin 用户页面（防止交换）*/
+    vfio_pin_pages_remote(dma, ...);
+    // → pin_user_pages_remote() 锁定用户页
+
+    /* 4. IOMMU 映射 */
+    ret = iommu_map(domain->domain, dma->iova, phys_pfn, npage, dma->prot);
+    // → iommu_map() → domain->ops->map_pages()
+    // → intel/arm_smmu 驱动写入页表
 }
 ```
 
-### 2.3 IOMMU 页表映射——iommu_map
+### 3.2 vfio_dma_do_unmap——解除 DMA 映射
+
+```c
+static int vfio_dma_do_unmap(struct vfio_iommu *iommu, struct vfio_iommu_type1_dma_unmap *unmap)
+{
+    /* 1. 从红黑树查找 dma 条目 */
+    dma = vfio_find_dma(iommu, unmap->iova, unmap->size);
+
+    /* 2. IOMMU 解除映射 */
+    iommu_unmap(domain->domain, dma->iova, dma->size);
+
+    /* 3. unpin 页面 */
+    vfio_unpin_pages_remote(dma, ...);
+    // → unpin_user_pages() 释放对用户页的 pin
+
+    /* 4. 脏页跟踪 */
+    if (dma->bitmap)
+        vfio_dma_populate_bitmap(dma, pgsize);
+
+    /* 5. 删除条目 */
+    vfio_unlink_dma(iommu, dma);
+    kfree(dma);
+}
+```
+
+### 3.3 脏页跟踪
+
+```c
+// 用于 VM 迁移时的脏页记录
+// 通过 IOMMU 页表的 Access/Dirty 位或软件记录
+// vfio_dma->bitmap 存储脏页位图
+// 迁移时通过 VFIO_IOMMU_DIRTY_PAGES ioctl 读取
+```
+
+---
+
+## 4. IOMMU API——iommu_map
 
 ```c
 // drivers/iommu/iommu.c
 int iommu_map(struct iommu_domain *domain, unsigned long iova,
               phys_addr_t paddr, size_t size, int prot)
 {
-    // 1. 验证参数（对齐、大小）
+    // 1. 检查 IOVA 是否已被映射
     if (iommu_is_addr_mapped(domain, iova, size))
         return -EEXIST;
 
-    // 2. 调用底层 IOMMU 驱动
-    ret = domain->ops->map_pages(domain, iova, paddr, size, pgcount, prot, gfp);
-    // → x86: intel_iommu_map_pages() 写 DMAR 页表
-    // → ARM: arm_smmu_map_pages() 写 SMMU 页表
+    // 2. 调用底层驱动
+    ret = domain->ops->map_pages(domain, iova, paddr, size, pgcount, prot, GFP_KERNEL);
+    // Intel: intel_iommu_map_pages() → 写 DMAR 根级页表
+    // ARM: arm_smmu_map_pages() → 写 SMMU 页表（CD/TTBR）
 }
 ```
 
 ---
 
-## 3. 中断
+## 5. 设备操作
 
 ```c
-// VFIO 支持三种中断类型：
-// 1. INTX（PCI 传统中断）
-// 2. MSI（消息信号中断）
-// 3. MSI-X（扩展消息信号中断）
+// VFIO_DEVICE_GET_INFO → 获取设备信息（PCI VID/DID/区域数）
+// VFIO_DEVICE_GET_REGION_INFO → 获取 MMIO BAR 信息
+// VFIO_DEVICE_SET_IRQS → 设置中断（INTX/MSI/MSI-X）
+// VFIO_DEVICE_RESET → 复位设备
 
-// 用户空间通过 ioctl(VFIO_DEVICE_SET_IRQS) 注册中断处理：
-// → vfio_pci_set_irqs_ioctl()
-//   → vfio_msi_set_vector_signal()
-//     → eventfd_signal() — 通过 eventfd 通知用户空间
-
-// 设备中断发生时：
-// 硬件 → 中断控制器 → vfio_msi_handler()
-//   → eventfd_signal(vfio_irq_ctx.trigger)
-//   → 用户空间的 epoll/select 返回
+// mmap 设备 BAR：
+// → vfio_pci_mmap()
+//   → remap_pfn_range() 直接映射 PCI BAR 到用户空间
+//   → 用户空间直接读写硬件寄存器（零拷贝）
 ```
 
 ---
 
-## 4. 设备迁移
+## 6. 关键函数索引
 
-```c
-// VFIO 支持设备状态迁移（用于 VM live migration）：
-// 状态：
-//   VFIO_DEVICE_STATE_RUNNING    — 运行中
-//   VFIO_DEVICE_STATE_SAVING     — 保存状态
-//   VFIO_DEVICE_STATE_RESUMING   — 恢复状态
-//   VFIO_DEVICE_STATE_STOPPED    — 暂停
-//   VFIO_DEVICE_STATE_ERROR      — 错误
-
-// 迁移数据通过 ioctl(VFIO_MIG_GET_REGION_INFO) 获取
-// 通过 mmap 读写迁移区域
-```
+| 函数 | 文件 | 作用 |
+|------|------|------|
+| `vfio_group_set_container` | `vfio_main.c` | 组绑定到容器 |
+| `vfio_device_fops_open` | `vfio_main.c` | 创建设备 fd |
+| `vfio_dma_do_map` | `iommu_type1.c` | DMA 映射（pin + iommu_map）|
+| `vfio_dma_do_unmap` | `iommu_type1.c` | 解除 DMA 映射 |
+| `vfio_find_dma` | `iommu_type1.c` | 红黑树查找 DMA 条目 |
+| `vfio_pin_pages_remote` | `iommu_type1.c` | pin 用户页面 |
+| `iommu_map` | `iommu.c` | IOMMU 页表映射 |
+| `iommu_attach_group` | `iommu.c` | 组绑定到域 |
 
 ---
 
-## 5. 调试
+## 7. 总结
 
-```bash
-# 查看 IOMMU 分组
-ls /sys/kernel/iommu_groups/
-cat /sys/kernel/iommu_groups/0/devices/*/vendor
-
-# 查看 VFIO 容器
-cat /sys/class/vfio/vfio/
-
-# 查看 IOMMU 映射
-cat /sys/kernel/debug/iommu/addresses
-
-# dmesg 调试
-echo 'file drivers/vfio/vfio_main.c +p' > /sys/kernel/debug/dynamic_debug/control
-echo 'file drivers/vfio/vfio_iommu_type1.c +p' > /sys/kernel/debug/dynamic_debug/control
-```
-
----
-
-## 6. 总结
-
-VFIO 通过 IOMMU 组隔离设备，通过 `vfio_iommu_type1` 后端管理 DMA 映射（`vfio_dma_do_map` → `iommu_map` 写入页表）。用户空间通过 ioctl 控制设备直通——PCI 配置空间、MMIO、中断、DMA 全部直通到用户空间。
+VFIO 通过 `vfio_dma_do_map`（`iommu_type1.c`）→ `iommu_map`（`iommu.c`）→ `intel_iommu_map_pages` 实现用户态设备直通。`struct vfio_dma`（`:87`）管理 IOVA→用户 vaddr 映射，`vfio_pin_pages_remote` 锁定用户页面防止交换，IOMMU 驱动写入硬件页表完成 DMA 重映射。
 
 ---
 
