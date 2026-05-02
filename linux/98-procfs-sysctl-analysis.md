@@ -8,30 +8,29 @@
 
 ## 0. 概述
 
-**procfs**（`/proc`）是进程信息文件系统——读取时动态生成进程状态、内存映射等。**sysctl**（`/proc/sys/`）是内核运行时参数接口——通过 `struct ctl_table` 注册的键值对，通过红黑树管理目录条目。
+**sysctl**（`/proc/sys/`）是 Linux 内核参数运行时配置接口。内核模块通过 `register_sysctl()` 注册 `struct ctl_table` 到 `/proc/sys/` 目录树，用户通过文件读写或 `sysctl()` 系统调用访问。
 
-**核心设计**：sysctl 使用红黑树（`rb_node`）管理 `/proc/sys/` 目录下的条目。注册时 `__register_sysctl_table()` → `insert_header()` 构建 `ctl_dir` → `ctl_node` 红黑树。读写时 `find_entry()` 在红黑树中搜索匹配的 `ctl_table` → 调用 `proc_handler`。
+**核心设计**：sysctl 使用**红黑树**（rb_tree）管理 `/proc/sys/` 下的目录结构。`find_entry`（`proc_sysctl.c:113`）在红黑树中二分查找匹配 `ctl_table` 条目，`insert_entry`（`:146`）将新条目插入红黑树。读写通过 `proc_handler` 回调访问内核变量。
 
 ```
 注册路径:
-  register_sysctl("kernel/fs", table)
+  register_sysctl("kernel/pty", pty_table)
     → __register_sysctl_table()
-      → insert_header() → 创建/查找 ctl_dir 目录节点
-      → 逐行遍历 table[] → insert_entry()
-        → 将 table 条目插入父目录的红黑树
-    ↓
-  /proc/sys/kernel/fs/xxx 可见
+      → insert_header() → 创建/查找 ctl_dir
+      → for each table entry: insert_entry()
+        → 在父目录红黑树中按名字排序插入
 
 读写路径:
-  open("/proc/sys/kernel/fs/xxx") → proc_sys_make_inode() 创建 inode
-  read() → proc_sys_read()
-    → find_entry() → 红黑树查找
-    → table->proc_handler() → 读取内核变量
-  write() → proc_sys_write()
-    → find_entry() → proc_handler(write=1)
+  open("/proc/sys/kernel/pty/max")
+    → proc_sys_make_inode()
+  read()
+    → proc_sys_read() → find_entry() → 红黑树二分查找
+    → table->proc_handler() → proc_dointvec() 等
+  write()
+    → proc_sys_write() → find_entry() → proc_handler(write=1)
 ```
 
-**doom-lsp 确认**：`fs/proc/proc_sysctl.c`（1,726 行，100 符号）。
+**doom-lsp 确认**：`fs/proc/proc_sysctl.c`（1,726 行，100 符号）。`find_entry` @ `:113`，`insert_entry` @ `:146`。
 
 ---
 
@@ -42,20 +41,20 @@
 ```c
 // include/linux/sysctl.h
 struct ctl_table {
-    const char *procname;                    // 文件名
-    const char *data;                        // 内核变量地址
-    int maxlen;                              // 最大长度
-    umode_t mode;                             // 文件权限
+    const char *procname;            // 文件名（如 "hostname"、"max"）
+    const char *data;                 // 内核变量地址
+    int maxlen;                       // buffer 最大长度
+    umode_t mode;                     // 文件权限
 
-    proc_handler *proc_handler;              // 读写处理函数
+    proc_handler *proc_handler;       // 读写处理函数
     struct ctl_table_poll *poll;
 
-    // 内建 proc_handler：
-    // proc_dostring     — 字符串
-    // proc_dointvec     — int 数组
-    // proc_doulongvec_minmax — unsigned long + 范围
-    // proc_dobool       — 布尔
-    // proc_dointvec_jiffies — jiffies
+    // 内建处理器：
+    proc_dostring          — 字符串变量
+    proc_dointvec          — int 数组
+    proc_doulongvec_minmax — unsigned long + 范围约束
+    proc_dobool            — 布尔值
+    proc_dointvec_jiffies  — jiffies 值
 };
 ```
 
@@ -63,127 +62,159 @@ struct ctl_table {
 
 ```c
 struct ctl_table_header {
-    struct ctl_table *ctl_table;             // 条目数组
-    struct ctl_node *node;                   // 红黑树节点数组
+    struct ctl_table *ctl_table;       // 条目数组（最多 CTL_MAX_NAME 个）
+    struct ctl_node *node;             // 红黑树节点数组（与 ctl_table 一一对应）
     struct ctl_table_root *root;
     struct ctl_table_set *set;
-    struct ctl_dir *parent;                  // 父目录
-    int count;
+    struct ctl_dir *parent;            // 父目录指针
+    int count;                         // 引用计数
     int nreg;
 };
 ```
 
-### 1.3 红黑树目录结构
+### 1.3 红黑树目录索引
 
 ```c
-// /proc/sys/ 的目录条目通过红黑树管理：
-// struct ctl_dir { struct ctl_table_header h; ... };  // 目录=一种特殊的表头
-// struct ctl_node { struct rb_node node; };            // 红黑树节点
+// 每个 /proc/sys/ 目录对应一个 struct ctl_dir——ctl_dir->root 是红黑树根
+// struct ctl_node { struct rb_node node; };    // 红黑树节点
+// struct ctl_dir  { struct ctl_table_header h; };
 
-// find_entry @ :113 — 红黑树查找：
+// find_entry @ :113——红黑树二分查找
+// 按 procname 字符串比较定位
 static const struct ctl_table *find_entry(
     struct ctl_table_header **phead, struct ctl_dir *dir,
     const char *name, int namelen)
 {
-    struct rb_node *node = dir->h.node[0].node.rb_node;
+    struct rb_node *node = dir->root.rb_node;
+
     while (node) {
         ctl_node = rb_entry(node, struct ctl_node, node);
-        // 通过 table->procname 匹配文件名
-        cmp = namecmp(name, entry->procname, namelen);
-        if (cmp < 0) node = node->rb_left;
+        head = ctl_node->header;
+        entry = &head->ctl_table[ctl_node - head->node];
+        cmp = namecmp(name, namelen, entry->procname, strlen(entry->procname));
+        if (cmp < 0)  node = node->rb_left;
         else if (cmp > 0) node = node->rb_right;
-        else return entry;
+        else { *phead = head; return entry; }
     }
     return NULL;
+}
+
+// insert_entry @ :146——红黑树插入
+// 按 procname 排序，namecmp 决定左右子树
+static int insert_entry(struct ctl_table_header *head, const struct ctl_table *entry)
+{
+    struct rb_node **p = &head->parent->root.rb_node;
+    // ... 标准红黑树插入
+    rb_link_node(node, parent, p);
+    rb_insert_color(node, &head->parent->root);
 }
 ```
 
 ---
 
-## 2. 注册路径
+## 2. 注册路径——__register_sysctl_table
 
 ```c
-// register_sysctl("kernel", table)
-// → __register_sysctl_sz(&sysctl_table_root, "kernel", table, ...)
+// 内核模块注册 sysctl：
+// register_sysctl("kernel/pty", pty_table)
+// → __register_sysctl_sz(&sysctl_table_root, "kernel/pty", pty_table, ...)
 
-struct ctl_table_header *__register_sysctl_table(
-    struct ctl_table_root *root, const char *path, ...)
-{
-    // 1. 组装目录路径
-    // "kernel/fs" → [kernel, fs]
-
-    // 2. 遍历路径，创建或查找目录
-    for (each component) {
-        dir = find_dir(dir, component, false);
-        if (!dir) dir = new_dir(dir, component);
-    }
-
-    // 3. insert_header() — 挂载表头到目录 @ :228
-    // → link 到父目录
-
-    // 4. insert_entry() — 逐个插入条目 @ :146
-    // → 将 ctl_table 中的每个条目插入 dir 的红黑树
-}
+// 内部流程：
+// 1. 将 "kernel/pty" 按 '/' 分割为组件
+// 2. 从 sysctl_table_root.default_set.dir 开始
+//    → find_dir(dir, "kernel") 查找或创建 kernel 目录
+//    → find_dir(dir, "pty")    查找或创建 pty 目录
+// 3. insert_header() — 将新表挂载到 pty 目录下
+// 4. for each entry in table[]:
+//    → insert_entry() — 插入红黑树
 ```
 
 ---
 
 ## 3. 读写路径
 
+### 3.1 proc_sys_read——读取
+
 ```c
-// 用户读取 /proc/sys/kernel/hostname：
+// 用户读取 /proc/sys/kernel/pty/max：
 // → proc_sys_read(file, buf, len, ppos)
-//   → find_entry() 红黑树查找
-//   → table->proc_handler(table, 0, buf, lenp, ppos)
-//   → proc_dostring():
-//     → 从 table->data 读取字符串
-//     → copy_to_user(user_buf, data, len)
+//   → 1. sysctl_follow_link() → find_entry() 红黑树查找
+//   → 2. table->proc_handler(table, 0, buffer, lenp, ppos)
+//   → 3. 例如 proc_dostring():
+//        → copy_to_user(user_buf, table->data, strlen(table->data))
+```
 
-// 用户写入：
+### 3.2 proc_sys_write——写入
+
+```c
+// 用户写入 echo 100 > /proc/sys/kernel/pty/max
 // → proc_sys_write()
-//   → find_entry()
-//   → table->proc_handler(table, 1, buf, lenp, ppos)
-//   → proc_dostring():
-//     → copy_from_user(data, user_buf, len)
-//     → 字符串存入内核变量
-
-// proc_sys_make_inode() — 创建 sysctl 文件的 inode：
-// → 在该次 open 时查找条目
-// → 将 table->proc_handler 与 inode 关联
+//   → 1. find_entry() 红黑树查找
+//   → 2. table->proc_handler(table, 1, buffer, lenp, ppos)
+//   → 3. 例如 proc_dointvec():
+//        → kstrtoint(user_buf, 0, &val) 解析整数
+//        → *(int *)(table->data) = val 写入内核变量
 ```
 
 ---
 
-## 4. 关键函数索引
+## 4. 关键 sysctl 路径示例
+
+```c
+// /proc/sys/kernel/hostname → sysctl_table 指向 utsname()->nodename
+static struct ctl_table kern_table[] = {
+    {
+        .procname   = "hostname",
+        .data       = &init_uts_ns.name.nodename,
+        .maxlen     = __NEW_UTS_LEN,
+        .proc_handler = proc_dostring,
+    },
+    {
+        .procname   = "panic",
+        .data       = &panic_timeout,
+        .maxlen     = sizeof(int),
+        .proc_handler = proc_dointvec,
+    },
+};
+```
+
+---
+
+## 5. 关键函数索引
 
 | 函数 | 行号 | 作用 |
 |------|------|------|
-| `find_entry` | `:113` | 红黑树查找 sysctl 条目 |
-| `insert_entry` | `:146` | 条目插入红黑树 |
-| `insert_header` | `:228` | 表头挂载到目录 |
+| `find_entry` | `:113` | 红黑树二分查找 sysctl 条目 |
+| `insert_entry` | `:146` | 红黑树插入 sysctl 条目 |
+| `insert_header` | `:228` | 表头注册到目录 |
+| `namecmp` | `:103` | 条目名称比较函数 |
 | `new_dir` | — | 创建 sysctl 目录 |
 | `find_dir` | — | 查找 sysctl 目录 |
-| `proc_sys_read` | — | sysctl 文件读取 |
-| `proc_sys_write` | — | sysctl 文件写入 |
-| `proc_sys_make_inode` | — | sysctl inode 创建 |
+| `__register_sysctl_table` | — | 注册入口 |
 
 ---
 
-## 5. 调试
+## 6. 调试
 
 ```bash
+# sysctl 操作
 sysctl kernel.hostname
 sysctl -w kernel.hostname=myhost
-ls /proc/sys/kernel/
+sysctl -a | grep kernel
+
+# /proc/sys 文件
 cat /proc/sys/kernel/panic
 echo 10 > /proc/sys/kernel/panic
+
+# 查看所有 sysctl 文件树
+find /proc/sys/ -type f | head -20
 ```
 
 ---
 
-## 6. 总结
+## 7. 总结
 
-sysctl 通过 `find_entry`（`:113`，红黑树二分查找）定位 `/proc/sys/` 下的条目，读写通过 `proc_handler` 回调访问内核变量。注册通过 `__register_sysctl_table` → `insert_header`（`:228`）挂载表头 → `insert_entry`（`:146`）插入红黑树。
+sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113`）二分查找、`insert_entry`（`:146`）排序插入。读写通过 `proc_handler` 回调访问内核变量。`register_sysctl` → `__register_sysctl_table` → `insert_header` + 逐条目 `insert_entry` 注册键值对。
 
 ---
 
