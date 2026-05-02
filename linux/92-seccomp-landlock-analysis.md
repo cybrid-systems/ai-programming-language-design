@@ -252,3 +252,31 @@ struct seccomp_cache_filter {
 // sd->instruction_pointer = instruction_pointer(current);
 // syscall_get_arguments(current, sd->args);
 ```
+
+## 11. seccomp 过滤器返回值缓存
+
+```c
+// Linux 5.x+ 引入了 seccomp 缓存——对于高频系统调用
+// 可以缓存 BPF 决策结果，跳过 BPF 执行：
+
+// 缓存键：系统调用号 + 架构 + 参数特征
+// 缓存值：SECCOMP_RET_ALLOW（只有 ALLOW 被缓存）
+
+// seccomp_cache_check_allow() @ :177
+// → 检查当前过滤器的缓存
+// → 如果存在缓存且是 ALLOW → 直接返回 ALLOW
+// → 否则执行 seccomp_run_filters()
+
+// 缓存失效：添加新的过滤器（seccomp_attach_filter）时清空
+```
+ADD && wc -c 92-seccomp-landlock-analysis.md
+
+## 11. seccomp 过滤器缓存
+
+```c
+// 缓存高频系统调用的 ALLOW 决策，避免重复执行 BPF：
+// seccomp_cache_check_allow() @ :177
+// → 缓存命中且有 ALLOW → 直接返回
+// → 否则执行 seccomp_run_filters()
+// 缓存失效：新过滤器添加时清空
+```
