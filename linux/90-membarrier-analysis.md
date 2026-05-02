@@ -209,9 +209,115 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
 
 ---
 
-## 7. 总结
+## 6. 用户空间 RCU 使用模式
 
-`membarrier`（`kernel/sched/membarrier.c`，679 行）通过 `SYSCALL_DEFINE3` → `membarrier_private_expedited`（`:316`）→ 遍历 CPU 检查 `rq->curr->mm == current->mm` → `smp_call_function_many(tmpmask, ipi_mb, NULL, 1)` → `ipi_mb`（`:184`）→ `smp_mb()` 实现进程级内存屏障。文件头注释（`:30-90`）提供完整的内存序正确性证明，`SYSCALL_DEFINE3`（`:585`）分派 10 个子命令。
+```c
+// liburcu 中的 synchronize_rcu() 实现（简化）：
+void synchronize_rcu(void) {
+    // 1. 写屏障：确保写操作在 IPI 前可见
+    smp_mb();
+
+    // 2. 调用 membarrier——IPI 到所有同进程 CPU
+    membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0);
+
+    // 3. 读屏障：确保 IPI 后读操作正确
+    smp_mb();
+}
+
+// 读侧（零额外开销）：
+rcu_read_lock()     → 无操作
+p = rcu_dereference(gp) → READ_ONCE()
+rcu_read_unlock()   → 无操作
+```
+
+## 7. SYSCALL_DEFINE3 @ :585——命令分发详情
+
+```c
+SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
+{
+    switch (cmd) {
+    case MEMBARRIER_CMD_QUERY:
+        return MEMBARRIER_CMD_BITMASK;           // 返回支持的命令位图
+
+    case MEMBARRIER_CMD_GLOBAL:
+        if (tick_nohz_full_enabled()) return -EINVAL;
+        synchronize_rcu();                       // 全局同步（慢）
+        return 0;
+
+    case MEMBARRIER_CMD_GLOBAL_EXPEDITED:
+        return membarrier_global_expedited();     // IPI 所有 CPU
+
+    case MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED:
+        return membarrier_register_global_expedited();
+
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
+        return membarrier_private_expedited(0, cpu_id);
+
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE:
+        return membarrier_private_expedited(SYNC_CORE, cpu_id);
+
+    case MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ:
+        return membarrier_private_expedited(RSEQ, cpu_id);
+
+    case MEMBARRIER_CMD_GET_REGISTRATIONS:
+        return membarrier_get_registrations();
+    }
+}
+```
+
+## 8. 注册路径——membarrier_register_private_expedited
+
+```c
+// 使用 membarrier 前必须先注册：
+// membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0)
+
+static int membarrier_register_private_expedited(int flags)
+{
+    // atomic_or(MEMBARRIER_STATE_PRIVATE_EXPEDITED, &mm->membarrier_state)
+    // sync_runqueues_membarrier_state(mm) 同步所有 CPU 的 runqueue
+    // atomic_or(MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY, &mm->membarrier_state)
+}
+```
+
+## 9. IPI 回调函数详细
+
+```c
+// ipi_mb @ :184 — 基础内存屏障
+static void ipi_mb(void *info)  { smp_mb(); }
+
+// ipi_sync_core @ :194 — 内存屏障 + 指令流同步
+// 用于 SYNC_CORE 命令（修改代码后需要清指令缓存）
+static void ipi_sync_core(void *info) {
+    smp_mb();
+    sync_core_before_usermode();  // x86: CPUID; arm64: ISB
+}
+
+// ipi_rseq @ :204 — 内存屏障 + 可重启序列事件
+static void ipi_rseq(void *info) {
+    smp_mb();
+    rseq_sched_switch_event(current);  // 重启 RSEQ 临界区
+}
+
+// ipi_sync_rq_state @ :213 — 同步 membarrier_state 到 runqueue
+static void ipi_sync_rq_state(void *info) {
+    if (current->mm != (struct mm_struct *)info) return;
+    this_cpu_write(runqueues.membarrier_state,
+                   atomic_read(&current->mm->membarrier_state));
+}
+```
+
+## 10. 性能
+
+| 命令 | 延迟 | 说明 |
+|------|------|------|
+| `PRIVATE_EXPEDITED`（单线程）| **~0** | mm_users==1 直接返回 |
+| `PRIVATE_EXPEDITED`（多线程）| **~5-50μs** | IPI 到匹配 CPU |
+| `GLOBAL_EXPEDITED` | **~10-100μs** | IPI 到所有 CPU |
+| `GLOBAL`（慢路径）| **~1-10ms** | synchronize_rcu() |
+
+## 11. 总结
+
+`membarrier`（`kernel/sched/membarrier.c`，679 行）通过 `SYSCALL_DEFINE3`（`:585`）分派 10 个子命令。核心路径 `membarrier_private_expedited`（`:316`）→ 遍历 CPU 检查 `rq->curr->mm` → `smp_call_function_many(tmpmask, ipi_mb, NULL, 1)` → `ipi_mb`（`:184`）→ `smp_mb()`。提供 `ipi_mb`（基础）、`ipi_sync_core`（`:194`，+ISB）、`ipi_rseq`（`:204`，+RSEQ）、`ipi_sync_rq_state`（`:213`，状态同步）四种回调。文件头（`:30-90`）提供 5 种场景的内存序正确性证明。
 
 ---
 
