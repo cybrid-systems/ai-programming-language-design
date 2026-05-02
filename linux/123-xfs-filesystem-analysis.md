@@ -1,4 +1,4 @@
-# 248-xfs-filesystem-analysis — XFS 文件系统深度分析
+# 123-xfs-filesystem — Linux XFS 文件系统深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行符号解析与代码追踪

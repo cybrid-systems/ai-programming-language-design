@@ -1,4 +1,4 @@
-# ext4 文件系统深度分析
+# 122-ext4-filesystem — Linux ext4 文件系统深度源码分析
 
 ext4（fourth extended filesystem）是 Linux 最主流的文件系统，从 ext3 演化而来，引入了 extent 存储、多块分配器、延迟分配、校验和等关键优化。本文以 Linux 7.0-rc1 内核源码为依据，深入分析 ext4 的五大核心机制：extent 树组织、mballoc 分配器、JBD2 日志、目录 htree 索引，以及快速 fsck 的设计原理。
 
