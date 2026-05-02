@@ -41,15 +41,17 @@ struct rchan {
     size_t subbuf_size;                        // 每个子缓冲区大小
     size_t allocated_size;                     // 总分配大小
 
-    void *(*create_buf_file)(const char *name, struct dentry *parent,
-                              umode_t mode, struct rchan *chan,
-                              int *is_global);
-    int (*remove_buf_file)(struct dentry *dentry);
-
+    const struct rchan_callbacks *cb;          // 用户回调函数
     struct dentry *dentry;                     // debugfs 文件 dentry
-
     int is_global;                             // 是否全局模式
     struct list_head list;                     // relay_channels 链表
+};
+
+struct rchan_callbacks {
+    int (*subbuf_start)(struct rchan_buf *buf, void *subbuf,
+                        void *prev_subbuf);   // 子缓冲区切换回调
+    struct dentry *(*create_buf_file)(...);    // 创建 debugfs 文件
+    int (*remove_buf_file)(struct dentry *);    // 移除文件
 };
 ```
 
@@ -62,12 +64,10 @@ struct rchan_buf {
     size_t offset;                             // 当前子缓冲区偏移
     size_t subbufs_produced;                   // 已产生的子缓冲区数
     size_t subbufs_consumed;                   // 已消费的子缓冲区数
-
-    struct rchan *chan;                        // 所属 channel
-    unsigned int cpu;                           // 所属 CPU
-
+    struct rchan *chan;
+    unsigned int cpu;
     wait_queue_head_t read_wait;                // 读取者等待队列
-    unsigned int subbuf_avail;                  // 可用子缓冲区计数
+    unsigned int subbuf_avail;
 };
 ```
 
