@@ -199,3 +199,132 @@ Bonding 提供 7 种内置模式（`bond_xmit_slave_id` 按模式选择 slave）
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 7. 发送模式详解
+
+```c
+// 7 种模式的发送算法：
+
+// BOND_MODE_ROUNDROBIN (0)：
+//   slave = bond->slave_ids[bond->rr_tx_counter++ % slave_cnt]
+//   每个连接数据包会在不同端口间轮转（可能乱序）
+
+// BOND_MODE_ACTIVEBACKUP (1)：
+//   slave = bond->active_slave（只有一个端口活动）
+//   故障时切换到 backup slave（切换时间 < 1s）
+
+// BOND_MODE_XOR (2)：
+//   slave = bond->slave_ids[skb->hash % slave_cnt]
+//   hash = (src_mac ^ dst_mac) % slave_cnt（同流同端口）
+//   保证每个 TCP 连接走一个端口（不乱序）
+
+// BOND_MODE_8023AD (4)：
+//   使用 LACP 协议协商聚合
+//   根据 actor/partner 的速率/双工选择活跃端口
+
+// BOND_MODE_TLB (5)：
+//   自适应发送负载均衡
+//   根据每个 slave 的当前负载动态分配
+
+// BOND_MODE_ALB (6)：
+//   自适应负载均衡（发送+接收）
+//   接收侧通过 ARP 协商更新 peer 的 ARP 缓存
+```
+
+## 8. 链路监控
+
+```c
+// 两种链路监控方式：
+
+// MII 监控（推荐）：
+//   bond->params.miimon = 100  // 每 100ms 检查一次
+//   bond_mii_monitor() — 定时器周期检查
+//   → 检查 slave->dev 的链路状态（netif_carrier_ok）
+//   → 状态变化时触发 failover
+
+// ARP 监控：
+//   bond->params.arp_interval = 1000  // 每 1s 发一次 ARP
+//   bond_arp_send_all() — 发送 ARP 请求到目标 IP
+//   bond_arp_rcv() — 接收 ARP 响应
+//   → 如果 arp_ip_target 无响应 → 标记为 DOWN
+
+// 802.3ad 模式下使用 MII 监控（ARP 监控不支持）
+```
+
+## 9. bonding sysfs 接口
+
+```c
+// /sys/class/net/bond0/bonding/ 下的参数：
+// mode          — 当前模式（可动态切换）
+// slaves        — 所有 slave 列表
+// active_slave  — 当前活动 slave
+// miimon        — MII 监控间隔
+// arp_interval  — ARP 监控间隔
+// arp_ip_target — ARP 目标 IP
+// updelay       — 启用延迟
+// downdelay     — 停用延迟
+// lacp_rate     — LACP 速率（slow/fast）
+
+// 查看：
+// cat /sys/class/net/bond0/bonding/mode
+// cat /sys/class/net/bond0/bonding/slaves
+```
+
+## 10. Team 模式注册
+
+```c
+// Team 支持可插拔模式（用户空间加载）：
+// team_mode_register(&roundrobin_mode_ops)
+// → 注册 roundrobin 模式
+// → mode_ops->transmit() 在 team_xmit 中调用
+
+struct team_mode {
+    const char *kind;                       // 模式名
+    struct team_mode_ops ops;               // 操作函数
+};
+
+// 内建模式：
+// roundrobin — 轮询（与 bonding RR 相同）
+// activebackup — 主备
+// loadbalance — 负载均衡（基于哈希）
+```
+
+## 11. 关键 doom-lsp 确认
+
+```c
+// bond_main.c:
+// bond_xmit_slave_id @ :376  — 按模式选择 slave
+// bond_enslave @ :1884        — 添加 slave
+// bond_release @ :2594        — 移除 slave
+// bond_mii_monitor            — MII 链路监控
+// bond_arp_rcv                — ARP 监控接收
+
+// bond_3ad.c:
+// bond_3ad_state_machine_handler — LACP 状态机
+
+// team_core.c:
+// team_xmit                   — 统一发送入口
+// team_mode_register           — 注册模式
+```
+
+
+## 12. 故障切换流程
+
+```c
+// 链路故障时的 failover 流程：
+// 1. bond_mii_monitor() 检测到 slave 链路 DOWN
+// 2. bond_set_slave_inactive_flags(slave)
+// 3. 如果是 active_slave：
+//    a. bond_select_active_slave() 选择新的 active
+//    b. 更新 ARP 表（bond_arp_send_all 发送 gratuitous ARP）
+//    c. 802.3ad → 发送 LACP PDU 通知对端
+//    d. 发送 NETDEV_BONDING_FAILOVER uevent
+// 4. 用户空间监控 uevent 可触发额外动作
+
+// 恢复流程：
+// 1. slave 链路恢复
+// 2. bond_set_slave_active_flags(slave)
+// 3. 如果 updelay 配置了 → 等待延迟时间
+// 4. 重新加入活跃端口池
+```
+
