@@ -26,7 +26,7 @@ CPUFreq 子系统是 Linux 内核中负责 CPU 动态频率与电压调整的核
 | `drivers/cpufreq/cpufreq_governor.c` | ~550 | 44 | Governor 基类、DBS 采样框架 |
 | `kernel/sched/cpufreq_schedutil.c` | 933 | 82 | schedutil governor（PELT 驱动） |
 | `drivers/cpufreq/intel_pstate.c` | ~4000+ | 200+ | Intel P-State 驱动 |
-| `include/linux/cpufreq.h` | ~1200 | 100+ | 核心数据结构定义 |
+| `include/linux/cpufreq.h` | ~900 | 100+ | 核心数据结构定义 |
 
 ---
 
@@ -150,7 +150,7 @@ struct cpufreq_governor {
 `cpufreq_driver` 是面向硬件的底层驱动接口。框架层通过它与具体硬件交互：
 
 ```c
-// include/linux/cpufreq.h:502-530（精选字段）
+// include/linux/cpufreq.h:349-400（精选字段）
 struct cpufreq_driver {
     const char      *name;                      /* 驱动名："intel_pstate", "acpi-cpufreq" */
     unsigned int    flags;                      /* CPUFREQ_* flags */
@@ -186,7 +186,7 @@ struct cpufreq_driver {
 ### 1.4 cpufreq_frequency_table — 硬件频率点索引
 
 ```c
-// include/linux/cpufreq.h:482-500
+// include/linux/cpufreq.h:715
 struct cpufreq_frequency_table {
     unsigned int    flags;
     unsigned int    driver_data;     /* 驱动私有数据（如 P-State ID）*/
@@ -1255,7 +1255,7 @@ static int cpufreq_transition_notifier_call(
 ### 14.1 cpufreq_frequency_table 的内部结构
 
 ```c
-// include/linux/cpufreq.h:482-500
+// include/linux/cpufreq.h:715
 struct cpufreq_frequency_table {
     unsigned int    frequency;  /* 频率值（kHz）或特殊值 */
     unsigned int    driver_data;/* 驱动私有数据（如 P-State ID）*/
