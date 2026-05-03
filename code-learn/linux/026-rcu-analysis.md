@@ -62,16 +62,14 @@ RCU 的核心理念：
 
 ### 1.3 grace period 的检测
 
+每个 CPU 的 tick（定时器中断）中通过调度时钟中断检查是否需要报告 QS：
+
 ```c
-// 每个 CPU 在每个 tick 中检查是否需要报告 QS
-// kernel/rcu/tree.c
-void rcu_check_callbacks(int cpu)
-{
-    // 如果当前不在 RCU 读临界区
-    if (!rcu_read_lock_held())
-        rcu_flavor_sched_clock_irq(cpu);
-        // → 标记此 CPU 通过了 QS
-}
+// kernel/rcu/tree.c: 调度时钟中断处理
+// 如果当前 CPU 在用户态或 idle（不在 RCU 读临界区）
+// → 标记此 CPU 通过了 QS
+// 实际路径：update_process_times → rcu_sched_clock_irq(user)
+//   → rcu_flavor_sched_clock_irq(user)
 ```
 
 ---
@@ -323,8 +321,8 @@ synchronize_rcu_tasks();
 
 ```c
 // RCU_SOFTIRQ 的处理函数：
-// kernel/rcu/tree.c
-static void rcu_core(void)
+// kernel/rcu/tree.c — 注册在 rcu_init() 中
+static void rcu_core_si(void)               // tree.c:2884
 {
     // 处理此 CPU 上等待的回调
     rcu_do_batch(rdp);
@@ -334,7 +332,7 @@ static void rcu_core(void)
 }
 
 // 注册为 RCU_SOFTIRQ 处理函数：
-open_softirq(RCU_SOFTIRQ, rcu_core);
+open_softirq(RCU_SOFTIRQ, rcu_core_si);     // tree.c:4887
 ```
 
 ---
@@ -450,23 +448,15 @@ void kmem_cache_free(struct kmem_cache *s, void *x)
 
 ## 14. RCU 与 tickless idle
 
-在 CPU 进入 tickless idle 状态时，不产生定时器中断。RCU 需要特殊处理：
+在 CPU 进入 extended quiescent state（如 tickless idle）时，RCU 通过动态 tick 机制处理：
 
 ```c
-// kernel/rcu/tree_plugin.h
-// 在 CPU 进入 idle 时：
-void rcu_idle_enter(void)
-{
-    // 标记此 CPU 进入 idle
-    // → idle 是一个有效的 QS
-    rcu_dynticks_eqs_enter();
-    // → 即使不产生 tick，RCU 也认为此 CPU 通过了 QS
-}
-
-void rcu_idle_exit(void)
-{
-    rcu_dynticks_eqs_exit();
-}
+// kernel/rcu/tree.c / tree_plugin.h
+// 当 CPU 进入 idle 不再产生 tick 时：
+// rcu_dynticks 计数器递增，标记 CPU 处于 EQS（Extended Quiescent State）
+// 在 EQS 中，RCU 认为该 CPU 持续处于 QS 状态
+// 即使不产生 tick，也不会阻碍宽限期完成
+// 退出 idle 时递减计数器，恢复 tick 检测
 ```
 
 ---
@@ -475,8 +465,8 @@ void rcu_idle_exit(void)
 
 ```c
 // CPU 下线时 rcuc 线程的处理：
-// kernel/rcu/tree_plugin.h
-int rcutree_prepare_cpu(unsigned int cpu)
+// kernel/rcu/tree.c
+int rcutree_prepare_cpu(unsigned int cpu)      // tree.c:4240
 {
     struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
     // 初始化 rdp
@@ -486,7 +476,7 @@ int rcutree_prepare_cpu(unsigned int cpu)
     return 0;
 }
 
-int rcutree_dead_cpu(unsigned int cpu)
+int rcutree_dead_cpu(unsigned int cpu)          // tree.c:4504
 {
     // CPU 下线时迁移其回调到其他 CPU
     // 确保所有 pending 的 call_rcu 回调会被执行
