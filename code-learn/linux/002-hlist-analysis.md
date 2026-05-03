@@ -178,8 +178,8 @@ static inline void hlist_add_before(struct hlist_node *n,
 {
     WRITE_ONCE(n->pprev, next->pprev);     // n 的前驱 = next 的前驱
     WRITE_ONCE(n->next, next);             // n 的后继 = next
-    WRITE_ONCE(*n->pprev, n);              // 让前驱指向 n
     WRITE_ONCE(next->pprev, &n->next);      // 更新 next 的 pprev
+    WRITE_ONCE(*(n->pprev), n);             // 让前驱指向 n
 }
 ```
 
@@ -360,7 +360,7 @@ static inline size_t hlist_count_nodes(struct hlist_head *head)
 #define hlist_for_each(pos, head) \
     for (pos = (head)->first; pos ; pos = pos->next)
 
-// list.h:1152
+// list.h:1151
 #define hlist_for_each_safe(pos, n, head) \
     for (pos = (head)->first; pos && ({ n = pos->next; 1; }); \
          pos = n)
@@ -370,7 +370,7 @@ static inline size_t hlist_count_nodes(struct hlist_head *head)
 
 这两种底层遍历很少直接使用——大多数情况下调用者需要的是带自动解引用的版本。
 
-### 6.2 `hlist_entry_safe`——安全的类型转换辅助（`list.h:1156`）
+### 6.2 `hlist_entry_safe`——安全的类型转换辅助（`list.h:1155`）
 
 ```c
 #define hlist_entry_safe(ptr, type, member) \
@@ -429,8 +429,8 @@ static inline size_t hlist_count_nodes(struct hlist_head *head)
 | 宏名 | 行号 | 预存下一个 | 用途 |
 |------|------|-----------|------|
 | `hlist_for_each` | 1148 | ❌ | 底层 `hlist_node*` 遍历 |
-| `hlist_for_each_safe` | 1152 | ✅ | 安全的底层遍历 |
-| `hlist_entry_safe` | 1156 | — | NULL 安全的类型转换 |
+| `hlist_for_each_safe` | 1151 | ✅ | 安全的底层遍历 |
+| `hlist_entry_safe` | 1155 | — | NULL 安全的类型转换 |
 | `hlist_for_each_entry` | 1166 | ❌ | **最常用**，数据节点遍历 |
 | `hlist_for_each_entry_continue` | 1176 | ❌ | 从当前位置继续 |
 | `hlist_for_each_entry_from` | 1186 | ❌ | 从当前位置开始 |
