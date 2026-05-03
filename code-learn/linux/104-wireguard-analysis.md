@@ -1,4 +1,4 @@
-# 105-wireguard — Linux WireGuard VPN 深度源码分析
+# 104-wireguard — Linux WireGuard VPN 深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -259,7 +259,7 @@ static void keep_key_fresh(struct wg_peer *peer)
 
 ---
 
-## 6. 调试
+## 7. 调试
 
 ```bash
 # WireGuard 状态
@@ -275,7 +275,7 @@ cat /proc/net/wireguard
 
 ---
 
-## 7. 总结
+## 8. 总结
 
 WireGuard 通过 `wg_packet_create_data`（`send.c:311`）→ `encrypt_packet`（`:162`）加密后通过 UDP 发送。接收端 `wg_packet_receive`（`receive.c:542`）→ `decrypt_packet`（`:242`）→ `counter_validate`（`:295`）解密并检查重放后送入网络栈。Noise_IK 握手机制在 1-RTT 内完成密钥交换。
 

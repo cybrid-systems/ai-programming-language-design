@@ -1,4 +1,4 @@
-# 98-procfs-sysctl — Linux procfs 和 sysctl 子系统深度源码分析
+# 097-procfs-sysctl — Linux procfs 和 sysctl 子系统深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -212,7 +212,7 @@ find /proc/sys/ -type f | head -20
 
 ---
 
-## 6. 文件操作表
+## 7. 文件操作表
 
 ```c
 // /proc/sys/ 文件的 file_operations：
@@ -232,7 +232,7 @@ static const struct proc_ops proc_sys_dir_file_operations = {
 };
 ```
 
-## 7. proc_sys_make_inode——inode 创建
+## 8. proc_sys_make_inode——inode 创建
 
 ```c
 // 每次 open /proc/sys/kernel/xxx 时调用
@@ -243,7 +243,7 @@ static const struct proc_ops proc_sys_dir_file_operations = {
 //   → inode->i_private = (void *)entry (用于 proc_sys_read/write 查找)
 ```
 
-## 8. 常用 sysctl 表注册示例
+## 9. 常用 sysctl 表注册示例
 
 ```c
 // kernel/sysctl.c 中的注册：
@@ -264,7 +264,7 @@ static struct ctl_table kern_table[] = {
 register_sysctl("kernel", kern_table);
 ```
 
-## 9. 总结
+## 10. 总结
 
 sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113`）二分查找、`insert_entry`（`:146`）排序插入。`proc_sys_make_inode` 创建 inode，`proc_sys_read`/`write` 通过 `proc_handler` 回调访问内核变量。`register_sysctl` → `__register_sysctl_table` → `insert_header` + 逐条目 `insert_entry` 注册键值对。
 
@@ -272,7 +272,7 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
 
-## 10. sysctl 热插拔注册
+## 11. sysctl 热插拔注册
 
 ```c
 // 动态加载模块时的 sysctl 注册：
@@ -290,7 +290,7 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 // fs/proc/proc_sysctl.c — vm.* (vm.dirty_ratio, vm.swappiness)
 ```
 
-## 10. sysctl 目录树管理
+## 12. sysctl 目录树管理
 
 ```c
 // /proc/sys/ 下的目录树通过 sysctl_lock 保护：
@@ -312,7 +312,7 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 // → 递归向上清理父目录（如果父目录空）
 ```
 
-## 11. sysctl 的目录操作
+## 13. sysctl 的目录操作
 
 ```c
 // /proc/sys 的目录文件操作：
@@ -333,7 +333,7 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 // → .getattr — 获取属性
 ```
 
-## 12. proc_sys_poll_notify @ :62
+## 14. proc_sys_poll_notify @ :62
 
 ```c
 // sysctl 文件支持 poll（epoll 监听变化）：
@@ -347,7 +347,7 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 // → 通过 epoll 等待参数变化通知
 ```
 
-## 13. 关键函数索引
+## 15. 关键函数索引
 
 | 函数 | 符号 | 作用 |
 |------|------|------|

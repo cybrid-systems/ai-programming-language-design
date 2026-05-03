@@ -36,7 +36,7 @@ brk(扩展):                    brk(收缩):
   do_brk_flags()              do_vmi_align_munmap()
 ```
 
-**doom-lsp 确认**：`SYSCALL_DEFINE1(brk)` @ `mm/mmap.c:116`。`do_brk_flags` @ `:1205`。`vm_brk_flags` @ `mm/mmap.c:1205`。
+**doom-lsp 确认**：`SYSCALL_DEFINE1(brk)` @ `mm/mmap.c:116`。`do_brk_flags` @ `mm/vma.c:2880`。`vm_brk_flags` @ `mm/mmap.c:1205`。
 
 ---
 
@@ -95,7 +95,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 
 ---
 
-## 2. do_brk_flags @ :1205——堆扩展
+## 2. do_brk_flags @ mm/vma.c:2880——堆扩展
 
 ```c
 int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *brkvma,
@@ -124,7 +124,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *brkvma,
 }
 ```
 
-**doom-lsp 确认**：`do_brk_flags` @ `:1205`。堆扩展本质上是在堆顶添加一个匿名读/写 VMA，不占用物理页——直到访问时才通过 `do_anonymous_page` 分配。
+**doom-lsp 确认**：`do_brk_flags` @ `mm/vma.c:2880`。堆扩展本质上是在堆顶添加一个匿名读/写 VMA，不占用物理页——直到访问时才通过 `do_anonymous_page` 分配。
 
 ---
 
@@ -195,7 +195,7 @@ cat /proc/sys/kernel/randomize_va_space
 | 函数 | 行号 | 作用 |
 |------|------|------|
 | `SYSCALL_DEFINE1(brk)` | `:116` | brk 系统调用 |
-| `do_brk_flags` | `:1205` | 堆扩展（VMA 创建/合并）|
+| `do_brk_flags` | `vma.c:2880` | 堆扩展（VMA 创建/合并）|
 | `vm_brk_flags` | `:1205` | 通用堆扩展 API |
 | `check_brk_limits` | — | 堆限制检查 |
 | `do_vmi_align_munmap` | — | 堆收缩（VMA 移除+页释放）|
@@ -204,7 +204,7 @@ cat /proc/sys/kernel/randomize_va_space
 
 ## 8. 总结
 
-`brk`（@ `mm/mmap.c:116`）扩展堆时调用 `do_brk_flags`（`:1205`）创建/合并匿名 VMA，收缩时调用 `do_vmi_align_munmap` 释放页面。物理内存采用懒分配——缺页时才通过 `do_anonymous_page` 分配零页。
+`brk`（@ `mm/mmap.c:116`）扩展堆时调用 `do_brk_flags`（`mm/vma.c:2880`）创建/合并匿名 VMA，收缩时调用 `do_vmi_align_munmap` 释放页面。物理内存采用懒分配——缺页时才通过 `do_anonymous_page` 分配零页。
 
 ### brk 系统调用完整路径 @ mmap.c:116
 
@@ -236,7 +236,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 }
 ```
 
-### do_brk_flags @ :1205——扩展实现
+### do_brk_flags @ vma.c:2880——扩展实现
 
 ```c
 int do_brk_flags(..., unsigned long addr, unsigned long len, ...)

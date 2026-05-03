@@ -1,4 +1,4 @@
-# 106-tap-tun — Linux TUN/TAP 虚拟网络设备深度源码分析
+# 105-tap-tun — Linux TUN/TAP 虚拟网络设备深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -66,7 +66,7 @@ struct tun_file {                                // TUN 文件句柄
 
 ---
 
-## 2. 写入路径——tun_get_user @ :1131
+## 2. 写入路径——tun_get_user @ :1695
 
 ```c
 // 用户 write → tun_chr_write_iter → tun_get_user
@@ -115,7 +115,7 @@ static ssize_t tun_get_user(struct tun_struct *tun, struct tun_file *tfile,
 
 ---
 
-## 3. 读取路径——tun_put_user @ :2120
+## 3. 读取路径——tun_put_user @ :2035
 
 ```c
 // 用户 read → tun_chr_read_iter → tun_do_read → tun_put_user
@@ -193,8 +193,8 @@ static const struct net_device_ops tun_netdev_ops = {
 
 | 函数 | 行号 | 作用 |
 |------|------|------|
-| `tun_get_user` | `:1131` | 写入路径——用户数据→skb→网络栈 |
-| `tun_put_user` | `:2120` | 读取路径——skb→用户空间 |
+| `tun_get_user` | `:1695` | 写入路径——用户数据→skb→网络栈 |
+| `tun_put_user` | `:2035` | 读取路径——skb→用户空间 |
 | `tun_do_read` | — | 从接收队列取 skb |
 | `tun_net_xmit` | — | 协议栈→TUN 设备（送入接收队列）|
 | `__tun_set_iff` | — | 创建设备 |
@@ -222,13 +222,13 @@ cat /sys/class/net/tun0/statistics/tx_packets
 
 ## 8. 总结
 
-TUN/TAP 通过 `tun_get_user`（`:1131`）将用户空间写入的 skb 注入内核网络栈（`netif_rx`/`netif_receive_skb`），通过 `tun_put_user`（`:2120`）从接收队列抓取 skb 复制到用户空间。`IFF_TUN` 处理 IP 包（L3），`IFF_TAP` 处理以太帧（L2）。多队列通过 `tfiles[]` 数组和 NAPI 实现并行处理。
+TUN/TAP 通过 `tun_get_user`（`:1695`）将用户空间写入的 skb 注入内核网络栈（`netif_rx`/`netif_receive_skb`），通过 `tun_put_user`（`:2035`）从接收队列抓取 skb 复制到用户空间。`IFF_TUN` 处理 IP 包（L3），`IFF_TAP` 处理以太帧（L2）。多队列通过 `tfiles[]` 数组和 NAPI 实现并行处理。
 
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
 
-## 8. TUN 设备创建和销毁
+## 9. TUN 设备创建和销毁
 
 ```c
 // TUN 设备的完整生命周期：
@@ -252,7 +252,7 @@ TUN/TAP 通过 `tun_get_user`（`:1131`）将用户空间写入的 skb 注入内
 // → 通过 flow_table 的 RSS 哈希分发
 ```
 
-## 9. TUN 的 XDP 支持
+## 10. TUN 的 XDP 支持
 
 ```c
 // TUN 支持 XDP（eXpress Data Path）：
@@ -271,7 +271,7 @@ TUN/TAP 通过 `tun_get_user`（`:1131`）将用户空间写入的 skb 注入内
 // XDP 在容器网络中有重要应用（如 Flannel、Calico 加速）
 ```
 
-## 10. TUN 的 tap_filter
+## 11. TUN 的 tap_filter
 
 ```c
 // TAP（L2 模式）支持多播过滤：
@@ -292,13 +292,13 @@ struct tap_filter {
 // 减少了不需要传递给用户空间的 L2 帧数量
 ```
 
-## 11. 关键函数索引
+## 12. 关键函数索引
 
 | 函数 | 符号数 | 作用 |
 |------|--------|------|
 | `tun.c` | 237 | TUN/TAP 驱动 |
-| `tun_get_user` | `:1131` | 写入路径（skb→网络栈）|
-| `tun_put_user` | `:2120` | 读取路径（skb→用户）|
+| `tun_get_user` | `:1695` | 写入路径（skb→网络栈）|
+| `tun_put_user` | `:2035` | 读取路径（skb→用户）|
 | `tun_do_read` | — | 从接收队列取 skb |
 | `tun_net_xmit` | — | 协议栈→TUN 队列 |
 | `tun_chr_open` | — | 字符设备打开 |
@@ -306,7 +306,7 @@ struct tap_filter {
 | `tun_napi_init` | — | NAPI 初始化 |
 
 
-## 12. TUN 的特性标志
+## 13. TUN 的特性标志
 
 ```c
 // TUN 设备支持的特性标志：

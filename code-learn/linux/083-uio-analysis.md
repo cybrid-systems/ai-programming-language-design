@@ -161,7 +161,7 @@ static int uio_open(struct inode *inode, struct file *filep)
 }
 ```
 
-### 3.2 uio_read @ :249——等待中断
+### 3.2 uio_read @ :580——等待中断
 
 ```c
 static ssize_t uio_read(struct file *filep, char __user *buf,
@@ -286,7 +286,7 @@ cat /sys/class/uio/uio0/portio/port0/start
 
 | 函数 | 行号 | 作用 |
 |------|------|------|
-| `uio_read` | `uio.c:249` | 中断事件读取（阻塞/非阻塞）|
+| `uio_read` | `uio.c:580` | 中断事件读取（阻塞/非阻塞）|
 | `uio_write` | — | 中断控制（irqcontrol 回调）|
 | `uio_mmap` | — | 设备内存到用户空间映射 |
 | `uio_interrupt` | — | 中断处理（事件计数+唤醒）|

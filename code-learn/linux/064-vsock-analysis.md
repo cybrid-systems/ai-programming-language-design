@@ -50,6 +50,7 @@ struct vsock_sock {
     bool trusted;
     bool cached_peer_allow_dgram;
     u32 cached_peer;
+    const struct cred *owner;                    /* socket 所有者凭据 */
 
     /* ── SOCK_STREAM 专用字段 ─ */
     long connect_timeout;                         /* 连接超时（默认 2s）*/

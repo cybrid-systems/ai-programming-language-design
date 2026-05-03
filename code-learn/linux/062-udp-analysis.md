@@ -73,7 +73,9 @@ hash4 (三级):  (sport, dport, saddr, daddr) → 已 connect 的 socket
 ```c
 struct udp_hslot_main {
     struct udp_hslot hslot;                     /* 基础桶 */
+#if !IS_ENABLED(CONFIG_BASE_SMALL)
     u32 hash4_cnt;                              /* 此桶中 hash4 socket 数 */
+#endif
 };
 ```
 

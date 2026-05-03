@@ -48,14 +48,20 @@ struct nf_conntrack_tuple {
     struct {
         union nf_inet_addr u3;                   /* 目标 IP */
         union {
-            __be16 u6;                           /* 目标端口 */
+            __be16 all;                          /* 通用端口 */
+            struct { __be16 port; } tcp;
+            struct { __be16 port; } udp;
             struct {
                 u8 type, code;                   /* ICMP 类型/代码 */
-            };
+            } icmp;
+            struct { __be16 port; } dccp;
+            struct { __be16 port; } sctp;
+            struct { __be16 key; } gre;
         } u;
         u_int8_t protonum;                       /* 协议号 (IPPROTO_TCP/UDP/ICMP) */
+        struct { } __nfct_hash_offsetend;         /* 哈希偏移填充 */
+        u_int8_t dir;                            /* 方向 */
     } dst;
-    struct nf_conntrack_zone zone;               /* 区域 */
 };
 
 struct nf_conntrack_man {
@@ -71,25 +77,36 @@ struct nf_conntrack_man {
 ### 1.2 struct nf_conn — 连接条目
 
 ```c
-// include/net/netfilter/nf_conntrack.h:45-120
+// include/net/netfilter/nf_conntrack.h:74-105
 struct nf_conn {
     struct nf_conntrack ct_general;              /* 引用计数 */
 
     spinlock_t lock;
     u32 timeout;                                  /* 超时时间 (jiffies32) */
 
+#ifdef CONFIG_NF_CONNTRACK_ZONES
     struct nf_conntrack_zone zone;                /* conntrack 区域 */
+#endif
     struct nf_conntrack_tuple_hash tuplehash[IP_CT_DIR_MAX]; /* 双向元组 */
 
     unsigned long status;                         /* IPS_* 状态位 */
     possible_net_t ct_net;                        /* 所属 netns */
 
+#if IS_ENABLED(CONFIG_NF_NAT)
+    struct hlist_node nat_bysource;               /* NAT 源跟踪 */
+#endif
+    struct { } __nfct_init_offset;                /* memset 初始化偏移 */
     struct nf_conn *master;                       /* 主连接（expect）*/
+
+#if defined(CONFIG_NF_CONNTRACK_MARK)
     u32 mark;                                     /* 连接标记 */
+#endif
+#ifdef CONFIG_NF_CONNTRACK_SECMARK
     u32 secmark;                                  /* 安全标记 */
+#endif
 
     /* 扩展区域（可变大小，通过 nf_ct_ext_add 添加）*/
-    struct nf_ct_ext *extensions;
+    struct nf_ct_ext *ext;
 
     /* 协议私有数据 */
     union nf_conntrack_proto proto;
@@ -199,7 +216,7 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
         goto out;
 
     /* 4. 添加扩展区（helper、NAT、seqadj 等）*/
-    if (tmpl && tmpl->extensions) {
+    if (tmpl && tmpl->ext) {
         nf_ct_ext_add(ct, extension, GFP_ATOMIC);
     }
 

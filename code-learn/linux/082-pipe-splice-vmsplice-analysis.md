@@ -34,7 +34,7 @@ splice 零拷贝：
 ### 1.1 struct pipe_buffer——环形缓冲区条目
 
 ```c
-// include/linux/pipe_fs_i.h:30-38
+// include/linux/pipe_fs_i.h:26
 struct pipe_buffer {
     struct page *page;                          /* 数据页 */
     unsigned int offset, len;                   /* 页内偏移和长度 */
@@ -47,7 +47,7 @@ struct pipe_buffer {
 ### 1.2 struct pipe_inode_info——管道实例
 
 ```c
-// include/linux/pipe_fs_i.h:74-100
+// include/linux/pipe_fs_i.h:84-110
 struct pipe_inode_info {
     struct mutex mutex;                          /* 保护整个管道的 mutex */
     wait_queue_head_t rd_wait, wr_wait;          /* 读/写等待队列 */
@@ -87,10 +87,10 @@ occupancy ≥ max_usage → 满
 
 ## 2. 管道读写
 
-### 2.1 pipe_read @ :269
+### 2.1 anon_pipe_read @ :269
 
 ```c
-static ssize_t pipe_read(struct kiocb *iocb, struct iov_iter *to)
+static ssize_t anon_pipe_read(struct kiocb *iocb, struct iov_iter *to)
 {
     size_t total_len = iov_iter_count(to);
     mutex_lock(&pipe->mutex);
@@ -132,10 +132,10 @@ static ssize_t pipe_read(struct kiocb *iocb, struct iov_iter *to)
 }
 ```
 
-### 2.2 pipe_write @ :431
+### 2.2 anon_pipe_write @ :431
 
 ```c
-static ssize_t pipe_write(struct kiocb *iocb, struct iov_iter *from)
+static ssize_t anon_pipe_write(struct kiocb *iocb, struct iov_iter *from)
 {
     mutex_lock(&pipe->mutex);
 
@@ -186,7 +186,7 @@ ssize_t splice(fd_in, off_in, fd_out, off_out, len, flags);
 
 ```c
 // do_splice() → splice_file_to_pipe() → f_op->splice_read()
-// → generic_file_splice_read():
+// → filemap_splice_read():
 //   1. filemap_get_pages() 从页缓存获取 pages
 //   2. 通过 page_cache_pipe_buf_ops 将 pages 塞入管道
 //   3. page 引用从文件页缓存转移到管道
@@ -299,10 +299,10 @@ static int vmsplice_to_pipe(struct file *file, struct iov_iter *from,
 
 | 函数 | 文件:行号 | 作用 |
 |------|----------|------|
-| `pipe_read` | `pipe.c:269` | 管道读取（环形缓冲+阻塞等待）|
-| `pipe_write` | `pipe.c:431` | 管道写入（页面分配+合并）|
+| `anon_pipe_read` | `pipe.c:269` | 管道读取（环形缓冲+阻塞等待）|
+| `anon_pipe_write` | `pipe.c:431` | 管道写入（页面分配+合并）|
 | `do_splice` | `splice.c` | splice 系统调用调度 |
-| `generic_file_splice_read` | `splice.c` | 文件→管道（页缓存窃取）|
+| `filemap_splice_read` | `splice.c` | 文件→管道（页缓存窃取）|
 | `splice_from_pipe_to_file` | `splice.c` | 管道→文件 |
 | `vmsplice_to_pipe` | `splice.c` | 用户页→管道 |
 | `pipe_buf_confirm` | `pipe_fs_i.h` | 页面内容确认 |
@@ -314,7 +314,7 @@ static int vmsplice_to_pipe(struct file *file, struct iov_iter *from,
 
 ## 7. 总结
 
-pipe 通过**环形缓冲区**（`pipe_inode_info.bufs`）管理数据，`pipe_read`（`:269`）和 `pipe_write`（`:431`）通过 mutex + waitqueue 同步。splice 和 vmsplice 利用**页面窃取**（`pipe_buf_try_steal`）在内核空间零拷贝传输数据——文件系统页缓存的 page 直接转移到管道（`splice_read`），再从管道转移到目标文件（`splice_write`）。
+pipe 通过**环形缓冲区**（`pipe_inode_info.bufs`）管理数据，`anon_pipe_read`（`:269`）和 `anon_pipe_write`（`:431`）通过 mutex + waitqueue 同步。splice 和 vmsplice 利用**页面窃取**（`pipe_buf_try_steal`）在内核空间零拷贝传输数据——文件系统页缓存的 page 直接转移到管道（`splice_read`），再从管道转移到目标文件（`splice_write`）。
 
 ---
 

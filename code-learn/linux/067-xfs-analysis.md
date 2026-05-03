@@ -277,28 +277,38 @@ xfs_buf_delwri_submit(&buffer_list);       /* 整个队列一次提交 */
 ```c
 struct xfs_cil {
     struct xlog *xc_log;
-    struct xfs_cil_ctx *xc_ctx;            /* 当前上下文 */
-    struct list_head xc_cil;               /* 日志向量链表 */
-    spinlock_t xc_push_lock;
+    unsigned long xc_flags;
     struct workqueue_struct *xc_push_wq;
-    wait_queue_head_t xc_commit_wait;
-};
+    struct rw_semaphore xc_ctx_lock;       /* 上下文锁（写序列化）*/
+    struct xfs_cil_ctx *xc_ctx;            /* 当前上下文 */
+    spinlock_t xc_push_lock;
+    struct list_head xc_committing;        /* 提交中上下文列表 */
+    wait_queue_head_t xc_commit_wait;      /* 提交等待队列 */
+    wait_queue_head_t xc_start_wait;       /* 启动等待队列 */
+    void __percpu *xc_pcp;                 /* percpu CIL 结构 */
+} ____cacheline_aligned_in_smp;
 
 // 每次 trans_commit：
 // 1. 将脏 buffer 格式化为 xfs_log_vec
-// 2. 追加到 cil->xc_cil 链表
+// 2. 追加到 percpu CIL（xc_pcp）
 // 3. 检查空间 → 超过阈值触发 xlog_cil_push_work()
 ```
 
 ### 6.3 iclog 循环缓冲区
 
 ```c
+// 实际定义在 fs/xfs/xfs_log_priv.h:202
 struct xlog_in_core {
+    wait_queue_head_t ic_force_wait;         /* 强制等待队列 */
+    wait_queue_head_t ic_write_wait;        /* 等待写入 */
     struct xlog_in_core *ic_next, *ic_prev;  /* 双向循环链表 */
-    struct xfs_buf *ic_bp;                   /* 底层 buffer */
-    int ic_size, ic_offset;                  /* 当前写入位置 */
+    struct xlog *ic_log;
+    u32 ic_size, ic_offset;                  /* 当前写入位置 */
+    enum xlog_iclog_state ic_state;
     unsigned int ic_flags;                   /* XLOG_* */
-    int ic_refcnt;                           /* 引用计数 */
+    atomic_t ic_refcnt;                      /* 引用计数 */
+    struct xlog_rec_header *ic_header;
+    struct bio ic_bio;                       /* 底层 IO */
 };
 
 // iclog 是内存中的日志循环缓冲区

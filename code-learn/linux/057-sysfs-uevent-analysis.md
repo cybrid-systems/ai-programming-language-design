@@ -69,9 +69,9 @@ struct kobj_type {
     void (*release)(struct kobject *kobj);       /* 释放回调 */
     const struct sysfs_ops *sysfs_ops;            /* sysfs show/store */
     const struct attribute_group **default_groups;/* 默认属性组 */
-    const struct kobj_ns_type_operations *(*child_ns_type)(struct kobject *kobj);
-    const void *(*namespace)(struct kobject *kobj);
-    void (*get_ownership)(struct kobject *kobj,
+    const struct kobj_ns_type_operations *(*child_ns_type)(const struct kobject *kobj);
+    const struct ns_common *(*namespace)(const struct kobject *kobj);
+    void (*get_ownership)(const struct kobject *kobj,
                           kuid_t *uid, kgid_t *gid);
 };
 ```
@@ -192,7 +192,7 @@ static int kobject_add_internal(struct kobject *kobj)
 kref_put → kobject_release → kobject_cleanup → ktype->release(kobj)
 ```
 
-**doom-lsp 确认**：`kobject_get` 在 `kobject.c:614`，`kobject_put` 在 `kobject.c:665`。`kobject_release` 在 `kobject.c:644` 通过 `kref_put` 的 release 回调机制触发。
+**doom-lsp 确认**：`kobject_get` 在 `kobject.c:636`，`kobject_put` 在 `kobject.c:730`。`kobject_release` 在 `kobject.c:709` 通过 `kref_put` 的 release 回调机制触发。
 
 ---
 
@@ -399,7 +399,7 @@ for device in iter(monitor.poll, None):
     print(f"{device.action}: {device.sys_path}")
 ```
 
-**doom-lsp 确认**：`kobject_uevent_env` 在 `lib/kobject_uevent.c`。`kobject_uevent_net_broadcast()` 使用 `NETLINK_KOBJECT_UEVENT` 协议（`net/core/netlink.c`）。
+**doom-lsp 确认**：`kobject_uevent_env` 在 `lib/kobject_uevent.c:476`。`kobject_uevent_net_broadcast()` 使用 `NETLINK_KOBJECT_UEVENT` 协议（`net/core/netlink.c`）。
 
 ---
 

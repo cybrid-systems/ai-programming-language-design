@@ -37,24 +37,36 @@
 ```c
 // include/net/neighbour.h
 struct neighbour {
-    struct neighbour __rcu *next;         /* 哈希链表 */
-    struct neigh_table *tbl;              /* 所属邻居表 */
+    struct hlist_node hash;                /* 哈希链表节点 */
+    struct hlist_node dev_list;            /* per-dev 设备链表 */
+    struct neigh_table *tbl;               /* 所属邻居表 */
     struct neigh_parms *parms;
+    unsigned long confirmed;               /* 确认可达时间 */
+    unsigned long updated;                 /* 更新时间 */
+    rwlock_t lock;                         /* 保护邻居条目的读写锁 */
+    refcount_t refcnt;
+    unsigned int arp_queue_len_bytes;      /* ARP 等待队列字节数 */
+    struct sk_buff_head arp_queue;         /* 等待 ARP 响应的 skb 队列 */
+    struct timer_list timer;               /* 状态机定时器 */
+    unsigned long used;                    /* 最近使用时间 */
+    atomic_t probes;                       /* 探测计数 */
+    u8 nud_state;                          /* NUD_* 状态 */
+    u8 type;                               /* 邻居类型 */
+    u8 dead;                               /* 是否已标记死亡 */
+    u8 protocol;                           /* 上层协议 */
+    u32 flags;                             /* NTF_* 标志 */
+    seqlock_t ha_lock;                     /* L2 地址保护锁 */
+    unsigned char ha[ALIGN(MAX_ADDR_LEN, sizeof(unsigned long))] __aligned(8); /* L2 地址 */
+    struct hh_cache hh;                    /* 硬件头缓存 */
+    int (*output)(struct neighbour *, struct sk_buff *); /* 输出函数 */
+    const struct neigh_ops *ops;           /* 操作函数表 */
+    struct list_head gc_list;              /* GC 链表 */
+    struct list_head managed_list;         /* 管理链表 */
     struct rcu_head rcu;
     struct net_device *dev;
-    unsigned long used;                   /* 最近使用时间 */
-    unsigned long confirmed;              /* 确认可达时间 */
-    unsigned long updated;                /* 更新时间 */
-    __u8 flags;                           /* NTF_* 标志 */
-    __u8 nud_state;                       /* NUD_* 状态 */
-    __u8 type;                            /* 邻居类型 */
-    __u8 dead;                            /* 是否已标记死亡 */
-    refcount_t refcnt;
-    struct sk_buff_head arp_queue;        /* 等待 ARP 响应的 skb 队列 */
-    struct timer_list timer;              /* 状态机定时器 */
-    struct neigh_ops *ops;                /* 操作函数（输出/更新）*/
-    u8 ha[];                              /* L2 地址（变长）*/
-};
+    netdevice_tracker dev_tracker;
+    u8 primary_key[];                      /* 查找 key（IP 地址）*/
+} __randomize_layout;
 ```
 
 ### 1.2 NUD 状态机
@@ -94,38 +106,44 @@ enum {
 // include/net/neighbour.h
 struct neigh_table {
     int family;                            /* AF_INET / AF_INET6 */
-    int entry_size;                        /* neighbour + ha 大小 */
-    int key_len;                           /* 地址长度（4/16）*/
+    unsigned int entry_size;               /* neighbour + ha 大小 */
+    unsigned int key_len;                  /* 地址长度（4/16）*/
     __be16 protocol;                       /* ETH_P_IP / ETH_P_IPV6 */
+    __u32 (*hash)(const void *pkey,
+                  const struct net_device *dev, __u32 *hash_rnd); /* 哈希函数 */
+    bool (*key_eq)(const struct neighbour *, const void *pkey);
+    int (*constructor)(struct neighbour *);/* 邻居创建 */
+    int (*pconstructor)(struct pneigh_entry *); /* 代理构造 */
+    void (*pdestructor)(struct pneigh_entry *); /* 代理析构 */
+    void (*proxy_redo)(struct sk_buff *skb); /* 代理重做 */
+    int (*is_multicast)(const void *pkey);   /* 多播检查 */
+    bool (*allow_add)(const struct net_device *dev, struct netlink_ext_ack *extack);
+    char *id;                              /* "arp_cache" / "ndisc_cache" */
     struct neigh_parms parms;              /* 默认参数 */
     struct list_head parms_list;
-    unsigned long entries;                 /* 条目数 */
-    unsigned long gc_entries;
-    unsigned int last_flush;
-    unsigned int gc_thresh1;               /* 垃圾回收阈值 1 */
-    unsigned int gc_thresh2;               /* 阈值 2 */
-    unsigned int gc_thresh3;               /* 阈值 3 */
-    unsigned long gc_interval;             /* 回收间隔 */
-    unsigned int gc_chain_max;
-    struct timer_list gc_timer;            /* GC 定时器 */
+    int gc_interval;                       /* 回收间隔 */
+    int gc_thresh1;                        /* 垃圾回收阈值 1 */
+    int gc_thresh2;                        /* 阈值 2 */
+    int gc_thresh3;                        /* 阈值 3 */
+    unsigned long last_flush;
+    struct delayed_work gc_work;            /* GC work（非 timer_list）*/
+    struct delayed_work managed_work;
     struct timer_list proxy_timer;
     struct sk_buff_head proxy_queue;
-    struct neigh_hash_table __rcu *nht;    /* 哈希表 */
+    atomic_t entries;                       /* 条目数 */
+    atomic_t gc_entries;
     struct list_head gc_list;
     struct list_head managed_list;
-    int (*constructor)(struct neighbour *);/* 邻居创建 */
-    int (*pconstructor)(...);              /* 代理构造 */
-    void (*pdestructor)(...);              /* 代理析构 */
-    void (*proxy_redo)(struct sk_buff *skb); /* 代理重做 */
-    int (*is_multicast)(const void *addr);  /* 多播检查 */
-    int (*allow_add)(...);
-    char *id;                              /* "arp_cache" / "ndisc_cache" */
+    spinlock_t lock;
+    unsigned long last_rand;
     struct neigh_statistics __percpu *stats;
-    struct net *net;
+    struct neigh_hash_table __rcu *nht;    /* 哈希表 */
+    struct mutex phash_lock;
+    struct pneigh_entry __rcu **phash_buckets;
 };
 ```
 
-**doom-lsp 确认**：`struct neigh_table` 在 `include/net/neighbour.h`。IPv4 的 `arp_tbl` 和 IPv6 的 `nd_tbl` 是全局的 `neigh_table` 实例。
+**doom-lsp 确认**：`struct neigh_table` 在 `include/net/neighbour.h:209`。IPv4 的 `arp_tbl` 和 IPv6 的 `nd_tbl` 是全局的 `neigh_table` 实例。
 
 ---
 

@@ -102,8 +102,9 @@ struct port {
     u16 actor_oper_port_key;
     u16 partner_admin_port_key;
     u8 sm_vars;                      // 状态机变量
+};
 
-## 3. Slave 管理
+## 4. Slave 管理
 
 ```c
 // bond_enslave @ bond_main.c:1884 — 添加 slave：
@@ -125,12 +126,11 @@ struct port {
 //   → 发送 uevent BOND_EVENT_SLAVE_RELEASED
 ```
 
-};
 ```
 
 ---
 
-## 4. Team 架构
+## 5. Team 架构
 
 ```c
 // Team 相比 Bonding 的核心改进——可插拔模式：
@@ -155,7 +155,7 @@ struct team_mode_ops {
 
 ---
 
-## 5. Bonding vs Team
+## 6. Bonding vs Team
 
 | 特性 | Bonding | Team |
 |------|---------|------|
@@ -167,7 +167,7 @@ struct team_mode_ops {
 
 ---
 
-## 6. 调试
+## 7. 调试
 
 ```bash
 # Bonding
@@ -181,7 +181,7 @@ teamnl <team> ports
 
 ---
 
-## 7. 关键函数索引
+## 8. 关键函数索引
 
 | 函数 | 文件 | 作用 |
 |------|------|------|
@@ -192,7 +192,7 @@ teamnl <team> ports
 
 ---
 
-## 8. 总结
+## 9. 总结
 
 Bonding 提供 7 种内置模式（`bond_xmit_slave_id` 按模式选择 slave），802.3ad LACP 通过 `bond_3ad_state_machine_handler` 实现。Team 通过 `team_mode_ops` 实现可插拔发送算法。
 

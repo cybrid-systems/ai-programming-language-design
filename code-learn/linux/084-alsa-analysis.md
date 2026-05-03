@@ -185,14 +185,13 @@ enum snd_pcm_state {
 // 原子操作，确保状态一致性
 ```
 
-### 2.2 snd_pcm_lib_write @ pcm_lib.c——用户写入
+### 2.2 snd_pcm_write 路径 @ pcm_native.c——用户写入
 
 ```c
-// 用户调用 snd_pcm_writei() → 最终到达：
+// 用户调用 snd_pcm_writei() → 最终到达 pcm_native.c 中的 snd_pcm_lib_write()
+// 该函数已内联重构，核心通过 do_transfer() 完成数据拷贝：
 
-snd_pcm_sframes_t snd_pcm_lib_write(struct snd_pcm_substream *substream,
-                                     const void __user *buf, snd_pcm_uframes_t size)
-{
+do_transfer(substream, c, ...)  @ pcm_lib.c:2099
     // 1. 等待环形缓冲区有空间
     while (avail < size) {
         // → wait_event_interruptible(substream->runtime->sleep, avail >= size)
@@ -292,8 +291,8 @@ arecord -D hw:0,0 -f cd test.wav
 | `snd_pcm_hw_params` | `pcm_native.c` | 设置采样参数 |
 | `snd_pcm_prepare` | `pcm_native.c` | 准备 DMA 传输 |
 | `snd_pcm_start` | `pcm_native.c` | 启动音频流 |
-| `snd_pcm_lib_write` | `pcm_lib.c` | 写入音频数据 |
-| `snd_pcm_lib_read` | `pcm_lib.c` | 读取音频数据 |
+| `snd_pcm_lib_write` | `pcm_native.c` | 写入音频数据 |
+| `snd_pcm_lib_read` | `pcm_native.c` | 读取音频数据 |
 | `snd_pcm_period_elapsed` | `pcm_lib.c` | 周期完成中断 |
 | `snd_ctl_elem_read` | `control.c` | control 读取 |
 | `snd_ctl_elem_write` | `control.c` | control 写入 |

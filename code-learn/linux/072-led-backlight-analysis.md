@@ -80,7 +80,7 @@ void led_set_brightness(struct led_classdev *led_cdev, unsigned int brightness)
     led_set_brightness_nosleep(led_cdev, brightness);
 }
 
-// 第二级：led_set_brightness_nosleep @ :357
+// 第二级：led_set_brightness_nosleep @ :361
 // 非睡眠版本——设置 brightness 字段 + 处理挂起
 void led_set_brightness_nosleep(struct led_classdev *led_cdev, unsigned int value)
 {
@@ -90,7 +90,7 @@ void led_set_brightness_nosleep(struct led_classdev *led_cdev, unsigned int valu
     led_set_brightness_nopm(led_cdev, led_cdev->brightness);
 }
 
-// 第三级：led_set_brightness_nopm @ :317
+// 第三级：led_set_brightness_nopm @ :331
 // 分为直接调用（brightness_set 不睡眠）和 workqueue（可能睡眠）
 void led_set_brightness_nopm(struct led_classdev *led_cdev, unsigned int value)
 {
@@ -121,9 +121,9 @@ int led_set_brightness_sync(struct led_classdev *led_cdev, unsigned int value)
 }
 ```
 
-**doom-lsp 确认**：`led_set_brightness` @ `:304`，`led_set_brightness_nosleep` @ `:357`，`led_set_brightness_nopm` @ `:317`，`led_set_brightness_sync` @ `:372`。
+**doom-lsp 确认**：`led_set_brightness` @ `:304`，`led_set_brightness_nosleep` @ `:361`，`led_set_brightness_nopm` @ `:331`，`led_set_brightness_sync` @ `:372`。
 
-### 1.3 软件/硬件闪烁 @ led-core.c:396+
+### 1.3 软件/硬件闪烁 @ led-core.c:220+
 
 ```c
 // 两种闪烁方式：
@@ -137,9 +137,9 @@ int led_set_brightness_sync(struct led_classdev *led_cdev, unsigned int value)
 // → blink_timer → led_timer_function() → brightness_set()
 // 
 // led_init_core @ :236 初始化 blink_timer
-// led_blink_set @ :396 — 清除旧状态，调用 led_blink_setup
-// led_blink_set_oneshot @ :415 — 单次闪烁
-// led_stop_software_blink @ :436 — 停止软件闪烁
+// led_blink_set @ :244 — 清除旧状态，调用 led_blink_setup
+// led_blink_set_oneshot @ :258 — 单次闪烁
+// led_stop_software_blink @ :295 — 停止软件闪烁
 ```
 
 ### 1.4 sysfs 接口 @ led-class.c
@@ -318,12 +318,12 @@ bd = backlight_device_register("backlight", dev, data, &ops, &props);
 | 函数 | 文件:行号 | 作用 |
 |------|----------|------|
 | `led_set_brightness` | `led-core.c:304` | 亮度设置入口（IRQ安全）|
-| `led_set_brightness_nosleep` | `led-core.c:357` | 非睡眠设置 |
-| `led_set_brightness_nopm` | `led-core.c:317` | 硬件/工作队列分流 |
+| `led_set_brightness_nosleep` | `led-core.c:361` | 非睡眠设置 |
+| `led_set_brightness_nopm` | `led-core.c:331` | 硬件/工作队列分流 |
 | `led_set_brightness_sync` | `led-core.c:372` | 同步设置（阻塞）|
 | `led_init_core` | `led-core.c:236` | work+blink_timer 初始化 |
-| `led_blink_set` | `led-core.c:396` | 闪烁设置 |
-| `led_stop_software_blink` | `led-core.c:436` | 停止软件闪烁 |
+| `led_blink_set` | `led-core.c:244` | 闪烁设置 |
+| `led_stop_software_blink` | `led-core.c:295` | 停止软件闪烁 |
 | `led_trigger_register` | `led-triggers.c:318` | 触发器注册 |
 | `led_trigger_event` | `led-triggers.c:408` | 触发器事件通知 |
 | `brightness_store` (LED) | `led-class.c:44` | sysfs 写入 |

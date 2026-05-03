@@ -19,7 +19,7 @@ fsnotify() @ fs/notify/fsnotify.c:492
 send_to_group() @ :331    遍历标记组
   ↓
 group->ops->handle_event()  根据 group 类型分发
-  ├── inotify_handle_event()
+  ├── inotify_handle_inode_event()
   │     → 构造 inotify_event
   │     → 加入 group->notification_list
   │     → wake_up(&group->notification_waitq)
@@ -85,7 +85,7 @@ static int send_to_group(__u32 mask, ...)
     // 3. 调用组特定的 handle_event
     if (group->ops->handle_event)
         return group->ops->handle_event(group, ...);
-    // → inotify: inotify_handle_event (inotify_user.c)
+    // → inotify: inotify_handle_inode_event (inotify_fsnotify.c)
     // → fanotify: fanotify_handle_event (fanotify.c)
 }
 ```
@@ -229,7 +229,7 @@ struct fanotify_event_metadata {
 | `inotify_read` | `inotify_user.c:249` | inotify 事件读取 |
 | `inotify_poll` | `inotify_user.c:139` | inotify poll |
 | `inotify_add_to_idr` | `inotify_user.c:394` | watch 注册 |
-| `inotify_handle_event` | `inotify_fsnotify.c` | inotify 事件处理 |
+| `inotify_handle_inode_event` | `inotify_fsnotify.c:59` | inotify 事件处理 |
 | `fanotify_merge` | `fanotify.c:182` | fanotify 事件合并 |
 | `fanotify_get_response` | `fanotify.c:224` | fanotify 访问控制 |
 | `fanotify_handle_event` | `fanotify.c` | fanotify 事件处理 |

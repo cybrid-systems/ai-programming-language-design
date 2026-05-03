@@ -1,4 +1,4 @@
-# 103-netlink-deep — Linux netlink 套接字深度源码分析
+# 102-netlink-deep — Linux netlink 套接字深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -274,14 +274,14 @@ static int netlink_dump(struct sock *sk)
 
 ---
 
-## 6. 关键函数索引
+## 7. 关键函数索引
 
 | 函数 | 行号 | 作用 |
 |------|------|------|
 | `netlink_create` | — | 创建 netlink socket |
-| `netlink_sendmsg` | `:1739` | 发送消息（单播/多播）|
-| `netlink_unicast` | `:992` | 单播发送 |
-| `netlink_broadcast` | `:1457` | 多播发送 |
+| `netlink_sendmsg` | `:1812` | 发送消息（单播/多播）|
+| `netlink_unicast` | `:1327` | 单播发送 |
+| `netlink_broadcast` | `:1554` | 多播发送 |
 | `netlink_rcv_skb` | — | 内核侧消息解析分发 |
 | `netlink_recvmsg` | — | 用户空间接收 |
 | `netlink_dump` | `:133` | dump 异步数据发送 |
@@ -293,7 +293,7 @@ static int netlink_dump(struct sock *sk)
 
 ## 7. 总结
 
-netlink 通过 `netlink_sendmsg`（`:1739`）→ `netlink_unicast`（`:992`）或 `netlink_broadcast`（`:1457`）发送消息，内核侧通过 `netlink_rcv_skb` 解析分发。内核服务通过 `netlink_kernel_create` 注册接收回调。`nl_table`（`:90`）全局哈希表管理所有 netlink socket 的查找。dump 机制（`netlink_dump` @ `:133`）支持大数据量的异步查询。
+netlink 通过 `netlink_sendmsg`（`:1812`）→ `netlink_unicast`（`:1327`）或 `netlink_broadcast`（`:1554`）发送消息，内核侧通过 `netlink_rcv_skb` 解析分发。内核服务通过 `netlink_kernel_create` 注册接收回调。`nl_table`（`:90`）全局哈希表管理所有 netlink socket 的查找。dump 机制（`netlink_dump` @ `:133`）支持大数据量的异步查询。
 
 ---
 

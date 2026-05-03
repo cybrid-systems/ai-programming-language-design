@@ -59,7 +59,7 @@ static int do_eventfd(unsigned int count, int flags)
 }
 ```
 
-**doom-lsp 确认**：`do_eventfd` @ `:379`。`SYSCALL_DEFINE2(eventfd2)` @ `:416`。`FMODE_NOWAIT` 标记支持 IOCB_NOWAIT。
+**doom-lsp 确认**：`do_eventfd` @ `:379`。`SYSCALL_DEFINE2(eventfd2)` @ `:414`。`FMODE_NOWAIT` 标记支持 IOCB_NOWAIT。
 
 ---
 
@@ -124,7 +124,7 @@ static ssize_t eventfd_read(struct kiocb *iocb, struct iov_iter *to)
 }
 ```
 
-### 1.5 eventfd_write @ :250——用户写入
+### 1.5 eventfd_write @ :247——用户写入
 
 ```c
 static ssize_t eventfd_write(struct file *file, const char __user *buf, size_t count,
@@ -319,7 +319,7 @@ eventfd 被广泛用于内核→用户异步通知：
 | `do_eventfd` | `eventfd.c:379` | fd 创建（kmalloc + anon_inode + ida）|
 | `eventfd_signal_mask` | `eventfd.c:56` | 内核侧信号（in_eventfd 递归防护）|
 | `eventfd_read` | `eventfd.c:214` | 用户读取（阻塞/非阻塞）|
-| `eventfd_write` | `eventfd.c:250` | 用户写入（溢出检测）|
+| `eventfd_write` | `eventfd.c:247` | 用户写入（溢出检测）|
 | `eventfd_poll` | `eventfd.c:118` | poll（内存序屏障分析）|
 | `eventfd_ctx_remove_wait_queue` | `eventfd.c:198` | KVM/VFIO 专用 API |
 | `do_signalfd4` | `signalfd.c:251` | signalfd 创建 |
@@ -329,7 +329,7 @@ eventfd 被广泛用于内核→用户异步通知：
 
 ## 5. 总结
 
-eventfd（`eventfd_signal_mask` @ `:56` + `eventfd_read` @ `:214` + `eventfd_write` @ `:250`）将**计数器通知**转换为 fd，通过 `in_eventfd` 递归防护（`:60`）和 `poll_wait` 屏障分析（`:118`）保证正确性。signalfd（`signalfd_dequeue` @ `:154`）将**信号传递**转换为 fd，底层通过 `dequeue_signal`（`kernel/signal.c`）从 pending 队列取信号。
+eventfd（`eventfd_signal_mask` @ `:56` + `eventfd_read` @ `:214` + `eventfd_write` @ `:247`）将**计数器通知**转换为 fd，通过 `in_eventfd` 递归防护（`:60`）和 `poll_wait` 屏障分析（`:118`）保证正确性。signalfd（`signalfd_dequeue` @ `:154`）将**信号传递**转换为 fd，底层通过 `dequeue_signal`（`kernel/signal.c`）从 pending 队列取信号。
 
 ---
 

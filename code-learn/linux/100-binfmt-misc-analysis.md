@@ -1,4 +1,4 @@
-# 101-binfmt-misc — Linux 杂项二进制格式处理器深度源码分析
+# 100-binfmt-misc — Linux 杂项二进制格式处理器深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -194,7 +194,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
 
-## 6. 格式字符串解析——create_entry @ :350
+## 8. 格式字符串解析——create_entry @ :350
 
 ```c
 // 写入 register 的格式字符串：:name:type:offset:magic:mask:interpreter:flags
@@ -216,7 +216,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 //    'F' — fix binary（固定二进制，不会受 setuid 影响）
 ```
 
-## 7. 文件操作
+## 9. 文件操作
 
 ```c
 // /proc/sys/fs/binfmt_misc/ 下的文件操作：
@@ -236,7 +236,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 // 写入 1  → 启用
 ```
 
-## 8. 执行优先级
+## 10. 执行优先级
 
 ```c
 // 内核处理 exec() 时的 binfmt 优先级：
@@ -250,7 +250,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 // → 如果匹配失败 → 返回 -ENOEXEC → 尝试下一个 binfmt
 ```
 
-## 9. 关键 doom-lsp 确认
+## 11. 关键 doom-lsp 确认
 
 ```c
 // fs/binfmt_misc.c 关键函数：
@@ -263,7 +263,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 ```
 
 
-## 10. MISC_FMT_OPEN_FILE——文件引用模式
+## 12. MISC_FMT_OPEN_FILE——文件引用模式
 
 ```c
 // MISC_FMT_OPEN_FILE 标志（5.x+ 新增）：
@@ -279,7 +279,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 // 而是将匹配的文件 fd 传递给用户空间
 ```
 
-## 11. 格式禁用与删除
+## 13. 格式禁用与删除
 
 ```c
 // 通过写入 register 文件控制条目：
@@ -295,7 +295,7 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 ```
 
 
-## 12. sysctl 接口
+## 14. sysctl 接口
 
 ```c
 // binfmt_misc 的 sysctl 设置：

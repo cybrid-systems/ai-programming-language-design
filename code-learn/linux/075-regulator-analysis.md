@@ -193,14 +193,14 @@ static int regulator_map_voltage(struct regulator_dev *rdev, int min_uV, int max
 
 ```c
 // regulator_set_voltage() 内部路径：
-// → _regulator_call_set_voltage  @ ~:3802
+// → _regulator_call_set_voltage  @ :3764
 //   → PRE_VOLTAGE_CHANGE 通知（可阻止变更）
 //   → ops->set_voltage(rdev, min_uV, max_uV, &selector)
 //   → 成功后 POST_VOLTAGE_CHANGE 通知
 //   → 失败后 ABORT_VOLTAGE_CHANGE 通知
 ```
 
-**doom-lsp 确认**：`regulator_map_voltage` @ `:3742`。`_regulator_call_set_voltage` @ `:3802`。通知机制允许其他驱动监听电压变更。
+**doom-lsp 确认**：`regulator_map_voltage` @ `:3742`。`_regulator_call_set_voltage` @ `:3764`。通知机制允许其他驱动监听电压变更。
 
 ---
 

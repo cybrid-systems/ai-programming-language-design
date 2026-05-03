@@ -1,4 +1,4 @@
-# 97-capabilities-prctl — Linux 能力（capabilities）系统深度源码分析
+# 096-capabilities-prctl — Linux 能力（capabilities）系统深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪

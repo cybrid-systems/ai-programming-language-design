@@ -53,7 +53,7 @@ struct ovl_path {
 ### 1.3 struct ovl_entry — dentry 的底层路径栈
 
 ```c
-// fs/overlayfs/ovl_entry.h:159
+// fs/overlayfs/ovl_entry.h:52
 struct ovl_entry {
     unsigned int __numlower;                /* 下层数量 */
     struct ovl_path __lowerstack[];         /* 下层路径栈 */
@@ -63,7 +63,7 @@ struct ovl_entry {
 ### 1.4 struct ovl_inode — overlay inode
 
 ```c
-// fs/overlayfs/ovl_entry.h:159-172
+// fs/overlayfs/ovl_entry.h:159
 struct ovl_inode {
     union {
         struct ovl_dir_cache *cache;        /* 目录缓存 */
@@ -82,7 +82,7 @@ struct ovl_inode {
 ### 1.5 struct ovl_fs — overlay 超级块
 
 ```c
-// fs/overlayfs/ovl_entry.h:54-90
+// fs/overlayfs/ovl_entry.h:58
 struct ovl_fs {
     unsigned int numlayer;                   /* 总层数 */
     unsigned int numdatalayer;
@@ -97,7 +97,7 @@ struct ovl_fs {
 };
 ```
 
-**doom-lsp 确认**：`struct ovl_fs` 在 `ovl_entry.h:54`，`struct ovl_inode` 在 `ovl_entry.h:159`。`struct ovl_layer` 在 `ovl_entry.h:33`。掩码宏 `OVL_FS()` 在 `ovl_entry.h:74`，`OVL_I()` 在 `ovl_entry.h:177`。
+**doom-lsp 确认**：`struct ovl_fs` 在 `ovl_entry.h:58`，`struct ovl_inode` 在 `ovl_entry.h:159`。`struct ovl_layer` 在 `ovl_entry.h:33`。掩码宏 `OVL_FS()` 在 `ovl_entry.h:98`，`OVL_I()` 在 `ovl_entry.h:177`。
 
 ---
 

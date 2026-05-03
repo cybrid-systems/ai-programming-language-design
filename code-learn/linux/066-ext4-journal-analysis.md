@@ -41,21 +41,28 @@ ext4 文件系统                     JBD2 日志层                    磁盘
 
 ```c
 // include/linux/jbd2.h
-typedef struct handle_s {
-    /* 保护 handle 的计数器 */
-    int h_ref;                           /* 引用计数 */
-    int h_err;                           /* 事务错误 */
-    unsigned int h_sync:1;              /* 需要同步 */
-    unsigned int h_jdata:1;              /* 数据日志 */
+// handle_t is typedef for struct jbd2_journal_handle (include/linux/jbd2.h:500)
+typedef struct jbd2_journal_handle {
+    union {
+        struct transaction_s *h_transaction; /* 所属事务 */
+        journal_t *h_journal;              /* 所属日志 */
+    };
+    handle_t *h_rsv_handle;                /* 保留 handle */
+    int h_total_credits;                   /* 剩余可修改的 buffer 数 */
+    int h_revoke_credits;                  /* 撤销记录信用 */
+    int h_revoke_credits_requested;        /* 请求的撤销信用 */
+    int h_ref;                             /* 引用计数 */
+    int h_err;                             /* 事务错误 */
+
+    unsigned int h_sync:1;                /* 需要同步 */
+    unsigned int h_reserved:1;            /* 保留信用标记 */
     unsigned int h_aborted:1;
+    unsigned int h_type:8;                /* handle 类型 */
+    unsigned int h_line_no:16;            /* 调用行号 */
 
-    struct transaction_s *h_transaction; /* 所属事务 */
-    int h_buffer_credits;                /* 剩余可修改的 buffer 数 */
-    int h_revoke_credits;                /* 撤销记录信用 */
-
-    /* 锁等待统计 */
-    unsigned long h_start, h_requested;
-    unsigned long h_timestamp;
+    unsigned long h_start_jiffies;         /* 开始时间 */
+    unsigned int h_requested_credits;      /* 请求的信用数 */
+    unsigned int saved_alloc_context;
 } handle_t;
 ```
 
