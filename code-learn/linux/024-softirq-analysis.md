@@ -107,9 +107,9 @@ open_softirq(NET_RX_SOFTIRQ, net_rx_action);
 open_softirq(NET_TX_SOFTIRQ, net_tx_action);
 
 // 定时器（kernel/time/timer.c）:
-open_softirq(TIMER_SOFTIRQ, timer_list_action);
+open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
 
-// 块设备完成（block/blk-softirq.c）:
+// 块设备完成（block/blk-mq.c）:
 open_softirq(BLOCK_SOFTIRQ, blk_done_softirq);
 
 // 高精度定时器（kernel/time/hrtimer.c）:
@@ -150,7 +150,7 @@ raise_softirq(NET_RX_SOFTIRQ)               @ kernel/softirq.c
     → __raise_softirq_irqoff(BLOCK_SOFTIRQ)
 
 定时器:
-  timer_list_action()
+  run_timer_softirq()
     → __raise_softirq_irqoff(TIMER_SOFTIRQ)
 
 调度器:
@@ -199,7 +199,7 @@ restart:
 
         // ★ 执行软中断处理函数！
         // 对于 NET_RX：net_rx_action()
-        // 对于 TIMER：timer_list_action()
+        // 对于 TIMER：run_timer_softirq()
         // 对于 BLOCK：blk_done_softirq()
         h->action(h);
 
@@ -455,11 +455,10 @@ int igb_poll(struct napi_struct *napi, int budget)
 | `kernel/softirq.c` | 核心实现 | `__do_softirq`, `raise_softirq`, `open_softirq` |
 | `include/linux/interrupt.h` | 软中断枚举 + 声明 | `NR_SOFTIRQS`, `local_bh_disable/enable` |
 | `net/core/dev.c` | 网络软中断 | `net_rx_action`, `net_tx_action` |
-| `kernel/time/timer.c` | 定时器软中断 | `timer_list_action` |
+| `kernel/time/timer.c` | 定时器软中断 | `run_timer_softirq` |
 | `block/blk-mq.c` | 块软中断 | `blk_done_softirq` |
 
 ---
-
 
 - **23-interrupt**：硬中断在 `irq_exit()` 中触发软中断
 - **25-hrtimer**：HRTIMER_SOFTIRQ 软中断
@@ -507,7 +506,7 @@ copy_from_user();                 // 可能缺页
 | `kernel/softirq.c` | 核心实现 | `__do_softirq`, `raise_softirq`, `open_softirq` |
 | `include/linux/interrupt.h` | 软中断枚举 + 声明 | `NR_SOFTIRQS`, `local_bh_disable/enable` |
 | `net/core/dev.c` | 网络软中断 | `net_rx_action`, `net_tx_action` |
-| `kernel/time/timer.c` | 定时器软中断 | `timer_list_action` |
+| `kernel/time/timer.c` | 定时器软中断 | `run_timer_softirq` |
 | `block/blk-mq.c` | 块软中断 | `blk_done_softirq` |
 
 ---
