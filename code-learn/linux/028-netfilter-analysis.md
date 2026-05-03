@@ -107,29 +107,33 @@ nft add rule ip filter INPUT ip saddr 10.0.0.0/8 drop
 ## 3. Hook 执行路径——nf_hook_slow
 
 ```c
-// net/netfilter/core.c — hook 执行
+// net/netfilter/core.c — hook 执行（tree.c:612）
 int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
-                  const struct nf_hook_ops *elem)
+                  const struct nf_hook_entries *e, unsigned int s)
 {
     unsigned int verdict;
+    int ret;
 
-    // 遍历 hook 链表
-    list_for_each_entry_cont(elem, state->hook_head, list) {
-        verdict = elem->hook(state->hook_ops_priv, skb, state);
-        switch (verdict) {
+    // 遍历 hook entries 数组（非链表！）
+    for (; s < e->num_hook_entries; s++) {
+        verdict = nf_hook_entry_hookfn(&e->hooks[s], skb, state);
+        switch (verdict & NF_VERDICT_MASK) {
         case NF_ACCEPT:
-            continue;        // 继续下一个 hook
+            break;            // 继续下一个 hook
         case NF_DROP:
-            kfree_skb(skb);  // 丢弃数据包
-            return NF_DROP;
+            kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
+            ret = NF_DROP_GETERR(verdict);
+            return ret ? ret : -EPERM;
         case NF_QUEUE:
-            nf_queue(skb, state, elem, verdict); // 排队到用户空间
-            return NF_QUEUE;
+            ret = nf_queue(skb, state, s, verdict);
+            if (ret == 1)
+                continue;     // 重新处理
+            return ret;
         case NF_STOLEN:
-            return NF_STOLEN; // hook 接管了 skb
+            return NF_DROP_GETERR(verdict);
         }
     }
-    return NF_ACCEPT;  // 所有 hook 都接受
+    return 1;  // NF_ACCEPT — 所有 hook 接受
 }
 ```
 
@@ -137,12 +141,21 @@ int nf_hook_slow(struct sk_buff *skb, struct nf_hook_state *state,
 
 ```c
 // 例：IPv4 接收路径中的 hook
-// net/ipv4/ip_input.c
-int ip_local_deliver(struct sk_buff *skb)
+// net/ipv4/ip_input.c — PRE_ROUTING 在 ip_rcv 中
+int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
+           struct net_device *orig_dev)
 {
     // PRE_ROUTING hook 点
     return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
-                   net, NULL, skb, NULL, skb->dev, ip_local_deliver_finish);
+                   net, NULL, skb, dev, NULL, ip_rcv_finish);
+}
+
+// LOCAL_IN 在 ip_local_deliver 中
+int ip_local_deliver(struct sk_buff *skb)
+{
+    // LOCAL_IN hook 点
+    return NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_IN,
+                   net, NULL, skb, skb->dev, NULL, ip_local_deliver_finish);
 }
 ```
 
