@@ -64,39 +64,48 @@ skb_pull(eth_hdr_len)（到 IP 层，去掉 L2 头部）：
 
 ```c
 // include/linux/skbuff.h — 852 个符号
+// 注意：以下为简化表示，实际结构使用大量 union 和 struct_group
 struct sk_buff {
-    // ----- 缓存线 1（数据指针）-----
+    // ----- 缓存线 0：链表 + socket -----
     struct sk_buff      *next;         // 链表 next
     struct sk_buff      *prev;         // 链表 prev
+    union {
+        struct net_device *dev;        // 网络设备
+        unsigned long      dev_scratch;
+    };
     struct sock         *sk;           // 关联的 socket
 
     ktime_t             tstamp;        // 时间戳
+    char                cb[48];        // 控制缓冲区（各协议层私有）
+
+    // ----- 长度信息 -----
     unsigned int        len;           // 数据长度
     unsigned int        data_len;      // 分散/聚集数据长度
     __u16               mac_len;       // MAC 头部长度
+    __u16               hdr_len;       // 协议头长度
 
-    // ----- Buffer 指针 -----
+    // ----- 协议元数据（在 struct_group(headers) 内）-----
+    __u8                pkt_type:3;    // PACKET_HOST / PACKET_BROADCAST ...
+    __u8                ip_summed:2;   // 校验和状态
+    __u8                encapsulation:1; // 封装标志
+    __be16              protocol;      // 协议（htons(ETH_P_IP)）
+    __u32               priority;      // 优先级
+    __u16               transport_header; // L4 头部偏移
+    __u16               network_header;   // L3 头部偏移
+    __u16               mac_header;       // L2 头部偏移
+
+    // ----- buffer 指针（位于 struct 末尾）-----
+    sk_buff_data_t      tail;          // 数据结束（相对于 head 的偏移）
+    sk_buff_data_t      end;           // 缓冲区结束（相对于 head 的偏移）
     unsigned char       *head;         // 缓冲区起始
     unsigned char       *data;         // 当前协议数据起点
-    unsigned char       *tail;         // 数据结束
-    unsigned char       *end;          // 缓冲区结尾
-
-    // ----- 协议元数据 -----
-    __u16               protocol;      // 协议（htons(ETH_P_IP)）
-    __u32               priority;      // 优先级
-    __u8                pkt_type;      // PACKET_HOST / PACKET_BROADCAST ...
-    __u8                ip_summed;     // CHECKSUM_NONE / CHECKSUM_UNNECESSARY ...
-    __u8                encapsulation; // 封装类型
-
-    // ----- 功能标志 -----
-    sk_buff_data_t      transport_header; // L4 头部偏移
-    sk_buff_data_t      network_header;   // L3 头部偏移
-    sk_buff_data_t      mac_header;       // L2 头部偏移
-
-    struct skb_shared_info *shinfo;   // 共享信息（frags, frag_list, tso_size 等）
+    unsigned int        truesize;      // 总分配大小（含 sk_buff 本身）
+    refcount_t          users;         // 引用计数
     // ...
 };
-```
+// skb_shared_info 不直接作为字段，而是通过 skb_shinfo(skb) 宏
+// 从 skb->end 之后的内存位置获取
+``````
 
 ### 1.3 `struct skb_shared_info`——数据分担信息
 
@@ -110,6 +119,10 @@ struct skb_shared_info {
     skb_frag_t      frags[MAX_SKB_FRAGS]; // 分散页数组
     // ...
 };
+// 注意：skb_shared_info 不直接嵌入 struct sk_buff，
+// 而是存储在 skb 数据缓冲区的末尾（head 起始处偏移 skb->end）。
+// 访问方式：skb_shinfo(skb) → (struct skb_shared_info *)skb->end
+// 这种设计让 GSO/GRO 的分片数据紧跟在 skb 数据区之后，充分利用局部性。
 ```
 
 ---
@@ -185,260 +198,7 @@ struct sk_buff *pskb_copy(struct sk_buff *skb, gfp_t gfp_mask)
 
 ---
 
-## 3. 源码文件索引
-
-| 文件 | 内容 |
-|------|------|
-| `include/linux/skbuff.h` | sk_buff 定义 + inline 函数 |
-| `include/linux/skbuff.h` | skb_shared_info |
-| `net/core/skbuff.c` | 核心实现 |
-
----
-
-## 4. 关联文章
-
-- **141-skb-shared-info**：共享信息详解
-- **139-netif-receive-skb**：数据包接收路径
-- **144-tcp-sendmsg**：TCP 发送中的 skb 操作
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 3. sk_buff 完整字段详解
-
-### 3.1 数据指针（head/data/tail/end）
-
-四个指针定义了 sk_buff 数据缓冲区的边界：
-
-```c
-struct sk_buff {
-    unsigned char *head;      // 缓冲区起始
-    unsigned char *data;      // 当前协议数据起始
-    unsigned char *tail;      // 当前协议数据结束
-    unsigned char *end;       // 缓冲区结束
-};
-```
-
-**headroom** = `data - head`：可供 `skb_push` 使用的空间
-**tailroom** = `end - tail`：可供 `skb_put` 使用的空间
-**data_len** = `skb->len` 中位于分片中的部分（非线形数据）
-
-### 3.2 协议头部偏移
-
-```c
-    sk_buff_data_t transport_header;  // L4 头部偏移（TCP/UDP）
-    sk_buff_data_t network_header;    // L3 头部偏移（IP/IPv6）
-    sk_buff_data_t mac_header;        // L2 头部偏移（Ethernet）
-```
-
-通过 `skb_set_network_header(skb, offset)` 等函数设置，配合 `ip_hdr(skb)` / `tcp_hdr(skb)` 等宏使用。
-
-### 3.3 协议信息
-
-```c
-    __u16   protocol;       // 帧类型：htons(ETH_P_IP), ETH_P_IPV6
-    __u8    pkt_type;       // PACKET_HOST（发往本地）/PACKET_BROADCAST/PACKET_MULTICAST
-    __u32   priority;       // 优先级（用于 QoS）
-    __u8    ip_summed;       // 校验和状态：
-                             // CHECKSUM_NONE：没有计算校验和
-                             // CHECKSUM_UNNECESSARY：硬件计算了校验和
-                             // CHECKSUM_COMPLETE：硬件验证了校验和
-                             // CHECKSUM_PARTIAL：部分校验和（TPO/GSO）
-```
-
----
-
-## 4. Socket 关联
-
-```c
-struct sk_buff {
-    struct sock     *sk;        // 关联的 socket
-    struct net_device *dev;     // 接收/发送的网络设备
-};
-```
-
-`skb->sk` 在数据包接收路径中由协议层设置（TCP/UDP 查表后关联 socket），发送路径中由 `sendmsg` 系统调用传入。
-
----
-
-## 5. 控制缓冲区（cb）
-
-```c
-struct sk_buff {
-    char            cb[48] __aligned(8);  // 控制缓冲区
-};
-```
-
-`cb[]` 是各协议层的私有存储区，用于在协议栈处理过程中传递上下文。例如 TCP 协议层在 `cb` 中存储序列号等信息，IP 层在 `cb` 中存储路由信息。不同协议层通过宏定义复用此区域。
-
----
-
-## 6. 克隆和复制
-
-| 函数 | sk_buff | data 缓冲区 | 分片 | 场景 |
-|------|---------|------------|------|------|
-| `alloc_skb` | 分配 | 分配 | 空 | 新建包 |
-| `skb_clone` | 复制 | 共享 | 共享 | 多点分发 |
-| `pskb_copy` | 复制 | 复制 | 共享 | 修改线性数据 |
-| `skb_copy` | 复制 | 复制 | 复制 | 完全独立副本 |
-| `pskb_expand_head` | 扩展 | 扩展head | 共享 | 添加额外头部 |
-
----
-
-## 7. GSO/TSO/GRO 功能
-
-```c
-struct skb_shared_info {
-    unsigned short  gso_size;     // GSO 分片大小（MSS 值）
-    unsigned short  gso_segs;     // 分片后的总段数
-    unsigned int    gso_type;     // GSO 类型（SKB_GSO_TCPV4 等）
-};
-```
-
-**GSO（Generic Segmentation Offload）**：在协议栈中用大包传输，由网卡或内核分割为 MTU 大小的段。减少协议栈处理次数，提升吞吐量。
-
-**GRO（Generic Receive Offload）**：接收路径的反向操作——将多个小包合并为大包再提交给协议栈。
-
----
-
-## 8. skb 生命周期
-
-```
-1. alloc_skb(len, GFP_ATOMIC)  ← 在中断/NET_RX_SOFTIRQ 中分配
-   skb_reserve(skb, headroom)  ← 预留头部空间
-
-2. 网卡驱动调用 skb_put(skb, pkt_len)  ← 添加收到的数据
-   写入从硬件 DMA 获取的数据
-
-3. 设置协议头部：
-   skb->protocol = eth_type_trans(skb, dev)
-   skb_set_network_header(skb, ETH_HLEN)
-   skb_set_transport_header(skb, ETH_HLEN + IP_HLEN)
-
-4. netif_receive_skb(skb) → 协议栈处理
-
-5. 协议释放：
-   consume_skb(skb) / kfree_skb(skb)
-```
-
----
-
-## 9. 源码文件索引
-
-| 文件 | 关键函数 |
-|------|---------|
-| `include/linux/skbuff.h` | sk_buff 结构（852 符号）|
-| `net/core/skbuff.c` | alloc_skb, skb_clone, skb_copy |
-
----
-
-## 10. 关联文章
-
-- **141-sk_shared_info**：分片和 GSO 详细
-- **139-netif-receive-skb**：数据包接收路径
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 3. sk_buff 完整字段详解
-
-### 3.1 数据指针
-
-```c
-struct sk_buff {
-    unsigned char *head;      // 缓冲区起始地址
-    unsigned char *data;      // 当前协议层数据起始
-    unsigned char *tail;      // 当前协议层数据结束
-    unsigned char *end;       // 缓冲区结束地址
-};
-```
-
-headroom = data - head：可供 skb_push 添加协议头
-tailroom = end - tail：可供 skb_put 添加数据
-
-### 3.2 协议头偏移
-
-```c
-sk_buff_data_t transport_header;  // L4 头偏移
-sk_buff_data_t network_header;    // L3 头偏移  
-sk_buff_data_t mac_header;        // L2 头偏移
-```
-
-通过 skb_set_network_header(skb, offset) 等设置。
-
-### 3.3 校验和信息
-
-```c
-__u8 ip_summed;
-// CHECKSUM_NONE: 未计算校验和
-// CHECKSUM_UNNECESSARY: 硬件已计算
-// CHECKSUM_COMPLETE: 硬件已验证
-// CHECKSUM_PARTIAL: 部分校验和
-```
-
-### 3.4 skb_shared_info
-
-```c
-struct skb_shared_info {
-    __u8 nr_frags;
-    __u8 tx_flags;  
-    unsigned short gso_size;     // MSS 分片大小
-    unsigned short gso_segs;     // GSO 总段数
-    struct sk_buff *frag_list;
-    skb_frag_t frags[MAX_SKB_FRAGS];  // 分散页面数组
-};
-```
-
----
-
-## 4. 控制缓冲区 (cb)
-
-```c
-char cb[48] __aligned(8);  // 各协议层私有存储
-```
-
-TCP 在 cb 中存序列号、IP 层存路由、网桥存端口信息。
-
----
-
-## 5. 主要操作速查
-
-| 函数 | 作用 | 影响 |
-|------|------|------|
-| alloc_skb(len, gfp) | 分配 skb + 数据缓冲区 | — |
-| skb_reserve(skb, len) | 预留头部空间 | data += len |
-| skb_put(skb, len) | 在尾部添加数据 | tail += len, len += len |
-| skb_push(skb, len) | 在头部添加协议头 | data -= len, len += len |
-| skb_pull(skb, len) | 移除协议头 | data += len, len -= len |
-| skb_clone(skb, gfp) | 轻量复制（共享数据） | dataref++ |
-| pskb_copy(skb, gfp) | 部分复制（重分配线性区） | 复制 headroom |
-| skb_copy(skb, gfp) | 完全复制 | 所有数据 |
-
----
-
-## 6. GSO/GRO
-
-GSO：用大包传，网卡或内核分割为 MTU 小包
-GRO：接收时合并小包再提交协议栈
-```c
-shinfo->gso_size = mss;   // 分片大小
-shinfo->gso_segs = segs;  // 段数
-```
-
----
-
-## 7. 关联文章
-
-- **141-skb-shared-info**：分片与 GSO 详细
-- **139-netif-receive-skb**：接收路径
-
----
-
-*分析工具：doom-lsp*
-
-## 8. 网络栈处理举例——TCP 数据包接收
+## 6. 网络栈处理举例——TCP 数据包接收
 
 ```
 1. netif_receive_skb(skb)     → skb 进入协议栈
@@ -453,7 +213,28 @@ shinfo->gso_segs = segs;  // 段数
 
 ---
 
+## 7. 源码文件索引
+
+| 文件 | 内容 |
+|------|------|
+| `include/linux/skbuff.h` | sk_buff 定义 + inline 函数 |
+| `net/core/skbuff.c` | 核心实现（alloc_skb, skb_clone, skb_copy）|
+
+---
+
+## 8. 关联文章
+
+- **141-skb-shared-info**：共享信息详解
+- **139-netif-receive-skb**：数据包接收路径
+- **144-tcp-sendmsg**：TCP 发送中的 skb 操作
+
+---
+
 ## 9. 总结
 
-sk_buff 的设计核心是无复制协议层传递——各层通过移动 data 指针而非复制数据来"添加/移除"协议头。四个数据指针 + 三个协议头偏移 + skb_shared_info 的分片机制，使网络栈能以最小开销处理任意大小的数据包。
+sk_buff 的设计核心是无复制协议层传递——各层通过移动 data 指针而非复制数据来"添加/移除"协议头。四个数据指针（head/data/tail/end）定义了缓冲区边界，三个 16 位偏移（transport/network/mac_header）记录协议层位置。skb_shared_info 通过 `skb_shinfo()` 宏从缓冲区尾部获取，使分片和 GSO 数据紧邻主数据区。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
