@@ -21,7 +21,7 @@ VFS 的四层架构：
   通用块层（submit_bio, make_request...）
 ```
 
-**doom-lsp 确认**：核心结构体定义在 `include/linux/fs.h`（1994 行，内核最大的头文件之一）。关键结构体包括 `struct file`、`struct inode`、`struct dentry`、`struct super_block`。系统调用实现在 `fs/read_write.c`、`fs/open.c`、`fs/namei.c`。
+**doom-lsp 确认**：核心结构体定义在 `include/linux/fs.h`（3660 行，内核最大的头文件之一）。`struct super_block` 定义在 `include/linux/fs/super_types.h`。关键结构体包括 `struct file`、`struct inode`、`struct dentry`、`struct super_block`。系统调用实现在 `fs/read_write.c`、`fs/open.c`、`fs/namei.c`。
 
 ---
 
@@ -31,17 +31,20 @@ VFS 的四层架构：
 
 ```c
 struct file {
-    struct path             f_path;            // dentry + mount 对
-    struct inode            *f_inode;          // 指向 inode（f_path 的快捷方式）
-    const struct file_operations *f_op;        // 文件操作表
-    spinlock_t              f_lock;            // 保护 f_pos 等字段
+    spinlock_t              f_lock;            // 保护 f_ep、f_flags
     fmode_t                 f_mode;            // FMODE_READ/WRITE/EXEC
-    loff_t                  f_pos;             // 读写位置
+    const struct file_operations *f_op;        // 文件操作表
     struct address_space    *f_mapping;        // 地址映射（= inode->i_mapping）
-    unsigned int            f_flags;           // O_RDONLY, O_NONBLOCK 等
     void                    *private_data;     // 文件系统私有数据
-    struct list_head        f_ep_links;        // epoll 监听链表
-    struct fown_struct      f_owner;           // 异步 IO 所有者
+    struct inode            *f_inode;          // 指向 inode
+    unsigned int            f_flags;           // O_RDONLY, O_NONBLOCK 等
+    const struct cred       *f_cred;           // 打开时的凭证
+    struct fown_struct      *f_owner;          // 异步 IO 所有者
+    const struct path       f_path;            // dentry + mount 对
+    loff_t                  f_pos;             // 读写位置
+    struct hlist_head       *f_ep;             // epoll 监听链表（CONFIG_EPOLL）
+    struct file_ra_state    f_ra;              // 预读状态
+    file_ref_t              f_ref;             // 引用计数
     // ...
 };
 ```
@@ -94,6 +97,8 @@ struct dentry {
 
 ### 1.4 `struct super_block`——文件系统实例
 
+定义在 `include/linux/fs/super_types.h`：
+
 ```c
 struct super_block {
     struct list_head        s_list;            // 全局 super_block 链表
@@ -103,7 +108,7 @@ struct super_block {
     struct file_system_type *s_type;           // 文件系统类型（ext4, xfs...）
     const struct super_operations *s_op;       // super_block 操作表
     struct list_head        s_inodes;          // 此文件系统所有 inode 链表
-    struct xarray           s_fs_info;         // 文件系统私有数据
+    void                    *s_fs_info;        // 文件系统私有数据
     // ...
 };
 ```
