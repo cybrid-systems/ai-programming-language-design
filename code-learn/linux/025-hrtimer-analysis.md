@@ -280,10 +280,9 @@ hrtimer_reprogram(timer, cpu_base)
 ### 5.1 基本使用
 
 ```c
-// 1. 定义和初始化
+// 1. 定义和设置
 struct hrtimer my_timer;
-hrtimer_init(&my_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-my_timer.function = my_callback;
+hrtimer_setup(&my_timer, my_callback, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 // 2. 启动（1ms 后执行）
 hrtimer_start(&my_timer, ns_to_ktime(1_000_000), HRTIMER_MODE_REL);
@@ -357,7 +356,7 @@ int hrtimer_try_to_cancel(struct hrtimer *timer);
 struct timespec req = { .tv_sec = 0, .tv_nsec = 500000 }; // 500μs
 nanosleep(&req, NULL);
 // → 内核实现：hrtimer_nanosleep()
-//    → __hrtimer_init_sleeper(timer, current)
+//    → hrtimer_setup_sleeper_on_stack(&t, clock_id, mode)
 //    → hrtimer_start(timer, timespec_to_ktime(*rqtp), HRTIMER_MODE_REL)
 //    → set_current_state(TASK_INTERRUPTIBLE)
 //    → schedule()  ← 休眠
@@ -377,12 +376,11 @@ hrtimer 的回调可以在两个上下文中执行：
 | HRTIMER_BASE_MONOTONIC_SOFT（soft）| HRTIMER_SOFTIRQ | 不可休眠，可稍长 |
 
 ```c
-// 选择软中断执行：
-hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-// 默认是硬中断执行
+// 软中断执行（回调在 HRTIMER_SOFTIRQ 上下文）：
+hrtimer_setup(&timer, callback, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_SOFT);
 
-// 无法在初始化时选择——需要手动修改 base 指针：
-timer.base = &cpu_base->clock_base[HRTIMER_BASE_MONOTONIC_SOFT];
+// 硬中断执行（回调在硬中断上下文，默认）：
+hrtimer_setup(&timer, callback, CLOCK_MONOTONIC, HRTIMER_MODE_REL | HRTIMER_MODE_HARD);
 ```
 
 软中断路径的优点是：它不会阻塞硬中断处理，适合对实时性要求不那么苛刻的场景。
@@ -430,9 +428,19 @@ $ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
 | `include/linux/clockchips.h` | `struct clock_event_device` | 硬件时钟抽象 |
 | `arch/x86/kernel/apic/apic.c` | — | LAPIC 定时器 |
 
+### 6.10 ktime 转换辅助
+
+| 函数 | 说明 |
+|------|------|
+| `ktime_get()` | 获取当前 MONOTONIC 时间 |
+| `ktime_get_real()` | 获取当前 REALTIME 时间 |
+| `ktime_to_ns(kt)` | ktime_t → 纳秒 |
+| `ns_to_ktime(ns)` | 纳秒 → ktime_t |
+| `ms_to_ktime(ms)` | 毫秒 → ktime_t |
+
 ---
 
-## 8. 关联文章
+## 10. 关联文章
 
 - **23-interrupt**：硬件时钟中断
 - **24-softirq**：HRTIMER_SOFTIRQ
@@ -441,12 +449,3 @@ $ cat /sys/devices/system/clocksource/clocksource0/current_clocksource
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-
-### 6.10 ktime 转换辅助
-
-ktime_get(): 获取当前 MONOTONIC 时间
-ktime_get_real(): 获取当前 REALTIME 时间
-ktime_to_ns(kt): ktime_t → 纳秒
-ns_to_ktime(ns): 纳秒 → ktime_t
-ms_to_ktime(ms): 毫秒 → ktime_t
