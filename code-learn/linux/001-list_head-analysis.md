@@ -22,10 +22,9 @@ Linux 内核反过来设计——"数据包含链表"。每个需要被链入链
 ### 1.1 struct list_head
 
 ```c
-// include/linux/list.h:27-30
+// include/linux/types.h:204-207
 struct list_head {
-    struct list_head *next;      // 指向链表中下一个节点
-    struct list_head *prev;      // 指向链表中上一个节点
+    struct list_head *next, *prev;
 };
 ```
 
@@ -230,7 +229,9 @@ list_add_tail(X, head) → head → A → B → X → head  (队列, FIFO)
 ### 3.4 调试检查的选择性编译
 
 ```c
-// include/linux/list.h:50-56
+// include/linux/list.h:49-55
+#ifdef CONFIG_LIST_HARDENED
+
 #ifdef CONFIG_DEBUG_LIST
 # define __list_valid_slowpath
 #else
@@ -238,7 +239,7 @@ list_add_tail(X, head) → head → A → B → X → head  (队列, FIFO)
 #endif
 ```
 
-当 `CONFIG_DEBUG_LIST** 未使能时，`__list_add_valid` 和 `__list_del_entry_valid` 都被标记为 `__cold __preserve_most`。`__cold` 指示编译器这些函数几乎不会被调用（dead code elimination 的提示），`__preserve_most` 使用特殊的调用约定来节省寄存器保存/恢复的开销。**生产内核中这部分代码的运行时开销实际上为零**。
+当 `CONFIG_LIST_HARDENED` 未使能时这部分代码完全被编译掉。当 `CONFIG_LIST_HARDENED` 使能但 `CONFIG_DEBUG_LIST` 未使能时，`__list_add_valid_or_report` 和 `__list_del_entry_valid_or_report` 被标记为 `__cold __preserve_most`——`__cold` 指示编译器这些函数几乎不会被调用（dead code elimination 的提示），`__preserve_most` 使用特殊的调用约定来节省寄存器保存/恢复的开销。**生产内核中这部分代码的运行时开销实际上为零**。
 
 ---
 
@@ -432,14 +433,18 @@ static inline void list_bulk_move_tail(struct list_head *head,
                                        struct list_head *first,
                                        struct list_head *last)
 {
-    __list_del(first->prev, last->next);   // 从原链表中摘除 [first, last] 区间
-    list_add_tail(first, head);            // 将 first 移到 head 尾部
-    list_add_tail(last, head);             // 将 last 移到 head 尾部 (跟在 first 后)
-    // 注：first 和 last 之间的节点自动跟随
+    first->prev->next = last->next;
+    last->next->prev = first->prev;
+
+    head->prev->next = first;
+    first->prev = head->prev;
+
+    last->next = head;
+    head->prev = last;
 }
 ```
 
-**O(1) 操作的原理**：无论区间内有 1 个还是 1000 个节点，只修改 first 的前驱、last 的后继、head 的前驱和 head 的 next——只需 4 个指针操作。这是一个**宏**，在编译时展开为 4 条赋值；实际汇编级别写入 4 个指针。
+**O(1) 操作的原理**：无论区间内有 1 个还是 1000 个节点，只修改 6 个指针，不涉及任何函数调用。这是一个 `static inline` 函数，编译后直接嵌入调用点；实际汇编级别写入 6 个指针。
 
 ### 6.3 `list_rotate_left`——左旋转
 
@@ -489,43 +494,43 @@ list_rotate_to_front(&target, &head)
 这些宏是 `container_of` 的直接包装，是遍历宏的基础设施。
 
 ```c
-// include/linux/list.h:605
+// include/linux/list.h:608
 #define list_entry(ptr, type, member) \
     container_of(ptr, type, member)
 
-// list.h:611
+// list.h:619
 #define list_first_entry(ptr, type, member) \
     list_entry((ptr)->next, type, member)
 
-// list.h:622
+// list.h:630
 #define list_last_entry(ptr, type, member) \
     list_entry((ptr)->prev, type, member)
 
-// list.h:631 - 安全版本，空链表返回 NULL（不崩溃）
+// list.h:641 - 安全版本，空链表返回 NULL（不崩溃）
 #define list_first_entry_or_null(ptr, type, member) ({ \
     struct list_head *head__ = (ptr); \
     struct list_head *pos__ = READ_ONCE(head__->next); \
     pos__ != head__ ? list_entry(pos__, type, member) : NULL; \
 })
 
-// list.h:649 - 尾部方向的空安全版本
+// list.h:655 - 尾部方向的空安全版本
 #define list_last_entry_or_null(ptr, type, member) ...
 
-// list.h:659
+// list.h:666
 #define list_next_entry(pos, member) \
     list_entry((pos)->member.next, typeof(*(pos)), member)
 
-// list.h:669 - 循环版本：如果 pos 是最后一个，则绕到头部
+// list.h:678 - 循环版本：如果 pos 是最后一个，则绕到头部
 #define list_next_entry_circular(pos, head, member) \
     (list_is_last(&(pos)->member, head) ? \
      list_first_entry(head, typeof(*(pos)), member) : \
      list_next_entry(pos, member))
 
-// list.h:680
+// list.h:687
 #define list_prev_entry(pos, member) \
     list_entry((pos)->member.prev, typeof(*(pos)), member)
 
-// list.h:691 - 循环版本
+// list.h:699 - 循环版本
 #define list_prev_entry_circular(pos, head, member) \
     (list_is_first(&(pos)->member, head) ? \
      list_last_entry(head, typeof(*(pos)), member) : \
@@ -620,11 +625,11 @@ if (entry) {
 
 这是内核中使用频率最高的遍历宏。它直接从链表节点通过 `container_of` 跳转到包含该节点的数据结构，开发者不需要手动调用 `list_entry`。
 
-**注意**：终止条件是 `list_entry_is_head(pos, head, member)` 而不是 `pos != NULL`，更不是 `&pos->member != head`。`list_entry_is_head` 定义为：
+**注意**：终止条件是 `list_entry_is_head(pos, head, member)` 而不是 `pos != NULL`，更不是 `&pos->member != head`。`list_entry_is_head`（list.h:772）定义为：
 
 ```c
 #define list_entry_is_head(pos, head, member) \
-    (&pos->member == head)
+    list_is_head(&pos->member, (head))
 ```
 
 这个比较的是**链表节点的地址**（`&pos->member`）是否等于头节点地址。
@@ -632,7 +637,7 @@ if (entry) {
 ### 8.7 `list_for_each_entry_reverse`——反向自动解引用遍历
 
 ```c
-// include/linux/list.h:790
+// include/linux/list.h:792
 #define list_for_each_entry_reverse(pos, head, member) \
     for (pos = list_last_entry(head, typeof(*pos), member); \
          !list_entry_is_head(pos, head, member); \
@@ -667,10 +672,10 @@ if (entry) {
 | `list_for_each` | 708 | ❌ | ❌ (`list_head*`) | 正向 |
 | `list_for_each_continue` | 718 | ❌ | ❌ | 正向续 |
 | `list_for_each_prev` | 726 | ❌ | ❌ | 反向 |
-| `list_for_each_safe` | 734 | ✅ `n` | ❌ | 正向 |
-| `list_for_each_prev_safe` | 744 | ✅ `n` | ❌ | 反向 |
+| `list_for_each_safe` | 735 | ✅ `n` | ❌ | 正向 |
+| `list_for_each_prev_safe` | 746 | ✅ `n` | ❌ | 反向 |
 | `list_for_each_entry` | 781 | ❌ | ✅ | 正向 |
-| `list_for_each_entry_reverse` | 790 | ❌ | ✅ | 反向 |
+| `list_for_each_entry_reverse` | 792 | ❌ | ✅ | 反向 |
 | `list_for_each_entry_continue` | ~813 | ❌ | ✅ | 正向续 |
 | `list_for_each_entry_safe` | 868 | ✅ `n` | ✅ | 正向 |
 | `list_for_each_entry_continue_reverse` | ~883 | ❌ | ✅ | 反向续 |
