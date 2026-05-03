@@ -271,7 +271,7 @@ cat /sys/class/regulator/regulator.0/num_voltages
 | `_regulator_do_enable` | — | 执行硬件使能（GPIO/ops）|
 | `_regulator_do_disable` | — | 执行硬件禁用 |
 | `regulator_map_voltage` | `:3742` | 选择最优电压档位 |
-| `_regulator_call_set_voltage` | `:3802` | 设置电压（含通知链）|
+| `_regulator_call_set_voltage` | `:3764` | 设置电压（含通知链）|
 | `set_machine_constraints` | `:1446` | 应用约束 |
 | `regulator_resolve_supply` | `:2171` | 解析输入电源连接 |
 | `drms_uA_update` | `:983` | 动态电流管理 |
@@ -280,7 +280,7 @@ cat /sys/class/regulator/regulator.0/num_voltages
 
 ## 9. 总结
 
-Regulator 框架的核心是 `_regulator_enable`（`:3116`）和 `_regulator_disable`（`:3237`）的**引用计数 + 级联**设计——每个 `regulator_enable()` 递增 `use_count`/`enable_count`，递减到 0 时才真正关闭硬件。电压通过 `regulator_map_voltage`（`:3742`）选择最优档位，并通过 `_regulator_call_set_voltage`（`:3802`）配合通知链完成设置。
+Regulator 框架的核心是 `_regulator_enable`（`:3116`）和 `_regulator_disable`（`:3237`）的**引用计数 + 级联**设计——每个 `regulator_enable()` 递增 `use_count`/`enable_count`，递减到 0 时才真正关闭硬件。电压通过 `regulator_map_voltage`（`:3742`）选择最优档位，并通过 `_regulator_call_set_voltage`（`:3764`）配合通知链完成设置。
 
 **doom-lsp 确认**：553 个符号分布在 6,890 行的 `core.c`。核心路径是：`regulator_enable` → `_regulator_enable` → `_regulator_do_enable` → `ops->enable`。
 
