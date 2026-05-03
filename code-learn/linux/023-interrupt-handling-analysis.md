@@ -124,17 +124,16 @@ IDT 条目类型：
             │             └─ DEFINE_IDTENTRY_IRQ(common_interrupt)
             │                  @ arch/x86/kernel/irq.c:326
             │                  │
-            │                  ├─ irq_enter()                    [L286]
-            │                  │   → 增加 in_interrupt 计数
-            │                  │   → 标记当前上下文为中断上下文
-            │                  │   → rcu_irq_enter()
+            │                  ├─ [DEFINE_IDTENTRY_IRQ 宏展开：
+            │                  │   irqentry_enter() → 标记中断上下文]
             │                  │
-            │                  ├─ desc = __this_cpu_read(vector_irq[vector])
-            │                  │   ← 根据向量号获取 IRQ 描述符
+            │                  ├─ __this_cpu_read(vector_irq[vector])
+            │                  │   (在 call_irq_handler() 中，根据向量号获取 IRQ 描述符)
             │                  │
-            │                  ├─ handle_irq(desc, regs)         [L258]
-            │                  │    │
-            │                  │    ├─ if (desc->handle_irq)
+            │                  ├─ call_irq_handler(vector, regs)
+            │                  │   └─ handle_irq(desc, regs)         [L258]
+            │                  │       │
+            │                  │       ├─ if (desc->handle_irq)
             │                  │    │     desc->handle_irq(desc, regs)
             │                  │    │     ← handle_fasteoi_irq 等
             │                  │    │        │
@@ -178,16 +177,19 @@ IDT 条目类型：
             │                  │         │
             │                  │         └─ raw_spin_unlock(&desc->lock)
             │                  │
-            │                  ├─ irq_exit()                        [L512]
-            │                  │   │
-            │                  │   ├─ [触发下半部处理]
-            │                  │   │   if (softirq_pending())
-            │                  │   │     invoke_softirq()          ← 处理软中断
-            │                  │   │     → do_softirq() (见 article 24)
-            │                  │   │
-            │                  │   └─ rcu_irq_exit()
+            │                  ├─ [DEFINE_IDTENTRY_IRQ 宏结尾：
+            │                  │   irqentry_exit() → 恢复上下文]
             │                  │
-            │                  └─ return（到汇编层）
+            │                  ├─ [返回 __common_interrupt] -> 汇编 IRETQ
+            │                  │
+            │                  ├─ [中断处理结束后遇到 irq_exit()：
+            │                  │   → 触发下半部处理]
+            │                  │   if (softirq_pending())
+            │                  │     invoke_softirq()              ← 处理软中断
+            │                  │     → do_softirq() (见 article 24)
+            │                  │
+            │                  └─ 汇编返回：
+            │                       └─ IRETQ
             │                       │
             │                       └─ 汇编返回：
             │                            └─ IRETQ
