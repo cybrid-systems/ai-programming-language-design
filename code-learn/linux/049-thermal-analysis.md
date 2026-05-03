@@ -205,7 +205,7 @@ struct thermal_cooling_device_ops {
 每个 `trip` + `cdev` 绑定为一个 `thermal_instance`，描述在特定 trip 触发时冷却设备如何响应：
 
 ```c
-// drivers/thermal/thermal_core.h:206-222
+// drivers/thermal/thermal_core.h:236-252
 struct thermal_instance {
     int id;
     char name[THERMAL_NAME_LENGTH];
@@ -231,7 +231,7 @@ struct cooling_spec {
 ### 1.5 struct thermal_governor — 调温策略
 
 ```c
-// drivers/thermal/thermal_core.h:74-89
+// drivers/thermal/thermal_core.h:53-63
 struct thermal_governor {
     const char *name;
     int (*bind_to_tz)(struct thermal_zone_device *tz);
@@ -1140,9 +1140,9 @@ Linux Thermal 框架通过**三层抽象**实现了灵活的温控管理：
 | `include/linux/thermal.h` | 72 | `struct thermal_trip` |
 | `include/linux/thermal.h` | 95 | `struct thermal_zone_device_ops` |
 | `include/linux/thermal.h` | 123 | `struct thermal_cooling_device` |
-| `include/linux/thermal.h` | 156 | `struct thermal_cooling_device_ops` |
-| `drivers/thermal/thermal_core.h` | 74 | `struct thermal_governor` |
-| `drivers/thermal/thermal_core.h` | 111 | `struct thermal_instance` |
+| `include/linux/thermal.h` | 114 | `struct thermal_cooling_device_ops` |
+| `drivers/thermal/thermal_core.h` | 53 | `struct thermal_governor` |
+| `drivers/thermal/thermal_core.h` | 236 | `struct thermal_instance` |
 | `drivers/thermal/thermal_core.h` | 119 | `struct thermal_zone_device` |
 | `drivers/thermal/thermal_core.c` | 53 | `__find_governor()` |
 | `drivers/thermal/thermal_core.c` | 119 | `thermal_register_governor()` |

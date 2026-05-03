@@ -42,8 +42,8 @@ bpf_prog 依附到 hook 点
 |------|------|------|
 | `kernel/bpf/verifier.c` | 20203 | BPF 程序验证器 |
 | `kernel/bpf/syscall.c` | 6614 | `bpf()` 系统调用入口 |
-| `kernel/bpf/core.c` | ~2000 | BPF 核心（解释器、通用逻辑）|
-| `kernel/bpf/helpers.c` | ~1500 | BPF 辅助函数 |
+| `kernel/bpf/core.c` | 3505 | BPF 核心（解释器、通用逻辑）|
+| `kernel/bpf/helpers.c` | 4928 | BPF 辅助函数 |
 | `kernel/bpf/bpf_iter.c` | ~600 | BPF 迭代器 |
 | `kernel/bpf/trampoline.c` | 1385 | BPF 跳板函数（fentry/fexit）|
 | `kernel/bpf/map.c` | ~400 | 通用 map 操作 |

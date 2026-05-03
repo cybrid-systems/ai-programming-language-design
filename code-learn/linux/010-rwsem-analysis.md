@@ -16,11 +16,11 @@
 ## 1. 核心数据结构
 
 ```c
-// include/linux/rwsem.h:48
+// include/linux/rwsem.h:48 (使用 context_lock_struct 宏包裹)
 struct rw_semaphore {
     atomic_long_t count;              // 64-bit: 编码读者数/写者锁/等待标志
     atomic_long_t owner;              // 写者 task_struct 指针 / 读者标记
-    struct optimistic_spin_queue osq; // MCS 自旋队列
+    struct optimistic_spin_queue osq;  // MCS 自旋队列（CONFIG_RWSEM_SPIN_ON_OWNER）
     raw_spinlock_t wait_lock;         // 保护等待队列
     struct rwsem_waiter *first_waiter;// 等待队列首项（单链表）
 };
@@ -29,12 +29,12 @@ struct rw_semaphore {
 ### 1.1 count 编码
 
 ```c
-// kernel/locking/rwsem.c:114-129
-#define RWSEM_WRITER_LOCKED  (1UL << 0)  // bit 0: 写者持有锁
-#define RWSEM_FLAG_WAITERS   (1UL << 1)  // bit 1: 有等待者
-#define RWSEM_FLAG_HANDOFF   (1UL << 2)  // bit 2: 交接中
-#define RWSEM_READER_BIAS    (1UL << 8)  // bit 8: 每位读者 +256
-#define RWSEM_FLAG_READFAIL  (1UL << 63) // bit 63: 读者失败标记
+// kernel/locking/rwsem.c:118-129
+#define RWSEM_WRITER_LOCKED  (1UL << 0)  // bit 0: 写者持有锁 (L118)
+#define RWSEM_FLAG_WAITERS   (1UL << 1)  // bit 1: 有等待者 (L119)
+#define RWSEM_FLAG_HANDOFF   (1UL << 2)  // bit 2: 交接中 (L120)
+#define RWSEM_FLAG_READFAIL  (1UL << (BITS_PER_LONG - 1)) // bit 63: 读者失败标记 (L121)
+#define RWSEM_READER_BIAS    (1UL << RWSEM_READER_SHIFT)  // bit 8: 每位读者 +256 (L124)
 ```
 
 **count 位布局（64-bit）**：
@@ -478,14 +478,6 @@ static bool rwsem_optimistic_spin(struct rw_semaphore *sem, ...)
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01*
 
-## 20. 读者计数溢出保护
-
-
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01*
-
 ## 21. rwsem 与 RCU 对比
 
 | 特性 | rwsem | RCU |
@@ -500,7 +492,7 @@ static bool rwsem_optimistic_spin(struct rw_semaphore *sem, ...)
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01*
 
-## 22. 小结
+## 21. 小结
 
 rwsem 通过 64 位 count 字段同时编码写者锁、等待标志、读者计数。读路径一次 atomic_add_return 即可获取，无竞争时延迟与 spinlock 相当。写者优先策略通过 WAITERS 标志阻塞后续读者。handoff 机制在写者长时间无法获取时强制执行交接。
 

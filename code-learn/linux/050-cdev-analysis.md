@@ -291,7 +291,7 @@ static int exact_lock(dev_t dev, void *data)
 ### 3.3 cdev_del——从系统移除
 
 ```c
-// fs/char_dev.c:470-478
+// fs/char_dev.c:510-522
 void cdev_del(struct cdev *p)
 {
     cdev_unmap(p->dev, p->count);       /* 从 kobj_map 移除 */
@@ -302,7 +302,7 @@ void cdev_del(struct cdev *p)
 **注意**：`cdev_del()` 只是阻止**新打开**。已经打开的文件仍然可以继续操作——因为 `filp->f_op` 已经指向驱动的 `file_operations`：
 
 ```c
-// char_dev.c:508-513（函数注释）
+// char_dev.c:510-513（函数注释）
 void cdev_del(struct cdev *p)
 {
     /* NOTE: This guarantees that cdev device will no longer be able
@@ -314,7 +314,7 @@ void cdev_del(struct cdev *p)
 ### 3.4 release 函数
 
 ```c
-// fs/char_dev.c:480-492
+// fs/char_dev.c:522-535
 static void cdev_default_release(struct kobject *kobj)
 {
     struct cdev *p = container_of(kobj, struct cdev, kobj);
@@ -429,7 +429,7 @@ chrdev_open():
 现代内核推荐使用 `cdev_device_add()` 将 cdev 与 struct device 绑定：
 
 ```c
-// fs/char_dev.c:398-436
+// fs/char_dev.c:541-560
 int cdev_device_add(struct cdev *cdev, struct device *dev)
 {
     if (dev->devt) {
@@ -832,17 +832,17 @@ Linux cdev 子系统是字符设备驱动的**入口框架**，其设计体现�
 | `fs/char_dev.c` | 37 | `chrdevs[]` 哈希表 |
 | `fs/char_dev.c` | 66 | `find_dynamic_major()` |
 | `fs/char_dev.c` | 94 | `__register_chrdev_region()` |
-| `fs/char_dev.c` | 223 | `chrdev_open()` |
-| `fs/char_dev.c` | 294 | `def_chr_fops` |
-| `fs/char_dev.c` | 432 | `cdev_add()` |
-| `fs/char_dev.c` | 470 | `cdev_del()` |
-| `fs/char_dev.c` | 480 | `cdev_default_release()` |
-| `fs/char_dev.c` | 485 | `cdev_dynamic_release()` |
+| `fs/char_dev.c` | 370 | `chrdev_open()` |
+| `fs/char_dev.c` | 449 | `def_chr_fops` |
+| `fs/char_dev.c` | 476 | `cdev_add()` |
+| `fs/char_dev.c` | 510 | `cdev_del()` |
+| `fs/char_dev.c` | 522 | `cdev_default_release()` |
+| `fs/char_dev.c` | 527 | `cdev_dynamic_release()` |
 | `fs/char_dev.c` | 493 | `cdev_alloc()` |
 | `fs/char_dev.c` | 500 | `cdev_init()` |
 | `fs/char_dev.c` | 509 | `chrdev_init()` |
-| `fs/char_dev.c` | 398 | `cdev_device_add()` |
-| `fs/char_dev.c` | 438 | `cdev_device_del()` |
+| `fs/char_dev.c` | 541 | `cdev_device_add()` |
+| `fs/char_dev.c` | 575 | `cdev_device_del()` |
 | `drivers/base/map.c` | 19 | `struct kobj_map` |
 | `drivers/base/map.c` | 32 | `kobj_map()` |
 | `drivers/base/map.c` | 95 | `kobj_lookup()` |

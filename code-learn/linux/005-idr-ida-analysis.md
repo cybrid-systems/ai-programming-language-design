@@ -26,7 +26,7 @@ IDA 则更轻量：它只管理哪些 ID 号被使用、哪些空闲，不存储
 ```c
 // include/linux/idr.h:20 — doom-lsp 确认
 struct idr {
-    struct xarray    idr_rt;       // 底层 XArray（存储 id → ptr 映射）
+    struct radix_tree_root idr_rt;  // 底层 XArray（通过宏别名 radix_tree_root）
     unsigned int     idr_base;     // ID 起始偏移（基址）
     unsigned int     idr_next;     // 下次分配的 hint（循环分配用）
 };
@@ -34,7 +34,7 @@ struct idr {
 
 三个字段：
 
-- **`idr_rt`**：`struct xarray`（24 字节）。存储 `id → void*` 的映射。ID 作为 XArray 的索引键。注意字段名 `idr_rt` 是历史遗迹——`rt` 表示 radix tree——但底层已是 XArray。
+- **`idr_rt`**：`struct xarray`（通过宏别名 `radix_tree_root`，24 字节）。存储 `id → void*` 的映射。ID 作为 XArray 的索引键。注意字段名 `idr_rt` 是历史遗迹——`rt` 表示 radix tree——但底层已是 XArray（`include/linux/radix-tree.h:25`：`#define radix_tree_root xarray`）。
 
 - **`idr_base`**：ID 基址。很多场景需要从特定数字开始分配 ID（如 `/dev/null` 的主设备号为 1），`idr_base` 允许偏移整个 ID 空间而无需修改 XArray 的索引。
 
@@ -45,7 +45,7 @@ struct idr {
 ```c
 // include/linux/idr.h:259 — doom-lsp 确认
 struct ida_bitmap {
-    unsigned long bitmap[IDA_BITMAP_BITS / BITS_PER_LONG];
+    unsigned long bitmap[IDA_BITMAP_LONGS];
 };
 ```
 
@@ -68,10 +68,10 @@ IDA 的 XArray 存储的是 bitmap 页（`struct ida_bitmap*` 或值编码的 `u
 
 ## 2. IDR API——doom-lsp 确认的行号
 
-### 2.1 `idr_alloc`（`lib/idr.c:81`）
+### 2.1 `idr_alloc`（`lib/idr.c:84`）
 
 ```c
-// lib/idr.c:81 — doom-lsp 确认
+// lib/idr.c:84 — doom-lsp 确认
 int idr_alloc(struct idr *idr, void *ptr, int start, int end, gfp_t gfp)
 {
     u32 id = start;
@@ -88,29 +88,27 @@ int idr_alloc(struct idr *idr, void *ptr, int start, int end, gfp_t gfp)
 **doom-lsp 数据流追踪——完整调用链**：
 
 ```
-idr_alloc(idr, ptr, start, end, gfp)             @ lib/idr.c:81
-  └─ idr_alloc_u32(idr, ptr, &id, max, gfp)       @ lib/idr.c:33
+idr_alloc(idr, ptr, start, end, gfp)             @ lib/idr.c:84
+  └─ idr_alloc_u32(idr, ptr, &id, max, gfp)       @ lib/idr.c:35
        │
        ├─ 校正 ID 基数:
        │   id = id - idr->idr_base                (减去基址)
        │
-       ├─ radix_tree_iter_init(&iter, id)          (兼容层初始化)
+       ├─ radix_tree_iter_init(&iter, id)          (radix tree 兼容层初始化)
        │
-       ├─ idr_get_free(...)                         (在 XArray 中找空闲 slot)
-       │   └─ xa_alloc(&idr->idr_rt, ...)           (底层)
-       │       └─ xas_find_marked(xa, XA_FREE_MARK) ← 搜索空闲标记的 slot
+       ├─ idr_get_free(&idr->idr_rt, &iter, gfp, max - base)
+       │   └─ 内部调用 xa_alloc → xas_find_marked(XA_FREE_MARK)
+       │      (XArray 搜索有空闲标记的 slot)
        │
-       ├─ radix_tree_iter_replace(...)              (写入 ptr)
-       │   └─ xas_store(&xas, ptr)
-       │       └─ rcu_assign_pointer(slot, ptr)    (RCU 安全写入)
+       ├─ radix_tree_iter_replace(&idr->idr_rt, &iter, slot, ptr)  (写入 ptr)
+       │   └─ 内部: xas_store → rcu_assign_pointer(slot, ptr)
        │
-       ├─ radix_tree_iter_tag_clear(&iter, IDR_FREE) (清除空闲标记)
-       │   └─ xas_clear_mark(&xas, XA_FREE_MARK)
+       ├─ radix_tree_iter_tag_clear(&idr->idr_rt, &iter, IDR_FREE) (清除空闲标记)
        │
        └─ return id = iter.index + base            (恢复基址)
 ```
 
-### 2.2 `idr_alloc_u32`（`lib/idr.c:33`）
+### 2.2 `idr_alloc_u32`（`lib/idr.c:35`）
 
 ```c
 // lib/idr.c:33 — doom-lsp 确认
@@ -149,11 +147,9 @@ idr_alloc_cyclic(idr, ptr, start, end, gfp)
 // lib/idr.c:174 — doom-lsp 确认
 void *idr_find(const struct idr *idr, unsigned long id)
 {
-    return xa_load(&idr->idr_rt, id);
+    return radix_tree_lookup(&idr->idr_rt, id - idr->idr_base);
 }
 ```
-
-本质上就是 `xa_load`——从 XArray 中读取 `id` 对应的 `void*`。
 
 ### 2.5 `idr_remove`——删除映射（`lib/idr.c:154`）
 
@@ -161,15 +157,11 @@ void *idr_find(const struct idr *idr, unsigned long id)
 // lib/idr.c:154 — doom-lsp 确认
 void *idr_remove(struct idr *idr, unsigned long id)
 {
-    void *ptr = xa_erase(&idr->idr_rt, id);  // XArray 擦除
-    if (ptr)
-        radix_tree_iter_tag_set(&idr->idr_rt, ...? 实际是 xas_set_mark)
-
-    return ptr;
+    return radix_tree_delete_item(&idr->idr_rt, id - idr->idr_base, NULL);
 }
 ```
 
-删除后**标记该 slot 为空闲**（`IDR_FREE`），使得后续 `idr_alloc` 可以重新使用此 ID。
+删除后底层 XArray 自动**标记该 slot 为空闲**（`IDR_FREE` tag），使得后续 `idr_alloc` 可以重新使用此 ID。
 
 ### 2.6 `idr_replace`——替换指针（`lib/idr.c:292`）
 
@@ -185,22 +177,28 @@ void *idr_replace(struct idr *idr, void *ptr, unsigned long id)
 ```c
 // lib/idr.c:197 — doom-lsp 确认
 int idr_for_each(const struct idr *idr,
-                  int (*fn)(unsigned long id, void *p, void *data),
+                  int (*fn)(int id, void *p, void *data),
                   void *data)
 {
-    unsigned long id = 0;
+    struct radix_tree_iter iter;
+    void __rcu **slot;
+    int base = idr->idr_base;
 
-    while ((p = idr_get_next_ul(idr, &id))) {
-        ret = fn(id, p, data);
+    radix_tree_for_each_slot(slot, &idr->idr_rt, &iter, 0) {
+        int ret;
+        unsigned long id = iter.index + base;
+
+        if (WARN_ON_ONCE(id > INT_MAX))
+            break;
+        ret = fn(id, rcu_dereference_raw(*slot), data);
         if (ret)
             return ret;
-        id++;
     }
     return 0;
 }
 ```
 
-使用 `idr_get_next_ul` 逐个获取下一个非空映射。注意：遍历时空洞（hole）被跳过。
+使用 `radix_tree_for_each_slot` 遍历 XArray 中的非空 slot。注意：遍历时空洞（hole）被跳过。需要对 `rcu_dereference_raw` 保护的数据正确管理生命周期。
 
 ### 2.8 `idr_get_next` / `idr_get_next_ul`——游标遍历（`lib/idr.c:266, 229`）
 
@@ -349,26 +347,29 @@ IDR 使用 **XArray 的标记系统**来跟踪哪些 slot 是空闲的：
 
 ```c
 // include/linux/idr.h — 内部标记
-#define IDR_FREE  XA_MARK_0     // XA_MARK_0 用于标记"空闲"的 slot
+#define IDR_FREE  0             // 标记位索引 0 用于"空闲"标记
 ```
 
-对于 IDR 来说，`XA_MARK_0` 的含义被重新定义为"此 slot 空闲"，这正好与默认的 XArray 标记含义相反。逻辑如下：
+> ⚠️ 实际源码中 `IDR_FREE` 定义为 `0`（标记位索引），并非 `XA_MARK_0`。底层 XArray 使用 `XA_MARK_0`（即标记位 0）来记录空闲状态。
+
+对于 IDR 来说，标记位 0 的含义被重新定义为"此 slot 空闲"，这正好与默认的 XArray 标记含义相反。逻辑如下：
 
 ```
 初始化：所有 slots 未被占用 → 全部标记 IDR_FREE
 分配后：清除 IDR_FREE 标记
 释放后：重新设置 IDR_FREE 标记
 
-idr_alloc:
-  → xas_find_marked(&xas, max, XA_FREE_MARK)  ← 搜索有空闲标记的 slot
-  → xas_clear_mark(&xas, XA_FREE_MARK)         ← 占用后清除
+idr_alloc (via idr_alloc_u32):
+  → radix_tree_iter_init(&iter, id)             ← 初始化 radix tree 遍历器
+  → idr_get_free(&idr_rt, &iter, ...)           ← 搜索空闲 slot（内部：xa_alloc 路径）
+  → radix_tree_iter_tag_clear(..., IDR_FREE)    ← 占用后清除空闲标记
 
 idr_remove:
-  → xas_store(&xas, NULL)                       ← 删除指针
-  → xas_set_mark(&xas, XA_FREE_MARK)            ← 标记为空闲
+  → radix_tree_delete_item(&idr_rt, idx, NULL)  ← 删除指针
+    底层自动设置空闲标记（IDR_FREE tag）
 ```
 
-**注意**：这里的标记语义是倒置的。通常 `XA_MARK_0` 表示"脏"或"写回"等肯定含义，但对 IDR 来说 `XA_MARK_0 = "空闲"`。这是 IDR 的实现细节，调用者无需关心。
+**注意**：这里的标记语义是倒置的。通常 `XA_MARK_0` 表示"脏"或"写回"等肯定含义，但对 IDR 来说标记位 0 = "空闲"。这是 IDR 的实现细节，调用者无需关心。
 
 ---
 
@@ -435,10 +436,9 @@ if (xa_is_value(bitmap)) {
 
 ```c
 // include/linux/idr.h:152 — doom-lsp 确认
-static inline void idr_init_base(struct idr *idr, unsigned int base)
+static inline void idr_init_base(struct idr *idr, int base)
 {
-    xa_init_flags(&idr->idr_rt, XA_FLAGS_ALLOC);  // 启用 xa_alloc
-    // XA_FLAGS_ALLOC 使 XArray 跟踪空闲 slot
+    INIT_RADIX_TREE(&idr->idr_rt, IDR_RT_MARKER);  // 通过 radix tree 兼容层初始化
     idr->idr_base = base;                          // 设置基址
     idr->idr_next = 0;                             // 重置 hint
 }
@@ -450,10 +450,11 @@ static inline void idr_init(struct idr *idr)
 }
 ```
 
-**关键：`XA_FLAGS_ALLOC`**。这个标志告诉 XArray：此 XArray 将用于 ID 分配，需要：
+
+**关键：`IDR_RT_MARKER`**。这个宏展开为 `ROOT_IS_IDR | (__force gfp_t)(1 << (ROOT_TAG_SHIFT + IDR_FREE))`。`INIT_RADIX_TREE` 是 `xa_init_flags` 的兼容层宏。与 `XA_FLAGS_ALLOC` 不同，`IDR_RT_MARKER` 额外设置了 `ROOT_IS_IDR` 标志，使 XArray 知道它是用于 IDR 分配：
 1. 跟踪哪些 slots 被占用、哪些空闲
-2. 维护 `XA_FREE_MARK` 标记
-3. 支持 `xa_alloc` 系列 API
+2. 维护标记位 0（`IDR_FREE`）标记空闲 slot
+3. 支持 IDR 的循环分配等特性
 
 ### 7.2 IDA 初始化
 
@@ -465,7 +466,7 @@ static inline void ida_init(struct ida *ida)
 }
 ```
 
-与 IDR 一样需要 `XA_FLAGS_ALLOC`。不使用 `idr_base`。
+IDA 使用 `XA_FLAGS_ALLOC`（而非 IDR 的 `IDR_RT_MARKER`），因为 IDA 直接使用 `struct xarray` 而非 `radix_tree_root` 别名。不使用 `idr_base`。
 
 ### 7.3 销毁
 
@@ -495,7 +496,7 @@ int idr_preload(struct idr *idr, gfp_t gfp);
 // include/linux/idr.h:189 — doom-lsp 确认
 static inline void idr_preload_end(void)
 {
-    preempt_enable();
+    local_unlock(&radix_tree_preloads.lock);
 }
 ```
 
@@ -583,14 +584,16 @@ id = ida_alloc(&module_ida, GFP_KERNEL);
 ## 11. XA_FLAGS_ALLOC 是什么
 
 ```c
-// include/linux/xarray.h
-#define XA_FLAGS_ALLOC     (XA_FLAGS_TRACK_FREE | XA_FLAGS_MARK(0))
+// include/linux/xarray.h:281
+#define XA_FLAGS_ALLOC     (XA_FLAGS_TRACK_FREE | XA_FLAGS_MARK(XA_FREE_MARK))
 
 // XA_FLAGS_TRACK_FREE: 跟踪哪些 entry 被释放（free）
-// XA_FLAGS_MARK(0):    启用 XA_MARK_0（用于 IDR_FREE 标记）
+// XA_FLAGS_MARK(XA_FREE_MARK): 启用 XA_MARK_0（空闲标记位）
 ```
 
 当 `XA_FLAGS_ALLOC` 使能后，XArray 的 `xa_store(..., NULL)` 会自动设置 `XA_MARK_0`（标记为空闲），而 `xa_store(..., ptr)` 会自动清除该标记。
+
+> ⚠️ IDR 内部使用 `IDR_RT_MARKER`（= `ROOT_IS_IDR | BIT(ROOT_TAG_SHIFT + 0)`）而非 `XA_FLAGS_ALLOC`。两者功能相似，但 IDR 版本额外设置了 `ROOT_IS_IDR` 标志。
 
 ---
 

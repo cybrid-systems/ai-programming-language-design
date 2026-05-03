@@ -11,7 +11,7 @@
 
 设计哲学：最简接口，零误用空间。两个核心操作——`wait_for_completion()`（等待）和 `complete()`（通知）。
 
-**doom-lsp 确认**：`include/linux/completion.h` 含 **21 个符号**。`kernel/sched/completion.c` 含 **58 个符号**。`complete_with_flags` @ L21，`do_wait_for_common` @ L85。
+**doom-lsp 确认**：`include/linux/completion.h` 含 **21 个符号**。`kernel/sched/completion.c` 含 **58 个符号**。`complete_with_flags` @ L21，`do_wait_for_common` @ L86。
 
 ---
 
@@ -95,7 +95,7 @@ void complete_all(struct completion *x)
 ## 3. 消费者路径——do_wait_for_common
 
 ```c
-// kernel/sched/completion.c:85 — doom-lsp 确认
+// kernel/sched/completion.c:86 — doom-lsp 确认
 static inline long __sched
 do_wait_for_common(struct completion *x,
                    long (*action)(long), long timeout, int state)
