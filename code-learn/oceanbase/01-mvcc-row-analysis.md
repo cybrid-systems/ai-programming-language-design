@@ -29,9 +29,11 @@ struct ObMvccTransNode
   transaction::ObTxSEQ   seq_no_;          // 事务内序列号（doom-lsp @ L154）
   int64_t               write_epoch_;      // 写入时的 epoch（doom-lsp @ L155）
   share::SCN            tx_end_scn_;       // 事务结束的 SCN（doom-lsp @ L156）
-  // ob_mvcc_row.h:157-158 - doom-lsp 确认：prev 指向更新版本，next 指向更旧版本
-  ObMvccTransNode      *prev_;            // 前驱版本（更新）
-  ObMvccTransNode      *next_;            // 后继版本（更旧）
+  // ob_mvcc_row.h:157-158 - doom-lsp 确认：prev 指向更旧版本，next 指向更新版本
+  // 验证：mvcc_write_ 中 `ATOMIC_STORE(&(writer_node.prev_), list_head_)` 即新节点的 prev_ 指向老的 list_head（更旧版本）
+  // 且 `list_head_->next_ = &writer_node` 即老节点的 next_ 指向新节点（更新版本）
+  ObMvccTransNode      *prev_;            // 前驱版本（更旧）
+  ObMvccTransNode      *next_;            // 后继版本（更新）
   uint32_t              modify_count_;     // 累计修改次数
   uint32_t              acc_checksum_;     // 累计校验和（数据完整性）
   int64_t               version_;          // 节点版本号
@@ -108,7 +110,7 @@ struct ObMvccRow
 };
 ```
 
-**核心不变量**：`list_head_` 指向链表的最新（newest）版本，`list_head_->next_` 指向次新版本，以此类推，链表按版本从新到旧排列。**所有遍历都是从 `list_head_` 开始沿着 `next_` 向后走**。
+**核心不变量**：`list_head_` 指向链表的最新（newest）版本，`list_head_->prev_` 指向次新版本。链表按版本从新到旧（沿 `prev_` 方向）排列。**所有遍历都是从 `list_head_` 开始沿着 `prev_` 向后走**（`iter = iter->prev_`，doom-lsp 确认 `mvcc_write_` L808 起的循环逻辑）。
 
 **`STATIC_ASSERT(sizeof(ObMvccRow) <= 120)`** —— 这个约束确保 `ObMvccRow` 可以放入 128 字节的缓存行（或 128 字节的内存分配粒度），避免一个行版本更新导致多个缓存行失效。这是数据库实现中的**缓存行友好设计**。
 
@@ -117,25 +119,40 @@ struct ObMvccRow
 ```
 ObMvccRow (120 bytes, cache-line aligned)
 ├── latch_: ObRowLatch          (自旋锁，保护整行)
-├── list_head_: ObMvccTransNode* ──────────────────┐
-├── ...meta...                              │
-└── index_: ObMvccRowIndex*                │
-                                              │
-            ┌────────────────────────────────┘
-            │ next_                    prev_
-            ▼                              ▼
-  ┌──────────────────┐         ┌──────────────────┐
-  │ ObMvccTransNode  │         │ ObMvccTransNode │
-  │ tx_id_: T1       │         │ tx_id_: T2       │
-  │ trans_version_: 5 │         │ trans_version_: 3│
-  │ flag_: COMMITTED │         │ flag_: COMMITTED │
-  │ buf_: [新值: X'] │         │ buf_: [旧值: X]  │
-  │ prev_ ← ──────  │         │ next_ → ──────  │
-  └──────────────────┘         └──────────────────┘
-         newest (T1提交版本5)        older (T2提交版本3)
+├── list_head_: ObMvccTransNode* ───────┐
+├── ...meta...                           │
+└── index_: ObMvccRowIndex*              │
+                                         │
+          ┌──────────────────────────────┘
+          ▼
+  ┌──────────────────┐      prev_ (toward older)
+  │ ObMvccTransNode  │────────────────────────→
+  │ tx_id_: T1       │                         │
+  │ trans_version_: 5│                         │
+  │ flag_: COMMITTED │                         │
+  │ buf_: [新值: X']  │                         │
+  │ next_: NULL       │                         │
+  └──────────────────┘                         │
+         newest (T1)                           │
+                                               │
+                                               │
+         ┌─────────────────────────────────────┘
+         ▼
+  ┌──────────────────┐      prev_ (toward older)
+  │ ObMvccTransNode  │────────────────────────→
+  │ tx_id_: T2       │                         │
+  │ trans_version_: 3│                         │
+  │ flag_: COMMITTED │                         │
+  │ buf_: [旧值: X]   │                         │
+  │ next_─────────────┘  (toward newer: T1)
+  └──────────────────┘
+         older (T2)
+
+> **方向总结**：`prev_` = 指向更旧版本（← 回退），`next_` = 指向更新版本（→ 前进）。
+> `list_head_` 指向最新版本，遍历时 `iter = iter->prev_` 逐步回溯到最旧版本。
 ```
 
-**`prev_` 和 `next_` 构成双向链表**：`prev_` 指向更新的版本，`next_` 指向更旧的版本。这与 Linux 内核链表的 `next/prev` 设计完全一致——`list_head` 双向循环链表通过 `prev/next` 串联，`ObMvccRow.list_head_` 是链表的锚点。
+**`prev_` 和 `next_` 构成双向链表**：`prev_` 指向更旧的版本（向时间回溯），`next_` 指向更新的版本（向未来推进）。逻辑上，`list_head_`→指向最新版本→沿着 `prev_` 遍历可回溯整个版本链。这与 Linux 内核链表的 `prev`（指向前驱）/`next`（指向后继）的双向指针设计一脉相承——`ObMvccRow.list_head_` 是链表的锚点。
 
 ---
 
