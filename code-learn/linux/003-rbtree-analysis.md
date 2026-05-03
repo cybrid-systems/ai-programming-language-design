@@ -43,7 +43,7 @@
 ### 2.1 `struct rb_node`
 
 ```c
-// include/linux/rbtree.h:27 — doom-lsp 确认
+// include/linux/rbtree_types.h:5 — doom-lsp 确认
 struct rb_node {
     unsigned long  __rb_parent_color;  // 父节点指针 + 颜色位
     struct rb_node *rb_right;          // 右子树
@@ -72,14 +72,12 @@ __rb_parent_color (unsigned long, 64-bit):
 // lib/rbtree.c:59 — doom-lsp 确认
 static inline void rb_set_black(struct rb_node *rb)
 {
-    rb->__rb_parent_color |= RB_BLACK;   // set bit 0
+    rb->__rb_parent_color += RB_BLACK;   // set bit 0 via addition
 }
-// 编译为: OR $1, [rb]     (x86-64: 一条 OR 指令，内存原子操作)
+// 编译为: ADD $1, [rb]     (x86-64: 一条 ADD 指令)
 
-static inline bool rb_is_red(const struct rb_node *rb)
-{
-    return !(rb->__rb_parent_color & RB_BLACK);  // test bit 0
-}
+#define rb_is_red(rb)    __rb_is_red((rb)->__rb_parent_color)
+// 展开为: !((rb)->__rb_parent_color & 1)
 // 编译为: TEST $1, [rb] + conditional jump
 ```
 
