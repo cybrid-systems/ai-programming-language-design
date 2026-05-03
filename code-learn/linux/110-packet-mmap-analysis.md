@@ -28,7 +28,7 @@ mmap 缓冲区布局：
   [sizeof(tpacket_hdr)] [skb data] [padding] [next_frame] ...
 ```
 
-**doom-lsp 确认**：`net/packet/af_packet.c`（4,819 行）。`tpacket_rcv` @ `:192`，`packet_mmap` @ `:400`，`packet_sendmsg`。
+**doom-lsp 确认**：`net/packet/af_packet.c`（4,819 行）。`tpacket_rcv` @ `:192`，`packet_mmap` @ `:4583`，`packet_sendmsg` @ `:3103`。
 
 ---
 
@@ -206,10 +206,10 @@ static int packet_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 | 函数 | 行号 | 作用 |
 |------|------|------|
 | `tpacket_rcv` | `:192` | mmap 接收（skb→ring→wake）|
-| `packet_sendmsg` | — | 发送入口 |
+| `packet_sendmsg` | `:3103` | 发送入口 |
 | `packet_snd` | — | 标准发送（copy→xmit）|
-| `tpacket_snd` | — | mmap 发送（ring→xmit）|
-| `packet_mmap` | `:400` | mmap 映射建立 |
+| `tpacket_snd` | `:2717` | mmap 发送（ring→xmit）|
+| `packet_mmap` | `:4583` | mmap 映射建立 |
 | `packet_rcv` | — | 标准接收（非 mmap）|
 
 ---
@@ -263,7 +263,7 @@ AF_PACKET 通过 `packet_sendmsg`/`tpacket_rcv` 收发 L2 数据包。PACKET_MMA
 // 3. 用户完成 → 标记块为 TP_STATUS_KERNEL
 // 4. 内核继续写入该块
 
-// tpacket_rcv @ :192 — V3 接收处理：
+// tpacket_rcv @ :2228 — V3 接收处理：
 // → prb_retire_current_block() — 满块切换
 // → prb_open_block() — 打开新块
 // → 写入帧到当前块
@@ -293,10 +293,10 @@ AF_PACKET 通过 `packet_sendmsg`/`tpacket_rcv` 收发 L2 数据包。PACKET_MMA
 // → 更大的 snaplen 范围
 ```
 
-## 10. packet_set_ring @ :174
+## 10. packet_set_ring @ :4416
 
 ```c
-// packet_set_ring — 设置 PACKET_MMAP 环形缓冲区：
+// packet_set_ring — 设置 PACKET_MMAP 环形缓冲区（实现在 :4416，前向声明在 :174）：
 
 // 1. 检查 socket 是否已绑定（已绑定时不能设置 ring）
 // 2. 根据 req->tp_block_size 分配页面
@@ -312,13 +312,13 @@ AF_PACKET 通过 `packet_sendmsg`/`tpacket_rcv` 收发 L2 数据包。PACKET_MMA
 
 ## 11. 关键函数索引
 
-| 函数 | 符号数 | 作用 |
-|------|--------|------|
-| `af_packet.c` | 196 | AF_PACKET 实现 |
-| `tpacket_rcv` | `:192` | mmap 接收（V1/V2/V3）|
-| `packet_mmap` | — | mmap 映射建立 |
-| `packet_sendmsg` | — | 发送入口 |
-| `packet_set_ring` | `:174` | ring 缓冲区设置 |
+| 函数 | 行号 | 作用 |
+|------|------|------|
+| `af_packet.c` | 196 符号 | AF_PACKET 实现 |
+| `tpacket_rcv` | `:192`（V1/V2）`:2228`（V3）| mmap 接收 |
+| `packet_mmap` | `:4583` | mmap 映射建立 |
+| `packet_sendmsg` | `:3103` | 发送入口 |
+| `packet_set_ring` | `:4416` | ring 缓冲区设置 |
 | `packet_previous_frame` | `:195` | 前一个帧定位 |
 | `prb_retire_current_block` | `:202` | 块完成处理 |
 | `prb_open_block` | `:205` | 块打开初始化 |

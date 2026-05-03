@@ -330,7 +330,7 @@ JBD2 通过**三级流水线**最大化并发：
 ## 5. 恢复——恢复回放
 
 ```c
-// fs/jbd2/recovery.c:996
+// fs/jbd2/recovery.c:282
 // 系统崩溃后，mount 时自动执行
 
 int jbd2_journal_recover(journal_t *journal)

@@ -200,7 +200,7 @@ Bonding 提供 7 种内置模式（`bond_xmit_slave_id` 按模式选择 slave）
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
 
-## 7. 发送模式详解
+## 10. 发送模式详解
 
 ```c
 // 7 种模式的发送算法：
@@ -231,7 +231,7 @@ Bonding 提供 7 种内置模式（`bond_xmit_slave_id` 按模式选择 slave）
 //   接收侧通过 ARP 协商更新 peer 的 ARP 缓存
 ```
 
-## 8. 链路监控
+## 11. 链路监控
 
 ```c
 // 两种链路监控方式：
@@ -251,7 +251,7 @@ Bonding 提供 7 种内置模式（`bond_xmit_slave_id` 按模式选择 slave）
 // 802.3ad 模式下使用 MII 监控（ARP 监控不支持）
 ```
 
-## 9. bonding sysfs 接口
+## 12. bonding sysfs 接口
 
 ```c
 // /sys/class/net/bond0/bonding/ 下的参数：
@@ -270,7 +270,7 @@ Bonding 提供 7 种内置模式（`bond_xmit_slave_id` 按模式选择 slave）
 // cat /sys/class/net/bond0/bonding/slaves
 ```
 
-## 10. Team 模式注册
+## 13. Team 模式注册
 
 ```c
 // Team 支持可插拔模式（用户空间加载）：
@@ -289,7 +289,7 @@ struct team_mode {
 // loadbalance — 负载均衡（基于哈希）
 ```
 
-## 11. 关键 doom-lsp 确认
+## 14. 关键 doom-lsp 确认
 
 ```c
 // bond_main.c:
@@ -308,7 +308,7 @@ struct team_mode {
 ```
 
 
-## 12. 故障切换流程
+## 15. 故障切换流程
 
 ```c
 // 链路故障时的 failover 流程：

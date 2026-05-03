@@ -311,7 +311,7 @@ cat /sys/class/uio/uio0/portio/port0/start
 
 ## 7. 总结
 
-UIO 是一个**极简的用户态驱动框架**——内核只负责中断通知（`uio_interrupt` → `atomic_inc(&event)` → `wake_up`）、内存映射（`uio_mmap` → `remap_pfn_range`）、文件操作（`uio_read` @ `:249`），全部业务逻辑在用户空间实现。适合 FPGA、低速数据采集等不需要 DMA 和 IOMMU 隔离的场景。
+UIO 是一个**极简的用户态驱动框架**——内核只负责中断通知（`uio_interrupt` → `atomic_inc(&event)` → `wake_up`）、内存映射（`uio_mmap` → `remap_pfn_range`）、文件操作（`uio_read` @ `:580`），全部业务逻辑在用户空间实现。适合 FPGA、低速数据采集等不需要 DMA 和 IOMMU 隔离的场景。
 
 ---
 

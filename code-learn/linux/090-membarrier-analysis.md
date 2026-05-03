@@ -38,7 +38,7 @@ Scenario B: 读者先 barrier 再写，写者在 IPI 后 barrier
   BUG_ON(r1==0 && r2==1)  // (c) 禁止 r1=x 前移到 IPI 前
 ```
 
-**doom-lsp 确认**：`ipi_mb` @ `:184`，`membarrier_global_expedited` @ `:250`，`membarrier_private_expedited` @ `:316`，`membarrier_register_global_expedited` @ `:462`，`sync_runqueues_membarrier_state` @ `:404`。
+**doom-lsp 确认**：`ipi_mb` @ `:170`，`membarrier_global_expedited` @ `:250`，`membarrier_private_expedited` @ `:316`，`membarrier_register_global_expedited` @ `:496`，`sync_runqueues_membarrier_state` @ `:438`。
 
 ---
 
@@ -51,7 +51,7 @@ Scenario B: 读者先 barrier 再写，写者在 IPI 后 barrier
 #define MEMBARRIER_STATE_PRIVATE_EXPEDITED             (1 << 1)
 #define MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY       (1 << 5)
 
-// 进程切换时同步到 runqueue @ :241：
+// 进程切换时同步到 runqueue @ :238：
 // void membarrier_update_current_mm(struct mm_struct *next_mm) {
 //     int state = next_mm ? atomic_read(&next_mm->membarrier_state) : 0;
 //     if (READ_ONCE(rq->membarrier_state) == state) return;
@@ -59,11 +59,11 @@ Scenario B: 读者先 barrier 再写，写者在 IPI 后 barrier
 // }
 ```
 
-**doom-lsp 确认**：`membarrier_update_current_mm` @ `:241` 在进程切换时由 `membarrier_arch_switch_mm` 调用。
+**doom-lsp 确认**：`membarrier_update_current_mm` @ `:238` 在进程切换时由 `membarrier_arch_switch_mm` 调用。
 
 ---
 
-## 2. 注册流程——membarrier_register_global_expedited @ :462
+## 2. 注册流程——membarrier_register_global_expedited @ :496
 
 ```c
 // 使用 membarrier 前必须先注册
@@ -146,7 +146,7 @@ static void ipi_rseq(void *info) {
 
 ---
 
-## 4. SYSCALL_DEFINE3——系统调用入口 @ :585
+## 4. SYSCALL_DEFINE3——系统调用入口 @ :627
 
 ```c
 SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
@@ -186,16 +186,16 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
 
 | 函数 | 行号 | 作用 |
 |------|------|------|
-| `ipi_mb` | `:184` | IPI 回调：smp_mb() |
-| `ipi_sync_core` | `:194` | IPI 回调：smp_mb + sync_core |
-| `ipi_rseq` | `:204` | IPI 回调：smp_mb + rseq event |
-| `membarrier_update_current_mm` | `:241` | 进程切 runqueue 同步 |
+| `ipi_mb` | `:170` | IPI 回调：smp_mb() |
+| `ipi_sync_core` | `:175` | IPI 回调：smp_mb + sync_core |
+| `ipi_rseq` | `:192` | IPI 回调：smp_mb + rseq event |
+| `membarrier_update_current_mm` | `:238` | 进程切 runqueue 同步 |
 | `membarrier_global_expedited` | `:250` | 全局 IPI 屏障 |
 | `membarrier_private_expedited` | `:316` | 进程内 IPI 屏障 |
-| `sync_runqueues_membarrier_state` | `:404` | 注册时 runqueue 同步 |
-| `membarrier_register_global_expedited` | `:462` | 注册全局屏障 |
-| `membarrier_register_private_expedited` | `:491` | 注册进程内屏障 |
-| `SYSCALL_DEFINE3(membarrier)` | `:585` | 系统调用入口 |
+| `sync_runqueues_membarrier_state` | `:438` | 注册时 runqueue 同步 |
+| `membarrier_register_global_expedited` | `:496` | 注册全局屏障 |
+| `membarrier_register_private_expedited` | `:515` | 注册进程内屏障 |
+| `SYSCALL_DEFINE3(membarrier)` | `:627` | 系统调用入口 |
 
 ---
 
@@ -230,7 +230,7 @@ p = rcu_dereference(gp) → READ_ONCE()
 rcu_read_unlock()   → 无操作
 ```
 
-## 7. SYSCALL_DEFINE3 @ :585——命令分发详情
+## 7. SYSCALL_DEFINE3 @ :627——命令分发详情
 
 ```c
 SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
@@ -282,23 +282,23 @@ static int membarrier_register_private_expedited(int flags)
 ## 9. IPI 回调函数详细
 
 ```c
-// ipi_mb @ :184 — 基础内存屏障
+// ipi_mb @ :170 — 基础内存屏障
 static void ipi_mb(void *info)  { smp_mb(); }
 
-// ipi_sync_core @ :194 — 内存屏障 + 指令流同步
+// ipi_sync_core @ :175 — 内存屏障 + 指令流同步
 // 用于 SYNC_CORE 命令（修改代码后需要清指令缓存）
 static void ipi_sync_core(void *info) {
     smp_mb();
     sync_core_before_usermode();  // x86: CPUID; arm64: ISB
 }
 
-// ipi_rseq @ :204 — 内存屏障 + 可重启序列事件
+// ipi_rseq @ :192 — 内存屏障 + 可重启序列事件
 static void ipi_rseq(void *info) {
     smp_mb();
     rseq_sched_switch_event(current);  // 重启 RSEQ 临界区
 }
 
-// ipi_sync_rq_state @ :213 — 同步 membarrier_state 到 runqueue
+// ipi_sync_rq_state @ :205 — 同步 membarrier_state 到 runqueue
 static void ipi_sync_rq_state(void *info) {
     if (current->mm != (struct mm_struct *)info) return;
     this_cpu_write(runqueues.membarrier_state,
@@ -317,7 +317,7 @@ static void ipi_sync_rq_state(void *info) {
 
 ## 11. 总结
 
-`membarrier`（`kernel/sched/membarrier.c`，679 行）通过 `SYSCALL_DEFINE3`（`:585`）分派 10 个子命令。核心路径 `membarrier_private_expedited`（`:316`）→ 遍历 CPU 检查 `rq->curr->mm` → `smp_call_function_many(tmpmask, ipi_mb, NULL, 1)` → `ipi_mb`（`:184`）→ `smp_mb()`。提供 `ipi_mb`（基础）、`ipi_sync_core`（`:194`，+ISB）、`ipi_rseq`（`:204`，+RSEQ）、`ipi_sync_rq_state`（`:213`，状态同步）四种回调。文件头（`:30-90`）提供 5 种场景的内存序正确性证明。
+`membarrier`（`kernel/sched/membarrier.c`，679 行）通过 `SYSCALL_DEFINE3`（`:627`）分派 10 个子命令。核心路径 `membarrier_private_expedited`（`:316`）→ 遍历 CPU 检查 `rq->curr->mm` → `smp_call_function_many(tmpmask, ipi_mb, NULL, 1)` → `ipi_mb`（`:170`）→ `smp_mb()`。提供 `ipi_mb`（基础）、`ipi_sync_core`（`:175`，+ISB）、`ipi_rseq`（`:192`，+RSEQ）、`ipi_sync_rq_state`（`:205`，状态同步）四种回调。文件头（`:11-100+`）提供内存序正确性证明。
 
 ---
 
