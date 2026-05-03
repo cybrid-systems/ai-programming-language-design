@@ -42,42 +42,54 @@ struct work_struct {
 #define WORK_STRUCT_PWQ_BIT         2   // PWQ: data 指向 pool_workqueue 而非 worker_pool
 #define WORK_STRUCT_LINKED_BIT      3   // LINKED: 工作是链式执行的（flush 跟踪）
 
-// 位 4-7——颜色位（flush 机制的核心）：
-#define WORK_STRUCT_COLOR_SHIFT     4
+// 位 4-7——颜色位（flush 机制的核心，PWQ 模式时使用）：
+#define WORK_STRUCT_COLOR_SHIFT     WORK_STRUCT_FLAG_BITS  // 4（无 debugobjects）
 #define WORK_STRUCT_COLOR_BITS      4   // 最大 16 种颜色
 
-// 位 16+——worker_pool ID（非 PWQ 模式时）：
-#define WORK_OFFQ_POOL_SHIFT        16
-#define WORK_OFFQ_POOL_BITS         48  // 64 - 16 = 48 位池 ID 空间
-#define WORK_OFFQ_BH_BIT            14  // BH 模式标记
+// OFFQ 模式位布局（非 PWQ 模式时）：
+#define WORK_OFFQ_BH_BIT            WORK_OFFQ_FLAG_SHIFT  // = WORK_STRUCT_FLAG_BITS
+#define WORK_OFFQ_DISABLE_SHIFT     (WORK_OFFQ_FLAG_SHIFT + 1)
+#define WORK_OFFQ_DISABLE_BITS      16
+#define WORK_OFFQ_POOL_SHIFT        (WORK_OFFQ_DISABLE_SHIFT + WORK_OFFQ_DISABLE_BITS)
+#define WORK_OFFQ_POOL_BITS         31  // 64-bit 上 bits 21-51 或 22-52
 ```
 
-**data 字段完整布局（64-bit）：**
+**data 字段的两种布局（64-bit，无 debugobjects）：**
 
+**PWQ 模式**（PWQ bit=1，工作已入队或正在执行时）：
 ```
-┌──────────────────────┬────┬─────────────┬──────┬──────┬──────┬──────┬──────┐
-│   pool_id (48 bits)  │ BH │ 颜色 (4 bits│LINKED│ PWQ  │INACTI│PENDIN│
-│   WORK_OFFQ_POOL     │bit │ WORK_STRUC  │bit 3 │bit 2 │ VE   │  G   │
-│   (bit 16-63)        │ 14 │ T_COLOR     │      │      │bit 1 │bit 0 │
-└──────────────────────┴────┴─────────────┴──────┴──────┴──────┴──────┴──────┘
+┌──────────────────────────┬─────────────┬──────┬──────┬──────┬──────┬──────┐
+│   pwq 指针 (52 bits)     │ 颜色 (4 bits│LINKED│ PWQ  │INACTI│PENDIN│
+│                         │ bit 4-7     │bit 3 │bit 2=1│ VE   │  G   │
+│                         │             │      │      │bit 1 │bit 0 │
+└──────────────────────────┴─────────────┴──────┴──────┴──────┴──────┴──────┘
+```
+
+**OFFQ 模式**（PWQ bit=0，工作已从队列移除但仍需追踪 pool 时）：
+```
+┌──────────────────┬────────────────┬──────┬──────┬──────┬──────┬──────┐
+│ pool_id (31 bits)│disable_depth(16│ BH   │LINKED│PWQ=0 │INACTI│PENDIN│
+│ bit 21-51        │ bits 5-20      │bit 4 │bit 3 │      │ VE   │  G   │
+│                  │                │      │      │      │bit 1 │bit 0 │
+└──────────────────┴────────────────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
 
 #### data 字段的两种状态
 
-当 `PWQ` 位为 0 时，`data` 编码池 ID + 标志：
-- 从 `data` 中通过 `WORK_OFFQ_POOL_SHIFT` 提取 pool_id
-- 用于工作已入队但未执行时定位所属 pool
+当 `PWQ` 位为 0（OFFQ 模式）时，`data` 编码池 ID + disable_depth + BH 标记：
+- 通过 `WORK_OFFQ_POOL_SHIFT` 从高位提取 pool_id
+- 用于工作已完成但仍在追踪时定位所属 pool
 
 当 `PWQ` 位为 1 时，`data` 直接指向 `pool_workqueue` 结构体：
-- 工作正在执行时，data 指向当前执行的 pwq
-- 用于跟踪哪个 pwq 正在执行此工作
+- 工作正在执行或已入队时，data 编码 pwq 指针
+- 低位编码颜色 + 标志，高位编码指针地址
 
 ### 1.2 `struct worker_pool`——线程池（`workqueue.c:195`）
 
 ```c
 // kernel/workqueue.c:195 — doom-lsp 确认
 struct worker_pool {
-    spinlock_t          lock;            // 保护池操作的自旋锁
+    raw_spinlock_t      lock;            // 保护池操作的原始自旋锁
     int                 cpu;             // CPU ID（per-CPU 池使用）
     int                 node;            // NUMA 节点
     int                 id;              // 池 ID
@@ -151,12 +163,19 @@ CREATED → IDLE（空闲，等待工作）
 struct pool_workqueue {
     struct worker_pool  *pool;          // 关联的 worker_pool
     struct workqueue_struct *wq;        // 关联的 workqueue
-    int                 nr_active;      // 活跃工作数
-    int                 max_active;     // 最大活跃工作数（限流）
-    struct list_head    inactive_works; // 非活跃工作链表（被 max_active 限流的）
-    struct list_head    pwqs_node;      // 链入 wq->pwqs
-    unsigned int        refcnt;         // 引用计数
-    // ...
+    int                 work_color;     // L: 当前颜色
+    int                 flush_color;    // L: flush 颜色
+    int                 refcnt;         // L: 引用计数
+    int                 nr_in_flight[WORK_NR_COLORS]; // L: 各颜色飞行中工作数
+    bool                plugged;        // L: 执行暂停
+    int                 nr_active;      // L: 活跃工作数
+    struct list_head    inactive_works; // L: 非活跃工作链表（被 max_active 限流的）
+    struct list_head    pending_node;   // LN: wq_node_nr_active->pending_pwqs 节点
+    struct list_head    pwqs_node;      // WR: 链入 wq->pwqs
+    struct list_head    mayday_node;    // MD: 链入 wq->maydays
+    struct work_struct  mayday_cursor;  // L: pool->worklist 游标
+    u64                 stats[PWQ_NR_STATS];
+    // ... (注：max_active 属于 workqueue_struct，不在 pwq 中)
 };
 ```
 

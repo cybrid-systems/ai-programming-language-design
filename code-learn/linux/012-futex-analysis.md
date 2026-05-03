@@ -39,15 +39,17 @@ struct futex_q {
     struct plist_node list;          // 按优先级排序的链表节点
     struct task_struct *task;        // 等待的任务
     spinlock_t *lock_ptr;            // 指向 hash bucket 的锁
+    futex_wake_fn *wake;             // 自定义唤醒函数（用于 requeue PI）
+    void *wake_data;                 // wake 回调的上下文数据
     union futex_key key;             // 标识唯一 futex
     struct futex_pi_state *pi_state; // PI-futex 状态
     struct rt_mutex_waiter *rt_waiter; // rt_mutex 等待者
-    union {
-        struct hrtimer_sleeper *requeue_pi_key; // requeue 用
-        struct rcuwait *rcu;         // RT 内核用
-    };
+    union futex_key *requeue_pi_key; // requeue 用的 key 指针
     u32 bitset;                      // bitset（FUTEX_WAIT_BITSET）
-};
+    atomic_t requeue_state;          // requeue 状态机
+    bool drop_hb_ref;                // 是否释放 hash bucket 引用
+    struct rcuwait requeue_wait;     // RT 内核 requeue 等待（仅 PREEMPT_RT）
+} __randomize_layout;
 ```
 
 ---
@@ -396,9 +398,11 @@ futex 在内核中使用全局哈希表来管理等待队列：
 ```c
 // kernel/futex/core.c — 全局哈希表
 struct futex_hash_bucket {
-    spinlock_t     lock;
-    struct plist_head chain;    // 优先级链表
-};
+    atomic_t        waiters;    // 等待者计数
+    spinlock_t      lock;       // 保护 chain 的自旋锁
+    struct plist_head chain;    // 优先级排序的等待队列
+    struct futex_private_hash *priv; // 私有哈希映射
+} ____cacheline_aligned_in_smp;
 
 static struct {
     struct futex_hash_bucket *queues;

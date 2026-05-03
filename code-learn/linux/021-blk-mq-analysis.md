@@ -23,7 +23,7 @@ blk-mq 的解决方案：
 → IOPS 随核数线性扩展
 ```
 
-**doom-lsp 确认**：`include/linux/blk-mq.h` 包含 **323 个符号**。核心实现在 `block/blk-mq.c`（3159 行）。关键函数：`blk_mq_submit_bio` @ L3141，`blk_mq_complete_request` @ L1353，`blk_mq_get_tag`。
+**doom-lsp 确认**：`include/linux/blk-mq.h` 包含 **323 个符号**。核心实现在 `block/blk-mq.c`（5330 行）。关键函数：`blk_mq_submit_bio` @ L3141，`blk_mq_complete_request` @ L1353，`blk_mq_get_tag`。
 
 ---
 

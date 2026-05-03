@@ -16,7 +16,7 @@
 
 **关键观察**：`fork()` 的主要开销不在 `copy_page_range` 本身（复制页表是 O(页面数) 的线性操作），而在后续的 COW 缺页处理。这也是为什么 `vfork()`（不复制地址空间）比 `fork()` 快几个数量级。
 
-**doom-lsp 确认**：`copy_page_range` @ `mm/memory.c:1490`，`copy_pte_range` @ L1208，`copy_pmd_range` @ L1363，`copy_pud_range` @ L1400，`copy_p4d_range` @ L1436。
+**doom-lsp 确认**：`copy_page_range` @ `mm/memory.c:1491`，`copy_pte_range` @ L1208，`copy_pmd_range` @ L1363，`copy_pud_range` @ L1400，`copy_p4d_range` @ L1437。
 
 ---
 
@@ -59,7 +59,7 @@ fork() → kernel_clone()
 ## 2. 🔥 copy_page_range——主入口
 
 ```c
-// mm/memory.c:1490 — doom-lsp 确认
+// mm/memory.c:1491 — doom-lsp 确认
 int copy_page_range(struct vm_area_struct *dst_vma,
                      struct vm_area_struct *src_vma)
 {
@@ -177,7 +177,7 @@ out:
 ### 3.1 copy_p4d_range
 
 ```c
-// mm/memory.c:1436 — doom-lsp 确认
+// mm/memory.c:1437 — doom-lsp 确认
 static int copy_p4d_range(struct vm_area_struct *dst_vma,
                            struct vm_area_struct *src_vma,
                            p4d_t *dst_p4d, p4d_t *src_p4d,
@@ -441,28 +441,33 @@ fork()+exec 的程序（如 Shell 执行外部命令）：
 ## 6. vma_needs_copy——复制决策
 
 ```c
-// mm/memory.c 附近
-static inline bool vma_needs_copy(struct vm_area_struct *dst_vma,
-                                   struct vm_area_struct *src_vma)
+// mm/memory.c:1466 — doom-lsp 确认
+static bool
+vma_needs_copy(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
 {
-    // 只有私有可写映射（MAP_PRIVATE | PROT_WRITE）需要 COW 复制
-    // 共享映射的页表直接共享，不需要复制
-    // 只读私有映射不需要修改，页表可以直接共享
-    return (src_vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+    if (dst_vma->vm_flags & VM_COPY_ON_FORK)
+        return true;
+    if (src_vma->anon_vma)
+        return true;
+    return false;
 }
 ```
 
+**决策逻辑**：
+1. `dst_vma->vm_flags & VM_COPY_ON_FORK` → 必须复制（userfaultfd 等场景）
+2. `src_vma->anon_vma` 存在 → 匿名映射已有页表，必须复制
+3. 否则 → 延迟页表分配（缺页时自动建立），不需要复制
+
 **完整决策矩阵**：
 
-| VMA 类型 | example | vm_flags | 需要复制？| 原因 |
-|----------|---------|----------|----------|------|
-| 私有可写 | 匿名页（mmap PRIVATE\|RW）| VM_MAYWRITE | ✅ | COW |
-| 私有只读 | 共享库的代码段 | 无 VM_MAYWRITE | ❌ | 只读安全共享 |
-| 共享可写 | MAP_SHARED\|RW | VM_SHARED | ❌ | 文件写直达 |
-| 共享只读 | MAP_SHARED\|RO | VM_SHARED | ❌ | 只读安全 |
-
----
-
+| VMA 类型 | 特征 | 需要复制？| 原因 |
+|----------|------|----------|------|
+| 匿名私有（已写入）| 有 anon_vma | ✅ | 页表已存在，不能靠缺页重建 |
+| 匿名私有（未写入）| 无 anon_vma | ❌ | 缺页时自动建立 |
+| 文件共享 | MAP_SHARED | ❌ | 缺页时从 page cache 读取 |
+| 文件私有只读 | MAP_PRIVATE\|RO | ❌ | 缺页时填充 |
+| 文件私有可写（已 COW）| 有 anon_vma | ✅ | 已创建匿名副本 |
+| VM_COPY_ON_FORK | VM_UFFD_WP 等 | ✅ | 用户明确要求 |
 ## 7. copy_hugetlb_page_range——大页复制
 
 当 VMA 是 hugetlb 映射时，使用专门的复制函数：
@@ -500,8 +505,8 @@ int copy_hugetlb_page_range(struct mm_struct *dst, struct mm_struct *src,
 
 | 函数 | 行号 | 文件 |
 |------|------|------|
-| `copy_page_range` | 1490 | mm/memory.c |
-| `copy_p4d_range` | 1436 | mm/memory.c |
+| `copy_page_range` | 1491 | mm/memory.c |
+| `copy_p4d_range` | 1437 | mm/memory.c |
 | `copy_pud_range` | 1400 | mm/memory.c |
 | `copy_pmd_range` | 1363 | mm/memory.c |
 | `copy_pte_range` | 1208 | mm/memory.c |

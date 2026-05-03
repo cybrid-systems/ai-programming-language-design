@@ -77,13 +77,15 @@ struct free_area {
 };
 ```
 
-**MAX_ORDER** 定义了 buddy 系统的阶数上限：
+**MAX_PAGE_ORDER** 定义了 buddy 系统的阶数上限（Linux 7.x 中 replaced `MAX_ORDER`）：
 
 ```c
-#define MAX_ORDER    11   // 最大 2^10 = 1024 页 = 4MB（4KB 页）
-// order:  0      1      2      3      ...    9       10
-// 页数:   1      2      4      8      ...    512     1024
-// 大小:   4KB    8KB    16KB   32KB   ...    2MB     4MB
+// include/linux/mmzone.h
+#define MAX_PAGE_ORDER  10       // 默认值（受 CONFIG_ARCH_FORCE_MAX_ORDER 影响）
+#define MAX_ORDER_NR_PAGES (1 << MAX_PAGE_ORDER)
+// order:  0      1      2      3      ...    8       9      10
+// 页数:   1      2      4      8      ...    256     512    1024
+// 大小:   4KB    8KB    16KB   32KB   ...    1MB     2MB     4MB
 ```
 
 ### 1.3 `struct page`——物理页描述符
@@ -483,7 +485,7 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 | 函数 | 行号 | 文件 |
 |------|------|------|
 | `__alloc_pages_noprof` | 声明@229 | include/linux/gfp.h |
-| `__free_pages_ok` | 208 | mm/page_alloc.c |
+| `__free_pages_ok` | 声明@208, 定义@1577 | mm/page_alloc.c |
 | `rmqueue` | — | mm/page_alloc.c |
 | `__rmqueue_smallest` | — | mm/page_alloc.c |
 | `expand` | — | mm/page_alloc.c |

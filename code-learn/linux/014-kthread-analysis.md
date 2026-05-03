@@ -24,19 +24,20 @@
 ```c
 // kernel/kthread.c:56 — doom-lsp 确认
 struct kthread {
-    unsigned long flags;                     // KTHREAD_SHOULD_STOP (bit 0),
-                                             // KTHREAD_IS_STOPPED (bit 1),
-                                             // KTHREAD_SHOULD_PARK (bit 2),
-                                             // KTHREAD_IS_PARKED (bit 3)
+    unsigned long flags;                     // 标志位：KTHREAD_IS_PER_CPU (bit 0),
+                                             // KTHREAD_SHOULD_STOP (bit 1),
+                                             // KTHREAD_SHOULD_PARK (bit 2)
     unsigned int cpu;                        // 绑定的 CPU
+    unsigned int node;                       // NUMA 节点
+    int started;                             // 已启动标志
+    int result;                              // 线程函数的返回值
     int (*threadfn)(void *data);             // 线程函数（仅 kthread_create 创建时用）
     void *data;                              // 线程函数参数
     struct completion parked;                // kthread_parkme 等待完成
     struct completion exited;                // 线程退出通知（kthread_stop 等待）
-    int result;                              // 线程函数的返回值
     char *full_name;                         // 完整线程名（如 "kworker/0:0"）
-    struct io_callback *io_cb;               // IO 回调
-    unsigned int started;                    // 已启动标志
+    struct task_struct *task;                // 指向自身的 task_struct
+    struct list_head affinity_node;          // 亲和性链表节点
     struct cpumask *preferred_affinity;      // 优先 CPU 亲和性
 };
 ```
@@ -48,15 +49,24 @@ struct kthread {
 bool set_kthread_struct(struct task_struct *p)
 {
     struct kthread *kthread;
-    kthread = kzalloc(sizeof(*kthread), GFP_KERNEL);
+
+    kthread = kzalloc_obj(*kthread);
     if (!kthread)
         return false;
-    p->set_child_tid = (int __user *)kthread;  // 复用 set_child_tid！
+
+    init_completion(&kthread->exited);
+    init_completion(&kthread->parked);
+    INIT_LIST_HEAD(&kthread->affinity_node);
+    p->vfork_done = &kthread->exited;
+
+    kthread->task = p;
+    kthread->node = tsk_fork_get_node(current);
+    p->worker_private = kthread;  // 复用 worker_private 字段！
     return true;
 }
 ```
 
-`set_child_tid` 原本用于用户空间线程库（NPTL）的 `set_tid_address` 系统调用。内核线程不需要用户空间地址，所以内核复用了这个指针来关联 `struct kthread`，没有增加 `task_struct` 的大小。
+`worker_private` 是 `task_struct` 中的通用私有指针字段。内核线程不需要用户空间 `set_child_tid`，因此复用了该字段关联 `struct kthread`（通过 `worker_private` 别名），没有增加 `task_struct` 的大小。`vfork_done` 设置为 `&kthread->exited`，线程退出时通过 `do_exit()` → `exit_mm()` → `mm_release()` → `complete_vfork_done()` 链路自动 complete 该 completion。
 
 ### 1.2 `struct kthread_create_info`——创建请求（`kthread.c:41`）
 
@@ -330,12 +340,18 @@ int kthread_stop(struct task_struct *k)
         return -EINVAL;
 
     // 设置停止标志
-    set_bit(KTHREAD_IS_STOPPED, &kthread->flags);
+    set_bit(KTHREAD_SHOULD_STOP, &kthread->flags);
 
-    // 唤醒线程（处理 TASK_INTERRUPTIBLE 等情况）
+    // 先 unpark（如果线程被 park，需要先恢复）
+    kthread_unpark(k);
+
+    // 设置 notify signal 并唤醒线程
+    set_tsk_thread_flag(k, TIF_NOTIFY_SIGNAL);
     wake_up_process(k);
 
     // 等待线程完全退出
+    // 线程调用 do_exit() → exit_mm() → complete_vfork_done()
+    // → 自动 complete(&kthread->exited)
     wait_for_completion(&kthread->exited);
 
     return kthread->result;
@@ -395,13 +411,16 @@ int kthread_park(struct task_struct *k)
 {
     struct kthread *kthread = to_kthread(k);
 
-    // 已暂停 → 避免重复
-    if (test_bit(KTHREAD_IS_PARKED, &kthread->flags))
+    if (WARN_ON(k->flags & PF_EXITING))
+        return -ENOSYS;
+
+    // 已设置 SHOULD_PARK → 避免重复
+    if (WARN_ON_ONCE(test_bit(KTHREAD_SHOULD_PARK, &kthread->flags)))
         return -EBUSY;
 
     // 设置 SHOULD_PARK 标志
     set_bit(KTHREAD_SHOULD_PARK, &kthread->flags);
-    if (!test_bit(KTHREAD_IS_PARKED, &kthread->flags)) {
+    if (k != current) {
         wake_up_process(k);           // 唤醒线程
         wait_for_completion(&kthread->parked);  // 等待确认暂停
     }
@@ -413,11 +432,17 @@ void kthread_unpark(struct task_struct *k)
 {
     struct kthread *kthread = to_kthread(k);
 
+    // 如果未设置 SHOULD_PARK，直接返回
+    if (!test_bit(KTHREAD_SHOULD_PARK, &kthread->flags))
+        return;
+
+    // 新创建的 kthread 在 CPU 下线时被 park，恢复绑定
+    if (test_bit(KTHREAD_IS_PER_CPU, &kthread->flags))
+        __kthread_bind(k, kthread->cpu, TASK_PARKED);
+
     clear_bit(KTHREAD_SHOULD_PARK, &kthread->flags);
-    if (test_bit(KTHREAD_IS_PARKED, &kthread->flags)) {
-        clear_bit(KTHREAD_IS_PARKED, &kthread->flags);
-        wake_up_process(k);           // 恢复运行
-    }
+    // __kthread_parkme() 会看到 SHOULD_PARK 被清除，或者收到 wakeup
+    wake_up_state(k, TASK_PARKED);
 }
 ```
 
@@ -428,11 +453,15 @@ void kthread_unpark(struct task_struct *k)
 static void __kthread_parkme(struct kthread *self)
 {
     for (;;) {
-        set_current_state(TASK_UNINTERRUPTIBLE);
+        // TASK_PARKED 是特殊状态，防止 store-store 冲突
+        set_special_state(TASK_PARKED);
         if (!test_bit(KTHREAD_SHOULD_PARK, &self->flags))
             break;
-        complete(&self->parked);       // ← 通知 parker：我已暂停
-        schedule();                    // ← 休眠直到 unpark
+        // 通知 parker：我已暂停
+        preempt_disable();
+        complete(&self->parked);
+        schedule_preempt_disabled();   // 休眠直到 unpark
+        preempt_enable();
     }
     __set_current_state(TASK_RUNNING);
 }
@@ -462,10 +491,19 @@ CPU N 下线流程（kernel/cpu.c）：
 // kthread.c:294 — doom-lsp 确认
 void kthread_do_exit(struct kthread *kthread, long result)
 {
+    // 保存返回值，清理亲和性关联
     kthread->result = result;
-    complete(&kthread->exited);      // 通知 kthread_stop
-    do_exit(result);                  // 真正退出
-}
+    // 从 affinity 链表摘除
+    if (!list_empty(&kthread->affinity_node)) {
+        mutex_lock(&kthread_affinity_lock);
+        list_del(&kthread->affinity_node);
+        mutex_unlock(&kthread_affinity_lock);
+        kfree(kthread->preferred_affinity);
+        kthread->preferred_affinity = NULL;
+    }
+} // 注意：complete(&kthread->exited) 并非在此处调用。
+  // do_exit() → exit_mm() → mm_release() → complete_vfork_done()
+  // 链路会通过 p->vfork_done 自动完成 exited notification
 
 // kthread.c:321 — doom-lsp 确认
 void __noreturn kthread_complete_and_exit(struct completion *comp, long code)

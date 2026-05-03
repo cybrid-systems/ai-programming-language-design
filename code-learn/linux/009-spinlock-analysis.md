@@ -76,7 +76,7 @@ DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes) = {
 // include/asm-generic/qspinlock.h:107 — doom-lsp 确认
 static __always_inline void queued_spin_lock(struct qspinlock *lock)
 {
-    u32 val = 0;
+    int val = 0;
 
     // 快速路径：尝试 cmpxchg(0 → _Q_LOCKED_VAL)
     if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
@@ -410,14 +410,14 @@ cat /proc/lock_stat
 // include/asm-generic/qspinlock.h:90 — doom-lsp 确认
 static __always_inline int queued_spin_trylock(struct qspinlock *lock)
 {
-    u32 val = atomic_read(&lock->val);
+    int val = atomic_read(&lock->val);
 
-    // 只有 locked=0 且 pending=0 且 tail=0 时才能获取
-    if ((val & ~_Q_LOCKED_MASK) == 0 &&
-        !atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))
-        return 0;  // 竞争失败
+    // 快速检查：只要有任何非零值（locked/pending/tail），锁不可用
+    if (unlikely(val))
+        return 0;  // 被持有或有等待者
 
-    return 1;  // 获取成功
+    // 只有 val==0 时尝试 cmpxchg
+    return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
 }
 ```
 

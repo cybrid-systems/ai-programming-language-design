@@ -9,7 +9,7 @@
 
 **VMA（Virtual Memory Area）** 是进程地址空间的描述单元。内核使用 `struct vm_area_struct` 描述一段连续的虚拟地址区间 `[vm_start, vm_end)`，包含这段地址的权限（读/写/执行）、映射类型（匿名/文件/共享/私有）、后备存储（文件路径或匿名页）等全部信息。
 
-每个进程的地址空间由多个 VMA 组成，通过红黑树（O(log n) 查找）和链表（O(1) 遍历）双重组织。`/proc/pid/maps` 中每一行对应一个 VMA：
+每个进程的地址空间由多个 VMA 组成，通过 Maple Tree（O(log n) 查找）组织。`/proc/pid/maps` 中每一行对应一个 VMA：
 
 ```
 00400000-00452000 r-xp 00000000 08:01 123456  /bin/bash   ← 代码段 (text)
@@ -19,7 +19,7 @@
 7fff12340000-7fff12351000 rw-p 00000000 00:00 0          [stack]
 ```
 
-**doom-lsp 确认**：`struct vm_area_struct` 定义在 `include/linux/mm_types.h:932`。VMA 操作实现在 `mm/mmap.c`（查找/创建/合并/分割）和 `mm/vma.c`（per-VMA 锁）。
+**doom-lsp 确认**：`struct vm_area_struct` 定义在 `include/linux/mm_types.h:932`。VMA 操作实现在 `mm/vma.c`（创建/合并/分割/per-VMA 锁）和 `mm/mmap.c`（查找）。
 
 ---
 
@@ -60,72 +60,100 @@ struct vm_area_struct {
 
     void *vm_private_data;                         // 文件系统私有数据
 
-    // ========== 树/链表节点 ==========
-    struct rb_node vm_rb;                          // 红黑树节点
-    struct list_head vm_list;                      // 链表节点（与 rb 同序）
-    struct list_head vma_link;                     // 文件映射链
-
     // ========== 条件编译 ==========
-    struct mempolicy *vm_policy;                   // NUMA 策略
-    struct vma_numab_state *numab_state;           // NUMA 均衡状态
+#ifdef CONFIG_SWAP
     atomic_long_t swap_readahead_info;             // 交换预读
+#endif
+#ifdef CONFIG_NUMA
+    struct mempolicy *vm_policy;                   // NUMA 策略
+#endif
+#ifdef CONFIG_NUMA_BALANCING
+    struct vma_numab_state *numab_state;           // NUMA 均衡状态
+#endif
 };
 ```
 
 ### 1.1 vm_flags——完整的权限与特性标志
 
+内核 7.x 使用基于 enum 位号的 VMA 标志系统：
+
 ```c
-// include/linux/mm.h
-#define VM_NONE       0x00000000
+// include/linux/mm.h — 枚举位号定义（通过 BIT() 宏转为实际值）
+enum {
+    VMA_READ_BIT = 0,              // 可读
+    VMA_WRITE_BIT = 1,             // 可写
+    VMA_EXEC_BIT = 2,              // 可执行
+    VMA_SHARED_BIT = 3,            // MAP_SHARED（多个进程共享物理页）
+    VMA_MAYREAD_BIT = 4,           // 将来可读
+    VMA_MAYWRITE_BIT = 5,          // 将来可写
+    VMA_MAYEXEC_BIT = 6,           // 将来可执行
+    VMA_MAYSHARE_BIT = 7,          // 将来可共享
+    VMA_GROWSDOWN_BIT = 8,         // 可向下增长（栈）
+    VMA_UFFD_MISSING_BIT = 9,      // userfaultfd 监听缺页
+    VMA_PFNMAP_BIT = 10,           // PFN 映射（非 struct page 管理）
+    VMA_MAYBE_GUARD_BIT = 11,
+    VMA_UFFD_WP_BIT = 12,          // userfaultfd 写保护
+    VMA_LOCKED_BIT = 13,           // mlock 锁定（不可换出）
+    VMA_IO_BIT = 14,               // IO 映射（PCI BAR 等）
+    VMA_SEQ_READ_BIT = 15,         // 顺序读（打开预读）
+    VMA_RAND_READ_BIT = 16,        // 随机读（关闭预读）
+    VMA_DONTCOPY_BIT = 17,         // fork 时不复制
+    VMA_DONTEXPAND_BIT = 18,       // 不可扩展（mremap）
+    VMA_LOCKONFAULT_BIT = 19,
+    VMA_ACCOUNT_BIT = 20,          // 计入 RLIMIT_AS 限额
+    VMA_NORESERVE_BIT = 21,        // 不预留交换空间
+    VMA_HUGETLB_BIT = 22,          // 大页（HugeTLB）
+    VMA_SYNC_BIT = 23,             // 同步写（DAX）
+    VMA_ARCH_1_BIT = 24,           // 架构特定（x86: PAT）
+    VMA_WIPEONFORK_BIT = 25,       // fork 时清空内容（安全）
+    VMA_DONTDUMP_BIT = 26,
+    VMA_SOFTDIRTY_BIT = 27,        // 页被写入过（CRIU 检测用）
+    // ... 更多标志位
+};
 
-// 基本权限（4 位）：
-#define VM_READ       0x00000001  // 可读
-#define VM_WRITE      0x00000002  // 可写
-#define VM_EXEC       0x00000004  // 可执行
-#define VM_SHARED     0x00000008  // MAP_SHARED（多个进程共享物理页）
+// 使用 INIT_VM_FLAG(NAME) 宏（实际 = BIT(VMA_NAME_BIT)）：
+#define VM_READ         INIT_VM_FLAG(READ)        // BIT(0)
+#define VM_WRITE        INIT_VM_FLAG(WRITE)       // BIT(1)
+#define VM_EXEC         INIT_VM_FLAG(EXEC)        // BIT(2)
+#define VM_SHARED       INIT_VM_FLAG(SHARED)      // BIT(3)
+#define VM_MAYREAD      INIT_VM_FLAG(MAYREAD)     // BIT(4)
+#define VM_MAYWRITE     INIT_VM_FLAG(MAYWRITE)    // BIT(5)
+#define VM_MAYEXEC      INIT_VM_FLAG(MAYEXEC)     // BIT(6)
+#define VM_MAYSHARE     INIT_VM_FLAG(MAYSHARE)    // BIT(7)
+#define VM_GROWSDOWN    INIT_VM_FLAG(GROWSDOWN)   // BIT(8)
+#define VM_PFNMAP       INIT_VM_FLAG(PFNMAP)      // BIT(10)
+#define VM_UFFD_WP      INIT_VM_FLAG(UFFD_WP)     // BIT(12)
+#define VM_LOCKED       INIT_VM_FLAG(LOCKED)      // BIT(13)
+#define VM_IO           INIT_VM_FLAG(IO)          // BIT(14)
+#define VM_SEQ_READ     INIT_VM_FLAG(SEQ_READ)    // BIT(15)
+#define VM_RAND_READ    INIT_VM_FLAG(RAND_READ)   // BIT(16)
+#define VM_DONTCOPY     INIT_VM_FLAG(DONTCOPY)    // BIT(17)
+#define VM_DONTEXPAND   INIT_VM_FLAG(DONTEXPAND)  // BIT(18)
+#define VM_ACCOUNT      INIT_VM_FLAG(ACCOUNT)     // BIT(20)
+#define VM_NORESERVE    INIT_VM_FLAG(NORESERVE)   // BIT(21)
+#define VM_HUGETLB      INIT_VM_FLAG(HUGETLB)     // BIT(22)
+#define VM_SYNC         INIT_VM_FLAG(SYNC)        // BIT(23)
+#define VM_ARCH_1       INIT_VM_FLAG(ARCH_1)      // BIT(24)
+#define VM_WIPEONFORK   INIT_VM_FLAG(WIPEONFORK)  // BIT(25)
+#define VM_SOFTDIRTY    INIT_VM_FLAG(SOFTDIRTY)   // BIT(27)
+#define VM_DENYWRITE     VM_NONE                  // 已废弃
+#define VM_GROWSUP      INIT_VM_FLAG(GROWSUP)     // 架构别名（parisc: BIT(24) 别名）
+#define VM_UFFD_MISSING INIT_VM_FLAG(UFFD_MISSING) // BIT(9)
+#define VM_UFFD_MINOR   INIT_VM_FLAG(UFFD_MINOR)  // BIT(41)
+```
 
-// 未来可能的权限（4 位）：
-#define VM_MAYREAD    0x00000010  // 将来可读
-#define VM_MAYWRITE   0x00000020  // 将来可写
-#define VM_MAYEXEC    0x00000040  // 将来可执行
-#define VM_MAYSHARE   0x00000080  // 将来可共享
-
-// 特殊类型（20+ 位）：
-#define VM_GROWSDOWN  0x00000100  // 可向下增长（栈）
-#define VM_GROWSUP    0x00000200  // 可向上增长
-#define VM_SOFTDIRTY  0x00000400  // 页被写入过（CRIU 检测用）
-#define VM_PFNMAP     0x00000800  // PFN 映射（非 struct page 管理）
-#define VM_DENYWRITE  0x00001000  // 拒绝写入对应文件
-#define VM_UFFD_MISSING 0x00002000 // userfaultfd 监听缺页
-#define VM_UFFD_WP    0x00004000  // userfaultfd 写保护
-#define VM_UFFD_MINOR 0x00008000  // userfaultfd 次级缺页
-
-// 物理内存行为（8 位）：
-#define VM_IO         0x00100000  // IO 映射（PCI BAR 等）
-#define VM_SEQ_READ   0x00200000  // 顺序读（打开预读）
-#define VM_RAND_READ  0x00400000  // 随机读（关闭预读）
-#define VM_DONTCOPY   0x00800000  // fork 时不复制
-#define VM_DONTEXPAND 0x01000000  // 不可扩展（mremap）
-#define VM_LOCKED     0x02000000  // mlock 锁定（不可换出）
-#define VM_ACCOUNT    0x04000000  // 计入 RLIMIT_AS 限额
-#define VM_NORESERVE  0x08000000  // 不预留交换空间
-
-// 高级特性（4 位）：
-#define VM_HUGETLB    0x10000000  // 大页（HugeTLB）
-#define VM_SYNC       0x20000000  // 同步写（DAX）
-#define VM_ARCH_1     0x40000000  // 架构特定（x86: PAT）
-#define VM_WIPEONFORK 0x80000000  // fork 时清空内容（安全）
+> **注意**：Linux 7.x 内核已从旧的十六进制常量迁移到基于枚举位号的 `INIT_VM_FLAG()` 宏。`VM_NONE=0x00000000` 保留不变，其余值的数字位序已重新排列。
 ```
 
 ---
 
-## 2. VMA 的组织——红黑树 + 链表 + 缓存
+## 2. VMA 的组织——Maple Tree
 
 ```c
 struct mm_struct {
-    struct rb_root mm_rb;                // 红黑树根（按 vm_start 排序）
-    struct vm_area_struct *mmap;         // 链表头（遍历用）
-    struct rb_node *mm_rb_cached;        // 上次查找的缓存
+    struct maple_tree mm_mt;             // Maple Tree 根（按 vm_start 排序）
+    // ...
+    // ...
     unsigned long mmap_base;             // mmap 布局基址
     unsigned long task_size;             // 用户地址空间大小
     // ...
@@ -136,13 +164,13 @@ struct mm_struct {
 
 | 结构 | 访问方式 | 复杂度 | 用途 |
 |------|---------|--------|------|
-| 红黑树 | `find_vma(addr)` | O(log n) | 精确查找 VMA |
-| 链表 | `vma->vm_list` | O(n) | 遍历所有 VMA |
-| 缓存 | `mm_rb_cached` | O(1) | 上次查找的结果缓存（顺序访问性能提升 10 倍）|
+| Maple Tree | `mt_find(&mm->mm_mt, &index, ULONG_MAX)` | O(log n) | 精确查找 VMA |
+| VMA Iterator | `vma_iter_xxx()` 宏 | O(1)~O(log n) | 顺序/范围遍历 |
+| `mm->map_count` | 计数 | O(1) | VMA 数量查询 |
 
 ---
 
-## 3. 🔥 find_vma——VMA 查找数据流
+## 3. 🔥 find_vma——VMA 查找（Maple Tree）
 
 ```c
 // mm/mmap.c — VMA 查找核心
@@ -158,7 +186,7 @@ struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
     if (cached && cached->vm_start <= addr && cached->vm_end > addr)
         return cached;  // 缓存命中！
 
-    // ——— 阶段 2：红黑树查找 ———
+    // ——— 阶段 2：Maple Tree查找 ———
     vma = NULL;
     rb_node = mm->mm_rb.rb_node;  // 从根开始
 
@@ -186,7 +214,7 @@ struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 **查找示例**：
 
 ```
-地址空间 VMA 布局（红黑树结构）：
+地址空间 VMA 布局（Maple Tree结构）：
 
         VMA_B [0x4000-0x5000]
        /                   \
@@ -214,7 +242,7 @@ VMA_A [0x1000-0x2000]    VMA_C [0x7000-0x8000]
 当新的映射紧邻现有 VMA 且权限一致时，内核自动合并以减少 VMA 数量：
 
 ```c
-// mm/mmap.c — VMA 合并
+// mm/vma.c — VMA 合并
 struct vm_area_struct *vma_merge(struct vma_iterator *vmi,
                                   struct mm_struct *mm,
                                   unsigned long addr, unsigned long end,
@@ -294,11 +322,11 @@ vma_mark_detached(vma)
 | `find_vma(mm, addr)` | mm/mmap.c | 查找包含 addr 或之后第一个 VMA | O(log n) |
 | `find_vma_prev(mm, addr, pprev)` | mm/mmap.c | 查找 VMA + 前一个 | O(log n) |
 | `find_vma_intersection(mm, start, end)` | mm/mmap.c | 查找区间内的 VMA | O(log n) |
-| `insert_vm_struct(mm, vma)` | mm/mmap.c | 插入新 VMA 到红黑树 | O(log n) |
-| `vma_merge(mm, ...)` | mm/mmap.c | 尝试合并紧邻 VMA | O(log n) |
-| `split_vma(mm, vma, addr, new_below)` | mm/mmap.c | 在 addr 处分割 VMA | O(log n) |
-| `remove_vma(vma)` | mm/mmap.c | 删除 VMA（munmap 时） | O(log n) |
-| `vma_link(mm, vma)` | mm/mmap.c | 链接到反向映射 | O(log n) |
+| `insert_vm_struct(mm, vma)` | mm/vma.c | 插入新 VMA 到 Maple Tree | O(log n) |
+| `vma_merge_new_range(vmg)` | mm/vma.c | 尝试合并紧邻 VMA | O(log n) |
+| `__split_vma(vmi, vma, addr, new_below)` | mm/vma.c | 在 addr 处分割 VMA | O(log n) |
+| `remove_vma(vma)` | mm/vma.c | 删除 VMA（munmap 时） | O(1) |
+| `vma_link(mm, vma)` | mm/vma.c | 链接到反向映射 | O(log n) |
 
 ---
 
@@ -309,7 +337,7 @@ vma_mark_detached(vma)
   │
   ├─ mmap_region(file, addr, len, flags, ...)
   │   │
-  │   ├─ find_vma_links(mm, addr, end, ...)   ← 查找红黑树插入位置
+  │   ├─ find_vma_links(mm, addr, end, ...)   ← 查找Maple Tree插入位置
   │   │
   │   ├─ vma_merge(mm, prev, addr, end, ...)   ← 尝试合并
   │   │   └─ 如果合并成功 → 不需要新 VMA
@@ -324,9 +352,9 @@ vma_mark_detached(vma)
   │   │   vma->vm_ops = file->f_op->mmap(...)
   │   │       → ext4_mmap: 设置 vm_ops = &ext4_file_vm_ops
   │   │
-  │   ├─ vma_link(mm, vma)                      ← 插入红黑树 + 链表
+  │   ├─ vma_link(mm, vma)                      ← 插入Maple Tree + 链表
   │   │   └─ __vma_link(mm, vma)
-  │   │        ├─ __vma_link_rb(mm, vma)        ← 插入红黑树
+  │   │        ├─ __vma_link_mt(mm, vma)        ← 插入Maple Tree
   │   │        ├─ __vma_link_list(mm, vma)      ← 插入链表
   │   │        └─ __vma_link_file(vma)          ← 插入文件的 i_mmap
   │   │
@@ -341,7 +369,7 @@ vma_mark_detached(vma)
   └─ 销毁（munmap, exit）：
       │
       ├─ do_munmap(mm, addr, len)
-      │   ├─ detach_vmas(mm, ...)               ← 从红黑树/链表分离
+      │   ├─ detach_vmas(mm, ...)               ← 从Maple Tree/链表分离
       │   ├─ unmap_region(mm, vma, ...)          ← 释放页表
       │   ├─ remove_vma_list(mm, vma)            ← 删除所有 VMA
       │   │   └─ remove_vma(vma)
@@ -415,7 +443,7 @@ static inline bool vma_is_accessible(struct vm_area_struct *vma)
 | `include/linux/mm.h` | `vm_flags` 定义 | — |
 | `mm/mmap.c` | `find_vma` | — |
 | `mm/mmap.c` | `vma_merge` | — |
-| `mm/mmap.c` | `insert_vm_struct` | — |
+| `mm/vma.c` | `insert_vm_struct` | 3296 |
 | `mm/vma.c` | `vma_start_read` / `vma_start_write` | — |
 | `mm/memory.c` | `handle_mm_fault` | — |
 
@@ -423,7 +451,7 @@ static inline bool vma_is_accessible(struct vm_area_struct *vma)
 
 ## 11. 关联文章
 
-- **03-rbtree**：VMA 的红黑树组织
+- **03-maple-tree**：VMA 的Maple Tree组织
 - **15-get_user_pages**：GUP 查找 VMA
 - **17-page_allocator**：缺页页面分配
 - **88-mmap**：mmap 系统调用和 VMA 创建
