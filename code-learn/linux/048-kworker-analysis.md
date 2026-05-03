@@ -1118,8 +1118,8 @@ nr_running ≥ 2 → 多余 worker 睡眠
 | `kernel/workqueue.c` | 349 | `struct workqueue_struct` |
 | `include/linux/workqueue_types.h` | 12 | `struct work_struct` |
 | `kernel/workqueue.c` | 950 | `need_more_worker()` |
-| `kernel/workqueue.c` | 955 | `may_start_working()` |
-| `kernel/workqueue.c` | 960 | `keep_working()` |
+| `kernel/workqueue.c` | 956 | `may_start_working()` |
+| `kernel/workqueue.c` | 962 | `keep_working()` |
 | `kernel/workqueue.c` | 968 | `need_to_create_worker()` |
 | `kernel/workqueue.c` | 1419 | `wq_worker_running()` |
 | `kernel/workqueue.c` | 1453 | `wq_worker_sleeping()` |
