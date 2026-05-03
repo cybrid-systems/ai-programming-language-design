@@ -27,21 +27,35 @@
 ## 2. 核心数据结构
 
 ```c
+// include/linux/cgroup-defs.h:474
 struct cgroup {
-    struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
+    struct cgroup_subsys_state self;       // self css with NULL ->ss
+    unsigned long flags;                   // CGRP_* 状态标志
+    int level;                             // 层次深度
+    struct kernfs_node *kn;                // sysfs 文件系统节点
+    struct cgroup_file procs_file;         // cgroup.procs 接口文件
+    struct cgroup_file events_file;        // cgroup.events 接口文件
+    struct cgroup_file psi_files[NR_PSI_RESOURCES]; // psi 压力指标文件
+    u32 subtree_control;                   // 子 cgroup 启用控制器
+    struct cgroup_subsys_state __rcu *subsys[CGROUP_SUBSYS_COUNT];
     struct cgroup_root *root;
-    struct kernfs_node *kn;          // sysfs 文件系统节点
-    unsigned long flags;             // CGRP_* 状态标志
-    struct list_head rstat_cpu_list;
-    struct cgroup_file files[];       // 接口文件列表
+    struct list_head cset_links;
+    struct list_head e_csets[CGROUP_SUBSYS_COUNT];
 };
 
+// include/linux/cgroup-defs.h:181
 struct cgroup_subsys_state {
-    struct cgroup *cgroup;           // 所属 cgroup
-    struct cgroup_subsys *ss;        // 所属子系统（控制器）
+    struct cgroup *cgroup;                // 所属 cgroup
+    struct cgroup_subsys *ss;             // 所属子系统（控制器）
     struct percpu_ref refcnt;
+    struct css_rstat_cpu __percpu *rstat_cpu; // per-CPU rstat 数据
+    struct list_head sibling;
+    struct list_head children;
+    int id;
+    unsigned int flags;
 };
 
+// include/linux/cgroup-defs.h:777
 struct cgroup_subsys {
     struct cgroup_subsys_state *(*css_alloc)(struct cgroup_subsys_state *);
     int (*css_online)(struct cgroup_subsys_state *);
@@ -50,7 +64,6 @@ struct cgroup_subsys {
     bool early_init;
     int id;
     const char *name;  // cpu, memory, io, pids, cpuset
-    struct list_head cftypes;  // 控制文件列表
 };
 ```
 
@@ -239,15 +252,15 @@ echo 1234 > /sys/fs/cgroup/my_cgroup/cgroup.procs
 cgroup v2 使用 per-CPU 统计避免锁竞争：
 
 ```c
-// kernel/cgroup/rstat.c
-void cgroup_rstat_updated(struct cgroup *cgrp, int cpu);
-// 标记某 CPU 的 cgroup 统计已更新
+// kernel/cgroup/rstat.c (Linux 7.0-rc1 改用 css 级别的 API)
+void css_rstat_updated(struct cgroup_subsys_state *css, int cpu);
+// 标记某 CPU 的 css 统计已更新（replaces cgroup_rstat_updated）
 
-void cgroup_rstat_flush(struct cgroup *cgrp);
-// 刷新所有 CPU 的统计到全局值
+void css_rstat_flush(struct cgroup_subsys_state *css);
+// 刷新所有 CPU 的统计到全局值（replaces cgroup_rstat_flush）
 
-void cgroup_rstat_flush_hold(struct cgroup *cgrp);
-// 带锁的刷新（遍历 cgroup 树）
+static void cgroup_base_stat_flush(struct cgroup *cgrp, int cpu);
+// 带锁的 flush（遍历 cgroup 树）
 ```
 
 **读取统计的流程**：
