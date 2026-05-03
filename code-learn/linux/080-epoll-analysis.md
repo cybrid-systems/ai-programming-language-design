@@ -30,7 +30,7 @@ epoll_wait → ep_send_events() 遍历 rdllist
            → ET（边缘触发）移除 → 下次有新事件才返回
 ```
 
-**doom-lsp 确认**：`fs/eventpoll.c`（**2,621 行**，**187 个符号**）。核心结构 `struct eventpoll`（`:172`）、`struct epitem`（`:113`）。
+**doom-lsp 确认**：`fs/eventpoll.c`（**2,621 行**，**187 个符号**）。核心结构 `struct eventpoll`（`:172`）、`struct epitem`（`:131`）。
 
 ---
 
@@ -58,7 +58,7 @@ struct eventpoll {
 };
 ```
 
-### 1.2 struct epitem @ :113——注册的 fd 条目
+### 1.2 struct epitem @ :131——注册的 fd 条目
 
 ```c
 struct epitem {
@@ -124,13 +124,13 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
     // 当目标 fd 有事件时 → wake_up → ep_poll_callback → 将 epi 移到 rdllist
 
     ep_ptable_queue_proc(&epq.pt, tfile, ...);
-    // → ep_poll_callback @ :1199 是事件就绪的核心回调
+    // → ep_poll_callback @ :1249 是事件就绪的核心回调
 }
 ```
 
 ---
 
-## 3. ep_poll_callback @ :1199——事件到达的核心回调
+## 3. ep_poll_callback @ :1249——事件到达的核心回调
 
 ```c
 // 当被监控的 fd 有事件时（如 socket 收到数据），
@@ -168,7 +168,7 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode,
 }
 ```
 
-**doom-lsp 确认**：`ep_poll_callback` @ `:1199`。这是 epoll 转分发机的核心——将文件描述符的通用 `wake_up` 事件转换为 epoll 的 `rdllist` 插入和 `epoll_wait` 唤醒。
+**doom-lsp 确认**：`ep_poll_callback` @ `:1249`。这是 epoll 转分发机的核心——将文件描述符的通用 `wake_up` 事件转换为 epoll 的 `rdllist` 插入和 `epoll_wait` 唤醒。
 
 ---
 
@@ -271,7 +271,7 @@ epoll 使用**两套数据结构**同时管理 fd：
 | 函数 | 行号 | 作用 |
 |------|------|------|
 | `ep_insert` | — | epoll_ctl(ADD) 主逻辑 |
-| `ep_poll_callback` | `:1199` | 事件到达回调（rdllist 插入+唤醒）|
+| `ep_poll_callback` | `:1249` | 事件到达回调（rdllist 插入+唤醒）|
 | `ep_poll` | — | epoll_wait 主逻辑 |
 | `ep_send_events` | — | 事件复制到用户空间 |
 | `ep_ptable_queue_proc` | — | poll 回调注册 |
@@ -281,7 +281,7 @@ epoll 使用**两套数据结构**同时管理 fd：
 
 ## 8. 总结
 
-epoll 通过**红黑树 + 就绪链表双结构**实现高性能 I/O 事件。`ep_poll_callback`（`:1199`）是核心分发点——它将目标 fd 的通用 `wake_up` 事件转换为 `rdllist` 插入和 `epoll_wait` 唤醒。`ovflist`（溢出链表）允许事件在消费期间无锁添加新就绪事件。
+epoll 通过**红黑树 + 就绪链表双结构**实现高性能 I/O 事件。`ep_poll_callback`（`:1249`）是核心分发点——它将目标 fd 的通用 `wake_up` 事件转换为 `rdllist` 插入和 `epoll_wait` 唤醒。`ovflist`（溢出链表）允许事件在消费期间无锁添加新就绪事件。
 
 **关键延迟**：
 - `ep_poll_callback` → rdllist 插入 + wake_up：**~200-500ns**

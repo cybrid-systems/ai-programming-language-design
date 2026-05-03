@@ -87,7 +87,7 @@ occupancy ≥ max_usage → 满
 
 ## 2. 管道读写
 
-### 2.1 pipe_read @ :273
+### 2.1 pipe_read @ :269
 
 ```c
 static ssize_t pipe_read(struct kiocb *iocb, struct iov_iter *to)
@@ -132,7 +132,7 @@ static ssize_t pipe_read(struct kiocb *iocb, struct iov_iter *to)
 }
 ```
 
-### 2.2 pipe_write @ :434
+### 2.2 pipe_write @ :431
 
 ```c
 static ssize_t pipe_write(struct kiocb *iocb, struct iov_iter *from)
@@ -299,8 +299,8 @@ static int vmsplice_to_pipe(struct file *file, struct iov_iter *from,
 
 | 函数 | 文件:行号 | 作用 |
 |------|----------|------|
-| `pipe_read` | `pipe.c:273` | 管道读取（环形缓冲+阻塞等待）|
-| `pipe_write` | `pipe.c:434` | 管道写入（页面分配+合并）|
+| `pipe_read` | `pipe.c:269` | 管道读取（环形缓冲+阻塞等待）|
+| `pipe_write` | `pipe.c:431` | 管道写入（页面分配+合并）|
 | `do_splice` | `splice.c` | splice 系统调用调度 |
 | `generic_file_splice_read` | `splice.c` | 文件→管道（页缓存窃取）|
 | `splice_from_pipe_to_file` | `splice.c` | 管道→文件 |
@@ -314,7 +314,7 @@ static int vmsplice_to_pipe(struct file *file, struct iov_iter *from,
 
 ## 7. 总结
 
-pipe 通过**环形缓冲区**（`pipe_inode_info.bufs`）管理数据，`pipe_read`（`:273`）和 `pipe_write`（`:434`）通过 mutex + waitqueue 同步。splice 和 vmsplice 利用**页面窃取**（`pipe_buf_try_steal`）在内核空间零拷贝传输数据——文件系统页缓存的 page 直接转移到管道（`splice_read`），再从管道转移到目标文件（`splice_write`）。
+pipe 通过**环形缓冲区**（`pipe_inode_info.bufs`）管理数据，`pipe_read`（`:269`）和 `pipe_write`（`:431`）通过 mutex + waitqueue 同步。splice 和 vmsplice 利用**页面窃取**（`pipe_buf_try_steal`）在内核空间零拷贝传输数据——文件系统页缓存的 page 直接转移到管道（`splice_read`），再从管道转移到目标文件（`splice_write`）。
 
 ---
 

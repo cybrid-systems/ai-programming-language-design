@@ -192,7 +192,7 @@ void dma_fence_signal(struct dma_fence *fence)
     // → 唤醒所有等待者
 }
 
-// 等待信号 @ :567
+// 等待信号 @ :524
 signed long dma_fence_wait_timeout(struct dma_fence *fence, bool intr, signed long timeout)
 {
     if (ops->wait)
@@ -318,7 +318,7 @@ void display_import(struct dma_buf *dmabuf, struct device *dev)
 | `dma_buf_mmap` | `dma-buf.c` | 用户空间 mmap |
 | `dma_buf_vmap` | `dma-buf.c` | 内核虚拟地址映射 |
 | `dma_fence_signal` | `dma-fence.c:487` | 发出完成信号 |
-| `dma_fence_wait_timeout` | `dma-fence.c:567` | 等待完成 |
+| `dma_fence_wait_timeout` | `dma-fence.c:524` | 等待完成 |
 | `dma_fence_add_callback` | `dma-fence.c:697` | 注册完成回调 |
 | `dma_resv_reserve_fences` | `dma-resv.c:182` | 预留 fence 槽位 |
 | `dma_resv_add_fence` | `dma-resv.c` | 添加 fence |
@@ -328,7 +328,7 @@ void display_import(struct dma_buf *dmabuf, struct device *dev)
 
 ## 7. 总结
 
-dma-buf 框架由三层组成：`dma_buf_export`/`attach`/`map_attachment`（缓冲区共享）、`dma_fence_signal`/`wait_timeout`/`add_callback`（完成通知）、`dma_resv_reserve_fences`/`add_fence`/`get_fences`（多 fence 管理）。导出者 `dma_buf_export`（`:708`）创建缓冲区，导入者 `dma_buf_map_attachment` 获取 DMA 地址，`dma_fence_signal`（`:487`）和 `dma_fence_wait_timeout`（`:567`）同步硬件操作。
+dma-buf 框架由三层组成：`dma_buf_export`/`attach`/`map_attachment`（缓冲区共享）、`dma_fence_signal`/`wait_timeout`/`add_callback`（完成通知）、`dma_resv_reserve_fences`/`add_fence`/`get_fences`（多 fence 管理）。导出者 `dma_buf_export`（`:708`）创建缓冲区，导入者 `dma_buf_map_attachment` 获取 DMA 地址，`dma_fence_signal`（`:487`）和 `dma_fence_wait_timeout`（`:524`）同步硬件操作。
 
 ---
 

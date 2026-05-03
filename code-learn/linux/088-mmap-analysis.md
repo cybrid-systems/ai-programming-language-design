@@ -10,7 +10,7 @@
 
 **mmap**（内存映射）是 Linux 中将文件或设备映射到进程地址空间的核心机制。映射后，进程可以直接通过内存读写访问文件内容——内核在缺页时自动读取/写入文件页缓存。
 
-**核心设计**：`do_mmap`（`mm/mmap.c:336`）创建 VMA（Virtual Memory Area），`mmap_region`（`:560`）将 VMA 插入进程的 VMA 红黑树，`remap_pfn_range` 映射物理地址，`handle_mm_fault` 在缺页时填充页表。
+**核心设计**：`do_mmap`（`mm/mmap.c:336`）创建 VMA（Virtual Memory Area），`mmap_region`（`mm/vma.c:2829`）将 VMA 插入进程的 VMA 红黑树，`remap_pfn_range` 映射物理地址，`handle_mm_fault` 在缺页时填充页表。
 
 ```
 mmap 系统调用路径：
@@ -126,11 +126,11 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 }
 ```
 
-**doom-lsp 确认**：`do_mmap` @ `mmap.c:336`，`mmap_region` @ `:560`。
+**doom-lsp 确认**：`do_mmap` @ `mmap.c:336`，`mmap_region` @ `vma.c:2829`。
 
 ---
 
-## 3. mmap_region @ :560——VMA 插入
+## 3. mmap_region @ :2829——VMA 插入
 
 ```c
 unsigned long mmap_region(struct file *file, unsigned long addr,
@@ -284,7 +284,7 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 | 函数 | 行号 | 作用 |
 |------|------|------|
 | `do_mmap` | `:336` | mmap 系统调用核心 |
-| `mmap_region` | `:560` | VMA 创建+插入 |
+| `mmap_region` | `vma.c:2829` | VMA 创建+插入 |
 | `__get_unmapped_area` | `:813` | 地址空间查找 |
 | `vma_merge` | — | VMA 合并 |
 | `vma_link` | — | VMA 插入红黑树 |
@@ -316,7 +316,7 @@ echo 1 > /sys/kernel/debug/tracing/events/mmap/mmap_unmap/enable
 
 ## 9. 总结
 
-`mmap` 通过 `do_mmap`（`:336`）→ `mmap_region`（`:560`）创建 VMA 并插入红黑树，`handle_mm_fault` 在缺页时填充页表。文件映射通过 `filemap_fault` 从页缓存读取，设备映射通过 `remap_pfn_range` 建立物理地址映射，匿名映射分配零页。
+`mmap` 通过 `do_mmap`（`:336`）→ `mmap_region`（`vma.c:2829`）创建 VMA 并插入红黑树，`handle_mm_fault` 在缺页时填充页表。文件映射通过 `filemap_fault` 从页缓存读取，设备映射通过 `remap_pfn_range` 建立物理地址映射，匿名映射分配零页。
 
 ---
 
