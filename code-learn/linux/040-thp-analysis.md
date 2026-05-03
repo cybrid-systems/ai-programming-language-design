@@ -65,7 +65,7 @@ do_anonymous_page() / do_fault() 缺页处理
        │
        └─ do_huge_pmd_anonymous_page(vmf)
             │
-            ├─ alloc_hugepage_vma() 从 buddy 分配 2MB 连续页
+            ├─ vma_alloc_anon_folio_pmd() 从 buddy 分配 2MB 连续 folio
             │   → alloc_pages_vma(HPAGE_PMD_ORDER)
             │   → 如果失败且 defrag=always:
             │       compact → 重试
@@ -140,7 +140,7 @@ static void khugepaged_do_scan(unsigned int scan_npages)
 // 3. 内存压力不足
 // 4. 页面迁移
 
-int split_huge_page_to_list(struct page *page, struct list_head *list)
+void split_huge_page_to_list_to_order(struct folio *folio, struct list_head *list)
 {
     struct address_space *mapping;
     int nr, ret = 0;
@@ -213,7 +213,7 @@ int do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 {
     struct vm_area_struct *vma = vmf->vma;
     gfp_t gfp;
-    struct page *page;
+    struct folio *folio;
     unsigned long haddr = vmf->address & HPAGE_PMD_MASK;
 
     // 1. 检查 VMA 是否可写、可读
@@ -223,10 +223,10 @@ int do_huge_pmd_anonymous_page(struct vm_fault *vmf)
     // 2. 大页分配
     if (vma->vm_flags & VM_SHARED) {
         // 共享映射
-        page = alloc_hugepage_vma(GFP_HIGHUSER, vma, haddr, HPAGE_PMD_ORDER);
+        page = vma_alloc_anon_folio_pmd(GFP_HIGHUSER, vma, haddr, HPAGE_PMD_ORDER);
     } else {
         // 私有映射
-        page = alloc_hugepage_vma(GFP_HIGHUSER_MOVABLE, vma, haddr, HPAGE_PMD_ORDER);
+        page = vma_alloc_anon_folio_pmd(GFP_HIGHUSER_MOVABLE, vma, haddr, HPAGE_PMD_ORDER);
     }
     if (!page) goto fallback;  // 分配失败，回退到 4KB
 
@@ -244,16 +244,16 @@ fallback:
 }
 ```
 
-## 12. alloc_hugepage_vma
+## 12. vma_alloc_anon_folio_pmd
 
 ```c
-// mm/huge_memory.c — 从 buddy 分配 2MB 连续页
-static struct page *alloc_hugepage_vma(gfp_t gfp, struct vm_area_struct *vma,
+// mm/huge_memory.c — 从 buddy 分配 2MB 连续 folio
+static struct folio *vma_alloc_anon_folio_pmd(gfp_t gfp, struct vm_area_struct *vma,
                                         unsigned long haddr, int order)
 {
-    struct page *page;
+    struct folio *folio;
 
-    // 尝试分配 2MB 连续页
+    // 尝试分配 2MB 连续 folio
     page = alloc_pages_vma(gfp, HPAGE_PMD_ORDER, vma, haddr, numa_node_id());
 
     if (page)
@@ -289,7 +289,7 @@ khugepaged_do_scan(pages_to_scan)
               │   → 检查引用计数
               │
               ├─ 3. 分配 2MB 大页
-              │   alloc_hugepage_vma()
+              │   vma_alloc_anon_folio_pmd()
               │
               ├─ 4. 拷贝 512 个小页内容到大页
               │   copy_user_highpage() × 512
@@ -537,7 +537,7 @@ THP 通过自动 4KB→2MB 页面合并，显著减少 TLB miss。khugepaged 后
 THP 是 Linux 内核内存管理的重要特性。2MB 大页减少 TLB miss 约 50
 THP is a key memory management feature. 2MB pages reduce TLB misses by about 50 percent. khugepaged background scanning handles coalescing. Fault path attempts 2MB allocation with transparent fallback to 4KB. Defrag options control compaction behavior.
 
-THP 通过 alloc_hugepage_vma 从 buddy 分配 2MB 连续内存。khugepaged 通过 khugepaged_scan_pmd 扫描 512 个 PTE 并合并。split_huge_page 在需要时将大页分裂回 4KB 小页。
+THP 通过 vma_alloc_anon_folio_pmd 从 buddy 分配 2MB 连续内存。khugepaged 通过 khugepaged_scan_pmd 扫描 512 个 PTE 并合并。split_huge_page_to_list_to_order 在需要时将大页分裂回 4KB 小页。
 
 THP 配置通过 sysfs 接口控制。enabled 控制启用模式，defrag 控制碎片整理，khugepaged 参数控制合并行为。透明大页对大多数应用透明且有益。
 

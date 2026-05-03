@@ -9,7 +9,7 @@
 
 **vmalloc** 分配虚拟地址连续但物理地址不连续的内存。与 kmalloc（物理连续）不同，vmalloc 通过修改页表将离散的物理页映射到 VMALLOC 区域的连续虚拟空间。适合大块内存分配。
 
-**doom-lsp 确认**：`mm/vmalloc.c` 核心实现。`__vmalloc_node_range` 是分配入口，`__vunmap` 是释放入口。
+**doom-lsp 确认**：`mm/vmalloc.c` 核心实现。`__vmalloc_node_range` 是分配入口，`__vunmap_range_noflush` 是释放入口。
 
 ---
 
@@ -202,7 +202,7 @@ void __iomem *ioremap(phys_addr_t phys_addr, unsigned long size)
 ## 8. 关联文章
 
 - **17-page-allocator**: buddy 分配器
-- **38-vmalloc**: vmalloc 深度分析（待补充）
+- 
 
 ---
 

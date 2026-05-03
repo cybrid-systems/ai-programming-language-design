@@ -324,7 +324,6 @@ Concurrent allocation scenarios:
 SLUB 分配器是内核中性能最关键的组件之一。per-CPU freelist 的无锁快速路径使小对象分配在 ~30ns 内完成。SLUB 相比 SLAB 减少了大量代码（3000 vs 5000 行），同时提供了更简单的 per-CPU 结构、更完善的内存调试、和更低的 NUMA 开销。
 
 EOF
-wc -c /home/dev/code/ai-programming-language-design/linux/36-slab-allocator-analysis.md
 
 ## 15. SLUB per-CPU partial 列表
 

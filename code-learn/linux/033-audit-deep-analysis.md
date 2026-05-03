@@ -65,43 +65,39 @@ static int __audit_filter_op(struct task_struct *tsk,
 
 ```c
 // kernel/audit.c
-static int audit_backlog_limit = 64;
+static u32 audit_backlog_limit = 64;
 static atomic_t audit_lost = ATOMIC_INIT(0);
-static int audit_backlog_wait_time = 60 * HZ;
+static u32 audit_backlog_wait_time = AUDIT_BACKLOG_WAIT_TIME;
 
 // audit_log_start 中的积压检查
-struct audit_buffer *audit_log_start(struct audit_context *ctx, ...)
+struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask, int type)
 {
-    // 检查 netlink 接收队列长度
-    if (audit_backlog_limit > 0) {
-        unsigned int queue_len;
+    // 使用 kauditd 队列（非 netlink sock 队列）
+    while (audit_backlog_limit &&
+           skb_queue_len(&audit_queue) > audit_backlog_limit) {
+        wake_up_interruptible(&kauditd_wait);
 
-        queue_len = skb_queue_len(&audit_sock->sk->sk_receive_queue);
-        if (queue_len > audit_backlog_limit) {
-            if (gfp_mask & __GFP_DIRECT_RECLAIM) {
-                // 可休眠上下文 → 等待积压下降
-                wait_event_interruptible_timeout(
-                    audit_backlog_wait,
-                    skb_queue_len(&audit_sock->sk->sk_receive_queue)
-                        <= audit_backlog_limit / 2,
-                    audit_backlog_wait_time);
-            }
-            // 仍然积压 → 丢弃
-            if (skb_queue_len(...) > audit_backlog_limit) {
-                atomic_inc(&audit_lost);
-                return NULL;
-            }
+        if (gfpflags_allow_blocking(gfp_mask) && stime > 0) {
+            // 可休眠上下文 → 等待 kauditd 处理
+            DECLARE_WAITQUEUE(wait, current);
+            add_wait_queue_exclusive(&audit_backlog_wait, &wait);
+            set_current_state(TASK_UNINTERRUPTIBLE);
+            stime = schedule_timeout(stime);
+            atomic_add(rtime - stime, &audit_backlog_wait_time_actual);
+            remove_wait_queue(&audit_backlog_wait, &wait);
+        } else {
+            // 不能休眠 → 丢弃
+            audit_log_lost("backlog limit exceeded");
+            return NULL;
         }
     }
 
-    // 分配缓冲区（使用 per-CPU 缓存）
-    ab = this_cpu_read(audit_buffer_cpu);
-    if (ab) {
-        this_cpu_write(audit_buffer_cpu, NULL);
-        return ab;
+    // 分配缓冲区（使用 slab 缓存）
+    ab = audit_buffer_alloc(ctx, gfp_mask, type);
+    if (!ab) {
+        audit_log_lost("out of memory in audit_log_start");
+        return NULL;
     }
-    ab = kmalloc(sizeof(*ab), gfp_mask);
-    ab->skb = alloc_skb(AUDIT_BUFSIZ, gfp_mask);
     return ab;
 }
 ```
@@ -155,17 +151,9 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh, ...)
 ### 3.1 事件传输
 
 ```c
-// 多播发送审计事件到所有监听者
-static int audit_send_list(struct audit_buffer *ab)
-{
-    struct sk_buff *skb = ab->skb;
-    struct nlmsghdr *nlh = nlmsg_put(skb, 0, 0, AUDIT_USER, 0, 0);
-
-    if (!nlh) return -ENOMEM;
-
-    // 多播到 AUDIT_NLGRP_READ 组
-    return nlmsg_multicast(audit_sock, skb, 0, AUDIT_NLGRP_READ, GFP_KERNEL);
-}
+// kauditd 线程发送审计事件
+// audit 使用 kauditd 工作线程 + audit_queue 队列
+// 事件通过 nlmsg_multicast 发送到 AUDIT_NLGRP_READLOG 组
 ```
 
 ---
@@ -193,27 +181,27 @@ struct audit_tree {
 
 ---
 
-## 5. per-CPU 缓冲区管理
+## 5. audit_buffer 分配管理
 
 ```c
-// kernel/audit.c — per-CPU 缓存减少分配
-static DEFINE_PER_CPU(struct audit_buffer *, audit_buffer_cpu);
+// kernel/audit.c — 使用 slab 缓存分配 audit_buffer
+static struct kmem_cache *audit_buffer_cache;
 
-// 释放时放回缓存
-static void audit_log_end(struct audit_buffer *ab)
+// 分配
+static struct audit_buffer *audit_buffer_alloc(struct audit_context *ctx,
+                                               gfp_t gfp_mask, int type)
 {
-    struct sk_buff *skb = ab->skb;
-
-    if (!skb) return;
-
-    if (!nlmsg_multicast(audit_sock, skb, 0, AUDIT_NLGRP_READ, GFP_KERNEL)) {
-        // 发送成功 → 放回 per-CPU 缓存
-        this_cpu_write(audit_buffer_cpu, ab);
-        return;
-    }
-    // 发送失败 → 释放
-    kfree_skb(skb);
-    kfree(ab);
+    struct audit_buffer *ab;
+    ab = kmem_cache_alloc(audit_buffer_cache, gfp_mask);
+    if (!ab) return NULL;
+    skb_queue_head_init(&ab->skb_list);
+    ab->skb = nlmsg_new(AUDIT_BUFSIZ, gfp_mask);
+    if (!ab->skb) goto err;
+    skb_queue_tail(&ab->skb_list, ab->skb);
+    return ab;
+err:
+    audit_buffer_free(ab);
+    return NULL;
 }
 ```
 
@@ -415,7 +403,7 @@ auditctl -s
 
 ## 19. 总结
 
-审计内部机制包括过滤引擎的 5 级优先级、积压控制的 3 阶段缓冲区（普通/重试/保持）、audit_tree 的 fsnotify 目录监控、per-CPU 缓冲区缓存、以及 netlink 多播传输。这些机制共同保证了审计的可靠性和性能。
+审计内部机制包括过滤引擎的 8 级优先级、积压控制的 3 阶段队列（audit_queue/retry/hold）、audit_tree 的 fsnotify 目录监控、kauditd 工作线程、以及 slab 缓存分配。这些机制共同保证了审计的可靠性和性能。
 
 ---
 
@@ -495,17 +483,13 @@ cat /proc/sys/kernel/audit/lost
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
 
-## 24. Audit 错误码
+## 24. Audit 错误处理
 
 ```c
-// kernel/audit.c — 审计错误码
-#define AUDIT_ERR_NOAUDIT     -ENOTTY   // 审计未启用
-#define AUDIT_ERR_NOROOM      -ENOMEM   // 内存不足
-#define AUDIT_ERR_NORULES     -EINVAL   // 无效规则
-#define AUDIT_ERR_BACKLOG     -EAGAIN   // 积压上限
-
-// audit_log_start 返回 NULL 时，调用者应处理错误
-// 不可能在中断上下文中重试
+// audit_log_start 返回 NULL 时的处理
+// - 积压超限: audit_log_lost("backlog limit exceeded")
+// - 内存不足: audit_log_lost("out of memory in audit_log_start")
+// - 规则排除: 直接返回 NULL (不记录)
 ```
 
 ## 25. 链接
@@ -522,7 +506,7 @@ cat /proc/sys/kernel/audit/lost
 
 
 
-audit 子系统通过过滤引擎的 5 级优先级、积压控制的 3 阶段缓冲区、audit_tree 的 fsnotify 标记实现可靠的系统级审计。per-CPU 缓冲区缓存优化性能，netlink 多播传输送达事件。
+audit 子系统通过过滤引擎的 8 级优先级、积压控制的 3 阶段队列、audit_tree 的 fsnotify 标记实现可靠的系统级审计。kauditd 工作线程处理事件队列，slab 缓存优化分配性能。
 
 
 audit_hold_queue 在 auditd 不在线时缓存事件。audit_retry_queue 在 auditd 上线后重试发送。这两个队列确保 auditd 临时掉线时不丢失事件。
