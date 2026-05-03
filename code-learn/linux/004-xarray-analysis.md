@@ -57,7 +57,7 @@ struct xa_node {
         struct list_head private_list;  // 回收链表
         struct rcu_head rcu_head;       // RCU 延迟释放
     };
-    void __rcu      *slots[];       // 子节点/entry 数组（柔性数组）
+    void __rcu      *slots[XA_CHUNK_SIZE];  // 子节点/entry 数组（固定 64 槽）
 };
 ```
 
@@ -69,7 +69,7 @@ struct xa_node {
 | `offset` | `unsigned char` | 本节点在父节点 `slots[]` 中的索引。用于向上传播标记时快速定位 |
 | `count` | `unsigned char` | 非空槽位数。`count == 0` 表示可回收 |
 | `nr_values` | `unsigned char` | 存储 `XA_ZERO_ENTRY` 的槽位数 |
-| `slots[]` | `void*[]` | 柔性数组，`XA_CHUNK_SIZE = 64` 个槽 |
+| `slots[]` | `void__rcu *[XA_CHUNK_SIZE]` | 固定数组，`XA_CHUNK_SIZE = 64` 个槽 |
 
 **`shift` 的工作示例**：
 
@@ -207,7 +207,7 @@ RCU 安全的 key：`struct xa_node` 中包含 `union { struct list_head private
 
 ```c
 // xarray.h:355 — doom-lsp 确认（声明）
-// lib/xarray.c:237 — 实际实现
+// lib/xarray.c:1612 — 实际实现
 void *xa_load(struct xarray *xa, unsigned long index)
 {
     XA_STATE(xas, xa, index);   // 初始化遍历器
@@ -451,10 +451,19 @@ struct {
 
 ```c
 // xa_node 的 marks 字段（xarray.h:1181）
-unsigned long marks[];  // (XA_CHUNK_SIZE / BITS_PER_LONG) × XA_MARK_MAX 个 long
+unsigned long marks[XA_MAX_MARKS][XA_MARK_LONGS];  // 固定 2D 数组
 ```
 
 每个标记是一个独立位图（`unsigned long` 数组），`XA_CHUNK_SIZE = 64` 位全覆盖一个节点的所有 slots。在 64 位系统上，每个标记位图恰好是 1 个 `unsigned long`，即 **64 bits**，正好对应 64 个 slots。
+
+实际代码中 `marks` 是一个 union 的一部分，与 `tags` 共享存储：
+
+```c
+union {
+    unsigned long tags[XA_MAX_MARKS][XA_MARK_LONGS];
+    unsigned long marks[XA_MAX_MARKS][XA_MARK_LONGS];
+};
+```
 
 ### 5.2 标记的传播
 
