@@ -319,7 +319,7 @@ vm_fault_t handle_userfault(struct vm_fault *vmf, unsigned long reason)
               重新执行缺页指令
 ```
 
-**doom-lsp 确认**：`handle_userfault` 在 `fs/userfaultfd.c:381`。`userfaultfd_must_wait()`（`wq.c:283`）在内核释放 mmap_lock 后重新检查 PTE 是否已被其他线程填充——避免虚假唤醒。
+**doom-lsp 确认**：`handle_userfault` 在 `fs/userfaultfd.c:381`。`userfaultfd_must_wait()`（`fs/userfaultfd.c:283`）在内核释放 mmap_lock 后重新检查 PTE 是否已被其他线程填充——避免虚假唤醒。
 
 ---
 
@@ -419,7 +419,7 @@ static int mfill_atomic_install_pte(pmd_t *dst_pmd, ...)
 }
 ```
 
-**doom-lsp 确认**：`mfill_atomic_install_pte` 在 `mm/userfaultfd.c:339`。`mfill_atomic_pte_copy` 在 `wq.c:536`。
+**doom-lsp 确认**：`mfill_atomic_install_pte` 在 `mm/userfaultfd.c:339`。`mfill_atomic_pte_copy` 在 `mm/userfaultfd.c:536`。
 
 ---
 
