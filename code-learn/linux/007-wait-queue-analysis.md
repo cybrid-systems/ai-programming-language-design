@@ -107,7 +107,7 @@ static inline void init_waitqueue_entry(struct wait_queue_entry *wq_entry,
     wq_entry->func     = default_wake_function;  // 标准唤醒函数
 }
 
-// wait.h:87
+// wait.h:88
 static inline void init_waitqueue_func_entry(struct wait_queue_entry *wq_entry,
                                               wait_queue_func_t func)
 {
@@ -150,7 +150,7 @@ static inline void __add_wait_queue_entry_tail(struct wait_queue_head *wq_head,
     list_add_tail(&wq_entry->entry, &wq_head->head);  // 插入到队尾（FIFO）
 }
 
-// wait.h:187
+// wait.h:188
 static inline void __add_wait_queue_exclusive(struct wait_queue_head *wq_head,
                                                struct wait_queue_entry *wq_entry)
 {
@@ -158,7 +158,7 @@ static inline void __add_wait_queue_exclusive(struct wait_queue_head *wq_head,
     __add_wait_queue_entry_tail(wq_head, wq_entry);  // FIFO 尾部
 }
 
-// wait.h:206
+// wait.h:207
 static inline void __remove_wait_queue(struct wait_queue_head *wq_head,
                                         struct wait_queue_entry *wq_entry)
 {
@@ -391,10 +391,10 @@ void finish_wait(struct wait_queue_head *wq_head,
 
 ---
 
-## 7. `autoremove_wake_function`——标准唤醒函数（`wait.h:1231`）
+## 7. `autoremove_wake_function`——标准唤醒函数（`kernel/sched/wait.c:401`）
 
 ```c
-// kernel/sched/wait.c — doom-lsp 确认
+// kernel/sched/wait.c:401 — doom-lsp 确认
 int autoremove_wake_function(struct wait_queue_entry *wq_entry, 
                               unsigned int mode, int sync, void *key)
 {
@@ -571,10 +571,10 @@ if (waitqueue_active(wq))               smp_mb();
 
 ---
 
-## 11. `woken_wake_function`——wait_woken 的配对函数（`wait.h:1230`）
+## 11. `woken_wake_function`——wait_woken 的配对函数（`kernel/sched/wait.c:457`）
 
 ```c
-// kernel/sched/wait.c — doom-lsp 确认
+// kernel/sched/wait.c:457 — doom-lsp 确认
 int woken_wake_function(struct wait_queue_entry *wq_entry,
                          unsigned int mode, int sync, void *key)
 {
