@@ -96,14 +96,13 @@ io_uring_enter(fd, to_submit=1, ...)       @ io_uring/io_uring.c
        ├─ io_init_sqe(req, sqe)            ← 分配 io_kiocb
        │   → io_kiocb = kmem_cache_alloc(ctx->kiocb_cachep)
        │
-       ├─ __io_submit_req(req, issue_flags)
+       ├─ io_queue_sqe(req, issue_flags)
        │   │
-       │   └─ io_queue_sqe(req, issue_flags)
+       │   └─ io_issue_sqe(req, issue_flags)
        │        │
-       │        └─ __io_queue_sqe(req, issue_flags)
+       │        └─ __io_issue_sqe(req, issue_flags, def)
        │             │
-       │             ├─ 直接执行：io_issue_sqe(req, issue_flags)
-       │             │   → __io_issue_sqe 根据 opcode 分发
+       │             ├─ 直接执行：根据 opcode 分发
        │             │   → IORING_OP_READV: io_read()
        │             │   → IORING_OP_WRITEV: io_write()
        │             │   → IORING_OP_POLL_ADD: io_poll_add()
@@ -124,24 +123,22 @@ io_uring_enter(fd, to_submit=1, ...)       @ io_uring/io_uring.c
 ```
 I/O 完成后：
   │
-  └─ io_complete_rw(req, ret, io-wq 或 IRQ 回调)
+  └─ io_complete_rw(kiocb, res)                         @ io_uring/rw.c:589
        │
-       ├─ req->flags |= REQ_F_COMPLETE_INLINE
-       │
-       ├─ io_req_complete_post(req, ret, 0)
-       │   │
-       │   └─ __io_req_complete_post(req)
-       │        │
-       │        ├─ io_fill_cqe_req(req, &cd)   ← 写入 CQ ring！
-       │        │   → cqe = &cq->cqes[tail & mask]
-       │        │   → cqe->user_data = req->cqe.user_data
-       │        │   → cqe->res = ret
-       │        │   → smp_store_release(cq->tail, tail + 1)
-       │        │
-       │        └─ io_free_req(req)
-       │             → 归还 io_kiocb 到 slab cache
-       │
-       └─ 用户空间通过 CQ ring 读取结果：
+       └─ 提交到 io-wq 或 IRQ 完成回调路径
+            │
+            ├─ io_req_complete_post(req, issue_flags)   @ io_uring/io_uring.c:906
+            │   │
+            │   ├─ io_cq_lock(ctx)
+            │   ├─ io_fill_cqe_req(ctx, req)             ← 写入 CQ ring！
+            │   │   → cqe = &cq->cqes[tail & mask]
+            │   │   → cqe->user_data = req->cqe.user_data
+            │   │   → cqe->res = ret                     ← 操作结果
+            │   │   → smp_store_release(cq->tail, tail + 1)
+            │   ├─ io_cq_unlock_post(ctx)
+            │   └─ req_ref_put(req)                      ← 释放引用（io-wq 持有）
+            │
+            └─ 用户空间通过 CQ ring 读取结果：
            while (cq->head != cq->tail) {
                cqe = &cq->cqes[head & mask];
                handle_cqe(cqe);
