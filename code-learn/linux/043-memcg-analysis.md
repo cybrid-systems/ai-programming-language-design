@@ -28,12 +28,13 @@ struct mem_cgroup {
     struct list_head cg_list;         // 同 cgroup 的进程链表
 };
 
-// mm/page_counter.h — 页面计数器
+// include/linux/page_counter.h — 页面计数器
 struct page_counter {
     atomic_long_t usage;              // 当前使用量（页数）
     unsigned long max;                // 上限（页数）
     struct page_counter *parent;      // 父计数器（层级检查）
-    struct list_head *failcnt;        // 超限次数
+    unsigned long failcnt;            // 超限次数（v1-only）
+    unsigned long min, low, high;     // 保护/软上限值
 };
 ```
 
@@ -94,7 +95,7 @@ failed:
 memcg 的计费是层级式的：每个页面从分配它的进程所在的 cgroup 开始计费，一直向上到根 cgroup。每个层级的限制独立生效：
 
 ```c
-// mm/page_counter.h
+// include/linux/page_counter.h:73
 static bool page_counter_try_charge(struct page_counter *counter,
                                      unsigned long nr_pages,
                                      struct page_counter **fail)
@@ -203,7 +204,7 @@ bool mem_cgroup_out_of_memory(struct mem_cgroup *memcg, gfp_t gfp, int order)
 | 文件 | 符号数 | 说明 |
 |------|--------|------|
 | mm/memcontrol.c | 393 | 完整实现 |
-| mm/page_counter.h | — | 页面计数器 |
+| include/linux/page_counter.h | — | 页面计数器 |
 | include/linux/memcontrol.h | — | 接口声明 |
 
 ---
@@ -426,7 +427,7 @@ echo 200M > /sys/fs/cgroup/myapp/memory.high
 ## 28. 参考
 
 - mm/memcontrol.c — 核心实现
-- mm/page_counter.h — 页面计数器
+- include/linux/page_counter.h — 页面计数器
 - Documentation/admin-guide/cgroup-v2.rst
 
 ---
