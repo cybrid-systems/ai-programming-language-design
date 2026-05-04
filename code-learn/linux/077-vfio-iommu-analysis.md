@@ -210,6 +210,59 @@ int iommu_map(struct iommu_domain *domain, unsigned long iova,
 
 ---
 
+
+### 4.1 iommu_map——IOMMU 核心 API
+
+（`drivers/iommu/iommu.c` L2866 — doom-lsp 确认）
+
+```c
+int iommu_map(struct iommu_domain *domain, unsigned long iova,
+              phys_addr_t paddr, size_t size, int prot)
+{
+    unsigned long orig_iova = iova;
+    unsigned int min_pagesz;
+    size_t orig_size = size;
+    phys_addr_t orig_paddr = paddr;
+    int ret = 0;
+
+    if (unlikely(!(domain->type & __IOMMU_DOMAIN_PAGING)))
+        return -EINVAL;
+
+    // 检查 IOVA 是否已被映射（不允许多次映射降低复杂度）
+    if (iommu_is_addr_mapped(domain, iova, size))
+        return -EEXIST;
+
+    // 计算最小页大小（对齐约束）
+    min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
+
+    // 调用底层驱动（Intel VT-d / ARM SMMU）
+    ret = domain->ops->map_pages(domain, iova, paddr, size, pgcount, prot, GFP_KERNEL);
+
+    return ret;
+}
+```
+
+### 4.2 完整调用链——从 QEMU 到硬件页表
+
+```
+QEMU ioctl(VFIO_IOMMU_MAP_DMA, {iova, vaddr, size})
+  │
+  └─ vfio_dma_do_map()  [vfio_iommu_type1.c]
+       ├─ vfio_find_dma() → 红黑树查找：iova 冲突检查
+       ├─ vfio_link_dma() → 插入红黑树
+       ├─ vfio_pin_pages_remote() → pin 用户页面
+       │    └─ pin_user_pages_remote(mm, vaddr, npages, ...)
+       │         → 锁定页面，增加 refcount
+       │         → 返回物理地址数组
+       │
+       └─ iommu_map(domain, iova, phys, npages << PAGE_SHIFT, prot)  [iommu.c]
+            └─ intel_iommu_map_pages()  [Intel IOMMU]
+                 ├─ 分配 DMAR 页表（4 级：PML4→PDP→PD→PT）
+                 └─ 写入 PTE（设置物理地址 + 权限位）
+                    └─ iommu_flush_iotlb() → 刷新 IOTLB
+```
+
+
 ## 5. 设备操作
 
 ```c
