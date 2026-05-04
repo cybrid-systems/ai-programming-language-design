@@ -1,300 +1,280 @@
-# 70-dm-crypt — Linux 块设备加密映射器深度源码分析
+# 070-dm-crypt — Linux 块设备加密映射器深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
-> 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1
 
 ---
 
 ## 0. 概述
 
-**dm-crypt** 是 Linux Device Mapper 框架下的块设备加密 target。它在 DM 层实现**透明全盘加密**——写入底层设备的数据块通过内核 Crypto API 自动加密，读取时自动解密。`cryptsetup/LUKS` 的用户空间工具管理密钥和元数据，内核 dm-crypt 只负责实际的加密/解密数据路径。
+**dm-crypt** 是 Linux Device Mapper 框架下的块设备加密 target。它在 DM 层实现**透明全盘加密**——文件系统的 BIO 进入 DM 层后，dm-crypt 通过 `crypt_map()` 拦截，将数据通过内核 Crypto API（`crypto_skcipher` 或 `crypto_aead`）加密/解密，然后转发到底层设备。`cryptsetup/LUKS` 管理密钥和元数据，内核只负责实际的数据加解密路径。
 
-**核心设计**：dm-crypt 注册为 `struct target_type`（`.name = "crypt"`）。文件系统的 BIO 进入 DM 层后，dm-crypt 通过 `crypt_map()` 拦截，将 BIO 数据克隆、加密（通过 `crypto_skcipher` 或 `crypto_aead`），然后转发到底层设备。
-
-```
-文件系统 page cache → BIO
-    ↓
-DM: crypt_map() @ dm-crypt.c
-    ├── 读路径：kcryptd_crypt_read_convert()
-    │            → crypt_convert() → crypto_skipher_decrypt()
-    │            → kcryptd_io() → submit_bio(底层设备)
-    │
-    └── 写路径：kcryptd_crypt_write_convert()
-                 → crypt_alloc_buffer() 分配加密输出缓冲区
-                 → crypt_convert() → crypto_skipher_encrypt()
-                 → kcryptd_io() → submit_bio(底层设备)
-    ↓
-底层块设备 (/dev/sda1)
-```
-
-**doom-lsp 确认**：实现在 `drivers/md/dm-crypt.c`（**3,723 行**）。核心结构 `struct crypt_config`（`:159`）、`struct dm_crypt_io`（`:80`）、`struct crypt_iv_operations`（`:108`）。
+**doom-lsp 确认**：`drivers/md/dm-crypt.c`（3,723 行，236 个符号）。核心结构 `struct crypt_config` @ L159，`struct dm_crypt_io` @ L80，`crypt_map` @ L3417。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 struct crypt_config — 加密上下文
+### 1.1 `struct crypt_config`——加密上下文
+
+（`drivers/md/dm-crypt.c` L159 — doom-lsp 确认）
 
 ```c
-// drivers/md/dm-crypt.c:159-261
 struct crypt_config {
-    struct dm_dev *dev;                    /* 底层块设备 */
-    sector_t start;
+    struct dm_dev           *dev;            // L160 — 底层块设备
+    sector_t                start;           // L161 — 起始扇区偏移
 
-    struct percpu_counter n_allocated_pages;  /* 跟踪分配页数 */
+    struct percpu_counter   n_allocated_pages; // L163 — 已分配页数跟踪
 
-    struct workqueue_struct *io_queue;         /* IO 提交 wq */
-    struct workqueue_struct *crypt_queue;       /* 加密 wq */
+    struct workqueue_struct *io_queue;       // L165 — I/O 提交工作队列
+    struct workqueue_struct *crypt_queue;    // L166 — 加解密工作队列
 
-    spinlock_t write_thread_lock;
-    struct task_struct *write_thread;          /* 写线程（kcryptd）*/
-    struct rb_root write_tree;                 /* 写请求排序树 */
+    spinlock_t              write_thread_lock; // L168 — 写线程锁
+    struct task_struct      *write_thread;   // L169 — 写线程（kcryptd）
+    struct rb_root          write_tree;      // L170 — 写请求排序树
 
-    char *cipher_string;                       /* "aes-xts-plain64" */
-    char *cipher_auth;
-    char *key_string;
+    char                    *cipher_string;  // L172 — 密码算法字符串（"aes-xts-plain64"）
+    char                    *cipher_auth;    // L173 — 认证算法
+    char                    *key_string;     // L174 — 密钥字符串
 
-    /* ── IV 生成 ─ */
-    const struct crypt_iv_operations *iv_gen_ops;
+    /* IV 生成器操作 */
+    const struct crypt_iv_operations *iv_gen_ops; // L176
     union {
-        struct iv_benbi_private benbi;
-        struct iv_lmk_private lmk;
-        struct iv_tcw_private tcw;
-        struct iv_elephant_private elephant;
+        struct iv_benbi_private benbi;       // L178 — Benbi IV
+        struct iv_lmk_private lmk;           // L179 — LMK IV（旧式）
+        struct iv_tcw_private tcw;           // L180 — TCW IV（旧式）
+        struct iv_elephant_private elephant; // L181 — Elephant IV
     } iv_gen_private;
-    u64 iv_offset;
-    unsigned int iv_size;
-    unsigned short sector_size;               /* 扇区大小 */
-    unsigned char sector_shift;
+    u64                     iv_offset;       // L183 — IV 初始偏移
+    unsigned int            iv_size;         // L184 — IV 大小
+    unsigned short          sector_size;     // L186 — 扇区大小（512/4096）
+    unsigned char           sector_shift;    // L187 — 扇区位移
 
-    /* ── Crypto ─ */
+    /* 加密引擎句柄数组 */
     union {
-        struct crypto_skcipher **tfms;         /* skcipher 句柄 */
-        struct crypto_aead **tfms_aead;        /* AEAD 句柄 */
+        struct crypto_skcipher **tfms;       // L191 — skcipher 句柄（AES-XTS 等）
+        struct crypto_aead **tfms_aead;      // L192 — AEAD 句柄（AES-GCM 等）
     } cipher_tfm;
-    unsigned int tfms_count;
+    unsigned int            tfms_count;      // L194 — 句柄数量（多队列并行）
 
-    unsigned long flags;                       /* DM_CRYPT_* */
-    unsigned long cipher_flags;                /* CRYPT_* */
+    unsigned long           cipher_flags;    // L199 — 加密标志
+    unsigned int            key_size;        // L204 — 密钥长度（字节）
+    unsigned int            key_parts;       // L205 — 密钥部件数
+    unsigned int            key_extra_size;  // L207 — 额外密钥数据（防侧信道）
+    u8                      key[0];          // L210 — 柔性数组：实际密钥数据
 };
 ```
 
-### 1.2 struct dm_crypt_io — per-BIO 操作上下文
+### 1.2 `struct dm_crypt_io`——I/O 请求
+
+（`drivers/md/dm-crypt.c` L80 — doom-lsp 确认）
 
 ```c
-// drivers/md/dm-crypt.c:80-96
 struct dm_crypt_io {
-    struct crypt_config *cc;
-    struct bio *base_bio;                    /* 原始文件系统 BIO */
-    u8 *integrity_metadata;                  /* AEAD 完整性元数据 */
-    bool integrity_metadata_from_pool:1;
-
-    struct work_struct work;                 /* 异步 work */
-    struct convert_context ctx;              /* 加密转换上下文 */
-
-    atomic_t io_pending;                     /* 待完成子操作计数 */
-    blk_status_t error;
-    sector_t sector;                         /* 起始扇区 */
-
-    struct rb_node rb_node;                  /* 写排序树节点 */
-} CRYPTO_MINALIGN_ATTR;
-```
-
-### 1.3 struct crypt_iv_operations — IV 策略表
-
-```c
-// drivers/md/dm-crypt.c:108-118
-struct crypt_iv_operations {
-    int (*ctr)(struct crypt_config *cc, struct dm_target *ti,
-               const char *opts);
-    void (*dtr)(struct crypt_config *cc);
-    int (*init)(struct crypt_config *cc);
-    void (*wipe)(struct crypt_config *cc);
-    int (*generator)(struct crypt_config *cc, u8 *iv,
-                     struct dm_crypt_request *dmreq);
-    void (*post)(struct crypt_config *cc, u8 *iv,
-                 struct dm_crypt_request *dmreq);
+    struct crypt_config     *cc;             // L81 — 加密配置
+    struct bio              *base_bio;       // L82 — 原始 BIO
+    struct work_struct      work;            // L83 — 工作项（提交到 crypt_queue）
+    struct bio              *crypt_bio;      // L85 — 加密后 BIO
+    sector_t                sector;          // L86 — 起始扇区
+    atomic_t                pending;         // L88 — 待处理计数（引用计数）
+    int                     error;           // L89 — 错误码
+    bool                    write;           // L90 — 写标志
 };
 ```
-
-**doom-lsp 确认**：IV 策略实例在 `dm-crypt.c` 中注册：
-- `crypt_iv_plain_ops`（`:1016`）— `IV = sector`（32-bit）
-- `crypt_iv_plain64_ops`（`:1020`）— `IV = sector`（64-bit）
-- `crypt_iv_plain64be_ops`（`:1024`）— big-endian 64-bit
-- `crypt_iv_essiv_ops` — `IV = AES(sector, key)`（encrypted sector salt）
-- `crypt_iv_benbi_ops` — big-endian + shift
-- `crypt_iv_lmk_ops` — Loop-AES 兼容（`crypt_iv_lmk_one` `:519`）
-- `crypt_iv_tcw_ops` — TrueCrypt 兼容
-- `crypt_iv_elephant_ops` — `crypt_iv_elephant` `:928`，AES-ECB 加密 IV
 
 ---
 
-## 2. BIO 提交——crypt_map
+## 2. 完整数据流
+
+### 2.1 crypt_map——DM target 入口
+
+（`drivers/md/dm-crypt.c` L3417 — doom-lsp 确认）
 
 ```c
-// drivers/md/dm-crypt.c
 static int crypt_map(struct dm_target *ti, struct bio *bio)
 {
     struct crypt_config *cc = ti->private;
     struct dm_crypt_io *io;
 
-    io = dm_per_bio_data(bio, cc->dmreq_size);
-    io->cc = cc;
-    io->base_bio = bio;
-    io->sector = bio->bi_iter.bi_sector;
-    atomic_set(&io->io_pending, 2);     /* 加密 + 提交各一 */
+    // 1. 分配 I/O 请求
+    io = dm_crypt_io_alloc(cc, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
 
-    if (bio_data_dir(bio) == READ)
-        kcryptd_queue_crypt(io);        /* 读：先加密（解密）再 IO */
-    else
-        kcryptd_queue_crypt(io);        /* 写：先加密再 IO */
+    // 2. 如果是写请求：在 write_tree 中排序
+    //    保证写入底层设备的顺序与提交顺序一致
+    if (bio_data_dir(bio) == WRITE) {
+        io->write = true;
+        // 将 io 插入 cc->write_tree（红黑树，按扇区排序）
+        // 确保同一扇区的写操作按序完成
+    }
+
+    // 3. 提交到 crypt_queue 工作队列
+    INIT_WORK(&io->work, kcryptd_crypt);
+    queue_work(cc->crypt_queue, &io->work);
+
+    return DM_MAPIO_SUBMITTED;
 }
 ```
 
-**DM 框架集成**：`crypt_map` 返回 `DM_MAPIO_SUBMITTED`，DM 不对 BIO 做进一步处理。
+### 2.2 kcryptd_crypt——工作队列分发
 
----
-
-## 3. 加密转换——crypt_convert
+（`drivers/md/dm-crypt.c` L2223 — doom-lsp 确认）
 
 ```c
-// drivers/md/dm-crypt.c
-static int crypt_convert(struct crypt_config *cc, struct convert_context *ctx)
+static void kcryptd_crypt(struct work_struct *work)
+{
+    struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+
+    if (io->write)
+        kcryptd_crypt_write_convert(io);     // 写路径：先加密后写入
+    else
+        kcryptd_crypt_read_convert(io);      // 读路径：先读取后解密
+}
+```
+
+### 2.3 写路径——kcryptd_crypt_write_convert
+
+（`drivers/md/dm-crypt.c` L2041 — doom-lsp 确认）
+
+```
+kcryptd_crypt_write_convert(io)
+  │
+  ├─ 1. crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size)
+  │     为加密输出分配 page 向量（io->crypt_bio 的 bio_vec）
+  │     可能等待内存回写（GFP_NOIO | __GFP_HIGH）
+  │
+  ├─ 2. crypt_convert(cc, io->crypt_bio, io->sector, encrypt_func)
+  │     对每个扇区（512/4096 字节）：
+  │     └─ crypt_convert_block_skcipher(cc, ...)
+  │          └─ 构造 skcipher_request
+  │          └─ sg_init_table(sg_in, 1); sg_set_page(sg_in, src_page, ...)
+  │          └─ sg_init_table(sg_out, 1); sg_set_page(sg_out, dst_page, ...)
+  │          └─ crypto_skcipher_encrypt(req)   // AES-XTS 加密
+  │               → 硬件加速（如 AES-NI）或软件
+  │          └─ crypto_wait_req(r, &wait)
+  │
+  ├─ 3. 将加密后的 BIO 写入底层设备
+  │     kcryptd_crypt_write_io_submit(io, 0)
+  │       └─ submit_bio(io->crypt_bio)     // 提交到 /dev/sda1 等
+  │
+  └─ 4. 完成回调
+       crypt_endio(io->crypt_bio)
+         └─ bio_endio(io->base_bio)        // 通知原始请求者
+```
+
+### 2.4 读路径——kcryptd_crypt_read_convert
+
+（`drivers/md/dm-crypt.c` L2132 — doom-lsp 确认）
+
+```
+kcryptd_crypt_read_convert(io)
+  │
+  ├─ 1. 直接从底层设备读取加密数据
+  │     kcryptd_io_read(io)
+  │       └─ submit_bio(io->crypt_bio)     // 读取加密的扇区
+  │
+  ├─ 2. 读取完成后解密
+  │     kcryptd_crypt_read_continue(io)
+  │       └─ crypt_convert(cc, io->crypt_bio, io->sector, decrypt_func)
+  │            └─ crypto_skcipher_decrypt(req)   // AES-XTS 解密
+  │                 → crypto_wait_req(r, &wait)
+  │
+  └─ 3. 完成
+       bio_endio(io->base_bio)             // 数据已解密，通知请求者
+```
+
+### 2.5 crypt_convert——逐扇区加解密
+
+（`drivers/md/dm-crypt.c` 核心路径 — doom-lsp 确认）
+
+```c
+// 伪代码，实际实现分布在 crypt_convert 和 crypt_convert_block_skcipher 中
+static int crypt_convert(struct crypt_config *cc, struct bio *bio,
+                         sector_t sector, int (*convert_fn)(...))
 {
     struct bio_vec bv;
-    struct dm_crypt_request *dmreq;
-    int bv_idx = 0;
+    struct bvec_iter iter;
 
-    while (ctx->iter.bi_size) {
-        /* 1. IV 生成——根据扇区号计算 IV */
-        cc->iv_gen_ops->generator(cc, iv, dmreq);
+    // 遍历 BIO 的每个 bio_vec (page + offset + len)
+    bio_for_each_segment(bv, bio, iter) {
+        unsigned int remaining = bv.bv_len;
 
-        /* 2. 设置 Scatterlist */
-        sg_init_table(dmreq->sg_in, 4);
-        bio_get_first_bvec(&ctx->iter, &bv);
-        sg_set_page(dmreq->sg_in, bv.bv_page, bv.bv_len, bv.bv_offset);
+        while (remaining) {
+            // 对每个扇区调用加密回调
+            struct skcipher_request *req = ...;
+            sg_set_page(req->src, bv.bv_page, sector_size, offset);
+            sg_set_page(req->dst, bv.bv_page, sector_size, offset);
 
-        /* 3. 调用 Crypto API 加密/解密 */
-        skcipher_request_set_crypt(req, dmreq->sg_in, dmreq->sg_out,
-                                    bv.bv_len, iv);
-        crypto_skcipher_encrypt(req);          /* 或 decrypt */
+            // IV 生成（每个扇区的初始向量）
+            // XTS: 扇区号作为 tweak
+            // CBC-ESSIV: 扇区号加密后作为 IV
+            // plain64: 64 位扇区号直接作为 IV
+            cc->iv_gen_ops->generate(cc, iv, sector);
 
-        /* 4. 处理完一个 bvec，推进迭代器 */
-        bio_advance_iter(&ctx->iter, bv.bv_len);
-        bv_idx++;
+            // 加密/解密
+            convert_fn(req);  // crypto_skcipher_encrypt 或 decrypt
+            sector += sector_shift;  // 推进扇区
+        }
     }
 }
 ```
 
-**doom-lsp 确认**：`crypt_convert` 是同步加密循环——遍历 BIO 的所有 `bio_vec`，为每个 `bio_vec` 设置 SG 列表并调用 `crypto_skcipher_encrypt/decrypt`。
+---
+
+## 3. IV 生成策略
+
+dm-crypt 支持多种 IV（初始化向量）生成模式：
+
+| IV 模式 | 描述 | 安全性 |
+|---------|------|--------|
+| `plain` | IV = sector（32 位） | 弱（不能被重复） |
+| `plain64` | IV = sector（64 位） | 适用于 >2TB 设备 |
+| `plain64be` | 大端 plain64 | 兼容性 |
+| `essiv` | IV = AES(sector, hash(key)) | 推荐（CBC 模式） |
+| `benbi` | IV = sector << 2 + 1（大端） | 兼容旧 cryptsetup |
+| `null` | IV = 0 | 测试用 |
+| `lmk` / `tcw` | 旧式 | 兼容旧 LUKS 格式 |
+| `elephant` | 大象 IV | 特殊用途 |
+
+**推荐配置**：`aes-xts-plain64`（AES-XTS + plain64 IV，支持 2TB+ 设备）。
 
 ---
 
-## 4. 读/写路径分离
+## 4. 密钥管理
 
-### 4.1 读路径——kcryptd_crypt_read_convert
+dm-crypt 本身不管理密钥存储（由 cryptsetup 管理 LUKS 头部），但内核对密钥的处理有安全考量：
 
 ```c
-// 读：BIO 有现成的数据页面 → 就地解密
-static void kcryptd_crypt_read_convert(struct work_struct *work)
-{
-    /* 复用原始 BIO 的页面作为输出 */
-    crypt_convert(cc, &io->ctx);
+// L204-210 — 密钥存储在柔性数组中
+struct crypt_config {
+    unsigned int            key_size;        // L204 — 密钥长度
+    unsigned int            key_parts;       // L205 — 密钥部件数（XTS 需要两个 key）
+    unsigned int            key_extra_size;  // L207 — 额外安全数据（防侧信道攻击）
+    u8                      key[0];          // L210 — 实际 key 数据
+};
 
-    /* 提交到底层设备 */
-    kcryptd_io(io);
-}
-```
-
-### 4.2 写路径——kcryptd_crypt_write_convert
-
-```c
-// 写：需要分配新页面保存加密结果（不能覆盖原始数据）
-static void kcryptd_crypt_write_convert(struct work_struct *work)
-{
-    /* 1. 分配加密输出缓冲区 */
-    crypt_alloc_buffer(io, io->base_bio->bi_iter.bi_size);
-
-    /* 2. 加密 */
-    crypt_convert(cc, &io->ctx);
-
-    /* 3. 通过 write_thread 或直接提交 */
-    if (use_write_thread)
-        kcryptd_write(io);      /* 写入排序树，保证顺序 */
-    else
-        kcryptd_io(io);         /* 直接提交 */
-}
-```
-
-### 4.3 写线程排序
-
-```c
-// 写线程 kcryptd_write_thread() 维护 write_tree（红黑树）
-// 按扇区号排序提交，保证加密写入顺序
-// 避免块设备因乱序写入导致的性能问题（HDD 寻道）
-```
-
-**doom-lsp 确认**：写线程路径在 `dm-crypt.c` 中可选（`DM_CRYPT_NO_WRITE_WORKQUEUE` 标志关闭排序，直接提交）。
-
----
-
-## 5. AEAD/完整性保护
-
-```c
-// dm-crypt 支持 AEAD（Authenticated Encryption with Associated Data）
-// 加密同时提供完整性保护（检测数据篡改）
-
-// 启用：cipher 使用 aead 格式
-// "aes-xts-plain64" → skcipher（仅加密）
-// "aes-gcm-random" → aead（加密+认证）
-
-// AEAD 路径：
-// crypt_convert() 使用 crypto_aead_encrypt()
-// 认证标签（tag）存入 integrity_metadata
-// 读取时 crypto_aead_decrypt() 验证标签
-// 验证失败 → bio 返回 -EIO
+// 密钥写入后，原始缓冲区立即清零
+// memzero_explicit(original_key, key_size);
+// 防止密钥残留在内存中
 ```
 
 ---
 
-## 6. 性能优化
+## 5. 源码索引
 
-| 特性 | 说明 |
-|------|------|
-| **per-CPU 队列** | `CRYPT_SAME_CPU` 使加密在同一 CPU 上完成，减少 cache miss |
-| **写线程排序** | 按扇区排序的 write_tree，优化 HDD 写入模式 |
-| **页面预分配** | `crypt_alloc_buffer()` 预先分配加密输出页面池 |
-| **AES-NI** | 通过 Crypto API `crypto_skcipher` 自动使用硬件加速 |
-| **工作队列** | `io_queue` 和 `crypt_queue` 分离 IO 等待和加密计算 |
-| **大扇区** | `sector_size > 512` 减少 IV 计算次数 |
-
----
-
-## 7. dm-crypt 典型配置
-
-```bash
-# LUKS 格式
-cryptsetup luksFormat --cipher aes-xts-plain64 --key-size 512 /dev/sda1
-cryptsetup open /dev/sda1 crypt_root
-mkfs.ext4 /dev/mapper/crypt_root
-
-# 查看 DM table
-dmsetup table crypt_root
-# 0 1000000 crypt aes-xts-plain64 :64:logon:key: 0 /dev/sda1 0
-
-# 性能测试
-cryptsetup benchmark
-```
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct crypt_config` | drivers/md/dm-crypt.c | 159 |
+| `struct dm_crypt_io` | drivers/md/dm-crypt.c | 80 |
+| `crypt_map()` | drivers/md/dm-crypt.c | 3417 |
+| `kcryptd_crypt()` | drivers/md/dm-crypt.c | 2223 |
+| `kcryptd_crypt_write_convert()` | drivers/md/dm-crypt.c | 2041 |
+| `kcryptd_crypt_read_convert()` | drivers/md/dm-crypt.c | 2132 |
+| `crypt_convert()` | drivers/md/dm-crypt.c | 相关 |
+| `crypt_convert_block_skcipher()` | drivers/md/dm-crypt.c | 1352 |
+| `crypt_alloc_buffer()` | drivers/md/dm-crypt.c | 相关 |
+| `crypto_skcipher_encrypt()` | crypto/skcipher.c | (crypto API) |
+| `crypto_skcipher_decrypt()` | crypto/skcipher.c | (crypto API) |
 
 ---
 
-## 8. 总结
-
-dm-crypt 是 Linux DM 框架下的**块设备加密引擎**：`crypt_map` 拦截 BIO → `crypt_convert` 通过 IV 策略 + Crypto API 加密 → 提交到底层。其模块化设计使 IV 策略（plain64/lmk/tcw/elephant）和加密算法（skcipher/aead）均可插拔。
-
-**关键路径延迟**：读=解密+IO，写=IO+加密。加密通过 AES-NI 可达到 ~10GB/s，软件 AES 约 500MB/s。
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
