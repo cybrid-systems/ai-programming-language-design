@@ -168,10 +168,11 @@ printk(fmt, ...)
 NBCon 解决这个问题的方式是**无锁 + 每控制台独立锁 + 紧急输出**：
 
 ```c
-// nbcon 控制台的状态（per-console）
-struct nbcon_state {
-    unsigned int    prio;       // 当前拥有者的优先级
-    bool            migratable; // 是否可迁移 CPU
+// nbcon 上下文（per-console）
+struct nbcon_context {
+    struct console      *console;    // 目标控制台
+    enum nbcon_prio     prio;        // 请求优先级
+    unsigned int        seq;         // 期望输出的最大 seq
 };
 
 // 优先级层次（越高越可以抢占）
@@ -179,22 +180,15 @@ enum nbcon_prio {
     NBCON_PRIO_NONE,        // 无拥有者
     NBCON_PRIO_NORMAL,      // 普通 printk
     NBCON_PRIO_EMERGENCY,   // 紧急消息（panic）
-    NBCON_PRIO_SYSTEM,      // 系统消息
+    NBCON_PRIO_PANIC,       // panic 输出
 };
 
 // 使用 cmpxchg 获取控制台的拥有权
-static bool nbcon_try_acquire(struct console *con, enum nbcon_prio prio)
+// 分配三步走：try_direct → try_handover → try_requested
+static int nbcon_context_try_acquire_direct(struct nbcon_context *ctxt)
 {
-    struct nbcon_state cur, new;
-    do {
-        cur = nbcon_read_state(con);
-        // 如果当前 prio >= 请求的 prio → 不能抢占
-        if (cur.prio >= prio)
-            return false;
-        new = cur;
-        new.prio = prio;
-    } while (!try_cmpxchg(&con->nbcon_state, &cur, new));
-    return true;
+    // 如果当前拥有者的 prio < 请求的 prio → 可以抢占
+    // 通过 cmpxchg 原子更新 nbcon_state
 }
 ```
 
@@ -320,8 +314,8 @@ PI_KN(pr_info("Hello %s\n", name))
 | `prb_reserve()` | kernel/printk/printk_ringbuffer.c | 原子保留 |
 | `prb_final_commit()` | kernel/printk/printk_ringbuffer.c | 原子提交 |
 | `prb_first_valid_seq()` | kernel/printk/printk_ringbuffer.c | 读取 |
-| `nbcon_try_acquire()` | kernel/printk/nbcon.c | NBCon 原子获取 |
-| `nbcon_release()` | kernel/printk/nbcon.c | NBCon 释放 |
+| `nbcon_context_try_acquire_direct()` | kernel/printk/nbcon.c | 243 |
+| `nbcon_release()` | kernel/printk/nbcon.c | 相关 |
 | `devkmsg_read()` | kernel/printk/printk.c | /dev/kmsg 读取 |
 | `devkmsg_write()` | kernel/printk/printk.c | /dev/kmsg 写入 |
 | `printk_index_init()` | kernel/printk/index.c | printk index |
