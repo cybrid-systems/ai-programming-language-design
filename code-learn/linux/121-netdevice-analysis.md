@@ -273,6 +273,18 @@ int dev_change_name(struct net_device *dev, const char *newname)
 
 ---
 
+
+## 7. 网络设备生命周期
+
+```
+alloc_netdev_mqs() → register_netdevice(dev)
+  → ndo_init → netif_carrier_on() → /sys/class/net/eth0
+  → ndo_open → ndo_start_xmit → ndo_stop
+  → unregister_netdevice(dev) → free_netdevice(dev)
+```
+
+## 8. 功能标志
+
 ## 7. 源码索引
 
 | 符号 | 文件 | 行号 |
