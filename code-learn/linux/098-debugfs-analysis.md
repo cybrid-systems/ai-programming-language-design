@@ -268,6 +268,45 @@ debugfs 的核心设计是**代理层 + 引用计数安全移除**。`__debugfs_
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
 
+
+## 2. debugfs_create_file——文件创建
+
+（`fs/debugfs/inode.c` — doom-lsp 确认）
+
+```c
+struct dentry *debugfs_create_file(const char *name, umode_t mode,
+                                   struct dentry *parent, void *data,
+                                   const struct file_operations *fops)
+{
+    // 1. 创建 dentry + inode 对
+    dentry = debugfs_create_mode(name, mode, parent, data, fops, NULL);
+
+    // 2. 如果创建了类型化文件（debugfs_create_u32 等），注册 show 回调
+    if (fops && fops->seq_show)
+        debugfs_create_mode(name, mode, parent, data, &fops, NULL);
+
+    return dentry;
+}
+```
+
+## 3. 使用模式
+
+```c
+// 最简单的用法（创建 u32 读写文件）：
+struct dentry *dir = debugfs_create_dir("my_driver", NULL);
+u32 *my_var = kmalloc(sizeof(u32), GFP_KERNEL);
+*my_var = 42;
+debugfs_create_u32("my_value", 0644, dir, my_var);
+// → /sys/kernel/debug/my_driver/my_value (可读写)
+
+// 自定义文件操作：
+static const struct file_operations my_fops = {
+    .read = my_read,
+    .write = my_write,
+};
+debugfs_create_file("custom", 0644, dir, my_data, &my_fops);
+```
+
 ## 源码索引
 
 | 符号 | 文件 | 行号 |
