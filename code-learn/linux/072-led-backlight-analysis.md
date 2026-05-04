@@ -341,3 +341,17 @@ LED 和 Backlight 子系统是**简单的控制类框架**——通过 sysfs 提
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `led_classdev_register()` | drivers/leds/led-core.c | LED 设备注册 |
+| `led_brightness_set()` | drivers/leds/led-core.c | 亮度设置 |
+| `struct led_classdev` | include/linux/leds.h | 91 |
+| `backlight_device_register()` | drivers/video/backlight/backlight.c | 背光注册 |
+| `struct backlight_device` | include/linux/backlight.h | 背光设备 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

@@ -287,3 +287,17 @@ Regulator 框架的核心是 `_regulator_enable`（`:3116`）和 `_regulator_dis
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct regulator_dev` | include/linux/regulator/driver.h | 核心结构 |
+| `regulator_enable()` | drivers/regulator/core.c | 使能 |
+| `_regulator_do_enable()` | drivers/regulator/core.c | 1660 |
+| `regulator_set_voltage()` | drivers/regulator/core.c | 调压 |
+| `_regulator_do_set_voltage()` | drivers/regulator/core.c | 109 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

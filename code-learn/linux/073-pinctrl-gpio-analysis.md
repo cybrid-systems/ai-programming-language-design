@@ -357,3 +357,17 @@ pinctrl 和 GPIO 是 SoC 引脚管理的两个层面——pinctrl 管理**复用
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `pinctrl_register()` | drivers/pinctrl/core.c | pinctrl 注册 |
+| `pinctrl_select_state()` | drivers/pinctrl/core.c | 状态选择 |
+| `struct pinctrl_dev` | drivers/pinctrl/core.c | 核心结构 |
+| `struct pinctrl_state` | include/linux/pinctrl/pinctrl.h | 引脚状态 |
+| `struct pin_desc` | drivers/pinctrl/core.c | 引脚描述 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

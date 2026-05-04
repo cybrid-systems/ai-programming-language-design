@@ -374,3 +374,17 @@ CCF 是一个**树形时钟管理框架**——时钟节点的父子关系构成
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `clk_register()` | drivers/clk/clk.c | 时钟注册 |
+| `clk_prepare_enable()` | drivers/clk/clk.c | 使能时钟 |
+| `struct clk_hw` | include/linux/clk-provider.h | 硬件时钟结构 |
+| `struct clk_core` | drivers/clk/clk.c | 核心时钟结构 |
+| `clk_hw_register_fixed_rate()` | drivers/clk/clk-fixed-rate.c | 固定频率时钟 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
