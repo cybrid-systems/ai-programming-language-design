@@ -334,3 +334,19 @@ eventfd（`eventfd_signal_mask` @ `:56` + `eventfd_read` @ `:214` + `eventfd_wri
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct eventfd_ctx` | fs/eventfd.c | 30 |
+| `eventfd_signal()` | fs/eventfd.c | 相关 |
+| `SYSCALL_DEFINE2(eventfd)` | fs/eventfd.c | 相关 |
+| `do_eventfd()` | fs/eventfd.c | 相关 |
+| `struct signalfd_ctx` | fs/signalfd.c | 41 |
+| `signalfd_dequeue()` | fs/signalfd.c | 154 |
+| `SYSCALL_DEFINE4(signalfd4)` | fs/signalfd.c | 相关 |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
