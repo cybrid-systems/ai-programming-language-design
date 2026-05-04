@@ -316,3 +316,16 @@ UIO 是一个**极简的用户态驱动框架**——内核只负责中断通知
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct uio_info` | include/linux/uio_driver.h | 核心 |
+| `uio_register_device()` | drivers/uio/uio.c | 相关 |
+| `uio_unregister_device()` | drivers/uio/uio.c | 相关 |
+| `struct uio_mem` | include/linux/uio_driver.h | 内存区域描述 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

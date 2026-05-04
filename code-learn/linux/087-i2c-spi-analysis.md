@@ -298,3 +298,16 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 // → 完成后 → msg->complete(msg->context)
 // spi_sync 基于 spi_async 实现：complete 中调用 completion
 ```
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct i2c_adapter` | include/linux/i2c.h | I2C 适配器 |
+| `struct i2c_driver` | include/linux/i2c.h | I2C 驱动 |
+| `struct spi_controller` | include/linux/spi/spi.h | SPI 控制器 |
+| `i2c_transfer()` | drivers/i2c/i2c-core.c | I2C 传输 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

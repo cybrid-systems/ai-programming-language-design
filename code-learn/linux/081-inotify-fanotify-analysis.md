@@ -283,3 +283,16 @@ inotify 和 fanotify 基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492` → 
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct fsnotify_group` | include/linux/fsnotify_backend.h | 核心 |
+| `inotify_add_watch()` | fs/notify/inotify/inotify_user.c | 相关 |
+| `fanotify_mark()` | fs/notify/fanotify/fanotify_user.c | 相关 |
+| `fsnotify()` | fs/notify/fsnotify.c | 核心分发 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

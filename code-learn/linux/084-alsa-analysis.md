@@ -306,3 +306,17 @@ ALSA 通过 `snd_pcm_open` → `hw_params` → `prepare` → `start` 管理 PCM 
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct snd_card` | include/sound/core.h | 核心 |
+| `struct snd_pcm` | include/sound/pcm.h | PCM 设备 |
+| `struct snd_pcm_ops` | include/sound/pcm.h | 操作表 |
+| `snd_card_new()` | sound/core/init.c | 分配声卡 |
+| `snd_pcm_new()` | sound/core/pcm.c | 创建 PCM |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

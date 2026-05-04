@@ -294,3 +294,17 @@ DRM/KMS 通过 **atomic modeset**（`drm_atomic_commit`）原子地更新 CRTC/E
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct drm_device` | include/drm/drm_device.h | 核心 |
+| `struct drm_crtc` | include/drm/drm_crtc.h | CRTC |
+| `struct drm_plane` | include/drm/drm_plane.h | 显示层 |
+| `struct drm_encoder` | include/drm/drm_encoder.h | 编码器 |
+| `drm_atomic_commit()` | drivers/gpu/drm/drm_atomic.c | 原子提交 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
