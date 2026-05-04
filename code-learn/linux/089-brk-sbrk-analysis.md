@@ -284,3 +284,16 @@ int do_brk_flags(..., unsigned long addr, unsigned long len, ...)
 // 当 mmap 分配过多时，kernel 会通过 /proc/sys/vm/max_map_count 限制
 // cat /proc/sys/vm/max_map_count  # 默认 65530
 ```
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `sys_brk()` | mm/mmap.c | 116 |
+| `do_brk_flags()` | mm/vma.c | 2880 |
+| `vm_brk_flags()` | mm/mmap.c | 1205 |
+| `check_brk_limits()` | mm/mmap.c | 相关 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

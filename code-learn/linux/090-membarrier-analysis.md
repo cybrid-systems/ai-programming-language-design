@@ -322,3 +322,18 @@ static void ipi_sync_rq_state(void *info) {
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `sys_membarrier()` | kernel/sched/membarrier.c | (SYSCALL_DEFINE3) |
+| `membarrier_global_expedited()` | kernel/sched/membarrier.c | 250 |
+| `membarrier_private_expedited()` | kernel/sched/membarrier.c | 316 |
+| `do_membarrier_register()` | kernel/sched/membarrier.c | 相关 |
+| `ipi_mb()` | kernel/sched/membarrier.c | IPI 回调 |
+| `mm_struct->membarrier_state` | include/linux/mm_types.h | 原子位标志 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

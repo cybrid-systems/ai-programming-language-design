@@ -321,3 +321,21 @@ echo 1 > /sys/kernel/debug/tracing/events/mmap/mmap_unmap/enable
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct vm_area_struct` | include/linux/mm_types.h | 932 |
+| `do_mmap()` | mm/mmap.c | 336 |
+| `do_munmap()` | mm/mmap.c | 1062 |
+| `handle_mm_fault()` | mm/memory.c | 相关 |
+| `do_anonymous_page()` | mm/memory.c | 相关 |
+| `do_wp_page()` | mm/memory.c | 写时复制 |
+| `do_swap_page()` | mm/memory.c | swap 换入 |
+| `filemap_fault()` | mm/filemap.c | 文件映射缺页 |
+| `sys_mmap_pgoff()` | mm/mmap.c | 613 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
