@@ -13,10 +13,10 @@ ptrace 的核心设计思想是**信号转发模型**：tracer 通过捕获 trac
 （`include/linux/sched.h`，L1190~1210 附近）
 
 ```c
-unsigned int            ptrace;             // 当前进程的 ptrace 状态位
-struct list_head        ptraced;            // 被该 tracer tracer 的进程列表
-struct list_head        ptrace_entry;       // 该进程在 tracer 的 ptraced 链表中的节点
-struct task_struct __rcu *parent;           // ptrace 时会指向 tracer（重定向父进程）
+unsigned int            ptrace;             // 当前进程的 ptrace 状态位（include/linux/sched.h）
+struct list_head        ptraced;            // 被 tracer 跟踪的进程列表
+struct list_head        ptrace_entry;       // 在 tracer 的 ptraced 链表中的节点
+struct task_struct __rcu *parent;           // ptrace 时指向 tracer（重定向父进程）
 ```
 
 关键 ptrace 状态位（`include/linux/ptrace.h`）：
