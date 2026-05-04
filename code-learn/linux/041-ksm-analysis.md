@@ -382,13 +382,13 @@ static struct rb_root *root_unstable_tree; // [nr_node_ids]
 | `struct ksm_mm_slot` | mm/ksm.c | 126 |
 | `struct ksm_scan` | mm/ksm.c | 140 |
 | `struct ksm_stable_node` | mm/ksm.c | 159 |
-| `ksm_scan_thread()` | mm/ksm.c | 2816 |
+| `ksm_scan_thread()` | mm/ksm.c | 2804 |
 | `ksm_do_scan()` | mm/ksm.c | 2783 |
 | `cmp_and_merge_page()` | mm/ksm.c | 2251 |
 | `try_to_merge_one_page()` | mm/ksm.c | 1478 |
 | `stable_tree_search()` | mm/ksm.c | 1828 |
 | `unstable_tree_search_insert()` | mm/ksm.c | 2137 |
-| `ksm_init()` | mm/ksm.c | 3620 |
+| `ksm_init()` | mm/ksm.c | 3977 |
 | `ksm_run` | mm/ksm.c | 482 |
 | `ksm_pages_shared` | mm/ksm.c | 258 |
 | `ksm_pages_sharing` | mm/ksm.c | 261 |
