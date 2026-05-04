@@ -30,23 +30,24 @@ mount -t overlay overlay -o lowerdir=/A:/B,upperdir=/U,workdir=/W /M
 ### 1.1 struct ovl_layer — 存储层
 
 ```c
-// fs/overlayfs/ovl_entry.h:33-40
+// fs/overlayfs/ovl_entry.h:33-40 — doom-lsp 确认
 struct ovl_layer {
-    struct vfsmount *mnt;                  /* 层的挂载点 */
-    struct inode *trap;                    /* trap inode */
-    struct ovl_sb *fs;
-    int idx;                               /* 层索引（0=upper）*/
-    int fsid;                              /* 底层 fs 唯一 ID */
-    bool has_xwhiteouts;
+    struct vfsmount *mnt;     /* L35 — 层的挂载点 */
+    struct inode *trap;       /* L36 — trap inode */
+    struct ovl_sb *fs;        /* L37 — 底层 fs 数据 */
+    int idx;                  /* L38 — 层索引（0=upper）*/
+    int fsid;                 /* L40 — 底层 fs 唯一 ID */
+    bool has_xwhiteouts;      /* L41 — 是否有 whiteout */
 };
 ```
 
 ### 1.2 struct ovl_path — 层路径
 
 ```c
+// fs/overlayfs/ovl_entry.h L47 — doom-lsp 确认
 struct ovl_path {
-    const struct ovl_layer *layer;
-    struct dentry *dentry;
+    const struct ovl_layer *layer;  /* L48 — 所属层 */
+    struct dentry *dentry;          /* L49 — 该层中的 dentry */
 };
 ```
 
@@ -63,19 +64,19 @@ struct ovl_entry {
 ### 1.4 struct ovl_inode — overlay inode
 
 ```c
-// fs/overlayfs/ovl_entry.h:159
+// fs/overlayfs/ovl_entry.h L159 — doom-lsp 确认
 struct ovl_inode {
     union {
-        struct ovl_dir_cache *cache;        /* 目录缓存 */
-        const char *lowerdata_redirect;
+        struct ovl_dir_cache *cache;        /* L161 — 目录缓存 */
+        const char *lowerdata_redirect;     /* L162 — 下层数据重定向 */
     };
-    const char *redirect;
-    u64 version;
-    unsigned long flags;
-    struct inode vfs_inode;                 /* VFS inode */
-    struct dentry *__upperdentry;           /* 上层 dentry */
-    struct ovl_entry *oe;                   /* 下层信息 */
-    struct mutex lock;                      /* copy-up 同步 */
+    const char *redirect;           /* L164 — 重定向路径 */
+    u64 version;                    /* L165 — 版本号（copy-up 跟踪） */
+    unsigned long flags;            /* L166 — 状态标志 */
+    struct inode vfs_inode;         /* L167 — VFS inode 缓存 */
+    struct dentry *__upperdentry;   /* L168 — 上层 dentry */
+    struct ovl_entry *oe;           /* L169 — 下层路径信息 */
+    struct mutex lock;              /* L171 — copy-up 同步锁 */
 };
 ```
 
