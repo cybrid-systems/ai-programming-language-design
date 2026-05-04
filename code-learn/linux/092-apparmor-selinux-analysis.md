@@ -291,3 +291,17 @@ LSM 框架（`include/linux/lsm_hooks.h`）提供约 200 个钩子点，通过 `
 //             → 遍历 profile 路径规则
 //     → 如果返回值非零 → open 被拒绝 → -EACCES
 ```
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct security_hook_list` | include/linux/lsm_hooks.h | 核心 |
+| `security_add_hooks()` | security/security.c | 相关 |
+| `security_file_open()` | security/security.c | 钩子点 |
+| `selinux_file_open()` | security/selinux/hooks.c | SELinux |
+| `apparmor_file_open()` | security/apparmor/lsm.c | AppArmor |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

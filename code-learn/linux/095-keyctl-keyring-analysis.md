@@ -301,3 +301,16 @@ cat /proc/sys/kernel/keys/maxbytes
 // KEYCTL_WATCH_KEY           — 监控密钥变化
 // KEYCTL_MOVE                — 在 keyring 间移动密钥
 ```
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct key` | include/linux/key.h | 核心 |
+| `keyctl_read_key()` | security/keys/keyctl.c | 读取密钥 |
+| `keyctl_search()` | security/keys/keyctl.c | 搜索密钥 |
+| `join_session_keyring()` | security/keys/keyctl.c | 加入 keyring |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

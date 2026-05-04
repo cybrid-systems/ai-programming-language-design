@@ -360,3 +360,16 @@ sysctl 通过红黑树管理 `/proc/sys/` 目录结构——`find_entry`（`:113
 | `drop_sysctl_table` | `:90` | 表头释放 |
 | `proc_sys_poll_notify` | `:62` | 文件变化通知 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct proc_dir_entry` | include/linux/proc_fs.h | 核心 |
+| `proc_create()` | fs/proc/generic.c | 创建 proc 文件 |
+| `struct ctl_table` | include/linux/sysctl.h | 核心 |
+| `register_sysctl()` | fs/proc/proc_sysctl.c | 注册 sysctl |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

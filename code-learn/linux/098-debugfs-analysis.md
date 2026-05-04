@@ -267,3 +267,15 @@ debugfs 的核心设计是**代理层 + 引用计数安全移除**。`__debugfs_
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-03 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `debugfs_create_file()` | fs/debugfs/inode.c | 文件创建 |
+| `debugfs_create_dir()` | fs/debugfs/inode.c | 目录创建 |
+| `debugfs_remove()` | fs/debugfs/inode.c | 删除 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

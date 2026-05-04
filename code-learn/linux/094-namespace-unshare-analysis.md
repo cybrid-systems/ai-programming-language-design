@@ -267,3 +267,17 @@ nsenter -t <pid> -n -m /bin/bash
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct nsproxy` | include/linux/nsproxy.h | 核心 |
+| `unshare_nsproxy_namespaces()` | kernel/nsproxy.c | 相关 |
+| `create_new_namespaces()` | kernel/nsproxy.c | 相关 |
+| `copy_pid_ns()` | kernel/pid_namespace.c | PID 命名空间 |
+| `copy_net_ns()` | net/core/net_namespace.c | 网络命名空间 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

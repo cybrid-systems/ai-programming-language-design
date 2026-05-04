@@ -299,3 +299,16 @@ struct rchan_callbacks {
 // → btrace 通过 relay 文件读取
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `relay_open()` | kernel/relay.c | 通道创建 |
+| `relay_write()` | kernel/relay.c | 数据写入 |
+| `relay_reserve()` | kernel/relay.c | 预留缓冲区 |
+| `struct rchan` | include/linux/relay.h | 核心结构 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

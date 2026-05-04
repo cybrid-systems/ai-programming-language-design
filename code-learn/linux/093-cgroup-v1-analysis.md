@@ -263,3 +263,17 @@ cgroup v1 通过 `struct cgroup` 层级树 + `struct cgroup_subsys` 控制器插
 //     },
 // };
 ```
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct cgroup` | include/linux/cgroup-defs.h | 核心 |
+| `struct cgroup_subsys_state` | include/linux/cgroup-defs.h | 核心 |
+| `cgroup_attach_task()` | kernel/cgroup/cgroup.c | 进程迁移 |
+| `cgroup_mkdir()` | kernel/cgroup/cgroup.c | 创建 cgroup |
+| `mem_cgroup_try_charge()` | mm/memcontrol.c | 内存计费 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

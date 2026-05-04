@@ -306,3 +306,15 @@ binfmt_misc 通过 `create_entry`（`:350`）解析注册格式字符串（`:nam
 // 挂载 procfs 后自动可用（无需额外模块参数）
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct binfmt_entry` | fs/binfmt_misc.c | 格式条目 |
+| `load_misc_binary()` | fs/binfmt_misc.c | 加载 |
+| `Entry` 注册格式 | /proc/sys/fs/binfmt_misc/register | sysfs 接口 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
