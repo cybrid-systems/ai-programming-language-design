@@ -491,17 +491,17 @@ DL Server → 包含所有 CFS 任务，以 EDF 调度
 |------|------|------|
 | `struct sched_dl_entity` | include/linux/sched.h | 644 |
 | `struct dl_rq` | kernel/sched/sched.h | 873 |
-| `enqueue_task_dl()` | kernel/sched/deadline.c | 720 |
-| `dequeue_task_dl()` | kernel/sched/deadline.c | 778 |
+| `enqueue_task_dl()` | kernel/sched/deadline.c | 2293 |
+| `dequeue_task_dl()` | kernel/sched/deadline.c | 2353 |
 | `pick_next_task_dl()` | kernel/sched/deadline.c | 相关 |
-| `update_curr_dl()` | kernel/sched/deadline.c | 相关 |
+| `update_curr_dl()` | kernel/sched/deadline.c | 1936 |
 | `start_dl_timer()` | kernel/sched/deadline.c | 1061 |
 | `dl_task_timer()` | kernel/sched/deadline.c | 1210 |
-| `push_dl_task()` | kernel/sched/deadline.c | 620 |
-| `pull_dl_task()` | kernel/sched/deadline.c | 631 |
+| `push_dl_task()` | kernel/sched/deadline.c | 2921 |
+| `pull_dl_task()` | kernel/sched/deadline.c | 3001 |
 | `dl_bw_manage()` | kernel/sched/core.c | 相关 |
 | `struct dl_bw` | kernel/sched/sched.h | 相关 |
 | `enqueue_pushable_dl_task()` | kernel/sched/deadline.c | 581 |
-| `__dequeue_dl_entity()` | kernel/sched/deadline.c | 相关 |
+| `__dequeue_dl_entity()` | kernel/sched/deadline.c | 2175 |
 | `grub_replenishment()` | kernel/sched/deadline.c | 相关 |
 | `dl_sched_class` | kernel/sched/deadline.c | (调度类全局) |
