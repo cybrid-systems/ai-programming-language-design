@@ -1,4 +1,4 @@
-# 023-interrupt-handling — Linux 内核中断处理深度源码分析
+# 023-interrupt — Linux 内核中断处理深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -15,240 +15,350 @@ Linux 内核的中断处理分为**上半部（top half）**和**下半部（bot
 中断到来
   │
   ├── 上半部（Hard IRQ Context）
-  │    ├── 关中断 → 保存上下文
+  │    ├── CPU 自动：关中断 + 保存上下文 + 查 IDT → 跳转
   │    ├── 执行驱动程序注册的 handler
-  │    │   → 读/写硬件寄存器（清除中断状态）
-  │    │   → 标记数据可用
-  │    │   → 触发下半部（raise_softirq）
-  │    └── 开中断 → 恢复上下文 → iret
+  │    │   → 读/写硬件寄存器（清除中断状态位）
+  │    │   → 标记数据可用（skb 入队、I/O 完成标志）
+  │    │   → 触发下半部（raise_softirq_irqoff）
+  │    └── 恢复上下文 → iret/irq_return
   │
-  └── 下半部（SoftIRQ Context）
-       ├── 软中断处理（do_softirq）
-       ├── tasklet 处理
-       └── 工作队列（线程上下文）
+  └── 下半部（SoftIRQ / Tasklet / Threaded）
+       ├── do_softirq() 处理 TIMER/NET_RX/NET_TX/BLOCK
+       ├── tasklet 处理（旧机制，逐步淘汰）
+       └── 内核线程 irq/XXX 处理（线程化中断）
 ```
 
-**doom-lsp 确认**：中断核心实现在 `kernel/irq/` 目录。入口函数在 `arch/x86/kernel/irq.c`（`common_interrupt` @ L326）。API 定义在 `include/linux/interrupt.h`。
+**doom-lsp 确认**：`arch/x86/kernel/irq.c` 含 **198 个符号**（主 IRQ 入口），`kernel/irq/manage.c` 含 **280 个符号**（request_irq 实现），`include/linux/interrupt.h` 含 **280 个符号**（API 声明），`include/linux/irqdesc.h` 含 **60 个符号**（irq_desc 定义）。
 
 ---
 
-## 1. 中断硬件架构（x86-64）
+## 1. 核心数据结构
 
-### 1.1 APIC（高级可编程中断控制器）
+### 1.1 `struct irq_desc`——中断描述符
 
-现代 x86 系统使用 APIC 架构管理中断：
+（`include/linux/irqdesc.h` L80 — doom-lsp 确认）
 
-```
-                      ┌───────────────────────┐
-                      │    IO-APIC            │
-                      │   (I/O APIC)          │
-                      │   24 个引脚            │
-                      │   IRQ 0-23            │
-                      └─────────┬─────────────┘
-                                │
-                    ┌───────────┴───────────┐
-                    │                       │
-              ┌─────▼─────┐          ┌─────▼─────┐
-              │ LAPIC CPU0│          │ LAPIC CPU1│
-              │ (Local      │          │            │
-              │  APIC)    │          │            │
-              └───────────┘          └───────────┘
-
-LAPIC 功能：
-  ├── LVT（Local Vector Table）: 定时器、性能计数器等本地中断
-  ├── IRR（Interrupt Request Register）: 待处理中断
-  ├── ISR（In-Service Register）: 正在处理的中断
-  └── TPR（Task Priority Register）: 优先级屏蔽
-```
-
-### 1.2 IDT（Interrupt Descriptor Table）
-
-每个 CPU 有一个 IDT，将中断向量号映射到处理函数入口：
+每个中断向量对应一个 `irq_desc`，是中断子系统的中枢结构：
 
 ```c
-// arch/x86/include/asm/desc.h
-struct idt_entry {
-    u16 offset_low;      // 处理函数地址低 16 位
-    u16 segment;         // CS 段选择子
-    u16 ist:3,           // Interrupt Stack Table
-        zero:5,
-        type:5,          // 门类型（中断门/陷阱门）
-        dpl:2,           // 描述符权限级别
-        p:1;             // Present
-    u16 offset_mid;      // 处理函数地址中 16 位
-    u32 offset_high;     // 处理函数地址高 32 位
-    u32 reserved;
+struct irq_desc {
+    struct irq_common_data  irq_common_data; // L82 — 共享数据（affinity, msi_desc）
+    struct irq_data         irq_data;        // L83 — 芯片层数据（hwirq, chip, domain）
+    struct irqstat __percpu *kstat_irqs;     // L84 — per-CPU 中断统计
+    irq_flow_handler_t      handle_irq;      // L85 — 流控 handler（handle_edge_irq / handle_level_irq / handle_fasteoi_irq）
+    struct irqaction        *action;         // L86 — 驱动程序注册的 action 链表
+    unsigned int            status_use_accessors; // L87 — IRQ 状态位
+    unsigned int            core_internal_state__do_not_mess_with_it; // L88
+    unsigned int            depth;           // L89 — disable 嵌套计数
+    unsigned int            wake_depth;      // L90 — wake 嵌套计数
+    unsigned int            tot_count;       // L91 — 总中断计数
+    unsigned int            irq_count;       // L92 — 用于检测坏 IRQ
+    unsigned long           last_unhandled;  // L93 — 上次未处理的计时
+    unsigned int            irqs_unhandled;  // L94 — 未处理计数（用于检测虚假中断）
+    atomic_t                threads_handled; // L95 — 线程处理计数
+    int                     threads_handled_last; // L96
+    raw_spinlock_t          lock;            // L97 — 中断描述符自旋锁
+    struct cpumask          *percpu_enabled; // L98 — per-CPU 启用掩码
+#ifdef CONFIG_SMP
+    struct irq_redirect     redirect;        // L101 — SMP 重定向
+    const struct cpumask    *affinity_hint;  // L102 — 亲和性提示
+    struct irq_affinity_notify *affinity_notify; // L103 — 亲和性变更通知
+#ifdef CONFIG_GENERIC_PENDING_IRQ
+    cpumask_var_t           pending_mask;    // L106 — 待处理的亲和性变更
+#endif
+#endif
+    atomic_t                threads_active;  // L112 — 活跃线程数
+    wait_queue_head_t       wait_for_threads; // L113
+#ifdef CONFIG_PM_SLEEP
+    unsigned int            nr_actions;
+    unsigned int            no_suspend_depth;
+    unsigned int            cond_suspend_depth;
+    unsigned int            force_resume_depth;
+#endif
+    struct mutex            request_mutex;   // L128 — 请求互斥锁
+    int                     parent_irq;      // L129 — 父中断
+    struct module           *owner;          // L130 — 所属模块
+    const char              *name;           // L131 — 名称（/proc/interrupts 显示）
+#ifdef CONFIG_SPARSE_IRQ
+    struct rcu_head         rcu;             // L121 — RCU 回调
+    struct kobject          kobj;            // L122 — kobject
+#endif
+} ____cacheline_aligned;
+```
+
+**关键字段**：
+
+| 字段 | 用途 |
+|------|------|
+| `handle_irq` | **流控 handler**——决定中断触发方式（边沿/电平/MSI）的处理策略 |
+| `action` | **irqaction 链表**——同一个 IRQ 可以注册多个 handler（共享中断） |
+| `lock` | 保护 desc 的自旋锁——在 handle_irq 调用期间持有 |
+| `depth` | 嵌套 disable 计数——`disable_irq` +1，`enable_irq` -1，>0 时中断被屏蔽 |
+| `irq_count` / `irqs_unhandled` | 用于**虚假中断检测**——如果连续 100K 次中断都未处理，该 IRQ 被自动禁用 |
+
+### 1.2 `struct irqaction`——中断处理器
+
+（`include/linux/interrupt.h` L123 — doom-lsp 确认）
+
+```c
+struct irqaction {
+    irq_handler_t           handler;       // L124 — 上半部处理器（中断上下文）
+    union {
+        void                *dev_id;       // L126 — 设备标识（共享中断识别）
+        void __percpu       *percpu_dev_id; // L127 — per-CPU dev_id
+    };
+    const struct cpumask    *affinity;    // L128 — CPU 亲和性
+    struct irqaction        *next;         // L129 — 下一 action（共享中断链表）
+    irq_handler_t           thread_fn;    // L130 — 线程处理器（进程上下文）
+    struct task_struct      *thread;      // L131 — irq/XXX-N 内核线程
+    struct irqaction        *secondary;   // L132 — 辅助 action
+    unsigned int            irq;          // L133 — 中断号
+    unsigned int            flags;        // L134 — IRQF_* 标志（IRQF_SHARED, IRQF_ONESHOT...）
+    unsigned long           thread_flags; // L136 — 线程化 IRQ 标志
+    unsigned long           thread_mask; // L137 — 线程化屏蔽位
+    const char              *name;        // L138 — 驱动名称
+    struct proc_dir_entry   *dir;         // L139 — /proc/irq/NNN 条目
+} ____cacheline_internodealigned_in_smp; // L140 — SMP cacheline 对齐
+```
+
+**handler 的返回值**：
+
+```c
+// include/linux/interrupt.h — doom-lsp 确认
+typedef irqreturn_t (*irq_handler_t)(int irq, void *dev_id);
+
+// irqreturn_t 枚举（doom-lsp @ include/linux/irqreturn.h）
+enum irqreturn {
+    IRQ_NONE        = (0 << 0), // 中断不是这个设备产生的
+    IRQ_HANDLED     = (1 << 0), // 已处理
+    IRQ_WAKE_THREAD = (1 << 1), // 需要唤醒线程处理
 };
 ```
 
-IDT 条目类型：
-- **中断门（Interrupt Gate）**：进入时关中断（`IF=0`），iret 时恢复
-- **陷阱门（Trap Gate）**：不修改 IF 标志
-- **任务门（Task Gate）**：硬件任务切换（已废弃）
+### 1.3 `struct irq_domain`——中断域映射
 
----
-
-## 2. 🔥 完整中断处理数据流（x86-64）
-
-```
-硬件设备触发中断信号
-  │
-  └─ IO-APIC 接收中断 → 转换到 LAPIC
-       │
-       ├─ LAPIC 检查 IRR 和 TPR（优先级匹配？）
-       │
-       ├─ LAPIC 通过 APIC 总线/LVT 发送中断到 CPU
-       │   目标 CPU 由 IRQ affinity 决定
-       │
-       └─ [在此 CPU 上]
-            │
-            ├─ CPU 完成当前指令                               [~1-10ns]
-            │
-            ├─ CPU 硬件自动保存：                              [~10ns]
-            │   → RSP, RIP, RFLAGS, CS 被推入内核栈
-            │   → IF=0（关中断）
-            │   → 切换到 IST（Interrupt Stack Table）栈
-            │
-            ├─ 根据中断向量号查询 IDT
-            │   → 第 vector 个 IDT 条目
-            │
-            ├─ 跳到 IDT 条目指定的入口
-            │   │
-            │   └─ 汇编入口（arch/x86/entry/entry_64.S）:
-            │        │
-            │        ├─ ERROR_CODE 入栈（x86 错误码）
-            │        ├─ 中断向量号入栈
-            │        │
-            │        └─ CALL common_interrupt()
-            │             │
-            │             └─ DEFINE_IDTENTRY_IRQ(common_interrupt)
-            │                  @ arch/x86/kernel/irq.c:326
-            │                  │
-            │                  ├─ [DEFINE_IDTENTRY_IRQ 宏展开：
-            │                  │   irqentry_enter() → 标记中断上下文]
-            │                  │
-            │                  ├─ __this_cpu_read(vector_irq[vector])
-            │                  │   (在 call_irq_handler() 中，根据向量号获取 IRQ 描述符)
-            │                  │
-            │                  ├─ call_irq_handler(vector, regs)
-            │                  │   └─ handle_irq(desc, regs)         [L258]
-            │                  │       │
-            │                  │       ├─ if (desc->handle_irq)
-            │                  │    │     desc->handle_irq(desc, regs)
-            │                  │    │     ← handle_fasteoi_irq 等
-            │                  │    │        │
-            │                  │    │        ├─ [级别触发中断处理]
-            │                  │    │        │   handle_level_irq():
-            │                  │    │        │   → mask_ack_irq()    ← 屏蔽+确认
-            │                  │    │        │   → handle_irq_event()
-            │                  │    │        │   → unmask_irq()     ← 取消屏蔽
-            │                  │    │        │
-            │                  │    │        ├─ [边沿触发中断处理]
-            │                  │    │        │   handle_edge_irq():
-            │                  │    │        │   → ack_irq()        ← 确认
-            │                  │    │        │   → handle_irq_event()
-            │                  │    │        │
-            │                  │    │        └─ [快速 EOI（MSI/MSI-X）]
-            │                  │    │            handle_fasteoi_irq():
-            │                  │    │            → handle_irq_event()
-            │                  │    │            → eoi_irq()       ← End Of Interrupt
-            │                  │    │
-            │                  │    └─ handle_irq_event(desc)     [核心]
-            │                  │         │
-            │                  │         ├─ raw_spin_lock(&desc->lock)
-            │                  │         │
-            │                  │         ├─ action = desc->action  ← 驱动程序注册的 handler 链表
-            │                  │         │
-            │                  │         ├─ for_each_handler(action) {
-            │                  │         │    │
-            │                  │         │    ├─ [★ 上半部：执行驱动程序处理函数]
-            │                  │         │    │   ret = action->handler(irq, action->dev_id)
-            │                  │         │    │   ← 例：nvme_irq()
-            │                  │         │    │   ← 或：ata_interrupt()
-            │                  │         │    │   ← 或：usb_hcd_irq()
-            │                  │         │    │   ← 返回值：IRQ_HANDLED / IRQ_WAKE_THREAD / IRQ_NONE
-            │                  │         │    │
-            │                  │         │    ├─ [如果 handler 返回 IRQ_WAKE_THREAD]
-            │                  │         │    │   → wake_up_process(desc->threads_handled)
-            │                  │         │    │   → 唤醒中断线程（threaded IRQ）
-            │                  │         │    │
-            │                  │         │    └─ action = action->next
-            │                  │         │  }
-            │                  │         │
-            │                  │         └─ raw_spin_unlock(&desc->lock)
-            │                  │
-            │                  ├─ [DEFINE_IDTENTRY_IRQ 宏结尾：
-            │                  │   irqentry_exit() → 恢复上下文]
-            │                  │
-            │                  ├─ [返回 __common_interrupt] -> 汇编 IRETQ
-            │                  │
-            │                  ├─ [中断处理结束后遇到 irq_exit()：
-            │                  │   → 触发下半部处理]
-            │                  │   if (softirq_pending())
-            │                  │     invoke_softirq()              ← 处理软中断
-            │                  │     → do_softirq() (见 article 24)
-            │                  │
-            │                  └─ 汇编返回：
-            │                       └─ IRETQ
-            │                       │
-            │                       └─ 汇编返回：
-            │                            └─ IRETQ
-            │                                 → 恢复 RFLAGS, RIP, RSP, CS
-            │                                 → 回到被中断的代码
-```
-
----
-
-## 3. 注册中断处理函数
+（`include/linux/irqdomain.h` L168）
 
 ```c
-// include/linux/interrupt.h
+struct irq_domain {
+    struct list_head        link;           // 全局 domain 链表
+    const char              *name;          // 域名（如 "IO-APIC", "PCI-MSI"）
+    const struct irq_domain_ops *ops;       // map/unmap/xlate 操作
+    void                    *host_data;     // 域私有数据
+    unsigned int            flags;          // IRQ_DOMAIN_FLAG_*
+    struct fwnode_handle    *fwnode;        // fwnode 关联
 
-// ——— 标准注册 ———
-int request_irq(unsigned int irq, irq_handler_t handler,
-                unsigned long flags, const char *name, void *dev);
+    // 映射方式
+    union {
+        struct irq_domain_chip_generic *gc; // 通用芯片域
+        struct irq_domain_hierarchy    *h;  // 层级域
+    };
 
-// ——— threaded IRQ（内核线程下半部） ———
-int request_threaded_irq(unsigned int irq,
-                          irq_handler_t handler,       // 上半部（可 NULL）
-                          irq_handler_t thread_fn,     // 线程化处理
-                          unsigned long flags,
-                          const char *name, void *dev);
+    // 层级域结构（doom-lsp 确认）
+    struct irq_domain        *parent;       // 父域（x86: IO-APIC → root domain）
+    const struct irq_domain_ops *parent_ops;
+    ...
+};
 ```
 
-**请求流程**（`request_threaded_irq`）：
+**x86 上的中断域层级**：
 
 ```
-request_threaded_irq(irq, handler, thread_fn, flags, name, dev)
+CPU 本地 APIC（lapic domain）
   │
-  └─ __setup_irq(irq, desc, action)           @ kernel/irq/manage.c
+  └── IO-APIC（ioapic domain）
        │
-       ├─ [1] 权限检查
-       ├─ [2] 分配 struct irqaction
-       │   action->handler = handler            ← 上半部
-       │   action->thread_fn = thread_fn        ← 下半部（线程）
-       │   action->name = name
-       │   action->dev_id = dev
+       ├── PCI-MSI（msi domain）
+       │    └── 每个 PCIe 设备
        │
-       ├─ [3] 如果是 threaded IRQ：
-       │   创建内核线程：
-       │   action->thread = kthread_create(irq_thread, action,
-       │                                    "irq/%d-%s", irq, name)
+       └── 传统 ISA 中断（i8259 domain）
+```
+
+---
+
+## 2. 硬件中断→软件处理的完整数据流
+
+### 2.1 x86-64 上的中断入口
+
+x86-64 上的外部硬件中断通过 `common_interrupt` 入口进入内核：
+
+```asm
+// arch/x86/entry/entry_64.S — doom-lsp 确认
+// 中断向量表由宏展开生成：
+// .irqentry.text 段中的 entry 代码
+
+// 每个硬件中断向量的入口：
+// vector 号从 32 到 255
+
+// 汇编入口关键代码（简化）：
+SYM_CODE_START(irq_entries_start)
+    vector = FIRST_EXTERNAL_VECTOR  // = 32
+    .rept NR_EXTERNAL_VECTORS       // 重复展开每个向量
+        push    $(~vector + 1)      // 保存 vector 号（取反编码）
+        jmp     common_interrupt    // 统一入口
+        .align  8
+        vector = vector + 1
+    .endr
+SYM_CODE_END(irq_entries_start)
+```
+
+### 2.2 common_interrupt → IDTENTRY_IRQ 宏
+
+`DEFINE_IDTENTRY_IRQ` 宏生成实际的 C 函数入口：
+
+```c
+// arch/x86/kernel/irq.c L326 — doom-lsp 确认
+DEFINE_IDTENTRY_IRQ(common_interrupt)
+{
+    struct pt_regs *old_regs = set_irq_regs(regs);
+    RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
+
+    if (unlikely(!call_irq_handler(vector, regs)))
+        apic_eoi();  // 未处理的中断 → 直接 EOI
+    set_irq_regs(old_regs);
+}
+```
+
+`DEFINE_IDTENTRY_IRQ` 宏的定义：
+
+```c
+// arch/x86/include/asm/idtentry.h — doom-lsp 确认
+#define DEFINE_IDTENTRY_IRQ(func)                                  \
+static __always_inline void __##func(struct pt_regs *regs, u8 vector); \
+__visible noinstr void func(struct pt_regs *regs)                   \
+{                                                                    \
+    irqentry_state_t state = irqentry_enter(regs);                  \
+    u8 vector = ~(regs->orig_ax - FIRST_EXTERNAL_VECTOR);           \
+                                                                    \
+    instrumentation_begin();                                         \
+    kasan_check_write(regs, sizeof(*regs));                         \
+    __##func(regs, vector);                                          \
+    instrumentation_end();                                           \
+    irqentry_exit(regs, state);                                     \
+}                                                                    \
+static __always_inline void __##func(struct pt_regs *regs, u8 vector)
+```
+
+**宏展开后的完整执行序列**：
+
+```
+1. CPU 硬件：查 IDT → 跳转到 irq_entries_start + vector{offset}
+2.   汇编：push vector → jmp common_interrupt
+3.   common_interrupt() → irqentry_enter() → RCU 进入
+4.   call_irq_handler(vector, regs)
+5.     irq_find_mapping() → 找到 irq_desc
+6.     handle_irq(desc, regs)
+7.       __handle_irq_event_percpu(desc)
+8.         action->handler(irq, dev_id)  ← 驱动程序！
+9.   irqentry_exit() → 检查是否需要处理 softirq
+10. 返回用户空间或中断点
+```
+
+### 2.3 call_irq_handler——向量到描述符的映射
+
+（`arch/x86/kernel/irq.c` L281 — doom-lsp 确认）
+
+```c
+static __always_inline bool call_irq_handler(int vector, struct pt_regs *regs)
+{
+    // 通过 per-CPU 向量表将中断向量映射到 irq_desc
+    struct irq_desc *desc = __this_cpu_read(vector_irq[vector]);
+
+    if (likely(!IS_ERR_OR_NULL(desc))) {
+        handle_irq(desc, regs);     // 调用流控 handler
+        return true;
+    }
+    // 未映射的中断 → 返回 false，common_interrupt 中 EOI
+    return false;
+}
+```
+
+### 2.4 __handle_irq_event_percpu——执行 action 链表
+
+（`kernel/irq/handle.c` L185 — doom-lsp 确认）
+
+```c
+irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc)
+{
+    irqreturn_t retval = IRQ_NONE;
+    unsigned int irq = desc->irq_data.irq;
+    struct irqaction *action;
+
+    // 遍历 action 链表（共享中断时多个 handler）
+    for_each_action_of_desc(desc, action) {
+        irqreturn_t res;
+
+        // 调用驱动程序注册的 handler
+        trace_irq_handler_entry(irq, action);
+        res = action->handler(irq, action->dev_id);
+        trace_irq_handler_exit(irq, action, res);
+
+        // 只有有 handler 认领（IRQ_HANDLED），才计数
+        if (res == IRQ_HANDLED || res == IRQ_WAKE_THREAD)
+            retval = res;
+
+        // 如果 handler 要求唤醒线程
+        if (res == IRQ_WAKE_THREAD)
+            __irq_wake_thread(desc, action);
+    }
+    return retval;
+}
+```
+
+---
+
+## 3. 中断请求——request_irq 数据流
+
+```c
+// include/linux/interrupt.h — 封装宏
+static inline int __must_check
+request_irq(unsigned int irq, irq_handler_t handler,
+            unsigned long flags, const char *name, void *dev)
+{
+    return request_threaded_irq(irq, handler, NULL, flags, name, dev);
+}
+
+// kernel/irq/manage.c — 核心实现
+request_threaded_irq(irq, handler, thread_fn, flags, name, dev)
+  └─ __setup_irq(irq, desc, action)           // doom-lsp @ manage.c
        │
-       ├─ [4] 启用中断（连接硬件）：
-       │   __irq_set_trigger(desc, flags)       ← 设置触发方式
-       │   irq_startup(desc, true)              ← 启用硬件中断
+       ├─ 1. 安全检查
+       │    如果 IRQF_SHARED 但第一个 action 不允许共享 → -EBUSY
+       │    如果 handler == NULL → 需要 thread_fn
        │
-       └─ [5] 如果 handler==NULL 且 thread_fn!=NULL：
-           唤醒中断线程：
-           wake_up_process(action->thread)      ← 线程启动
+       ├─ 2. 分配并初始化 struct irqaction
+       │    action->handler = handler          ← 上半部函数
+       │    action->thread_fn = thread_fn      ← 线程化下半部
+       │    action->name = name
+       │    action->dev_id = dev
+       │    action->irq = irq
+       │    action->flags = flags
+       │
+       ├─ 3. 如果是 threaded IRQ（thread_fn != NULL）
+       │    创建内核线程：
+       │    action->thread = kthread_create(irq_thread, action,
+       │                                     "irq/%d-%s", irq, name)
+       │    设置线程为 SCHED_FIFO 优先级 50
+       │
+       ├─ 4. 注册到 irq_desc
+       │    desc->action = action
+       │    共享中断: 添加到 action 链表末尾
+       │
+       ├─ 5. 连接硬件
+       │    __irq_set_trigger(desc, flags)     // 设置触发方式（边沿/电平/MSI）
+       │    irq_startup(desc, true)             // 启用硬件中断
+       │    │  └─ irq_domain_activate_irq()     // irqdomain 激活
+       │    │  └─ chip->irq_startup(desc)        // 芯片驱动操作
+       │    │       → IO-APIC: 写入 IOREDTBL
+       │    │       → MSI: 写 PCI 配置空间
+       │
+       └─ 6. 如果 handler==NULL:
+            wake_up_process(action->thread)     // 启动中断线程
 ```
 
 ---
 
 ## 4. Threaded IRQ——线程化的中断处理
-
-传统中断处理需要在中断上下文中快速执行。Threaded IRQ 允许将大部分工作推迟到内核线程中：
 
 ```c
 // 示例：mmc 块设备驱动
@@ -257,21 +367,19 @@ static irqreturn_t mmc_irq(int irq, void *dev_id)
     struct mmc_host *host = dev_id;
     // 上半部：快速检查硬件状态
     // 如果检测到 I/O 完成，返回 IRQ_WAKE_THREAD
-    return IRQ_WAKE_THREAD;  // ← 触发下半部线程
+    return IRQ_WAKE_THREAD;
 }
 
 static irqreturn_t mmc_thread_fn(int irq, void *dev_id)
 {
     // 下半部：在线程上下文中执行
-    // 可持有 mutex、可休眠
+    // 可持有 mutex、可调用 kmalloc(GFP_KERNEL)
     mmc_blk_rw_rq(mmc_queue);
     return IRQ_HANDLED;
 }
 
-// 注册为 threaded IRQ：
-request_threaded_irq(irq, mmc_irq, mmc_thread_fn, ...);
-// handler 在中断上下文执行
-// thread_fn 在内核线程 "irq/xx-mmc" 中执行
+// 注册
+request_threaded_irq(irq, mmc_irq, mmc_thread_fn, IRQF_ONESHOT, "mmc", host);
 ```
 
 **数据流**：
@@ -280,44 +388,151 @@ request_threaded_irq(irq, mmc_irq, mmc_thread_fn, ...);
 硬件中断
   │
   ├─ handler（上半部，中断上下文）：
-  │   快速读取状态寄存器
+  │   快速读状态寄存器
   │   返回 IRQ_WAKE_THREAD
   │
   └─ irq_thread（下半部，进程上下文）：
-       wake_up_process(irq_thread)
-       → 线程调用 thread_fn
-       → 可持有锁、可调用 kmalloc(GFP_KERNEL)
-       → 可同步等待 I/O
+       __irq_wake_thread(desc, action)
+         → wake_up_process(action->thread)
+           → 线程调用 thread_fn(irq, dev_id)
+             → 可持有锁、可调 kmalloc(GFP_KERNEL)
+             → IRQ_HANDLED 后等待下一轮
+```
+
+**irq_thread 函数的核心循环**（`kernel/irq/manage.c` — doom-lsp 确认）：
+
+```c
+static int irq_thread(void *data)
+{
+    struct irqaction *action = data;
+    struct task_struct *tsk = current;
+
+    while (!kthread_should_stop()) {
+        // 等待中断触发
+        set_current_state(TASK_INTERRUPTIBLE);
+        schedule();     // 由 __irq_wake_thread 唤醒
+
+        // 调用 thread_fn
+        do {
+            action->thread_fn(action->irq, action->dev_id);
+        } while (!atomic_read(&desc->threads_active) && ...);
+
+        // 检查是否所有 thread_fn 已完成 → 调用 chip->irq_eoi()
+    }
+}
 ```
 
 ---
 
-## 5. /proc/interrupts 解读
+## 5. 流控 Handler（handle_irq）
+
+`irq_desc->handle_irq` 指向三个标准流控函数之一：
+
+### 5.1 handle_edge_irq——边沿触发
+
+```c
+void handle_edge_irq(struct irq_desc *desc)
+{
+    // 1. 获取 desc->lock
+    // 2. 标记 IRQD_IRQ_INPROGRESS
+    // 3. 如果 IRQ 被禁用（depth > 0）→ 标记 IRQ_PENDING，返回
+    // 4. 循环处理：
+    //    while (pending) {
+    //        __handle_irq_event_percpu(desc)
+    //        如果处理期间新中断到达 → 继续循环
+    //    }
+    // 5. 清除 IRQD_IRQ_INPROGRESS
+    // 6. 释放 desc->lock
+}
+```
+
+**边沿触发的特殊性**：两次边沿之间的电平变化可能丢失，所以必须用循环保证所有到达的中断都被处理。
+
+### 5.2 handle_level_irq——电平触发
+
+```c
+void handle_level_irq(struct irq_desc *desc)
+{
+    // 1. mask_irq(desc)  ← 屏蔽中断线（防止重复触发）
+    // 2. __handle_irq_event_percpu(desc)
+    // 3. unmask_irq(desc) ← 处理完成后取消屏蔽
+}
+```
+
+电平信号只要电平有效就会持续触发，所以 handler 被调用前先屏蔽，完成后取消屏蔽。
+
+### 5.3 handle_fasteoi_irq——MSI/MSI-X 快速 EOI
+
+```c
+void handle_fasteoi_irq(struct irq_desc *desc)
+{
+    // 1. __handle_irq_event_percpu(desc)
+    // 2. 不需要 mask/unmask——硬件在 MSI 消息送达后自动抑制
+    //    EOI（End of Interrupt）由调用者（common_interrupt）处理
+}
+```
+
+**MSI 的特点**：不需要通过中断控制器 mask，每个消息是一次性的。
+
+---
+
+## 6. irqdomain 与硬件 IRQ 号映射
+
+### 6.1 映射结构
+
+x86-64 上的中断号转换：
+
+```
+PCI 设备硬件中断（Pin A/B/C/D 或 MSI 向量）
+  │
+  └─ PCI 配置空间 → MSI 地址/数据
+       │
+       ├─ irq_domain_ops.alloc()  → 分配 Linux IRQ 号
+       │     irq_domain_alloc_irqs(parent, nr_irqs, hwirq, ...)
+       │       → 在 domain 中分配 virq
+       │       → 调用 parent domain 的 alloc 递归
+       │
+       └─ irq_domain_ops.map()    → 建立 hwirq → virq 映射
+             ioapic_domain_ops.map(domain, virq, hwirq)
+               → 编程 IO-APIC IOREDTBL 寄存器
+```
+
+### 6.2 per-CPU 向量表
+
+```c
+// arch/x86/kernel/irq.c — doom-lsp 确认
+// 每个 CPU 维护一个向量 → irq_desc 的映射表
+DEFINE_PER_CPU(vector_irq_t, vector_irq);
+
+// 在 request_irq 时建立映射：
+// assign_irq_vector(irq, desc)
+//   → 选择一个空闲的 CPU 向量号
+//   → this_cpu_write(vector_irq[vector], desc)
+//   → 编程 interrupt controller
+```
+
+---
+
+## 7. /proc/interrupts 解读
 
 ```bash
 $ cat /proc/interrupts
            CPU0       CPU1       CPU2       CPU3
   0:         30          0          0          0   IO-APIC  2-edge      timer
   1:      12345       9876       5678       3456   IO-APIC  1-edge      i8042
-  8:          1          0          0          0   IO-APIC  8-edge      rtc0
  16:         12          0          0          0   IO-APIC 16-fasteoi   ehci_hcd:usb1
  24:    1234567    2345678    3456789    4567890   PCI-MSI 524288-edge  nvme0q0
  25:    9876543    8765432    7654321    6543210   PCI-MSI 524289-edge  nvme0q1
-NMI:          0          0          0          0   Non-maskable interrupts
-LOC:   12345678   23456789   34567890   45678901   Local timer interrupts
-```
+LOC:   12345678   23456789   34567890   34567890   Local timer interrupts
 
-| 列 | 含义 |
-|----|------|
-| `IRQ#` | 中断向量号 |
-| `CPU0-3` | 各 CPU 处理的中断次数 |
-| 控制器 | IO-APIC / PCI-MSI / LAPIC |
-| 类型 | `edge` / `fasteoi` / `level` |
-| 名称 | 注册的驱动名称 |
+IRQ#    CPU 计数              控制器类型 触发方式  驱动注册名
+ │      └ 每列 = per-CPU 计数  │        │         │
+ └─────────────────────────────┴────────┴─────────┘
+```
 
 ---
 
-## 6. 中断亲和性（IRQ Affinity）
+## 8. 中断亲和性（IRQ Affinity）
 
 ```bash
 # 查看 irq 24 的 CPU 亲和性
@@ -328,94 +543,50 @@ $ cat /proc/irq/24/smp_affinity
 $ echo 03 > /proc/irq/24/smp_affinity
 ```
 
-在内核中，亲和性通过 `irq_desc->irq_common_data.affinity` 控制：
+内核中的亲和性实现：
 
 ```c
-// 中断分配逻辑
-// 默认：在 CPU 之间轮询分配
-// 可手动设置：绑定特定中断到特定 CPU
-
-// 网络性能优化：将 NIC RX 队列中断分别绑定到不同 CPU
-// → 每个 CPU 处理自己的 RX 队列
-// → 避免跨 CPU 缓存失效
+// kernel/irq/manage.c — IRQ affinity
+/**
+ * @affinity: struct irqaction 中的 cpumask，由 /proc/irq/N/smp_affinity 设置
+ *
+ * 分配向量时：
+ *   assign_irq_vector(irq, desc, affinity)
+ *     → 在 affinity 掩码中选择一个 CPU
+ *     → 编程 interrupt controller 路由到此 CPU
+ *
+ * CPU hotplug 时：
+ *   irq_migrate_all_off_this_cpu()
+ *     → 将中断迁移到其他 CPU
+ */
 ```
+
+**典型优化**：将网络 IRQ 绑定到特定 CPU，避免跨 CPU 缓存失效。
 
 ---
 
-## 7. 中断处理的实时性保障
+## 9. 源码索引
 
-### 7.1 中断嵌套与优先级
-
-```c
-// Linux 允许高优先级中断打断低优先级中断处理
-// 但在 do_IRQ() 执行期间中断是关闭的
-// IRQ 的优先级 = 中断向量号（0-255）
-// 向量号越低优先级越高
-
-// 中断向量分配：
-//   0-31:   异常和陷阱（不可屏蔽）
-//   32-127: 设备中断
-//   128:    系统调用（int 0x80）
-//   129-238: 设备中断（MSI/MSI-X）
-//   239-255: 特殊中断（LOC, NMI 等）
-```
-
-### 7.2 中断屏蔽
-
-裸机驱动可以使用 `local_irq_save` / `local_irq_restore` 显式控制中断开关：
-
-```c
-unsigned long flags;
-local_irq_save(flags);   // 关中断 + 保存状态
-// 临界区（不会被中断打断）
-local_irq_restore(flags); // 恢复中断
-
-// 变体：
-local_irq_disable();      // 只关中断
-local_irq_enable();       // 只开中断
-
-// 中断上下文检测：
-// in_interrupt()    ← 是否在中断/软中断上下文
-// in_irq()          ← 是否在硬中断上下文
-// in_softirq()      ← 是否在软中断上下文
-```
-
-### 7.3 中断延迟测量
-
-```bash
-# 查看最大中断延迟
-$ cat /proc/latency_stats
-  IRQ 16: max=125μs, total=12345μs, count=1000
-
-# 使用 ftrace 跟踪中断关闭时间
-$ echo irqsoff > /sys/kernel/debug/tracing/current_tracer
-$ cat /sys/kernel/debug/tracing/trace
-  ...
-```
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct irq_desc` | include/linux/irqdesc.h | 80 |
+| `struct irqaction` | include/linux/interrupt.h | 123 |
+| `struct irq_domain` | include/linux/irqdomain.h | 168 |
+| `enum irqreturn` | include/linux/irqreturn.h | (IRQ_NONE/HANDLED/WAKE_THREAD) |
+| `DEFINE_IDTENTRY_IRQ()` | arch/x86/include/asm/idtentry.h | (宏) |
+| `common_interrupt` | arch/x86/kernel/irq.c | 326 |
+| `call_irq_handler()` | arch/x86/kernel/irq.c | 281 |
+| `__handle_irq_event_percpu()` | kernel/irq/handle.c | 185 |
+| `handle_irq_event()` | kernel/irq/handle.c | 255 |
+| `handle_edge_irq()` | kernel/irq/chip.c | 相关 |
+| `handle_level_irq()` | kernel/irq/chip.c | 相关 |
+| `handle_fasteoi_irq()` | kernel/irq/chip.c | 相关 |
+| `request_threaded_irq()` | kernel/irq/manage.c | 相关 |
+| `__setup_irq()` | kernel/irq/manage.c | 相关 |
+| `irq_find_mapping()` | kernel/irq/irqdomain.c | 837 |
+| `irq_entries_start` | arch/x86/entry/entry_64.S | (汇编标签) |
+| `DEFINE_PER_CPU(vector_irq_t, vector_irq)` | arch/x86/kernel/irq.c | (per-CPU 向量表) |
 
 ---
 
-## 8. 源码文件索引
-
-| 文件 | 内容 | 关键符号 |
-|------|------|---------|
-| `include/linux/interrupt.h` | API 声明 | `request_irq`, `request_threaded_irq` |
-| `kernel/irq/manage.c` | IRQ 管理 | `__setup_irq`, `irq_thread` |
-| `kernel/irq/chip.c` | 中断控制器操作 | `handle_level_irq`, `handle_edge_irq`, `handle_fasteoi_irq` |
-| `arch/x86/kernel/irq.c` | x86 中断入口 | `common_interrupt` @ L326 |
-| `arch/x86/entry/entry_64.S` | 汇编入口 | `common_interrupt` @ L398 |
-| `arch/x86/include/asm/desc.h` | IDT 格式 | `struct idt_entry` |
-| `arch/x86/kernel/apic/io_apic.c` | IO-APIC | |
-
----
-
-## 9. 关联文章
-
-- **24-softirq**：中断下半部的软中断机制
-- **25-hrtimer**：LAPIC 定时器中断
-- **26-RCU**：RCU 与中断的交互（rcu_irq_enter/exit）
-- **109-vlan-vxlan**：网络中断的处理
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+*分析工具：doom-lsp（clangd LSP 18.x） | 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
