@@ -245,6 +245,44 @@ dma_fence_wait_timeout(fence, intr, timeout);
   // 返回 0 = 超时, 1 = signaled, <0 = 错误
 ```
 
+
+### 4.1 dma_fence_init——初始化 fence
+
+（`drivers/dma-buf/dma-fence.c` L1114 — doom-lsp 确认）
+
+```c
+void dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
+                    spinlock_t *lock, u64 context, u64 seqno)
+{
+    __dma_fence_init(fence, ops, lock, context, seqno, 0UL);
+}
+// → 内部调用 __dma_fence_init，关键操作:
+//    spin_lock_init(&fence->lock)
+//    fence->context = context
+//    fence->seqno = seqno
+//    fence->ops = ops
+//    set_bit(DMA_FENCE_FLAG_INITIALIZED_BIT, &fence->flags)
+//    INIT_LIST_HEAD(&fence->cb_list)
+//    kref_init(&fence->refcount)
+```
+
+### 4.2 GPU 驱动中的典型使用模式
+
+```c
+// GPU 驱动提交命令时：
+// struct dma_fence *fence = kmalloc(sizeof(*fence), GFP_KERNEL);
+// dma_fence_init(fence, &gpu_driver_fence_ops, &ring->lock, drv->context, ++seqno);
+//
+// 将 fence 附加到 dma_buf 的 reservation object：
+// dma_resv_add_fence(dmabuf->resv, fence, DMA_RESV_USAGE_BOOKKEEP);
+//
+// 驱动提交命令到 GPU ring buffer
+//   → GPU 执行完成后触发中断
+//   → irq_handler 调用 dma_fence_signal(fence)
+//
+// 其他进程（如 compositor）通过 dma_fence_wait() 等待完成
+```
+
 ## 4. 源码索引
 
 | 符号 | 文件 | 行号 |
