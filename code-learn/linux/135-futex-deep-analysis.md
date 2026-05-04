@@ -329,9 +329,9 @@ futex_requeue(uaddr1, uaddr2, nr_wake, nr_requeue)
 | `futex_wake()` | kernel/futex/syscalls.c | 366 |
 | `futex_requeue()` | kernel/futex/syscalls.c | 442 |
 | `set_robust_list()` | kernel/futex/syscalls.c | 28 |
-| `futex_wait_setup()` | kernel/futex/waitwake.c | (声明在 futex.h) |
-| `futex_do_wait()` | kernel/futex/waitwake.c | (声明在 futex.h) |
-| `__futex_wake_mark()` | kernel/futex/core.c | (声明在 futex.h) |
+| `futex_wait_setup()` | kernel/futex/waitwake.c | 592 |
+| `futex_do_wait()` | kernel/futex/waitwake.c | 341 |
+| `__futex_wake_mark()` | kernel/futex/waitwake.c | 110 |
 | `futex_lock_pi()` | kernel/futex/pi.c | 相关 |
 | `futex_unlock_pi()` | kernel/futex/pi.c | 相关 |
 | `lookup_pi_state()` | kernel/futex/pi.c | 相关 |
