@@ -293,10 +293,12 @@ Regulator 框架的核心是 `_regulator_enable`（`:3116`）和 `_regulator_dis
 | 符号 | 文件 | 行号 |
 |------|------|------|
 | `struct regulator_dev` | include/linux/regulator/driver.h | 核心结构 |
-| `regulator_enable()` | drivers/regulator/core.c | 使能 |
+| `struct regulator` | include/linux/regulator/consumer.h | 核心结构 |
+| `regulator_enable()` | drivers/regulator/core.c | 相关 |
 | `_regulator_do_enable()` | drivers/regulator/core.c | 1660 |
-| `regulator_set_voltage()` | drivers/regulator/core.c | 调压 |
 | `_regulator_do_set_voltage()` | drivers/regulator/core.c | 109 |
+| `regulator_register()` | drivers/regulator/core.c | 注册 |
+| `of_regulator_match()` | drivers/regulator/of_regulator.c | DT 匹配 |
 
 ---
 
