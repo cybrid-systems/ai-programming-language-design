@@ -170,6 +170,81 @@ struct dma_buf_ops {
 
 ---
 
+
+## 3. dma_buf_export——核心分配函数
+
+（`drivers/dma-buf/dma-buf.c` L691 — doom-lsp 确认）
+
+```c
+/**
+ * dma_buf_export - Creates a new dma_buf, and associates an anon file
+ * with this buffer, so it can be exported.
+ */
+struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info)
+{
+    struct dma_buf *dmabuf;
+    struct file *file;
+    size_t alloc_size = sizeof(struct dma_buf);
+    
+    // 1. 参数检查
+    if (WARN_ON(!exp_info->ops || !exp_info->ops->release))
+        return ERR_PTR(-EINVAL);
+
+    // 2. 分配 dma_buf 结构体
+    dmabuf = kzalloc(alloc_size, GFP_KERNEL);
+    if (!dmabuf)
+        return ERR_PTR(-ENOMEM);
+
+    // 3. 创建匿名文件（作为共享 fd 的基础）
+    file = dma_buf_getfile(exp_info->size, exp_info->flags);
+    file->private_data = dmabuf;
+    dmabuf->file = file;
+
+    // 4. 初始化
+    dmabuf->ops = exp_info->ops;
+    dmabuf->size = exp_info->size;
+    dmabuf->priv = exp_info->priv;
+    mutex_init(&dmabuf->lock);
+    INIT_LIST_HEAD(&dmabuf->attachments);
+    init_waitqueue_head(&dmabuf->poll);
+    
+    // 5. reserve 对象初始化（用于 dma_fence 同步）
+    dma_resv_init(dmabuf->resv);
+    if (dma_resv_init(dmabuf->resv)) {
+        // 失败处理
+    }
+
+    return dmabuf;
+}
+```
+
+## 4. dma_fence 信号机制详解
+
+```c
+// drivers/dma-buf/dma-fence.c — doom-lsp 确认
+
+// 生产者（如 GPU 驱动）在提交渲染命令时创建 fence：
+struct dma_fence *fence;
+dma_fence_init(fence, &my_fence_ops, &my_lock, ctx, ++seqno);
+
+// GPU 完成渲染后：
+dma_fence_signal(fence);
+  └─ fence->flags |= DMA_FENCE_FLAG_SIGNALED_BIT
+  └─ __dma_fence_signal__rcu(fence)
+       └─ 遍历 cb_list，调用每个回调函数
+       └─ wake_up_all(&fence->wait_queue)
+
+// 消费者等待：
+dma_fence_wait(fence, true);  // intr = 可被信号中断
+  └─ 如果未 signaled：
+       └─ dma_fence_add_callback(fence, &cb, my_callback)
+       └─ schedule() → 等待 dma_fence_signal 唤醒
+
+// 内核等待的超时版本：
+dma_fence_wait_timeout(fence, intr, timeout);
+  // 返回 0 = 超时, 1 = signaled, <0 = 错误
+```
+
 ## 4. 源码索引
 
 | 符号 | 文件 | 行号 |
