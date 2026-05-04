@@ -278,3 +278,49 @@ kCFI + FineIBT 组合：
 | X86_FEATURE_SMEP | arch/x86/include/asm/cpufeatures.h | 特征位 |
 | X86_FEATURE_SMAP | arch/x86/include/asm/cpufeatures.h | 特征位 |
 | X86_FEATURE_IBT | arch/x86/include/asm/cpufeatures.h | 特征位 |
+
+## 9. 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `pti_init()` | arch/x86/mm/pti.c | 625 |
+| `pti_setup_espfix64()` | arch/x86/mm/pti.c | 502 |
+| `pti_setup_vsyscall()` | arch/x86/mm/pti.c | 294 |
+| `pti_check_boottime_disable()` | arch/x86/mm/init.c | 762 |
+| `pti_clone_p4d()` | arch/x86/mm/pti.c | 相关 |
+| `choose_random_location()` | arch/x86/boot/compressed/kaslr.c | 相关 |
+| `kernel_text_address()` | kernel/extable.c | 94 |
+| `__kernel_text_address()` | kernel/extable.c | 77 |
+| X86_FEATURE_PTI | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| X86_FEATURE_SMEP | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| X86_FEATURE_SMAP | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| X86_FEATURE_IBT | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| SMAP 的 stac()/clac() | arch/x86/include/asm/smap.h | 内联函数 |
+| `copy_from_user()` | include/linux/uaccess.h | (使用 stac/clac) |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
+
+## 9. 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `pti_init()` | arch/x86/mm/pti.c | 625 |
+| `pti_setup_espfix64()` | arch/x86/mm/pti.c | 502 |
+| `pti_setup_vsyscall()` | arch/x86/mm/pti.c | 294 |
+| `pti_check_boottime_disable()` | arch/x86/mm/init.c | 762 |
+| `pti_clone_p4d()` | arch/x86/mm/pti.c | 相关 |
+| `choose_random_location()` | arch/x86/boot/compressed/kaslr.c | 相关 |
+| `kernel_text_address()` | kernel/extable.c | 94 |
+| `__kernel_text_address()` | kernel/extable.c | 77 |
+| X86_FEATURE_PTI | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| X86_FEATURE_SMEP | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| X86_FEATURE_SMAP | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| X86_FEATURE_IBT | arch/x86/include/asm/cpufeatures.h | 特征位 |
+| SMAP 的 stac()/clac() | arch/x86/include/asm/smap.h | 内联函数 |
+| `copy_from_user()` | include/linux/uaccess.h | (使用 stac/clac) |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
