@@ -282,9 +282,45 @@ inotify 和 fanotify 基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492` → 
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
 
-## 源码索引
+## 2. inotify_add_watch——添加监视
+
+（`fs/notify/inotify/inotify_user.c` — doom-lsp 确认）
+
+```
+sys_inotify_add_watch(fd, pathname, mask)
+  └─ do_inotify_add_watch()
+       ├─ 1. fd → inode 解析
+       │     fget(fd) → file
+       │     vfs_statx(pathname, &stat) → 目标文件的 inode
+       │
+       ├─ 2. inotify_init_watch(inode, mask);
+       │     └─ inode->i_fsnotify_mask |= mask
+       │     └─ fsnotify_init_event(&fsn_event, ...)
+       │
+       ├─ 3. fsnotify_add_inode_mark(&watch, ...)
+       │     └─ group->ops->handle_event(mask, data, data_type, ...)
+       │          → inotify_handle_event()
+       │             → fsnotify_insert_event() 插入队列
+       │             → wake_up(&group->notification_waitq)
+       │
+       └─ 4. 返回 watch descriptor (wd)
+```
+
+## 3. fanotify——扩展版 inotify
+
+与 inotify 的区别：
+- 支持 **FAN_OPEN_PERM / FAN_ACCESS_PERM**（决策前等待用户空间响应）
+- 支持 **FAN_MARK_FILESYSTEM**（监控整个文件系统）
+- 审计场景：接收 fd 而非事件字符串
+
+```
+fanotify_mark(fd, FAN_MARK_ADD, FAN_OPEN | FAN_EVENT_ON_CHILD, AT_FDCWD, "/etc")
+  └─ [内核] fanotify_add_mark()
+       └─ 添加标记到 fsnotify_group
+```
+
+## 4. 源码索引
 
 | 符号 | 文件 | 行号 |
 |------|------|------|
@@ -292,7 +328,66 @@ inotify 和 fanotify 基于 fsnotify 框架（`fsnotify` @ `fsnotify.c:492` → 
 | `inotify_add_watch()` | fs/notify/inotify/inotify_user.c | 相关 |
 | `fanotify_mark()` | fs/notify/fanotify/fanotify_user.c | 相关 |
 | `fsnotify()` | fs/notify/fsnotify.c | 核心分发 |
+| `fsnotify_add_inode_mark()` | fs/notify/mark.c | 标记注册 |
+| `fsnotify_insert_event()` | fs/notify/notification.c | 事件入队 |
 
 ---
 
 *分析工具：doom-lsp | 分析日期：2026-05-04*
+（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+---
+
+
+## 2. inotify_add_watch——添加监视
+
+（`fs/notify/inotify/inotify_user.c` — doom-lsp 确认）
+
+```
+sys_inotify_add_watch(fd, pathname, mask)
+  └─ do_inotify_add_watch()
+       ├─ 1. fd → inode 解析
+       │     fget(fd) → file
+       │     vfs_statx(pathname, &stat) → 目标文件的 inode
+       │
+       ├─ 2. inotify_init_watch(inode, mask);
+       │     └─ inode->i_fsnotify_mask |= mask
+       │     └─ fsnotify_init_event(&fsn_event, ...)
+       │
+       ├─ 3. fsnotify_add_inode_mark(&watch, ...)
+       │     └─ group->ops->handle_event(mask, data, data_type, ...)
+       │          → inotify_handle_event()
+       │             → fsnotify_insert_event() 插入队列
+       │             → wake_up(&group->notification_waitq)
+       │
+       └─ 4. 返回 watch descriptor (wd)
+```
+
+## 3. fanotify——扩展版 inotify
+
+与 inotify 的区别：
+- 支持 **FAN_OPEN_PERM / FAN_ACCESS_PERM**（决策前等待用户空间响应）
+- 支持 **FAN_MARK_FILESYSTEM**（监控整个文件系统）
+- 审计场景：接收 fd 而非事件字符串
+
+```
+fanotify_mark(fd, FAN_MARK_ADD, FAN_OPEN | FAN_EVENT_ON_CHILD, AT_FDCWD, "/etc")
+  └─ [内核] fanotify_add_mark()
+       └─ 添加标记到 fsnotify_group
+```
+
+## 4. 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct fsnotify_group` | include/linux/fsnotify_backend.h | 核心 |
+| `inotify_add_watch()` | fs/notify/inotify/inotify_user.c | 相关 |
+| `fanotify_mark()` | fs/notify/fanotify/fanotify_user.c | 相关 |
+| `fsnotify()` | fs/notify/fsnotify.c | 核心分发 |
+| `fsnotify_add_inode_mark()` | fs/notify/mark.c | 标记注册 |
+| `fsnotify_insert_event()` | fs/notify/notification.c | 事件入队 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
+ | 分析日期：2026-05-04*
