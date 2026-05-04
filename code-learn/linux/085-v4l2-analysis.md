@@ -266,6 +266,25 @@ V4L2 通过 `VIDIOC_REQBUFS/ QBUF/ DQBUF` 管理视频缓冲循环——`vb2_cor
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
 
+
+## 3. videobuf2 缓冲区生命周期
+
+```
+                   用户空间                         内核
+                   ──────────                     ──────
+                   VIDIOC_REQBUFS → vb2_core_reqbufs() → ops->queue_setup()
+                   VIDIOC_QBUF    → vb2_core_qbuf()    → ops->buf_prepare()
+                   VIDIOC_STREAMON→ vb2_core_streamon()→ ops->start_streaming()
+
+                   [硬件中断] vb2_buffer_done(vb, DONE)
+                     → list_move to done_list
+                     → wake_up(&q->done_wq)
+
+                   VIDIOC_DQBUF → vb2_core_dqbuf()
+                     → wait_event(done_wq, !list_empty(&done_list))
+                     → 处理帧 → VIDIOC_QBUF 循环
+```
+
 ## 源码索引
 
 | 符号 | 文件 | 行号 |
