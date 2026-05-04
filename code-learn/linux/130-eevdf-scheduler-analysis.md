@@ -2,274 +2,382 @@
 
 ## 概述
 
-EEVDF（Earliest Eligible Virtual Deadline First）是 Linux 6.6 引入的调度器，替代了使用了近 20 年的 CFS（Completely Fair Scheduler）。EEVDF 由 Peter Zijlstra 实现，基于学术论文 "Earliest Eligible Virtual Deadline First: A Flexible and Accurate Mechanism for Proportional Share Resource Allocation"（Stoica et al., 1996）。
+EEVDF（Earliest Eligible Virtual Deadline First）是 Linux 6.6 引入的调度器，替代了使用了近 20 年的 CFS（Completely Fair Scheduler）。EEVDF 由 Peter Zijlstra 实现，基于 Stoica et al. 1996 年的学术论文。
 
 EEVDF 与 CFS 的核心区别：
 
-| 特性 | CFS (O(1)/BFS tree) | EEVDF (since Linux 6.6) |
-|------|---------------------|-------------------------|
-| 选择标准 | min vruntime（最小虚拟运行时间） | eligibility + deadline（最小截止时间） |
-| 调度切片 | `sched_slice()` 动态计算 | `sysctl_sched_base_slice` 固定基准（~3ms） |
-| 权重更新 | 仅影响 next slice 分配 | 实时调整 lag + 重算 deadline |
-| 保护机制 | buddy 提示（next/last） | `protect_slice()` — 最小执行时间保护 |
-| 延迟跟踪 | 无需 lag 计算 | `vlag`（virtual lag）精确量化不公平度 |
-| 唤醒抢占比 | `wakeup_preempt_entity` vruntime 比较 | `entity_eligible()` + deadline 比较 |
+| 特性 | CFS | EEVDF |
+|------|-----|-------|
+| 选择标准 | min vruntime | eligibility + deadline |
+| 调度切片 | `sched_slice()` 动态计算 | `sysctl_sched_base_slice` 固定基准 |
+| 公平度量 | vruntime 直接比较 | vlag（虚拟滞后）精确量化 |
+| 抢占判定 | vruntime 差值 | eligibility + deadline + protect_slice |
 
 ## 核心数据结构
 
-### sched_entity — EEVDF 关键字段
+### sched_entity
 
 （`include/linux/sched.h` L575~611）
 
 ```c
 struct sched_entity {
-    struct load_weight  load;           // L577 — 权重（nice 值）
-    struct rb_node      run_node;       // L578 — EEVDF 红黑树节点（按 deadline 排序）
-    u64                 deadline;       // L579 — 虚拟截止时间（EEVDF 选择依据）
-    u64                 min_vruntime;   // L580 — 子实体最小 vruntime（用于 group 调度）
-    u64                 min_slice;      // L581 — 最小切片（近似 1ms）
-    u64                 max_slice;      // L582 — 最大切片（约 100ms）
-    struct list_head    group_node;     // L584 — group 链表节点
-    unsigned char       on_rq;          // L585 — 是否在运行队列中
-    unsigned char       sched_delayed;  // L586 — 是否延迟 dequeued
-    unsigned char       rel_deadline;   // L587 — 截止时间是否相对
-    unsigned char       custom_slice;   // L588 — 是否自定义切片（sched_setattr）
-    u64                 exec_start;     // L591 — 当前执行开始时间
-    u64                 sum_exec_runtime; // L592 — 总执行时间
-    u64                 prev_sum_exec_runtime; // L593 — 上次统计的总执行时间
-    u64                 vruntime;       // L594 — 虚拟运行时间
-    s64                 vlag;           // L596 — 虚拟滞后（lag = 实际服务 - 应得服务）
-    u64                 vprot;          // L598 — 保护截止时间（protected deadline）
-    u64                 slice;          // L599 — 调度切片（请求时间 r_i）
-    u64                 nr_migrations;  // L601 — 跨 CPU 迁移次数
+    struct load_weight  load;           // 权重
+    struct rb_node      run_node;       // EEVDF 红黑树（按 deadline 排序）
+    u64                 deadline;       // 虚拟截止时间
+    u64                 min_vruntime;   // 子实体最小 vruntime
+    u64                 min_slice;      // 最小切片
+    u64                 max_slice;      // 最大切片
+    struct list_head    group_node;
+    unsigned char       on_rq;          // 是否在运行队列中
+    unsigned char       sched_delayed;  // 延迟 dequeue 状态
+    unsigned char       rel_deadline;
+    unsigned char       custom_slice;   // 通过 sched_setattr 自定义
+    u64                 exec_start;
+    u64                 sum_exec_runtime;
+    u64                 prev_sum_exec_runtime;
+    u64                 vruntime;       // 虚拟运行时间
+    s64                 vlag;           // 虚拟滞后（lag = V - v_i）
+    u64                 vprot;          // 保护截止时间（min_slice 保护）
+    u64                 slice;          // 调度切片（物理时间）
+    u64                 nr_migrations;
     ...
 };
 ```
 
-**EEVDF 特有字段**（对比 CFS 的新增或语义变化）：
+EEVDF 的**新增/语义变化字段**：
+- `deadline`：选择标准。每次 slice 用完重算
+- `vlag`：虚拟滞后 `= V - v_i`，正值表示欠服务（eligible）
+- `vprot`：保护截止时间，当前实体 `vruntime < vprot` 时不被抢占
+- `custom_slice`：`sched_setattr(SCHED_FLAG_CUSTOM_SLICE)` 设置
 
-- `deadline`：替代 CFS 的 vruntime-min 选择标准。每次 slice 用完时计算 `deadline = vruntime + r_i / w_i`
-- `vlag`：虚拟滞后，正值表示欠服务（eligible），负值表示过服务（欠其他实体）
-- `vprot`：保护截止时间，确保刚唤醒的实体至少有 `min_slice` 的执行时间
-- `min_slice` / `max_slice`：每个实体在其组权重下的最小/最大切片约束
-- `custom_slice`：通过 `sched_setattr` 设置的自定义切片（SCHED_FLAG_DSQ_*）
-- `sched_delayed`：新标志——调度延迟时实体保持 `on_rq=1` 但不在红黑树中
-
-### cfs_rq — CFS 运行队列
+### cfs_rq
 
 （`kernel/sched/sched.h` L678~）
 
 ```c
 struct cfs_rq {
-    struct load_weight  load;           // L679
-    unsigned int        nr_queued;      // L680 — 排队实体数
-    unsigned int        h_nr_queued;    // L681 — SCHED_NORMAL/BATCH/IDLE
-    unsigned int        h_nr_runnable;  // L682 — 可运行计数
-    unsigned int        h_nr_idle;      // L683 — SCHED_IDLE 计数
-    s64                 sum_w_vruntime; // L685 — 加权平均 vruntime 的分子
-    u64                 sum_weight;     // L686 — 加权平均 vruntime 的分母
-    u64                 zero_vruntime;  // L787 — 平均值的基准偏移
-    unsigned int        sum_shift;      // L788 — 精度调整参数
-    struct rb_root_cached tasks_timeline; // L695 — EEVDF 红黑树（按 deadline 排序）
-    struct sched_entity *curr;          // 当前运行的实体
-    struct sched_entity *next;          // 下一个候选（buddy 提示）
-    ... // PELT 相关字段
+    struct load_weight  load;
+    unsigned int        nr_queued;
+    unsigned int        h_nr_queued;
+    unsigned int        h_nr_runnable;
+    unsigned int        h_nr_idle;
+    s64                 sum_w_vruntime;        // 加权平均 vruntime 分子
+    u64                 sum_weight;            // 加权平均 vruntime 分母
+    u64                 zero_vruntime;         // 基准偏移
+    unsigned int        sum_shift;             // 溢出保护移位
+    struct rb_root_cached tasks_timeline;      // 按 deadline 排序的红黑树
+    struct sched_entity *curr;                 // 当前运行实体
+    struct sched_entity *next;                 // buddy 提示
+    ...
 };
 ```
 
-EEVDF 的 `tasks_timeline` 是按 **虚拟截止时间（deadline）** 排序的（CFS 按 vruntime）。红黑树的最小节点是 deadline 最小的实体。
+`tasks_timeline` 的排序键是 **deadline**（CFS 按 `vruntime - cfs_rq->min_vruntime`）。
 
-`sum_w_vruntime`、`sum_weight` 和 `zero_vruntime` 用于计算加权平均 vruntime，这是 eligibility 判定的数学基础。
+## EEVDF 算法详解
 
-## EEVDF 调度算法详解
-
-### 理论基础
-
-EEVDF 的核心数学概念：
+### 数学模型
 
 ```
 每个实体 i 的参数：
-  w_i    — 权重（从 nice 值映射）
-  r_i    — 请求时间（slice，由 sysctl_sched_base_slice 控制）
-  ve_i   — 虚拟开始时间（virtual eligible time）
-  vd_i   — 虚拟截止时间（virtual deadline time）
+  w_i    — 权重（nice → weight 映射）
+  r_i    — 请求时间（slice，默认 sysctl_sched_base_slice ≈ 3ms）
+  ve_i   — 虚拟开始时间 ≈ vruntime（实际已使用的虚拟时间）
+  vd_i   — 虚拟截止时间
 
-关系：
+核心公式：
   vd_i = ve_i + r_i / w_i
 
-滞后（lag）定义：
-  lag_i = 服务_i - 应得服务 = w_i × (V - v_i)
-  
-  其中 V = 加权平均 vruntime（avg_vruntime）
-        v_i = 实体的 vruntime
+滞后定义：
+  lag_i = w_i × (V - v_i)
+  其中 V = 加权平均 vruntime = (Σ w_j × v_j) / (Σ w_j)
+
+虚拟滞后（内核实际跟踪的）：
+  vl_i = V - v_i    (不需要权重因子的简化量)
 
 Eligibility 条件：
-  lag_i >= 0   ↔   V >= v_i   ↔   实体获得的服务不超过它应得的
-  
-  换句话说：只有"欠服务"的实体才有资格被调度
+  vl_i >= 0  ↔  V >= v_i  ↔  实体欠服务，有资格运行
 ```
 
-### 算法流程
+### avg_vruntime 计算
 
-```
-1. 调度 tick 到来（entity_tick / update_curr）
-   └─ update_curr(cfs_rq)
-        └─ 更新 exec_start / sum_exec_runtime / vruntime
-        └─ update_deadline(cfs_rq, curr)
-             │ 如果 vruntime >= deadline（slice 用完）:
-             │   └─ 设置新 deadline: vd = vruntime + r_i / w_i
-             │   └─ 返回 true (需要重调度)
-             │ 否则:
-             │   └─ 返回 false (继续运行)
-             
-2. 需要调度时（__schedule）
-   └─ pick_next_task_fair()
-        └─ pick_next_entity(rq, cfs_rq)
-             └─ pick_eevdf(cfs_rq)
-                  └─ __pick_eevdf(cfs_rq, protect=true)
-
-3. __pick_eevdf 的选择逻辑
-   a. 单实体快速路径：nr_queued == 1，直接返回
-   
-   b. Buddy 提示（next）优先：如果设置了 next 且 eligible
-   
-   c. 执行中实体保护：如果 curr 正在运行且未用完保护切片
-      (protect_slice())，留在 CPU 上
-
-   d. 红黑树搜索：
-      1) 取最左节点（deadline 最小）
-      2) 检查 eligibility：如果最左节点不可调度
-         → 搜索右子树，找到第一个 eligible 的 deadline 最小实体
-      3) eligibility 通过 avg_vruntime 检查：
-         avg_vruntime 的含义：所有实体 vruntime 的加权平均
-         一个实体 "eligible" 当且仅当它的 vruntime ≤ 加权平均
-         
-   e. 比较 curr 和 best：选 deadline 更小的
-```
-
-### 直方图搜索算法
-
-`__pick_eevdf` 中的红黑树搜索是 EEVDF 的核心创新：
-
-```
-    root
-    /   \
- left   right
-
-从根节点开始，depth-first：
-1. 如果 left 子树存在且 vruntime_eligible(left 子树中最小 vruntime)：
-   → 进入 left（left 中 deadline 最小的实体一定可调度）
-   
-2. 否则检查当前节点：
-   → 如果 entity_eligible(当前节点) → 这是最佳选择（best found）
-   
-3. 否则进入 right 子树
-
-这个搜索保证找到 deadline 最小且 eligible 的实体，
-搜索复杂度 O(log n)，最坏情况 O(n) 但极少达到。
-```
-
-## 关键执行路径
-
-### update_curr() — 时间簿记
-
-（`kernel/sched/fair.c` 附近）
+（`kernel/sched/fair.c` L676~780）
 
 ```c
+// entity_key = vruntime - zero_vruntime
+static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+    return se->vruntime - cfs_rq->zero_vruntime;
+}
+
+// V = sum_w_vruntime / sum_weight
+// 实际实现使用定点数除以避免除法
+// sum_w_vruntime = Σ entity_key(entity) × weight(entity)
+// sum_weight = Σ weight(entity)（经过 sum_shift 缩放）
+```
+
+`sum_shift` 是溢出保护机制 — 当 `sum_w_vruntime` 接近 64 位溢出时，逐步右移权重值。
+
+## 认证代码路径
+
+### 时间簿记：update_se + update_curr
+
+（`kernel/sched/fair.c` L1324~1425）
+
+时间簿记被分为两层：底层 `update_se()` 处理物理时间记录，上层 `update_curr()` 处理公平调度逻辑。
+
+```c
+// L1324 — 底层时间记录（物理时间）
+static s64 update_se(struct rq *rq, struct sched_entity *se)
+{
+    u64 now = rq_clock_task(rq);
+    s64 delta_exec = now - se->exec_start;
+    if (unlikely(delta_exec <= 0))
+        return delta_exec;
+
+    se->exec_start = now;
+    if (entity_is_task(se)) {
+        struct task_struct *donor = task_of(se);
+        struct task_struct *running = rq->curr;
+        // proxy-exec：running 可能是代理执行者，donor 是实际拥有实体的任务
+        running->se.exec_start = now;
+        running->se.sum_exec_runtime += delta_exec;
+        cgroup_account_cputime(donor, delta_exec);
+    } else {
+        se->sum_exec_runtime += delta_exec;
+    }
+    return delta_exec;
+}
+
+// L1378 — CFS 时间更新（公平调度逻辑）
 static void update_curr(struct cfs_rq *cfs_rq)
 {
     struct sched_entity *curr = cfs_rq->curr;
-    u64 now = rq_clock_task(rq_of(cfs_rq));
-    u64 delta_exec;
+    struct rq *rq = rq_of(cfs_rq);
+    s64 delta_exec;
+    bool resched;
 
     if (unlikely(!curr))
         return;
 
-    delta_exec = now - curr->exec_start;
-    if (unlikely(!delta_exec))
+    delta_exec = update_se(rq, curr);       // 由 update_se 处理物理时间
+    if (unlikely(delta_exec <= 0))
         return;
 
-    curr->exec_start = now;
-    curr->sum_exec_runtime += delta_exec;
+    curr->vruntime += calc_delta_fair(delta_exec, curr);  // 转换为虚拟时间
+    resched = update_deadline(cfs_rq, curr);  // 检查 slice 是否用完
 
-    // 按权重更新 vruntime
-    curr->vruntime += calc_delta_fair(delta_exec, curr);
+    if (entity_is_task(curr))
+        dl_server_update(&rq->fair_server, delta_exec);  // DL server 时间记账
 
-    update_entity_lag(cfs_rq, curr);   // 更新 vlag
-    update_deadline(cfs_rq, curr);      // 检查 slice 是否用完
+    account_cfs_rq_runtime(cfs_rq, delta_exec);  // CFS bandwidth
 
-    update_cfs_group(curr);
-    // ...
+    if (cfs_rq->nr_queued == 1)
+        return;  // 唯一实体，不需要抢占
+
+    if (resched || !protect_slice(curr)) {
+        resched_curr_lazy(rq);      // 设置 TIF_NEED_RESCHED_LAZY
+        clear_buddies(cfs_rq, curr);
+    }
 }
 ```
 
-注意：`update_entity_lag()` 在每次更新 vruntime 后调整 vlag，确保 lag 反应当前的公平度。
+**注意**：`resched_curr_lazy()` 使用懒抢占——不立即触发，等到下次调度点检查。只有 `resched_curr()` 才强制立即抢占。
 
-### update_deadline() — 截止时间重新计算
+### proxy-exec 的影响
+
+当前 Linux 支持代理执行（proxy-execution）。`rq->donor->se` 是被调度器选择的实体（真正拥有时间配额），而 `rq->curr->se` 是实际在 CPU 上运行的线程。`update_curr` 操作的是 `cfs_rq->curr`（= `rq->donor->se`），而 `update_se` 在实体是任务时同时更新了 `running->se`（= `rq->curr->se`）。
+
+### 切片到期检查：update_deadline()
 
 （`kernel/sched/fair.c` L1209~1235）
 
 ```c
 static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-    // 如果 vruntime 还没超过 deadline，继续运行
+    // 如果 vruntime 还没超过 deadline，slice 还没用完
     if (vruntime_cmp(se->vruntime, "<", se->deadline))
         return false;
 
-    // 计算新 slice（默认 sysctl_sched_base_slice ≈ 3ms）
+    // 使用默认基准切片或自定义切片
     if (!se->custom_slice)
         se->slice = sysctl_sched_base_slice;
 
-    // EEVDF 核心：vd_i = ve_i + r_i / w_i
-    // ve_i ≈ vruntime（实体累积到当前已经使用了的虚拟时间就是它的开始时间）
+    // EEVDF：vd_i = ve_i + r_i / w_i
+    // ve_i ≈ vruntime（累计虚拟时间就是开始时间）
+    // r_i / w_i：物理 slice 按权重缩放为虚拟时间
     se->deadline = se->vruntime + calc_delta_fair(se->slice, se);
-    avg_vruntime(cfs_rq);  // 更新加权平均 vruntime
+    avg_vruntime(cfs_rq);  // 更新加权平均
 
-    return true;  // slice 用完，需要重调度
+    return true;  // slice 用完 → 需要重调度
 }
 ```
 
-`calc_delta_fair(slice, se)` 将物理时间按权重缩放到虚拟时间：
+`calc_delta_fair(slice, se)` = `slice * NICE_0_LOAD / se->load.weight`。nice 0 实体：虚拟切片 = 物理切片。高权重实体虚拟切片更短。
 
-```
-calc_delta_fair(slice, se) = slice * NICE_0_LOAD / se->load.weight
-```
+### EEVDF 选择：__pick_eevdf()
 
-其中 `NICE_0_LOAD = 1024`（nice 0 的默认权重）。所以 nice = 0 的实体：虚拟切片 = 物理切片。权重更高的（nice 值更小）拥有更短的虚拟切片。
+（`kernel/sched/fair.c` L1102~1171）
 
-### protect_slice() — 最小执行时间保护
-
-（`kernel/sched/fair.c` 附近）
+这是 EEVDF 的核心。红黑树按 `deadline` 排序，但还受 eligibility 约束：
 
 ```c
-static bool protect_slice(struct sched_entity *se)
+static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 {
-    u64 delta = se->sum_exec_runtime - se->prev_sum_exec_runtime;
+    struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
+    struct sched_entity *se = __pick_first_entity(cfs_rq);  // 最左=最小 deadline
+    struct sched_entity *curr = cfs_rq->curr;
+    struct sched_entity *best = NULL;
 
-    // 如果当前实体的执行时间还没达到 min_slice，它应该继续运行
-    return delta < se->min_slice;
+    // 快速路径：只有一个实体
+    if (cfs_rq->nr_queued == 1)
+        return curr && curr->on_rq ? curr : se;
+
+    // Buddy 提示：如果设置了 next 且 eligible，优先选择
+    if (sched_feat(PICK_BUDDY) && protect &&
+        cfs_rq->next && entity_eligible(cfs_rq, cfs_rq->next))
+        return cfs_rq->next;
+
+    // 当前实体不可选的情况
+    if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
+        curr = NULL;
+
+    // protect_slice：当前实体仍在保护切片内，继续运行
+    if (curr && protect && protect_slice(curr))
+        return curr;
+
+    // 最左节点（deadline 最小）如果 eligible 直接选择
+    if (se && entity_eligible(cfs_rq, se)) {
+        best = se;
+        goto found;
+    }
+
+    // 否则：在红黑树中搜索第一个 eligible 且 deadline 最小的实体
+    while (node) {
+        struct rb_node *left = node->rb_left;
+
+        // 左子树中可能有更小 deadline 且 eligible 的实体
+        if (left && vruntime_eligible(cfs_rq,
+                    __node_2_se(left)->min_vruntime)) {
+            node = left;
+            continue;
+        }
+
+        se = __node_2_se(node);
+        if (entity_eligible(cfs_rq, se)) {
+            best = se;
+            break;
+        }
+        node = node->rb_right;
+    }
+
+found:
+    // 如果当前实体 deadline 更小（早），选当前实体
+    if (!best || (curr && entity_before(curr, best)))
+        best = curr;
+
+    return best;
 }
 ```
 
-避免了频繁上下文切换：一个实体必须至少执行 `min_slice`（通常约 1ms）才能被抢占。这解决了 CFS 在某些工作负载下调度抖动的问题。
+**树搜索的精妙之处**：
+1. 左子树的 `min_vruntime` 权限定该子树的 `vruntime` 下限
+2. 如果左子树的 `min_vruntime > V`（通过 `vruntime_eligible` 检查），左子树整体不可调度，无需进入
+3. 这保证搜索是 O(log n) 的，因为 eligibility 剪枝避免了全树遍历
 
-### place_entity() — 新实体的初始位置
+### 滞后计算：entity_lag + update_entity_lag
 
-当新进程创建或从睡眠中唤醒时，需要为其计算初始 vruntime、deadline 和 vlag：
+（`kernel/sched/fair.c` L832~870）
+
+注意：`update_entity_lag()` **不**在 `update_curr()` 中调用，而是在 enqueue/dequeue 路径中调用。
+
+```c
+static s64 entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se, u64 avruntime)
+{
+    u64 max_slice = cfs_rq_max_slice(cfs_rq) + TICK_NSEC;
+    s64 vlag = avruntime - se->vruntime;     // vl_i = V - v_i
+    s64 limit = calc_delta_fair(max_slice, se);
+
+    return clamp(vlag, -limit, limit);       // 夹在 [-limit, +limit] 内
+}
+```
+
+`entity_lag()` 将滞后限制在 `[-max_slice_weighted, +max_slice_weighted]` 范围内，防止极端情况下的不公平累积。
+
+```c
+static __always_inline
+bool update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+    s64 vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
+
+    // sched_delayed（延迟 dequeue）的实体滞后不能增加
+    if (se->sched_delayed) {
+        vlag = max(vlag, se->vlag);      // 只缩小不过期
+        if (sched_feat(DELAY_ZERO))
+            vlag = min(vlag, 0);         // 负滞后清零
+    }
+    se->vlag = vlag;
+    ...
+}
+```
+
+**延迟 dequeue**（`sched_delayed`）是 Linux 7.0 的新特性：被 dequeue 的实体不立即移出运行队列，而是标记为 `sched_delayed` 并在一定时间内保持在树中。期间，其滞后不增长（正滞后被截断），等待其他处理。
+
+### 切片保护：protect_slice
+
+（`kernel/sched/fair.c` L1050~1085）
+
+```c
+// 设置 vprot = deadline（初始）
+// 如果存在 RUN_TO_PARITY 特性，vprot = min(vruntime + min_slice, deadline)
+static inline void set_protect_slice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+    u64 slice = normalized_sysctl_sched_base_slice;
+    u64 vprot = se->deadline;
+
+    if (sched_feat(RUN_TO_PARITY))
+        slice = cfs_rq_min_slice(cfs_rq);
+
+    slice = min(slice, se->slice);
+    if (slice != se->slice)
+        vprot = min_vruntime(vprot, se->vruntime + calc_delta_fair(slice, se));
+
+    se->vprot = vprot;
+}
+
+// 保护切片检查
+static inline bool protect_slice(struct sched_entity *se)
+{
+    return vruntime_cmp(se->vruntime, "<", se->vprot);
+    // 等价于：vruntime < vprot → 仍在保护期内
+}
+```
+
+**保护切片的作用**：即使新实体有更早的 deadline，当前实体如果仍在保护期内（`vruntime < vprot`），也不会被抢占。防止运行时间过短的上下文切换。
+
+### 滞后保留：place_entity
+
+（`kernel/sched/fair.c` L5352~5420）
+
+当实体从睡眠中醒来时，`place_entity()` 使用 lag 保留算法：
 
 ```c
 static void place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
-    u64 vruntime = avg_vruntime(cfs_rq);
+    u64 avruntime = avg_vruntime(cfs_rq);
+    s64 lag = 0;
 
-    // 新创建的进程：从当前平均开始
-    se->vruntime = vruntime;
-    
-    // 唤醒的进程：补偿睡眠时间
-    if (flags & ENQUEUE_WAKEUP) {
-        // vlag 调整：睡眠期间不积累 lag
-        se->vlag = ...;
-        se->vruntime = vruntime - se->vlag;
+    // 如果有 vlag（之前运行过），保留 lag
+    if (sched_feat(PLACE_LAG) && cfs_rq->nr_queued && se->vlag) {
+        lag = se->vlag;
+        // 调整：新实体加入会改变加权平均 V 值
+        // 需要膨胀 lag 以补偿加权平均的偏移
+        // 数学公式见内核注释
+        ...
+        se->vruntime = avruntime - lag;
+    } else {
+        // 新创建的实体：从 V 出发
+        se->vruntime = avruntime;
     }
 
     // 设置初始 deadline
@@ -277,120 +385,92 @@ static void place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int fla
 }
 ```
 
-新创建的进程从 `avg_vruntime` 开始（不是像 CFS 那样从当前 `cfs_rq->min_vruntime` 减去一定值），这使得新进程立即拥有正常的调度优先级。
+lag 保留的数学原理（摘自内核注释）：
 
-## 抢占与唤醒
+```
+V' = V - w_i × vl_i / (W + w_i)
 
-### 唤醒抢占判定
-
-（`kernel/sched/fair.c` L8961~9155 附近）
-
-当运行队列上的实体被新唤醒的实体抢占时，由 `wakeup_preempt_entity()` 判定：
-
-```c
-// 简化逻辑
-bool should_preempt(struct cfs_rq *cfs_rq, struct sched_entity *curr, 
-                    struct sched_entity *pse)
-{
-    // 如果 pse（唤醒实体）不是 eligible → 不抢占
-    if (__pick_eevdf(cfs_rq, preempt_action != PREEMPT_WAKEUP_SHORT) != pse)
-        return false;
-    
-    // 检查 curr 的 deadline 是否比 pse 更晚
-    // 如果没有保护切片，抢占
-    return !protect_slice(curr) || curr->deadline > pse->deadline;
-}
+加入新实体后，V 会偏移。为了让实际 lag 等于期望的 vl_i，
+需要在加入前将 vl_i 膨胀：
+  vl_i (inflated) > vl_i (target)
+  
+结果：加入后有效 lag = vl_i (target)
 ```
 
-EEVDF 的抢占判定比 CFS 更严格：
-1. 唤醒实体必须 eligible（欠服务的才能抢占）
-2. 当前实体必须已用完保护切片，或 deadline 确实更晚
+## 实体状态机
 
-### buddy 机制
-
-EEVDF 保留了 CFS 的 buddy 提示，但语义简化：
-
-```c
-// PICK_BUDDY feature 控制
-if (sched_feat(PICK_BUDDY) && protect &&
-    cfs_rq->next && entity_eligible(cfs_rq, cfs_rq->next)) {
-    return cfs_rq->next;
-}
+```
+                 enqueue_task_fair()
+                    (从不运行→就绪)
+[TASK_NEW/SLEEP] ──────────────→ [ACTIVE (on_rq=1, sched_delayed=0)]
+     ↑                                   │
+     │                            pick_eevdf() 选择
+     │                                   │
+     │                                   ↓
+     │                              [RUNNING]
+     │                                   │
+     │                            schedule() 被抢占
+     │                                   │
+     │                    ┌──────────────┴──────────────┐
+     │                    │ preempt                     │ sleep
+     │                    ↓                             │
+     │              [ACTIVE (on_rq=1)]                  │
+     │                    │                             │
+     │         dequeue_task_fair()                      │
+     │         (DEQUEUE_DELAYED)                        │
+     │                    │              dequeue_task_fair(DEQUEUE_SLEEP)
+     │                    ↓                             │
+     │              [DELAYED (on_rq=1,                  │
+     │               sched_delayed=1)]                  │
+     │                    │                             │
+     │         re-enqueue                               │
+     │                    │                             │
+     └────────────────────┘                             │
+                     (ACTIVE → RUNNING)                 │
+                                                        │
+                        wakeup → enqueue_task_fair() ───┘
 ```
 
-`cfs_rq->next` 由 `set_next_buddy()` 设置，通常指示"哪个实体应该接下来运行"。这在 yield 和某些组调度场景中使用。
+`DELAYED` 状态是新引入的：实体仍在 `cfs_rq` 上（`on_rq=1`）但标记为 `sched_delayed`，`pick_eevdf` 跳过它。这允许在延迟 period 内调整 lag 而不丢失队列位置。
 
-## 从 CFS 到 EEVDF 的变化
+## 抢占判定
 
-### 变化一：选择标准
+在 tick 处理和唤醒时的抢占判定不同：
 
-| 标准 | CFS | EEVDF |
+```c
+// entity_tick() — 周期 tick 触发
+// 在 update_curr() 中处理：
+//   if (resched || !protect_slice(curr))
+//       resched_curr_lazy(rq)
+
+// wakeup_preempt — 唤醒时
+// 通过 __pick_eevdf(cfs_rq, preempt_action) 判断
+// 如果唤醒实体被 __pick_eevdf 选中 → 抢占
+```
+
+抢占判定严格遵循 EEVDF：只有 deadline 更早且 eligible 的实体才能抢占当前实体，且当前实体有保护切片豁免。
+
+## 设计特点
+
+### 与 CFS 的差异
+
+| 维度 | CFS | EEVDF |
 |------|-----|-------|
-| 红黑树排列 | 按 vruntime | 按 deadline |
-| 选择 | 最左节点（最小 vruntime） | 最小 deadline 且 eligible |
-| 唤醒抢占 | vruntime 比较 | eligibility + deadline 比较 |
+| 选择标准 | min vruntime | EEVDF（eligibility + deadline） |
+| 公平度量 | vruntime 差值的近似 | vlag 精确计算 |
+| 切片 | 动态（sched_slice） | 固定基准（可自定义） |
+| 保护 | wakeup/preempt 粒度 | protect_slice（最小执行时间） |
+| 滞后 | 无显式概念 | vlag + entity_lag 夹持 |
+| 延迟 dequeue | 无 | sched_delayed 状态 |
+| proxy-exec | 不支持 | rq->donor vs rq->curr |
+| 抢占信号 | resched_curr | resched_curr_lazy（懒模式） |
 
-### 变化二：buddy 系统简化
+### 性能特性
 
-CFS 有 `next`/`last`/`skip` 三个 buddy，EEVDF 大幅简化：
-- `skip` 被移除
-- `next` 的功能保留但仅生效于 `PICK_BUDDY` 特性启用时
-- `last` 效果通过 `protect_slice()` 自然实现
-
-### 变化三：调频接口统一
-
-EEVDF 与 `schedutil` 调频器协作更紧密，`update_deadline()` 返回的调度信号被调频器用来预测 CPU 需求。
-
-### 变化四：sched_delayed 机制
-
-新引入的 `sched_delayed` 状态介于 `on_rq=1` 和 `on_rq=0` 之间：
-
-```
-状态迁移：
-  ACTIVE  → DELAYED (dequeue delayed)
-  DELAYED → ACTIVE  (re-enqueue)
-  DELAYED → SLEEP   (dequeue sleep → on_rq=0)
-```
-
-`sched_delayed` 意味着实体的 vruntime 已更新但资源仍在清理中（例如，上下文切换的开销尚未完全计入）。EEVDF 的 `pick_next_entity` 会跳过 `sched_delayed` 的实体，返回 NULL 让调度器选择其他实体。
-
-## EEVDF 参数调优
-
-### 可调参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `sysctl_sched_base_slice` | 3ms（桌面）/ 6ms（服务器） | 基准时间片 |
-| `sysctl_sched_min_granularity` | 0.75ms | 最小调度粒度 |
-| `sysctl_sched_wakeup_granularity` | 1.0ms | 唤醒抢占粒度 |
-| `sysctl_sched_migration_cost` | 500μs | 迁移成本预估 |
-| `sysctl_sched_nr_migrate` | 32 | 负载均衡单次迁移数 |
-
-### 可通过 sched_setattr 设置的 per-task 参数
-
-```c
-struct sched_attr {
-    u32 size;
-    u32 sched_policy;          // SCHED_OTHER / SCHED_BATCH / SCHED_IDLE
-    u64 sched_flags;           // SCHED_FLAG_CUSTOM_SLICE 等
-    s32 sched_nice;            // nice 值（-20~19）
-    u32 sched_priority;        // RT 优先级
-    u64 sched_runtime;         // 自定义 slice（ns）
-    u64 sched_deadline;        // deadline 参数（DEADLINE 调度）
-    u64 sched_period;          // period 参数（DEADLINE 调度）
-};
-```
-
-通过 `SCHED_FLAG_CUSTOM_SLICE` 可以为特定进程设置非默认时间片。
-
-## 与 CFS 的性能对比
-
-EEVDF 学术论文和内核测试报告的主要发现：
-
-1. **延迟更可预测**：通过 slice 保护（`protect_slice`），交互式任务响应更稳定
-2. **调度抖动减少**：最小执行时间保护减少了短时间内的上下文切换次数（~10% reduction）
-3. **公平性量化**：vlag 提供了精确的公平度量，而不是 CFS 的近似
-4. **突发负载改善**：EEVDF 的 eligibility 约束避免了 CFS 中"偷跑"问题
+- **切片保护减少上下文切换**：高频 tick 下，短运行实体不会反复被抢占
+- **eligibility 约束消除 CFS 的"偷跑"问题**：CFS 中 vruntime 最小的实体被选择，但新唤醒实体的 lag 补偿可能不准确
+- **vlag 夹持防止滞后无限增长**：`[-max_slice_weighted, +max_slice_weighted]` 限制了极端场景
+- **懒抢占（TIF_NEED_RESCHED_LAZY）** 延迟抢占决策，减少调度器调用次数
 
 ## 源码索引
 
@@ -398,20 +478,24 @@ EEVDF 学术论文和内核测试报告的主要发现：
 |------|------|------|
 | `struct sched_entity` | include/linux/sched.h | 575 |
 | `struct cfs_rq` | kernel/sched/sched.h | 678 |
+| `update_se()` | kernel/sched/fair.c | 1324 |
+| `update_curr()` | kernel/sched/fair.c | 1378 |
+| `update_deadline()` | kernel/sched/fair.c | 1209 |
 | `__pick_eevdf()` | kernel/sched/fair.c | 1102 |
 | `pick_eevdf()` | kernel/sched/fair.c | 1173 |
 | `entity_eligible()` | kernel/sched/fair.c | 905 |
 | `vruntime_eligible()` | kernel/sched/fair.c | 889 |
-| `update_deadline()` | kernel/sched/fair.c | 1209 |
-| `update_entity_lag()` | kernel/sched/fair.c | ~860 |
-| `entity_lag()` | kernel/sched/fair.c | ~830 |
-| `protect_slice()` | kernel/sched/fair.c | 附近 |
-| `place_entity()` | kernel/sched/fair.c | 附近 |
-| `avg_vruntime()` | kernel/sched/fair.c | ~800 |
-| `update_curr()` | kernel/sched/fair.c | 附近 |
+| `entity_lag()` | kernel/sched/fair.c | 832 |
+| `update_entity_lag()` | kernel/sched/fair.c | 853 |
+| `avg_vruntime()` | kernel/sched/fair.c | 676 附近 |
+| `protect_slice()` | kernel/sched/fair.c | 1072 |
+| `set_protect_slice()` | kernel/sched/fair.c | 1050 |
+| `place_entity()` | kernel/sched/fair.c | 5352 |
 | `entity_tick()` | kernel/sched/fair.c | 5793 |
 | `pick_next_entity()` | kernel/sched/fair.c | 5752 |
 | `enqueue_task_fair()` | kernel/sched/fair.c | 7168 |
-| `dequeue_task_fair()` | kernel/sched/fair.c | 5981 |
+| `dequeue_task_fair()` | kernel/sched/fair.c | 7402 |
 | `sysctl_sched_base_slice` | kernel/sched/fair.c | (全局) |
-| `sched_setattr()` syscall | kernel/sched/syscalls.c | 附近 |
+| `calc_delta_fair()` | kernel/sched/fair.c | (内联) |
+| `entity_before()` | kernel/sched/fair.c | 589 |
+| `entity_key()` | kernel/sched/fair.c | 附近 |
