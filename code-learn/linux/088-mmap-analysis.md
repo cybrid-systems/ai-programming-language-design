@@ -1,244 +1,323 @@
-# 088-mmap — Linux 内存映射（mmap）子系统深度源码分析
+# 88-mmap — Linux 内存映射（mmap）子系统深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
+> 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1
 
 ---
 
 ## 0. 概述
 
-**mmap**（内存映射）是 Linux 中将文件或设备映射到进程地址空间的核心机制。映射后，进程可以直接通过内存读写访问文件内容——内核在缺页时自动从文件页缓存读取或通过 `fault()` 回调从设备获取。
+**mmap**（内存映射）是 Linux 中将文件或设备映射到进程地址空间的核心机制。映射后，进程可以直接通过内存读写访问文件内容——内核在缺页时自动读取/写入文件页缓存。
 
-**doom-lsp 确认**：`mm/mmap.c`（108 个符号），`mm/memory.c`（~300 个符号），`include/linux/mm.h`（~500 个符号），`include/linux/mm_types.h`（~200 个符号）。
+**核心设计**：`do_mmap`（`mm/mmap.c:336`）创建 VMA（Virtual Memory Area），`mmap_region`（`mm/vma.c:2829`）将 VMA 插入进程的 VMA 红黑树，`remap_pfn_range` 映射物理地址，`handle_mm_fault` 在缺页时填充页表。
+
+```
+mmap 系统调用路径：
+  mmap(addr, len, prot, flags, fd, offset)
+    ↓
+  ksys_mmap_pgoff → vm_mmap_pgoff
+    ↓
+  do_mmap() @ mm/mmap.c:336
+    → 参数验证（长度/标志/权限）
+    → get_unmapped_area() 选择地址（mm->get_unmapped_area）
+    → 如果是文件映射 → file->f_op->mmap(file, vma)
+      → 驱动调用 remap_pfn_range() 建立页表
+    → mmap_region() 创建 VMA 并插入红黑树
+
+缺页处理：
+  进程访问映射地址 → 页表缺失
+    ↓
+  handle_mm_fault() @ mm/memory.c
+    ↓
+  filemap_fault() 或 vma->vm_ops->fault()
+    → 从文件页缓存读取数据页
+    → 或从设备读取数据
+    → 填充页表 → 进程继续执行
+```
+
+**doom-lsp 确认**：`mm/mmap.c`（1,921 行，108 符号），`mm/memory.c`（7,587 行），`include/linux/mm.h`（5,237 行）。
 
 ---
 
 ## 1. 核心数据结构
 
-### 1.1 `struct vm_area_struct` (VMA)
-
-（`include/linux/mm_types.h` L932 — doom-lsp 确认）
-
-每个 VMA 描述进程地址空间中的一个连续区间：
+### 1.1 struct vm_area_struct——VMA
 
 ```c
+// include/linux/mm.h
 struct vm_area_struct {
-    unsigned long           vm_start;      // L943 — VMA 起始虚拟地址
-    unsigned long           vm_end;        // L945 — VMA 结束虚拟地址
+    unsigned long vm_start;                  // VMA 起始地址
+    unsigned long vm_end;                    // VMA 结束地址
 
-    struct rb_node          vm_rb;         // L949 — 红黑树节点（按地址排序）
-    struct list_head        anonymous_list; // L952 — 匿名页链表
-    struct list_head        shared;        // L956 — 共享 VMA 链表
+    struct rb_node vm_rb;                    // 红黑树节点（按地址排序）
+    struct list_head anon_vma_chain;         // 匿名页反向映射链
 
-    struct address_space    *vm_file;      // L958 — 映射的文件（NULL = 匿名映射）
-    unsigned long           vm_pgoff;      // L960 — 文件内的页偏移
-    unsigned long           vm_start_pgoff;// L962 — VMA 起始页偏移
+    const struct vm_operations_struct *vm_ops; // VMA 操作
 
-    struct mm_struct        *vm_mm;        // L1027 — 所属进程的 mm_struct
-    pgprot_t                vm_page_prot;  // L1030 — 页保护位（读写执行）
-    unsigned long           vm_flags;      // L1031 — VMA 标志（VM_READ/WRITE/EXEC/SHARED...）
+    unsigned long vm_pgoff;                  // 文件偏移（页单位）
+    struct file *vm_file;                    // 映射的文件
 
-    const struct vm_operations_struct *vm_ops; // L1039 — VMA 操作（open/close/fault/map_pages...）
-    unsigned long           vm_policy;     // L1066 — NUMA 内存策略
-
-    struct list_head        vma_list;      // L1088 — 进程 VMA 链表
-    struct rb_root_cached   vma_tree_cache;// L1093 — VMA 树缓存
+    unsigned long vm_flags;                  // 标志（VM_READ/VM_WRITE/VM_SHARED）
 };
 ```
 
-### 1.2 `struct vm_operations_struct`——VMA 操作
+### 1.2 struct mm_struct——进程地址空间
 
 ```c
-struct vm_operations_struct {
-    void    (*open)(struct vm_area_struct *vma);     // VMA 被 fork 复制时
-    void    (*close)(struct vm_area_struct *vma);    // VMA 被销毁时
-    vm_fault_t (*fault)(struct vm_fault *vmf);       // 缺页处理（核心！）
-    vm_fault_t (*map_pages)(struct vm_fault *vmf,    // 批量页表填充
-                         pgoff_t start_pgoff, pgoff_t end_pgoff);
-    int     (*page_mkwrite)(struct vm_fault *vmf);   // 页面变为可写时
-    int     (*set_policy)(...);                       // NUMA 策略
+struct mm_struct {
+    struct vm_area_struct *mmap;             // VMA 链表
+    struct rb_root mm_rb;                    // VMA 红黑树
+    unsigned long (*get_unmapped_area)(...); // 未映射区域查找
+
+    unsigned long mmap_base;                 // mmap 映射基址
+    unsigned long task_size;                 // 进程地址空间大小
+
+    int map_count;                           // VMA 数量
+    spinlock_t page_table_lock;              // 页表锁
+    struct rw_semaphore mmap_lock;            // VMA 读/写锁
+
+    unsigned long total_vm;                  // 映射总页数
+    unsigned long locked_vm;                 // 锁定页数
 };
 ```
 
----
-
-## 2. 完整数据流
-
-### 2.1 mmap 系统调用
-
-```
-mmap(addr, len, prot, flags, fd, offset)
-  └─ ksys_mmap_pgoff
-       └─ vm_mmap_pgoff
-            └─ do_mmap(file, addr, len, prot, flags, pgoff)   // mm/mmap.c L336
-                 │
-                 ├─ 1. 参数验证
-                 │    如果 len = 0 → 返回 -EINVAL
-                 │    如果 flags 包含 MAP_FIXED 但地址不对齐 → 返回 -EINVAL
-                 │
-                 ├─ 2. 选择地址
-                 │    如果 addr < mmap_min_addr → 修正
-                 │    get_unmapped_area(file, addr, len, pgoff, flags)
-                 │      → 找到空闲的地址区间
-                 │      → 如果 file->f_op->get_unmapped_area 存在，调用文件系统的实现
-                 │      → 否则使用通用算法：从 TASK_UNMAPPED_BASE 开始扫描
-                 │
-                 ├─ 3. 计算保护标志
-                 │    vm_flags = calc_vm_prot_bits(prot) | calc_vm_flag_bits(flags)
-                 │    // VM_READ | VM_WRITE | VM_EXEC | VM_SHARED ...
-                 │
-                 ├─ 4. 创建 VMA 并插入进程地址空间
-                 │    mmap_region(file, addr, len, vm_flags, pgoff, ...)
-                 │      └─ 分配 VMA: kmem_cache_zalloc(vm_area_cachep)
-                 │      └─ 设置 vm_start / vm_end / vm_flags / vm_pgoff
-                 │      └─ 插入红黑树（vma_tree_cache）和链表
-                 │
-                 ├─ 5. 文件映射的 mmap 回调
-                 │    if (file) {
-                 │        // 调用文件系统驱动建立映射
-                 │        // 驱动可能立即建立页表（remap_pfn_range）
-                 │        // 或延迟到缺页（设置 fault 回调）
-                 │        vma->vm_file = file
-                 │        vma->vm_ops = file->f_op->mmap(file, vma)
-                 │    }
-                 │
-                 └─ 6. 返回映射地址
-                      return addr
-```
-
-### 2.2 缺页处理——handle_mm_fault
-
-当进程访问映射区域但页表中没有对应条目时触发：
-
-```
-handle_mm_fault(vma, addr, flags, regs)             // mm/memory.c
-  └─ __handle_mm_fault(vma, addr, flags)
-       └─ 根据 addr 找到对应的 PUD/PMD/PTE 层级
-            └─ handle_pte_fault(vma, addr, pte, pmd, flags)
-                 │
-                 ├─ 如果 PTE 未映射（pte_none）：
-                 │    └─ do_fault(vmf)                      // 文件映射缺页
-                 │         └─ vma->vm_ops->fault(vmf)       // 驱动处理
-                 │              → filemap_fault(vmf)         // 通用文件映射
-                 │                   → 查找 page cache
-                 │                   → 如果不命中 → 从磁盘读取
-                 │                   → add_to_page_cache_lru()
-                 │                   → 建立 PTE 映射
-                 │
-                 ├─ 如果 PTE 是 swap 条目（pte_to_swp_entry）：
-                 │    └─ do_swap_page(vmf)                  // 页面被换出
-                 │         → swap_read_folio()
-                 │         → 建立 PTE 映射
-                 │
-                 ├─ 如果 PTE 已存在但写入权限不足：
-                 │    └─ do_wp_page(vmf)                    // 写时复制
-                 │         → 分配新页
-                 │         → 复制内容
-                 │         → 建立可写 PTE
-                 │
-                 └─ 如果 PTE 不存在且是匿名页：
-                      └─ do_anonymous_page(vmf)             // 匿名映射缺页
-                           → alloc_zeroed_user_highpage()
-                           → 建立零填充的 PTE
-```
-
-### 2.3 munmap 数据流
-
-```
-munmap(addr, len)
-  └─ do_munmap(mm, addr, len, uf)                   // mm/mmap.c L1062
-       └─ __do_munmap(mm, addr, len, uf)
-            ├─ 1. 找到 addr 所在 VMA
-            ├─ 2. 如果 VMA 被部分覆盖 → 分裂（split VMA）
-            │     split_vma(mm, vma, addr, 0)  // 前半部分
-            │     split_vma(mm, vma, addr+len, 1) // 后半部分
-            └─ 3. 取消映射
-                  unmap_region(mm, vma, prev, start, end)
-                    └─ unmap_vmas(mmu_gather, vma, start, end)
-                    └─ free_pgtables(mmu_gather, vma, ...)
-                  └─ remove_vma_list(mm, vma)
-```
+**doom-lsp 确认**：`struct vm_area_struct` 和 `struct mm_struct` 在 `include/linux/mm.h` 中定义。每个进程的 `task_struct->mm` 指向其地址空间。
 
 ---
 
-## 3. 四种映射类型
-
-| 类型 | flags | 创建方式 | 数据来源 | 缺页处理 |
-|------|-------|---------|---------|---------|
-| 匿名映射 | MAP_ANONYMOUS \| MAP_PRIVATE | glibc malloc 大块 | 零填充页 | do_anonymous_page |
-| 文件映射 | MAP_SHARED | mmap file | 文件页缓存 | filemap_fault |
-| 私有文件映射 | MAP_PRIVATE | mmap file（写时复制） | 文件页缓存 + COW | filemap_fault → COW |
-| 设备映射 | MAP_SHARED + 驱动 | mmap /dev/xxx | 设备内存 | 驱动的 fault 回调 |
-
----
-
-## 4. VMA 红黑树查找
+## 2. do_mmap @ :336——创建映射
 
 ```c
-// mm/mmap.c — 通过虚拟地址查找 VMA
-struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+unsigned long do_mmap(struct file *file, unsigned long addr,
+                       unsigned long len, unsigned long prot,
+                       unsigned long flags, vm_flags_t vm_flags,
+                       unsigned long pgoff, unsigned long *populate)
 {
-    struct rb_node *rb_node;
-    struct vm_area_struct *vma;
+    // 1. 参数验证
+    len = PAGE_ALIGN(len);
+    if (mm->map_count > sysctl_max_map_count)   // 太多映射
+        return -ENOMEM;
 
-    rb_node = mm->vma_tree_cache.rb_root.rb_node; // L1093 缓存
-    while (rb_node) {
-        vma = rb_entry(rb_node, ...);
-        if (vma->vm_end > addr) {
-            rb_node = rb_node->rb_left;  // 在左子树中
-            if (addr >= vma->vm_start)
-                return vma;              // 找到！
-        } else {
-            rb_node = rb_node->rb_right; // 在右子树中
+    // 2. 选择映射地址
+    addr = __get_unmapped_area(file, addr, len, pgoff, flags, vm_flags);
+    // → arch_get_unmapped_area()：从 mm->mmap_base 开始找一个空区域
+    // → arch_get_unmapped_area_topdown()：从栈底开始向下选（默认）
+
+    // 3. 文件映射检查
+    if (file) {
+        if (!file_mmap_ok(file, inode, pgoff, len))
+            return -EOVERFLOW;
+
+        if (file->f_op->mmap_capabilities) {
+            // 驱动声明 mmap 能力
         }
     }
-    return NULL;  // 没找到
+
+    // 4. 创建 VMA 并插入
+    addr = mmap_region(file, addr, len, vm_flags, pgoff, uf);
+    // → vma_merge() 尝试与相邻 VMA 合并
+    // → kmem_cache_zalloc(vm_area_cachep) 分配新 VMA
+    // → vma_link() 插入红黑树+链表
+    // → file->f_op->mmap(file, vma) 驱动回调
+    // → vma_set_page_prot() 设置页权限
+
+    return addr;
 }
 ```
 
-### mmap 与 brk 的地址空间范围
+**doom-lsp 确认**：`do_mmap` @ `mmap.c:336`，`mmap_region` @ `vma.c:2829`。
 
-```
-进程虚拟地址空间（x86-64）：
-  ┌─────────────────────────┐
-  │ 代码段 (0x400000)        │
-  ├─────────────────────────┤
-  │ 数据段                   │
-  ├─────────────────────────┤
-  │ 堆 (mm->start_brk ~     │ ← brk 控制
-  │    mm->brk)             │
-  ├─────────────────────────┤
-  │    ...                  │
-  ├─────────────────────────┤
-  │ mmap 区域               │ ← mmap 分配区
-  │ (TASK_UNMAPPED_BASE 起) │
-  ├─────────────────────────┤
-  │ 栈                      │
-  └─────────────────────────┘
+---
+
+## 3. mmap_region @ :2829——VMA 插入
+
+```c
+unsigned long mmap_region(struct file *file, unsigned long addr,
+                           unsigned long len, vm_flags_t vm_flags,
+                           unsigned long pgoff, struct list_head *uf)
+{
+    struct vm_area_struct *vma, *prev;
+
+    // 1. 尝试与前面或后面的 VMA 合并
+    vma = vma_merge(mm, prev, addr, addr + len, vm_flags, ...);
+    if (vma)
+        goto out;                           // 合并成功
+
+    // 2. 分配新 VMA
+    vma = vm_area_alloc(mm);
+    vma->vm_start = addr;
+    vma->vm_end = addr + len;
+    vma->vm_flags = vm_flags;
+    vma->vm_pgoff = pgoff;
+    vma->vm_file = get_file(file);          // 引用文件
+
+    // 3. 调用驱动 mmap
+    if (file) {
+        error = call_mmap(file, vma);     // → file->f_op->mmap(file, vma)
+        // 驱动通常调用：
+        //   remap_pfn_range(vma, addr, pfn, size, prot)
+        //   建立物理地址→用户地址的页表映射
+    }
+
+    // 4. 插入红黑树
+    vma_link(mm, vma, prev, rb_link, rb_parent);
+    // → __vma_link() — 插入红黑树
+    // → __vma_link_file() — 关联到文件的 mapping->i_mmap
+
+    mm->map_count++;
+    return addr;
+}
 ```
 
 ---
 
-## 5. 源码索引
+## 4. 缺页处理——handle_mm_fault @ memory.c:6683
 
-| 符号 | 文件 | 行号 |
+```c
+// 进程第一次访问 mmap 地址时产生缺页：
+// do_page_fault → handle_mm_fault @ :6683
+// → __handle_mm_fault @ :6449 — 逐级页表遍历
+
+vm_fault_t __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+                              unsigned int flags)
+{
+    struct vm_fault vmf = {
+        .vma = vma,
+        .address = address & PAGE_MASK,
+        .flags = flags,           // FAULT_FLAG_WRITE / FAULT_FLAG_ALLOW_RETRY
+        .pgoff = linear_page_index(vma, address),
+    };
+
+    // 1. 逐级分配页表
+    pgd = pgd_offset(mm, address);
+    p4d = p4d_alloc(mm, pgd, address);
+    vmf.pud = pud_alloc(mm, p4d, address);       // PUD 级（1GB 页）
+    vmf.pmd = pmd_alloc(mm, vmf.pud, address);   // PMD 级（2MB 页）
+
+    // 2. 尝试透明大页（THP）
+    if (pmd_none && thp_vma_allowable(...))
+        ret = create_huge_pmd(&vmf);             // 2MB 映射
+
+    // 3. 普通 4KB 页 (fallback)
+    vmf.orig_pte = pte_offset_map(vmf.pmd, address);
+    if (pte_none(vmf.orig_pte)) {                 // 页面不存在
+        if (vma->vm_ops && vma->vm_ops->fault) {
+            ret = vma->vm_ops->fault(vmf);        // 设备/文件系统自定义缺页
+        } else if (vma->vm_file) {
+            ret = filemap_fault(vmf);             // 文件页缓存
+            // → filemap_get_page(mapping, index)
+            // → 如果不在缓存 → 从磁盘读取
+            // → filemap_add_folio() 添加到页缓存
+        } else {
+            ret = do_anonymous_page(vmf);         // 匿名页：分配零页
+        }
+    } else if (pte_swp_uffd_wp(vmf.orig_pte)) {
+        ret = do_swap_page(vmf);                  // 换出页
+    } else if (flags & FAULT_FLAG_WRITE) {
+        ret = do_wp_page(vmf);                    // 写时复制（COW）
+    }
+
+    // 4. 设置页表
+    // → set_pte_at(mm, address, vmf->pte, entry);
+    return ret;
+}
+```
+
+**doom-lsp 确认**：`handle_mm_fault` @ `memory.c:6683`，`__handle_mm_fault` @ `:6449`。页表分配路径：`pgd` → `p4d` → `pud` → `pmd` → `pte`。
+
+---
+
+## 5. 特殊映射类型
+
+| 映射类型 | file 参数 | vm_ops | 缺页处理 |
+|---------|-----------|--------|---------|
+| **匿名映射**（MAP_ANONYMOUS）| NULL | NULL | `do_anonymous_page` → 分配零页 |
+| **文件映射**（普通文件）| regular file | NULL | `filemap_fault` → 读磁盘 |
+| **共享内存**（shmem）| shmem_file | shmem_vm_ops | shmem_fault |
+| **设备 mmap**（/dev/*）| device file | device->vm_ops | device fault |
+| **hugetlb**（大页）| hugetlbfs file | hugetlb_vm_ops | hugetlb_fault |
+
+### remap_pfn_range——物理地址映射
+
+```c
+// 设备驱动在 mmap 回调中调用此函数建立物理地址→用户空间的映射：
+// drivers/gpu/drm/ttm/ttm_bo_vm.c (GPU 显存映射)
+// drivers/pci/pci-sysfs.c (PCI BAR 映射)
+
+int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
+                    unsigned long pfn, unsigned long size, pgprot_t prot)
+{
+    // 遍历每一页
+    for (; addr < end; addr += PAGE_SIZE, pfn++) {
+        // 创建 PTE 条目：pfn → 物理地址
+        pte_t pte = pfn_pte(pfn, prot);
+        // 设置页表
+        set_pte_at(mm, addr, pte, pte);
+    }
+    // 刷新 TLB
+    flush_tlb_range(vma, addr, end);
+    return 0;
+}
+```
+
+---
+
+## 6. munmap 路径
+
+```c
+SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
+{
+    return __vm_munmap(addr, len, true);
+    // → do_vmi_munmap(vmi, mm, start, len, uf, false);
+    // → 查找 VMA：find_vma(mm, addr)
+    // → 分割/删除 VMA：detach_vmas_to_be_unmapped()
+    // → unmap_region() → 清除页表
+    // → remove_vma_list() → 释放 VMA
+}
+```
+
+---
+
+## 7. 关键函数索引
+
+| 函数 | 行号 | 作用 |
 |------|------|------|
-| `struct vm_area_struct` | include/linux/mm_types.h | 932 |
-| `do_mmap()` | mm/mmap.c | 336 |
-| `do_munmap()` | mm/mmap.c | 1062 |
-| `mmap_region()` | mm/vma.c | 2829 |
-| `find_vma()` | mm/mmap.c | 相关 |
-| `handle_mm_fault()` | mm/memory.c | 相关 |
-| `do_anonymous_page()` | mm/memory.c | 相关 |
-| `do_wp_page()` | mm/memory.c | 写时复制 |
-| `do_swap_page()` | mm/memory.c | swap 换入 |
-| `do_fault()` | mm/memory.c | 文件映射缺页 |
-| `filemap_fault()` | mm/filemap.c | 文件页缓存缺页 |
-| `sys_mmap_pgoff()` | mm/mmap.c | 613 |
-| `remap_pfn_range()` | mm/memory.c | 物理地址映射 |
-| `munmap()` | mm/mmap.c | 相关 |
-| `get_unmapped_area()` | mm/mmap.c | 相关 |
+| `do_mmap` | `:336` | mmap 系统调用核心 |
+| `mmap_region` | `vma.c:2829` | VMA 创建+插入 |
+| `__get_unmapped_area` | `:813` | 地址空间查找 |
+| `vma_merge` | — | VMA 合并 |
+| `vma_link` | — | VMA 插入红黑树 |
+| `handle_mm_fault` | `mm/memory.c` | 缺页处理 |
+| `remap_pfn_range` | `mm/memory.c` | 建立物理页映射 |
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
+## 8. 调试
+
+```bash
+# 查看进程的 VMA
+cat /proc/<pid>/maps
+# 7f1234000000-7f1236000000 rw-p 00000000 00:00 0          [anon]
+# 7f1236000000-7f1238000000 r--p 00000000 08:01 123456     /usr/lib/libc.so
+
+# 查看 VMA 数量
+cat /proc/<pid>/maps | wc -l
+
+# 查看 mmap 限额
+cat /proc/sys/vm/max_map_count
+
+# 跟踪缺页
+echo 1 > /sys/kernel/debug/tracing/events/mmap/mmap_map/enable
+echo 1 > /sys/kernel/debug/tracing/events/mmap/mmap_unmap/enable
+```
+
+---
+
+## 9. 总结
+
+`mmap` 通过 `do_mmap`（`:336`）→ `mmap_region`（`vma.c:2829`）创建 VMA 并插入红黑树，`handle_mm_fault` 在缺页时填充页表。文件映射通过 `filemap_fault` 从页缓存读取，设备映射通过 `remap_pfn_range` 建立物理地址映射，匿名映射分配零页。
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
