@@ -377,7 +377,7 @@ security_ptrace_access_check();          // LSM 钩子
 | `ptrace_attach()` | kernel/ptrace.c | 409 |
 | `ptrace_detach()` | kernel/ptrace.c | 564 |
 | `ptrace_check_attach()` | kernel/ptrace.c | 239 |
-| `ptrace_request()` | kernel/ptrace.c | 872 |
+| `ptrace_request()` | kernel/ptrace.c | 1137 |
 | `__ptrace_link()` | kernel/ptrace.c | 69 |
 | `__ptrace_unlink()` | kernel/ptrace.c | 117 |
 | `ptrace_stop()` | kernel/signal.c | 2351 |

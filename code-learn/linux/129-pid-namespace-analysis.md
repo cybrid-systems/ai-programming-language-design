@@ -202,7 +202,7 @@ struct task_struct *pid_task(struct pid *pid, enum pid_type type)  // L464
 struct task_struct *find_task_by_vpid(pid_t vnr)   // L488 — 当前命名空间
     → pid_task(find_pid_ns(vnr, task_active_pid_ns(current)), PIDTYPE_PID)
 
-struct task_struct *find_get_task_by_vpid(pid_t nr) // L498
+struct task_struct *find_get_task_by_vpid(pid_t nr) // L493
     → get_pid_task(find_pid_ns(nr, task_active_pid_ns(current)), PIDTYPE_PID)
 ```
 
@@ -462,10 +462,10 @@ PID 查找路径是 RCU 保护的：
 | `find_pid_ns()` | kernel/pid.c | 368 |
 | `pid_task()` | kernel/pid.c | 464 |
 | `find_task_by_vpid()` | kernel/pid.c | 488 |
-| `find_get_task_by_vpid()` | kernel/pid.c | 498 |
+| `find_get_task_by_vpid()` | kernel/pid.c | 493 |
 | `get_pid_task()` | kernel/pid.c | 516 |
 | `attach_pid()` | kernel/pid.c | 附近 |
-| `change_pid()` | kernel/pid.c | 附近 |
+| `change_pid()` | kernel/pid.c | 427 |
 | `__task_pid_nr_ns()` | kernel/pid.c | 232 |
 | `sys_getpid()` | kernel/sys.c | (通过 task_tgid_vnr) |
 | `init_pid_ns` | kernel/pid.c | 全局变量 |

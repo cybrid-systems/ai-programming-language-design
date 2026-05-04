@@ -19,7 +19,7 @@ Linux 提供多个创建进程的系统调用，最终统一由 `kernel_clone()`
 sys_fork()      — kernel/fork.c L2803 → kernel_clone(&args)
 sys_vfork()     — kernel/fork.c L2819 → kernel_clone(&args)
 sys_clone()     — kernel/fork.c L2799（需要解析寄存器参数）
-sys_clone3()    — kernel/fork.c L2784 → kernel_clone(&args)
+sys_clone3()    — kernel/fork.c L3006 → kernel_clone(&args)
 ```
 
 ```c
@@ -414,7 +414,7 @@ fork 的共享策略通过 clone flags 精确控制：
 | `exit_signals()` | kernel/exit.c | 3119 |
 | `exit_notify()` | kernel/exit.c | 相关逻辑 |
 | `sys_fork()` | kernel/fork.c | 2803 |
-| `sys_clone3()` | kernel/fork.c | 2784 |
+| `sys_clone3()` | kernel/fork.c | 3006 |
 | `sys_execve()` | fs/exec.c | 1924 |
 | `sys_execveat()` | fs/exec.c | 1934 |
 | `bprm_execve()` | fs/exec.c | 1724 |
@@ -423,4 +423,4 @@ fork 的共享策略通过 clone flags 精确控制：
 | `begin_new_exec()` | fs/exec.c | 1091 |
 | `struct linux_binprm` | include/linux/binfmts.h | 18 |
 | `struct task_struct` | include/linux/sched.h | 820 |
-| `struct kernel_clone_args` | include/linux/sched/task.h | 18 附近 |
+| `struct kernel_clone_args` | include/linux/sched/task.h | 23 |

@@ -486,14 +486,14 @@ V' = V - w_i × vl_i / (W + w_i)
 | `entity_eligible()` | kernel/sched/fair.c | 905 |
 | `vruntime_eligible()` | kernel/sched/fair.c | 889 |
 | `entity_lag()` | kernel/sched/fair.c | 832 |
-| `update_entity_lag()` | kernel/sched/fair.c | 853 |
+| `update_entity_lag()` | kernel/sched/fair.c | 852 |
 | `avg_vruntime()` | kernel/sched/fair.c | 676 附近 |
 | `protect_slice()` | kernel/sched/fair.c | 1072 |
 | `set_protect_slice()` | kernel/sched/fair.c | 1050 |
-| `place_entity()` | kernel/sched/fair.c | 5352 |
-| `entity_tick()` | kernel/sched/fair.c | 5793 |
-| `pick_next_entity()` | kernel/sched/fair.c | 5752 |
-| `enqueue_task_fair()` | kernel/sched/fair.c | 7168 |
+| `place_entity()` | kernel/sched/fair.c | 5351 |
+| `entity_tick()` | kernel/sched/fair.c | 5792 |
+| `pick_next_entity()` | kernel/sched/fair.c | 5751 |
+| `enqueue_task_fair()` | kernel/sched/fair.c | 7167 |
 | `dequeue_task_fair()` | kernel/sched/fair.c | 7402 (2nd def) |
 | `sysctl_sched_base_slice` | kernel/sched/fair.c | (全局) |
 | `calc_delta_fair()` | kernel/sched/fair.c | (内联) |
