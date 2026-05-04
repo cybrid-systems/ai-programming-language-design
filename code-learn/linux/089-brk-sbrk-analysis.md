@@ -297,3 +297,5 @@ int do_brk_flags(..., unsigned long addr, unsigned long len, ...)
 ---
 
 *分析工具：doom-lsp | 分析日期：2026-05-04*
+
+> brk 是最古老的内存分配系统调用之一，glibc 的 malloc 将其与 mmap 配合使用实现灵活的堆管理。
