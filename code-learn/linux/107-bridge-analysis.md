@@ -348,3 +348,16 @@ bridge 通过 `br_handle_frame`(`br_input.c`)截获输入数据包 → `br_fdb_u
 | `br_forward` | — | 单播转发 |
 | `br_flood` | — | 洪泛 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `br_dev_xmit()` | net/bridge/br_device.c | 桥转发 |
+| `br_handle_frame()` | net/bridge/br_input.c | 帧接收处理 |
+| `br_fdb_update()` | net/bridge/br_fdb.c | FDB 学习 |
+| `struct net_bridge` | net/bridge/br_private.h | 桥核心结构 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

@@ -395,3 +395,16 @@ Conntrack 是一个**通用、高速的连接跟踪引擎**：
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `nf_conntrack_in()` | net/netfilter/nf_conntrack_core.c | 连接跟踪入口 |
+| `nf_conntrack_confirm()` | net/netfilter/nf_conntrack_core.c | 连接确认 |
+| `struct nf_conn` | net/netfilter/nf_conntrack.h | 连接结构 |
+| `hash_conntrack_raw()` | net/netfilter/nf_conntrack_core.c | 连接哈希 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

@@ -303,3 +303,16 @@ USB 核心通过 `hub_events` 检测设备插拔，`usb_new_device` 枚举并配
 | `usb_register` | `driver.c` | 驱动注册 |
 | `usb_autosuspend_device` | `usb.c` | 自动挂起 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `usb_submit_urb()` | drivers/usb/core/urb.c | URB 提交 |
+| `usb_hcd_submit_urb()` | drivers/usb/core/hcd.c | HCD 分发 |
+| `struct usb_device` | include/linux/usb.h | USB 设备 |
+| `struct urb` | include/linux/usb.h | USB 请求块 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

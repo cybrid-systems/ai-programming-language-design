@@ -350,3 +350,16 @@ veth 的关键内部结构已在第 1 节中展示：`struct veth_priv` 包含 p
 | `veth_enable_xdp_range` | `:1110` | XDP 启用 |
 | `veth_get_stats64` | `:451` | 统计获取 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `veth_xmit()` | drivers/net/veth.c | veth 发送 |
+| `veth_poll()` | drivers/net/veth.c | NAPI poll |
+| `veth_open()` | drivers/net/veth.c | 设备打开 |
+| `struct veth_priv` | drivers/net/veth.c | 私有数据 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

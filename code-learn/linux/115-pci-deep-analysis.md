@@ -344,3 +344,16 @@ struct pci_domain_busn_res {
 // → pcie_print_link_status() — 打印链路状态
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `pci_read_config()` | drivers/pci/access.c | 配置空间读 |
+| `pci_enable_device()` | drivers/pci/pci.c | 设备使能 |
+| `pci_request_irq()` | drivers/pci/irq.c | 中断请求 |
+| `struct pci_dev` | include/linux/pci.h | PCI 设备 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

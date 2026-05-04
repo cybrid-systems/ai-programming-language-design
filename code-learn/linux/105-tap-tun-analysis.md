@@ -329,3 +329,16 @@ struct tap_filter {
 // ip -d link show tun0
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `tun_get_user()` | drivers/net/tun.c | 用户→内核数据 |
+| `tun_net_xmit()` | drivers/net/tun.c | 内核→TAP 发送 |
+| `tun_chr_open()` | drivers/net/tun.c | 字符设备打开 |
+| `struct tun_struct` | drivers/net/tun.c | TUN/TAP 设备 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

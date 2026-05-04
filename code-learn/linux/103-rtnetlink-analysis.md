@@ -306,3 +306,16 @@ struct rtnl_link @ :68 {
 | `rtnl_register` | — | 注册消息处理 |
 | `rtnl_link_register` | `:597` | 注册链路类型 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `rtnl_newlink()` | net/core/rtnetlink.c | 相关 |
+| `rtnl_dellink()` | net/core/rtnetlink.c | 相关 |
+| `rtnl_getlink()` | net/core/rtnetlink.c | 相关 |
+| `struct rtmsg` | include/uapi/linux/rtnetlink.h | 路由消息 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

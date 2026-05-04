@@ -321,3 +321,16 @@ struct ucma_file {
 // 原子操作需要硬件和 MR 支持 REMOTE_ATOMIC 权限
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `rdma_create_id()` | drivers/infiniband/core/cma.c | RDMA CM ID |
+| `ib_post_send()` | drivers/infiniband/core/verbs.c | 发送 WR |
+| `ib_post_recv()` | drivers/infiniband/core/verbs.c | 接收 WR |
+| `struct ib_qp` | include/rdma/ib_verbs.h | 队列对 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

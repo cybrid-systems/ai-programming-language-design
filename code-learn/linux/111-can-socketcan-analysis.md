@@ -345,3 +345,16 @@ struct can_device_stats {
 // raw_bind    — 绑定 CAN 接口+设置过滤器
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `can_send()` | net/can/af_can.c | CAN 帧发送 |
+| `can_rcv()` | net/can/af_can.c | CAN 帧接收 |
+| `struct can_sock` | net/can/af_can.c | CAN socket |
+| `struct can_frame` | include/uapi/linux/can.h | CAN 帧格式 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

@@ -325,3 +325,16 @@ struct zfcp_fsf_req {                            // FSF 请求
 // → 调用设备驱动的中断回调（zfcp 中的完成处理）
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `ccw_device_probe()` | drivers/s390/cio/device.c | CCW 探测 |
+| `zfcp_fsf_req_send()` | drivers/s390/scsi/zfcp_fsf.c | FSF 请求 |
+| `struct ccw_device` | drivers/s390/cio/ccw_device.h | CCW 设备 |
+| `struct zfcp_adapter` | drivers/s390/scsi/zfcp_def.h | zFCP 适配器 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

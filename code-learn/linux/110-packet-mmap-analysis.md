@@ -323,3 +323,16 @@ AF_PACKET 通过 `packet_sendmsg`/`tpacket_rcv` 收发 L2 数据包。PACKET_MMA
 | `prb_retire_current_block` | `:202` | 块完成处理 |
 | `prb_open_block` | `:205` | 块打开初始化 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `packet_rcv()` | net/packet/af_packet.c | 原始包接收 |
+| `packet_mmap()` | net/packet/af_packet.c | mmap 映射 |
+| `tpacket_rcv()` | net/packet/af_packet.c | TPACKET 接收 |
+| `struct packet_sock` | net/packet/af_packet.c | 核心结构 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

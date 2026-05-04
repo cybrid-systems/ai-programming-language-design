@@ -333,3 +333,15 @@ struct tb_path_hop {
 | `tb_tunnel_activate` | — | 隧道激活 |
 | `ctl_tx` | — | 控制帧发送 |
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `thunderbolt_icm_load()` | drivers/thunderbolt/icm.c | ICM 固件加载 |
+| `tb_register_property_dir()` | drivers/thunderbolt/property.c | 属性注册 |
+| `struct tb` | drivers/thunderbolt/tb.h | 域核心结构 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

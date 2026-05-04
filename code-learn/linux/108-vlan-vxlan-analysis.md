@@ -332,3 +332,16 @@ struct vxlan_rdst {
 // cat /proc/net/vlan/eth0.100 — 查看 VLAN 统计
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `vlan_dev_hard_start_xmit()` | net/8021q/vlan_dev.c | VLAN 发送 |
+| `vxlan_xmit()` | drivers/net/vxlan/vxlan_core.c | VXLAN 封装 |
+| `vxlan_rcv()` | drivers/net/vxlan/vxlan_core.c | VXLAN 解封装 |
+| `struct vxlan_dev` | drivers/net/vxlan/vxlan.h | VXLAN 设备 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

@@ -328,3 +328,16 @@ struct team_mode {
 // 4. 重新加入活跃端口池
 ```
 
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `bond_xmit_slave()` | drivers/net/bonding/bond_main.c | 主从发送 |
+| `bond_arp_rcv()` | drivers/net/bonding/bond_main.c | ARP 监控 |
+| `team_xmit()` | drivers/net/team/team_core.c | 组发送 |
+| `struct bonding` | drivers/net/bonding/bond_main.c | 核心结构 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
