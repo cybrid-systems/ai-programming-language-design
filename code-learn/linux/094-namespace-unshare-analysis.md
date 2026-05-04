@@ -268,6 +268,51 @@ nsenter -t <pid> -n -m /bin/bash
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
 
+
+## 2. unshare_nsproxy_namespaces——unshare 系统调用的命名空间处理
+
+（`kernel/nsproxy.c` L211 — doom-lsp 确认）
+
+```c
+int unshare_nsproxy_namespaces(unsigned long unshare_flags,
+    struct nsproxy **new_nsp, struct cred *new_cred, struct fs_struct *new_fs)
+{
+    struct user_namespace *user_ns;
+    u64 flags = unshare_flags;
+
+    if (!(flags & (CLONE_NS_ALL & ~CLONE_NEWUSER)))
+        return 0;  // 没有需要处理的命名空间标志
+
+    // 检查 CAP_SYS_ADMIN 权限
+    user_ns = new_cred ? new_cred->user_ns : current_user_ns();
+    if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+        return -EPERM;
+
+    // 创建新的命名空间
+    *new_nsp = create_new_namespaces(flags, current, user_ns,
+                                     new_fs ? new_fs : current->fs);
+    return PTR_ERR_OR_ZERO(*new_nsp);
+}
+```
+
+## 3. switch_task_namespaces——切换进程的命名空间视图
+
+```c
+// kernel/nsproxy.c L245 — doom-lsp 确认
+void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)
+{
+    struct nsproxy *old;
+
+    // 交换 task->nsproxy 指针
+    old = rcu_dereference_protected(p->nsproxy, ...);
+    rcu_assign_pointer(p->nsproxy, new);
+
+    // 释放旧的 nsproxy
+    if (old)
+        put_nsproxy(old);
+}
+```
+
 ## 源码索引
 
 | 符号 | 文件 | 行号 |
