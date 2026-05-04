@@ -429,21 +429,21 @@ __alloc_pages_nodemask()
 | `struct lruvec` | include/linux/mmzone.h | 757 |
 | `enum lru_list` | include/linux/mmzone.h | 387 |
 | `struct scan_control` | mm/vmscan.c | 74 |
-| `kswapd()` | mm/vmscan.c | 附近 |
-| `kswapd_try_to_sleep()` | mm/vmscan.c | 附近 |
-| `balance_pgdat()` | mm/vmscan.c | 附近 |
-| `wakeup_kswapd()` | mm/vmscan.c | 附近 |
-| `shrink_node()` | mm/vmscan.c | 附近 |
-| `get_scan_count()` | mm/vmscan.c | 附近 |
-| `shrink_folio_list()` | mm/vmscan.c | 附近 |
-| `shrink_inactive_list()` | mm/vmscan.c | 附近 |
-| `shrink_active_list()` | mm/vmscan.c | 附近 |
-| `isolate_lru_folios()` | mm/vmscan.c | 附近 |
-| `do_shrink_slab()` | mm/vmscan.c | 附近 |
-| `try_to_free_pages()` | mm/vmscan.c | 附近 |
-| `workingset_refault()` | mm/workingset.c | 附近 |
-| `page_referenced()` | mm/rmap.c | 附近 |
-| `__setup_per_zone_wmarks()` | mm/page_alloc.c | 附近 |
-| `__alloc_pages_slowpath()` | mm/page_alloc.c | 附近 |
+| `kswapd()` | mm/vmscan.c | 7438 |
+| `kswapd_try_to_sleep()` | mm/vmscan.c | 7341 |
+| `balance_pgdat()` | mm/vmscan.c | 7052 |
+| `wakeup_kswapd()` | mm/vmscan.c | 7519 |
+| `shrink_node()` | mm/vmscan.c | 6190 |
+| `get_scan_count()` | mm/vmscan.c | 2493 |
+| `shrink_folio_list()` | mm/vmscan.c | 1058 |
+| `shrink_inactive_list()` | mm/vmscan.c | 1951 |
+| `shrink_active_list()` | mm/vmscan.c | 2068 |
+| `isolate_lru_folios()` | mm/vmscan.c | 1685 |
+| `shrink_slab()` | mm/shrinker.c | 617 |
+| `try_to_free_pages()` | mm/vmscan.c | 6720 |
+| `workingset_refault()` | mm/workingset.c | 546 |
+| `folio_referenced()` | mm/rmap.c | 1064 |
+| `__setup_per_zone_wmarks()` | mm/page_alloc.c | 6372 |
+| `__alloc_pages_slowpath()` | mm/page_alloc.c | 4686 |
 | `watermark_boost` | include/linux/mmzone.h | (pglist_data 中) |
 | `struct lru_gen_folio` | include/linux/mmzone.h | (MGLRU) |

@@ -464,7 +464,7 @@ PID 查找路径是 RCU 保护的：
 | `find_task_by_vpid()` | kernel/pid.c | 488 |
 | `find_get_task_by_vpid()` | kernel/pid.c | 493 |
 | `get_pid_task()` | kernel/pid.c | 516 |
-| `attach_pid()` | kernel/pid.c | 附近 |
+| `attach_pid()` | kernel/pid.c | 390 |
 | `change_pid()` | kernel/pid.c | 427 |
 | `__task_pid_nr_ns()` | kernel/pid.c | 232 |
 | `sys_getpid()` | kernel/sys.c | (通过 task_tgid_vnr) |

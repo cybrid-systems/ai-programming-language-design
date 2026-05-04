@@ -346,22 +346,22 @@ NOHZ 系统使用 BASE_LOCAL/BASE_GLOBAL/BASE_DEF 三个 base：
 | `struct timer_list` | include/linux/timer_types.h | 8 |
 | `struct timer_base` | kernel/time/timer.c | 250 |
 | `timer_bases[]` | kernel/time/timer.c | 267 |
-| `__mod_timer()` | kernel/time/timer.c | 附近 |
-| `internal_add_timer()` | kernel/time/timer.c | 附近 |
-| `calc_wheel_index()` | kernel/time/timer.c | ~547 |
+| `__mod_timer()` | kernel/time/timer.c | 1017 |
+| `internal_add_timer()` | kernel/time/timer.c | 639 |
+| `calc_wheel_index()` | kernel/time/timer.c | 541 |
 | `calc_index()` | kernel/time/timer.c | 524 |
-| `collect_expired_timers()` | kernel/time/timer.c | 附近 |
-| `expire_timers()` | kernel/time/timer.c | 附近 |
+| `collect_expired_timers()` | kernel/time/timer.c | 1807 |
+| `expire_timers()` | kernel/time/timer.c | 1766 |
 | `__run_timers()` | kernel/time/timer.c | 2344 |
 | `run_timer_softirq()` | kernel/time/timer.c | 2401 |
 | `__run_timer_base()` | kernel/time/timer.c | 2378 |
-| `trigger_dyntick_cpu()` | kernel/time/timer.c | 附近 |
+| `trigger_dyntick_cpu()` | kernel/time/timer.c | 579 |
 | `timer_delete()` | kernel/time/timer.c | 1404 |
-| `timer_delete_sync()` | kernel/time/timer.c | 附近 |
+| `timer_delete_sync()` | kernel/time/timer.c | 1674 |
 | `__try_to_del_timer_sync()` | kernel/time/timer.c | 1451 |
 | `timer_shutdown()` | kernel/time/timer.c | 1425 |
-| `timer_base_try_to_set_idle()` | kernel/time/timer.c | ~2350 |
-| `timer_clear_idle()` | kernel/time/timer.c | ~2340 |
+| `timer_base_try_to_set_idle()` | kernel/time/timer.c | 2307 |
+| `timer_clear_idle()` | kernel/time/timer.c | 2320 |
 | `WHEEL_SIZE` | kernel/time/timer.c | 187 |
 | `LVL_DEPTH` | kernel/time/timer.c | 174 |
 | `LVL_SIZE` | kernel/time/timer.c | 168 |

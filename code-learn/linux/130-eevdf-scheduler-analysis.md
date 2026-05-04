@@ -487,7 +487,7 @@ V' = V - w_i × vl_i / (W + w_i)
 | `vruntime_eligible()` | kernel/sched/fair.c | 889 |
 | `entity_lag()` | kernel/sched/fair.c | 832 |
 | `update_entity_lag()` | kernel/sched/fair.c | 852 |
-| `avg_vruntime()` | kernel/sched/fair.c | 676 附近 |
+| `avg_vruntime()` | kernel/sched/fair.c | 780 |
 | `protect_slice()` | kernel/sched/fair.c | 1072 |
 | `set_protect_slice()` | kernel/sched/fair.c | 1050 |
 | `place_entity()` | kernel/sched/fair.c | 5351 |
@@ -498,4 +498,4 @@ V' = V - w_i × vl_i / (W + w_i)
 | `sysctl_sched_base_slice` | kernel/sched/fair.c | (全局) |
 | `calc_delta_fair()` | kernel/sched/fair.c | (内联) |
 | `entity_before()` | kernel/sched/fair.c | 589 |
-| `entity_key()` | kernel/sched/fair.c | 附近 |
+| `entity_key()` | kernel/sched/fair.c | 614 |
