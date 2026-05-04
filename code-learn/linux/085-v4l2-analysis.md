@@ -265,3 +265,19 @@ V4L2 通过 `VIDIOC_REQBUFS/ QBUF/ DQBUF` 管理视频缓冲循环——`vb2_cor
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct video_device` | include/media/v4l2-dev.h | 核心 |
+| `struct vb2_queue` | include/media/videobuf2-core.h | 核心 |
+| `video_register_device()` | drivers/media/v4l2-core/v4l2-dev.c | 相关 |
+| `vb2_core_qbuf()` | drivers/media/v4l2-core/videobuf2-core.c | 入队 |
+| `vb2_core_dqbuf()` | drivers/media/v4l2-core/videobuf2-core.c | 出队 |
+| `vb2_core_streamon()` | drivers/media/v4l2-core/videobuf2-core.c | 开始流 |
+| `__video_ioctl2()` | drivers/media/v4l2-core/v4l2-ioctl.c | ioctl 分发 |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*

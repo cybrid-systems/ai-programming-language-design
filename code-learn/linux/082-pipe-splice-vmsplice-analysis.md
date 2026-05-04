@@ -319,3 +319,18 @@ pipe 通过**环形缓冲区**（`pipe_inode_info.bufs`）管理数据，`anon_p
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+
+## 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct pipe_inode_info` | include/linux/pipe_fs_i.h | 核心 |
+| `pipe_write()` | fs/pipe.c | 相关 |
+| `pipe_read()` | fs/pipe.c | 相关 |
+| `sys_splice()` | fs/splice.c | (syscall) |
+| `generic_file_splice_read()` | fs/splice.c | 零拷贝读 |
+| `sys_vmsplice()` | fs/splice.c | (syscall) |
+
+---
+
+*分析工具：doom-lsp | 分析日期：2026-05-04*
