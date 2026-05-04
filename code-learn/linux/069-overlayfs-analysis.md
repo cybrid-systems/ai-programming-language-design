@@ -375,3 +375,15 @@ OverlayFS 是一个**VFS stacking 层**——不管理原始存储，通过 dent
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
+### 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct ovl_fs` | fs/overlayfs/ovl_entry.h | 58 |
+| `struct ovl_inode` | fs/overlayfs/ovl_entry.h | 159 |
+| `struct ovl_layer` | fs/overlayfs/ovl_entry.h | 33 |
+| `ovl_lookup()` | fs/overlayfs/namei.c | 相关 |
+| `ovl_copy_up()` | fs/overlayfs/copy_up.c | 相关 |
+| `ovl_getattr()` | fs/overlayfs/inode.c | 163 |
+
+---

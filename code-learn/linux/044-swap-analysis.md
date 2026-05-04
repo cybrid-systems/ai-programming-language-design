@@ -388,3 +388,17 @@ try_to_free_pages()
 ---
 
 *分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
+### 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct swap_info_struct` | include/linux/swap.h | 核心 |
+| `add_to_swap()` | mm/swapfile.c | 相关 |
+| `get_swap_page()` | mm/swapfile.c | 相关 |
+| `swap_writepage()` | mm/page_io.c | 相关 |
+| `swap_read_folio()` | mm/page_io.c | 相关 |
+| `do_swap_page()` | mm/memory.c | 相关 |
+| `scan_swap_map()` | mm/swapfile.c | 相关 |
+| `swapper_spaces[]` | mm/swap_state.c | swap cache |
+
+---
