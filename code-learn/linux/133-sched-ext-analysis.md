@@ -407,35 +407,17 @@ sched_ext 不是全部替代——它与其他调度类协作：
 - 使用 `scx_bpf_dsq_move_to_local()` 的迭代器模式实现 DSQ 遍历
 - 多个调度器实例共享数据通过 BPF map 实现
 
+
 ## 源码索引
 
 | 符号 | 文件 | 行号 |
 |------|------|------|
 | `struct sched_ext_ops` | kernel/sched/ext_internal.h | 292 |
-| `struct sched_ext_entity` | include/linux/sched.h | (嵌入 task_struct) |
 | `struct scx_sched` | kernel/sched/ext.c | 22 |
-| `select_task_rq_scx()` | kernel/sched/ext.c | (通过 ops.select_cpu) |
-| `enqueue_task_scx()` | kernel/sched/ext.c | (通过 ops.enqueue) |
-| `dequeue_task_scx()` | kernel/sched/ext.c | (通过 ops.dequeue) |
-| `pick_next_task_scx()` | kernel/sched/ext.c | (通过 ops.dispatch) |
-| `entity_tick_scx()` | kernel/sched/ext.c | (通过 ops.tick) |
+| `struct sched_ext_entity` | include/linux/sched.h | (嵌入 task_struct) |
+| `select_task_rq_scx()` | kernel/sched/ext.c | (ops.select_cpu) |
+| `enqueue_task_scx()` | kernel/sched/ext.c | (ops.enqueue) |
+| `pick_next_task_scx()` | kernel/sched/ext.c | (ops.dispatch) |
 | `scx_ops_enable()` | kernel/sched/ext.c | 6520 |
-| `scx_ops_disable()` | kernel/sched/ext.c | 相关 |
-| `scx_bpf_dsq_insert()` | kernel/sched/ext.c | (kfunc 定义) |
-| `scx_bpf_kick_cpu()` | kernel/sched/ext.c | (kfunc 定义) |
+| `scx_bpf_dsq_insert()` | kernel/sched/ext.c | (kfunc) |
 | `SCX_SLICE_DFL` | include/linux/sched/ext.h | (20ms) |
-| `ext_sched_class` | kernel/sched/ext.c | (调度类注册) |
-
-## sched_ext vs EEVDF/CFS 对比
-
-| 特性 | EEVDF（fair） | sched_ext |
-|------|-------------|-----------|
-| 调度策略 | 固定（EEVDF 算法） | 可编程（BPF） |
-| 时间片 | 3ms（默认） | 20ms（默认，可自定义） |
-| 公平性 | 数学保证（vlag, avg_vruntime） | 由 BPF 调度器保证 |
-| 复杂度 | 内核固有 | 用户空间可调试 |
-| 热升级 | 需要重启 | bpftool 加载/卸载 |
-| 安全 | 经测试的内核代码 | BPF 验证器保证 |
-| 性能开销 | 原生 | ~1-5% 间接调用开销 |
-| cgroup 集成 | cfs_bandwidth | 多调度器实例绑定 |
-| 适用场景 | 通用吞吐量 | 实验、定制工作负载 |
