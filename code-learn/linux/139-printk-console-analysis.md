@@ -36,14 +36,14 @@ printk 使用一种**基于描述符的环形缓冲区**（descriptor-based ring
 
 ```c
 struct printk_info {
-    u64         seq;            // 单调递增的序列号
-    u64         ts_nsec;        // 时间戳（CLOCK_MONOTONIC）
-    u16         text_len;       // 文本长度
-    u8          facility;       // LOG_KERN / LOG_USER 等
-    u8          flags;          // LOG_NEWLINE / LOG_CONT 等
-    u8          level;          // KERN_EMERG / KERN_ALERT 等
-    u8          caller_id;      // 调用者标识（task/irq）
-    char        reserved[24];   // 未来扩展
+    u64         seq;            // L19 — 单调递增的序列号
+    u64         ts_nsec;        // L20 — 时间戳（CLOCK_MONOTONIC）
+    u16         text_len;       // L21 — 文本长度
+    u8          facility;       // L22 — LOG_KERN / LOG_USER 等
+    u8          flags;          // L23 — LOG_NEWLINE / LOG_CONT 等
+    u8          level;          // L24 — KERN_EMERG / KERN_ALERT 等
+    u8          caller_id;      // L25 — 调用者标识（task/irq）
+    char        reserved[24];   // L27 — 未来扩展
 };
 ```
 
@@ -90,12 +90,12 @@ static int prb_reserve(struct prb *rb, struct printk_record *r, u32 size)
 
 ```c
 struct console {
-    char            name[8];                    // 控制台名称（"ttyS", "tty0" 等）
-    int             index;                      // 索引（ttyS0 → index=0）
-    void (*write)(struct console *, const char *, unsigned);  // 输出函数
-    int (*read)(struct console *, char *, unsigned);          // 输入函数
-    struct device   *device;                    // 关联的设备
-    struct list_head head;                      // 全局 console_drivers 链表
+    char            name[8];                    // L339 — 控制台名称（"ttyS", "tty0" 等）
+    int             index;                      // (内核分配) 索引（ttyS0 → index=0）
+    void (*write)(struct console *, const char *, unsigned);  // L340 — 输出函数
+    int (*read)(struct console *, char *, unsigned);          // L341 — 输入函数
+    struct device   *device;                    // L342 — 关联的设备
+    struct list_head head;                      // (内嵌) 全局 console_drivers 链表
     
     // 控制台标志
     short           flags;
