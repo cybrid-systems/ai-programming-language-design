@@ -259,6 +259,39 @@ struct crypt_config {
 
 ---
 
+
+### 2.7 crypt_convert——逐扇区加解密引擎
+
+（`drivers/md/dm-crypt.c` L1352 — doom-lsp 确认）
+
+```c
+static int crypt_convert_block_skcipher(struct crypt_config *cc,
+    struct skcipher_request *req, unsigned int tag_it)
+{
+    struct crypto_skcipher *tfm = cc->cipher_tfm.tfms[0];
+    struct skcipher_request *subreq;
+    int r;
+
+    subreq = skcipher_request_alloc(tfm, GFP_NOIO);
+    // 构造 IV（初始化向量）— 每个扇区不同
+    cc->iv_gen_ops->generate(cc, iv, dmreq->iv_sector);
+
+    // 设置散聚列表
+    sg_init_table(&srcsg, 1);  sg_set_page(&srcsg, dmreq->sg_pages[0], cc->sector_size, 0);
+    sg_init_table(&dstsg, 1);  sg_set_page(&dstsg, dmreq->sg_pages[1], cc->sector_size, 0);
+
+    skcipher_request_set_crypt(subreq, &srcsg, &dstsg, cc->sector_size, iv);
+
+    if (bio_data_dir(dmreq_io->base_bio) == WRITE)
+        r = crypto_skcipher_encrypt(subreq);  // 写：加密
+    else
+        r = crypto_skcipher_decrypt(subreq);  // 读：解密
+
+    crypto_wait_req(r, &wait);
+    return r;
+}
+```
+
 ## 5. 源码索引
 
 | 符号 | 文件 | 行号 |
