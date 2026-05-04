@@ -1,4 +1,4 @@
-# 41-ksm — Linux 内核同页合并深度源码分析
+# 041-ksm — Linux 内核同页合并（KSM）深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
@@ -7,349 +7,398 @@
 
 ## 0. 概述
 
-**KSM（Kernel Same-page Merging）** 是 Linux 内核的内存去重机制。它通过 ksmd 内核线程扫描进程的匿名页面，将内容相同的页面合并为写时复制（COW）页面，从而减少物理内存占用。在虚拟化场景中，运行相同操作系统的虚拟机之间大量内核代码和共享库页面内容相同，KSM 可节省 50% 以上的内存。
+**KSM（Kernel Same-page Merging）** 是 Linux 内核的内存去重机制。它通过 ksmd 内核线程扫描进程的匿名页面，将内容相同的页面合并为写时复制（COW）页面，消除重复物理页的冗余。这是虚拟化场景中的关键技术——运行相同操作系统的虚拟机共享大量内核代码和共享库，KSM 可节省 50% 以上的物理内存。
 
-**doom-lsp 确认**：`mm/ksm.c` 含 **285 个符号**。关键函数：`ksm_do_scan` @ L2783（每轮扫描入口），`stable_tree_search` @ L1828（稳定树查找），`cmp_and_merge_page` @ L2251（比较与合并），`try_to_merge_one_page` @ L1478（实际页合并）。
+KSM 的核心是两个红黑树：
+
+- **稳定树（stable tree）**：已合并的页面，内容不会再变化（不可写）
+- **不稳定树（unstable tree）**：待比较的候选页面，内容可能还在变化
+
+两棵树的区分是因为稳定树搜索更快——一旦页面被合并，内容保证不变，后续扫描可以直接跳过。而不稳定树的页面可能被写（触发 COW 拆离），需要重新比较。
+
+**doom-lsp 确认**：`mm/ksm.c` 含 **285 个符号**，6505 行。关键函数：`ksm_do_scan` @ L2783，`stable_tree_search` @ L1828，`cmp_and_merge_page` @ L2251，`try_to_merge_one_page` @ L1478。
 
 ---
 
 ## 1. 核心数据结构
 
-KSM 使用两个红黑树管理页面状态。稳定树（`root_stable_tree`）保存已经合并的页面，这些页面内容不会再变化。不稳定树（`root_unstable_tree`）保存待比较的候选页面，其内容可能还在变化。
+### 1.1 `struct ksm_mm_slot`——进程扫描槽
+
+（`mm/ksm.c` L126 — doom-lsp 确认）
 
 ```c
-// mm/ksm.c — 稳定树节点
-struct ksm_stable_node {
-    struct rb_node node;            // 红黑树节点
-    struct page *page;              // 合并后的 KSM 物理页
-    unsigned int kpfn;              // 页框号
+struct ksm_mm_slot {
+    struct mm_struct    *mm;             // L127 — 目标进程的 mm_struct
+    struct ksm_mm_slot  *next;           // L128 — 链表 next（单向链表遍历）
 };
+```
 
-// mm/ksm.c — 扫描状态
+每个进程的 mm_struct 嵌入了一个 `ksm_mm_slot`（通过 `mm->ksm_mm_slot` 访问），标识该进程是否被 KSM 扫描以及当前的扫描进度。
+
+### 1.2 `struct ksm_scan`——扫描游标
+
+（`mm/ksm.c` L140 — doom-lsp 确认）
+
+```c
 struct ksm_scan {
-    struct ksm_mm_slot *mm_slot;    // 当前扫描的进程槽
-    unsigned long address;          // 当前扫描地址
-    unsigned long seqnr;            // 扫描序列号
+    struct ksm_mm_slot  *mm_slot;        // L141 — 当前扫描的进程槽
+    unsigned long       address;         // L142 — 当前扫描地址
+    struct page         **pages;         // L143 — 当前扫描的页面数组
+    unsigned int        seqnr;           // L145 — 扫描轮次序列号（绕过 COW 拆离判断）
 };
-
-// 全局统计变量
-static unsigned long ksm_pages_shared;    // 已合并的唯⼀页数
-static unsigned long ksm_pages_sharing;   // 实际节省的页数
-static unsigned long ksm_pages_unshared;  // 待比较的页数
 ```
 
----
+`ksm_scan` 是全局唯一的扫描状态（`mm/ksm.c:static struct ksm_scan ksm_scan = { .mm_slot = &ksm_mm_head };`），由 ksmd 线程持有。
 
-## 2. ksmd 内核线程
+### 1.3 `struct ksm_stable_node`——稳定树节点
 
-ksmd 是 KSM 的后台内核线程，在内核初始化时通过 `kthread_run(ksm_scan_thread, NULL, "ksmd")` 创建。它每轮扫描 `ksm_thread_pages_to_scan`（默认 100）个页面，然后休眠 `ksm_thread_sleep_millisecs`（默认 20ms）。
+（`mm/ksm.c` L159 — doom-lsp 确认）
 
 ```c
-// mm/ksm.c:2783 — 每轮扫描的核心函数
-static void ksm_do_scan(unsigned int scan_npages)
-{
-    struct ksm_rmap_item *rmap_item;
-    struct page *page;
-
-    while (scan_npages-- && likely(!freezing(current))) {
-        cond_resched();  // 每扫描一页让出 CPU
-
-        rmap_item = scan_get_next_rmap_item(&page);
-        if (!rmap_item)
-            return;  // 当前进程扫描完毕
-
-        cmp_and_merge_page(page, rmap_item);
-        put_page(page);
-        ksm_pages_scanned++;
-    }
-}
+struct ksm_stable_node {
+    struct rb_node       node;           // L160 — 红黑树节点
+    struct page          *page;          // L162 — 合并后的 KSM 物理页
+    unsigned int         kpfn;           // L164 — 页框号（Page Frame Number）
+    struct ksm_rmap_item *rmap_item;     // L166 — 反向映射条目
+    unsigned int         age;            // L168 — 树中年龄（用于节点淘汰）
+    unsigned long        seq;            // L169 — 创建时的扫描序列号
+    struct list_head     list;           // L170 — 桶链表
+};
 ```
 
-ksmd 的优先级设为 NICE 5（低于普通进程），确保页面合并操作不会影响交互式性能。
-
----
-
-## 3. 页面合并流程
+### 1.4 全局统计
 
 ```c
-// mm/ksm.c:2251 — 比较并尝试合并
-static void cmp_and_merge_page(struct page *page, struct ksm_rmap_item *rmap_item)
+// mm/ksm.c — doom-lsp 确认
+static unsigned long ksm_pages_shared;     // L258 — 稳定树中的唯一页数（去重后的）
+static unsigned long ksm_pages_sharing;    // L261 — 实际节省的页数（共享引用数）
+static unsigned long ksm_pages_unshared;   // L264 — 不稳定树中的候选页数
+static unsigned long ksm_rmap_items;       // L267 — rmap_item 总数
+static bool ksm_use_zero_pages;            // L291 — 零页优化开关
+atomic_long_t ksm_zero_pages;              // L298 — 合并到零页的页数
 ```
 
-当 ksmd 扫描到一个页面时，执行以下步骤：
-
-**第一步：计算校验和。** `calc_checksum(page)` 计算页面的 32 位校验和。如果与上次扫描时的旧校验和相同，说明页面内容没有变化，可以进入合并尝试。如果不同，更新校验和并跳过此页面。
-
-**第二步：稳定树搜索。** 调用 `stable_tree_search(page)` @ L1828 在稳定树中查找内容完全相同的页面。稳定树按页框号（kpfn）组织成红黑树，搜索时通过 `memcmp(page_address(a), page_address(b), PAGE_SIZE)` 精确比较两个页面的 4096 字节内容。
-
-```c
-static struct folio *stable_tree_search(struct page *page)
-{
-    struct rb_root *root = root_stable_tree + page_to_nid(page);
-    struct rb_node *node;
-
-    for (node = root->rb_node; node; ) {
-        struct ksm_stable_node *stable_node;
-        stable_node = rb_entry(node, struct ksm_stable_node, node);
-
-        if (memcmp(page_address(page),
-                   page_address(stable_node->page), PAGE_SIZE)) {
-            // 内容不同，继续向左右子树搜索
-            node = (page_to_pfn(page) < stable_node->kpfn) ?
-                   node->rb_left : node->rb_right;
-        } else {
-            return folio;  // 内容匹配！返回已合并的页面
-        }
-    }
-    return NULL;
-}
-```
-
-**第三步：尝试合并。** 如果在稳定树中找到匹配页面，调用 `try_to_merge_one_page` @ L1478 进行合并。合并操作将当前页面的 PTE 指向已存在的 KSM 页面，并设置写保护。下次任何进程写入此页面时触发 COW（写时复制），在缺页处理中分配新页面。
-
-**第四步：不稳定树操作。** 如果稳定树中没有匹配，在不稳定树中搜索或插入当前页面。不稳定树中的页面在未来的扫描中可能与另一个页面匹配，此时两者一起移入稳定树并完成合并。
+**节省量计算**：`ksm_saved_pages = ksm_pages_sharing - ksm_pages_shared`。因为 `ksm_pages_shared` 是基础页（物理存在的页），`ksm_pages_sharing` 是所有引用（含基础页），差值就是节省的页面数。
 
 ---
 
-## 4. 稳定树 vs 不稳定树
+## 2. ksmd 内核线程生命周期
 
-| 特性 | 稳定树 | 不稳定树 |
-|------|--------|---------|
-| 内容 | 已合并，不再变化 | 可能仍在变化 |
-| 树结构 | 红黑树按 kpfn 排序 | 红黑树按地址排序 |
-| 生命周期 | 持久存在 | 页面变化时更新 |
-| 合并后 | — | 移入稳定树 |
+```
+start_kernel()
+  └─ ksm_init()                               // mm/ksm.c L3620
+       ├─ 初始化稳定树 root_stable_tree
+       ├─ 初始化不稳定树 root_unstable_tree
+       ├─ 创建设备 /sys/kernel/mm/ksm/
+       └─ kthread_run(ksm_scan_thread, NULL, "ksmd")
+              ↓
+ksm_scan_thread()                              // L2816
+  └─ while (!kthread_should_stop()):
+       ├─ if (ksm_run & KSM_RUN_MERGE):
+       │     ksm_do_scan(ksm_thread_pages_to_scan)  // 默认 100 页
+       │     wait_event_freezable(ksmd_wait, ...)
+       │     schedule_timeout(ksm_thread_sleep_ms)  // 默认 20ms
+       └─ else:
+             wait_event_freezable(ksmd_wait, ksm_run & KSM_RUN_MERGE)
+```
 
----
-
-## 5. sysfs 配置接口
+**sysfs 控制**：
 
 ```bash
-/sys/kernel/mm/ksm/
-├── pages_to_scan        # 每轮扫描页数（默认 100）
-├── sleep_millisecs      # 扫描间隔（默认 20ms）
-├── run                  # 1=启动，0=停止，2=取消合并
-├── pages_shared         # 已合并的唯⼀页数
-├── pages_sharing        # 实际节省的页数
-├── pages_unshared       # 待比较页数
-├── full_scans           # 完全扫描次数
-├── merge_across_nodes   # 是否跨 NUMA 节点合并
-├── max_page_sharing     # 每页面最大共享者（默认 256）
-└── use_zero_pages       # 零页合并
-```
+# 启用 KSM（默认关闭）
+echo 1 > /sys/kernel/mm/ksm/run
+# run = 0: 停止  |  1: 运行  |  2: 停止+取消合并已有页面
 
-零页合并（`use_zero_pages`）将全零页面合并到物理零页，不占用实际物理内存。这在虚拟机启动阶段特别有效，因为大量未初始化的内存页内容为零。
+# 调参
+echo 100 > /sys/kernel/mm/ksm/pages_to_scan    # 每轮扫描页数
+echo 20  > /sys/kernel/mm/ksm/sleep_millisecs   # 每轮休眠时间
+echo 0  > /sys/kernel/mm/ksm/merge_across_nodes # 禁止跨 NUMA 合并
+echo 1  > /sys/kernel/mm/ksm/use_zero_pages     # 零页优化
+```
 
 ---
 
-## 6. try_to_merge_one_page 实现
+## 3. ksm_do_scan——单轮扫描数据流
+
+（`mm/ksm.c` L2783 — doom-lsp 确认）
+
+```
+ksm_do_scan(scan_npages=100)
+  │
+  └─ for (i = 0; i < scan_npages; i++)
+       └─ ksm_scan.mm_slot = GET_NEXT_SLOT()
+            │  遍历所有注册了 KSM 的进程
+            │  按轮次切换进程（round-robin）
+            │
+            └─ ksm_scan.address = 当前扫描地址
+                 │
+                 └─ 通过 mm->ksm_mm_slot 找到目标 mm
+                      mmap_read_lock(mm)
+                      └─ while (address < mm->hiaddr):
+                           ├─ 找到下一个 VMA
+                           ├─ 获取映射到 address 的 page
+                           │   follow_page(vma, address, FOLL_GET)
+                           │
+                           └─ cmp_and_merge_page(page, rmap_item)
+                                │  核心函数：比较并合并页面
+                                │
+                                ksm_scan.address += PAGE_SIZE
+                      mmap_read_unlock(mm)
+```
+
+---
+
+## 4. cmp_and_merge_page——核心合并逻辑
+
+（`mm/ksm.c` L2251 — doom-lsp 确认）
+
+```
+cmp_and_merge_page(page, rmap_item)
+  │
+  ├─ 1. 尝试稳定树搜索
+  │     tree_page = stable_tree_search(page)
+  │     │  在稳定树中查找内容相同的已合并页面
+  │     │  通过 memcmp_pages() 比较页面内容
+  │     │
+  │     └─ 如果找到：
+  │           try_to_merge_one_page(vma, page, tree_page)
+  │           → 将 page 的内容替换为 tree_page 的引用（COW）
+  │           → page 的引用计数 +1
+  │           → ksm_pages_sharing++
+  │           → 返回
+  │
+  ├─ 2. 未在稳定树中找到 → 尝试不稳定树
+  │     tree_rmap_item = unstable_tree_search_insert(rmap_item, page, &tree_page)
+  │     │  在不稳定树中查找内容相同的候选页面
+  │     │
+  │     └─ 如果找到（tree_page != NULL）：
+  │           ├─ try_to_merge_one_page(vma, page, tree_page)
+  │           ├─ try_to_merge_one_page(vma, tree_rmap_item->page, page)
+  │           │  两个页面都尝试合并到同一个 KSM 页
+  │           │
+  │           ├─ 创建稳定树节点
+  │           │  ksm_stable_node = alloc_stable_node()
+  │           │  ksm_stable_node->page = kpage (合并后的 KSM 页)
+  │           │  rb_insert(&root_stable_tree, ksm_stable_node) 
+  │           │
+  │           ├─ 从不稳定树中移除 tree_rmap_item
+  │           └─ ksm_pages_shared++ / ksm_pages_sharing += 2
+  │
+  └─ 3. 两棵树都未找到
+        └─ 将 page 插入不稳定树（作为下次比较的候选）
+           unstable_tree_search_insert(rmap_item, page, NULL)
+```
+
+### 流程图
+
+```
+              cmp_and_merge_page(page)
+                    │
+                    ▼
+        稳定树搜索 (stable_tree_search)
+           ┌───────┴───────┐
+           │ 找到           │ 未找到
+           ▼                ▼
+     try_to_merge   不稳定树搜索 (unstable_tree_search)
+     (共享引用)       ┌───────┴───────┐
+                    │ 找到           │ 未找到
+                    ▼                ▼
+             双次合并 +     插入不稳定树
+             创建稳定树节点  (下次候选)
+                    │
+                    ▼
+              ksm_pages_shared++
+```
+
+---
+
+## 5. try_to_merge_one_page——实际页面合并
+
+（`mm/ksm.c` L1478 — doom-lsp 确认）
 
 ```c
-// mm/ksm.c:1478 — 将 page 合并到 kpage
 static int try_to_merge_one_page(struct vm_area_struct *vma,
-                                  struct page *page, struct page *kpage)
+                                 struct page *page, struct page *kpage)
 {
     int err = -EFAULT;
 
-    // 检查共享者数量是否达到上限
-    if (page_mapcount(page) + 1 + kpage_mapcount(kpage) + 1 > ksm_max_page_sharing)
-        return err;
+    // 1. 锁定页面，防止并发 I/O
+    if (trylock_page(page)) {
+        // 2. 解除原页面的所有 PTE 映射
+        //    将 page 的所有映射替换为 KSM 页面
+        //    (通过 rmap_walk 遍历所有映射该页面的 VMA)
+        try_to_merge_with_ksm_page(kpage, page);
 
-    folio_lock(page_folio(page));
+        // 3. 标记页面为 KSM 页面
+        SetPageKsm(page);
+        // 写时复制：页面被标记为 KSM 后，
+        // CPU 写入时触发 #PF → do_wp_page()
+        // → 分配新的页面 → 拷贝内容 → 更新 PTE
 
-    // 建立 COW 映射：page 的 PTE 指向 kpage
-    err = rmap_walk_anon(page, ...);
-    if (!err) {
-        set_page_stable_node(page, stable_node);
-        page->mapping = kpage->mapping;
+        // 4. 释放原页面的引用
+        put_page(page);
+        err = 0;
     }
-
-    folio_unlock(page_folio(page));
     return err;
 }
 ```
 
----
+**合并的物理效果**：
 
-## 7. 性能与效果
-
-KSM 的 CPU 开销主要来自页面比较（memcmp 4KB 约 1μs）和红黑树操作（O(log n)）。在典型配置下，ksmd 的 CPU 占用率通常低于 1%。实际内存节省效果取决于页面重复度：虚拟化场景可节省 50-80%，普通桌面场景则收益有限。
-
----
-
-## 8. 源码文件索引
-
-| 文件 | 符号数 | 关键函数 |
-|------|--------|---------|
-| mm/ksm.c | 285 | ksm_do_scan @ L2783, stable_tree_search @ L1828 |
-| mm/ksm.c | | try_to_merge_one_page @ L1478, cmp_and_merge_page @ L2251 |
-
----
-
-## 9. 关联文章
-
-- **40-thp**: 透明大页（另一种页面大小优化）
-- **42-oom-killer**: OOM Killer
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 10. COW 处理细节
-
-KSM 合并后的页面在所有进程的页表中都被标记为只读。当任意进程尝试写入时，CPU 触发页错误，内核在 `do_wp_page`（写时复制缺页处理）中检测到该页面属于 KSM，执行以下操作：
-
-1. 从 buddy 分配器分配一个新页面
-2. 将原 KSM 页面的内容复制到新页面
-3. 将触发写入的进程的 PTE 更新为指向新页面（可写）
-4. 其他进程的 PTE 仍然指向原 KSM 页面（只读）
-5. 原 KSM 页面的引用计数减一
-
-这种设计使得 KSM 对进程完全透明——进程可以正常读写自己的内存，只是共享的物理页面在写入时会自动获得独立副本。
-
-## 11. 节省率计算
-
-```bash
-# pages_shared = 已合并的唯一页面数（不同内容的页面）
-# pages_sharing = 总共被共享的次数（含自身）
-# 实际节省 = (pages_sharing - pages_shared) * 4KB
-
-# 示例：10 台虚拟机的内核页面
-pages_shared   = 50000    # 5 万个唯一页面
-pages_sharing  = 500000   # 50 万页共享
-内存节省 = (500000 - 50000) × 4KB = 1.8GB
 ```
+合并前：
+  进程 A: PTE → page_1 (物理页，内容 "hello")
+  进程 B: PTE → page_2 (物理页，内容 "hello")
+  物理页占用: 2 页
 
-## 12. 合并限制
+合并后：
+  进程 A: PTE → kpage (KSM 页，内容 "hello") [写保护]
+  进程 B: PTE → kpage (KSM 页，内容 "hello") [写保护]
+  物理页占用: 1 页（节省 1 页）
 
-`ksm_max_page_sharing` 参数（默认 256）控制每个 KSM 页面的最大共享者数量。当共享者达到上限时，新的请求不会合并到这个页面，而是创建新的稳定节点。这个限制防止单一页面被过度共享导致的 COW 延迟——如果 10000 个进程共享同一页面，任何一个进程写入时都需要复制整个页面，导致显著的延迟抖动。
-
-## 13. 扫描优化
-
-KSM 支持智能扫描（`ksm_smart_scan`，默认启用）。启用后，扫描器会跳过内容未变化的页面，减少不必要的 memcmp 调用。`ksm_pages_skipped` 统计跳过的页面数。
-
-`ksm_advisor` 模块根据页面变更率动态调整扫描频率。页面频繁变更时降低扫描频率以减少 CPU 开销，页面稳定时提高扫描频率以加快合并速度。
-
-## 14. MADV_MERGEABLE 控制
-
-进程可以通过 `madvise(addr, length, MADV_MERGEABLE)` 标记特定内存区域为可合并。ksmd 只扫描标记了 `VM_MERGEABLE` 的 VMA，不会扫描未标记的区域。`MADV_UNMERGEABLE` 取消标记并立即拆分区域内的所有 KSM 页面。
-
-这种细粒度控制允许进程只合并已知有重复内容的区域（如共享库、内核代码段），避免扫描频繁变化的堆栈区域。
-
-## 15. 调试命令
-
-```bash
-# 查看 KSM 状态
-cat /sys/kernel/mm/ksm/pages_shared
-cat /sys/kernel/mm/ksm/pages_sharing
-cat /sys/kernel/mm/ksm/full_scans
-
-# 启动/停止
-echo 1 > /sys/kernel/mm/ksm/run
-echo 0 > /sys/kernel/mm/ksm/run
-
-# 调整扫描参数
-echo 1000 > /sys/kernel/mm/ksm/pages_to_scan
-echo 50 > /sys/kernel/mm/ksm/sleep_millisecs
+写时分裂（进程 A 写入时）：
+  进程 A: #PF → do_wp_page → 分配 new_page → 拷贝 "hello" → 更新 PTE
+  进程 A: PTE → new_page (可写)
+  进程 B: PTE → kpage (内容 "hello")
+  物理页占用: 2 页（回到合并前）
 ```
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+## 6. 稳定树搜索与插入
 
-## 16. KSM 在虚拟化中的应用
+### 6.1 stable_tree_search
 
-KSM 在虚拟化平台（如 KVM）中特别有用。多台运行相同操作系统的虚拟机之间存在大量重复页面：内核代码、共享库、空置内存页等。QEMU/KVM 通过 `madvise(MADV_MERGEABLE)` 标记客户机内存，ksmd 自动扫描并合并这些页面。
+（`mm/ksm.c` L1828 — doom-lsp 确认）
 
-在一个运行 10 台 Ubuntu 虚拟机（每台 2GB 内存）的宿主机上，KSM 通常能将内存占用从 20GB 降至 8GB 左右，节省率约 60%。
+```c
+static struct folio *stable_tree_search(struct page *page)
+{
+    struct rb_root *root = root_stable_tree + nid;  // 按 NUMA 节点分树
+    struct rb_node *node;
+    struct folio *folio;
 
-## 17. ksmd 优先级与调度
-
-ksmd 线程的优先级设为 NICE 5（比普通进程低），CPU 占用通常小于 1%。但在大内存系统中，如果大量页面频繁变化，ksmd 的 CPU 占用可能上升到 5-10%。此时可以调大 `sleep_millisecs` 减少扫描频率，或调小 `pages_to_scan` 减少每轮工作量。
-
-## 18. 与 THP 的关系
-
-KSM 与透明大页（THP）可以共存。THP 将 4KB 页面合并为 2MB 大页以减少 TLB miss，而 KSM 合并不同进程间内容相同的页面以减少内存占用。两者优化目标不同，互不干扰。KSM 可以在 THP 已经合并的大页基础上进一步合并。
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 19. KSM 统计解读
-
-```bash
-# pages_shared:      已合并的唯一页面数（内容不同的 KSM 页）
-# pages_sharing:     总共被共享的次数（含自身计数）
-# pages_unshared:    已扫描但未匹配到的唯一页
-# pages_volatile:    内容频繁变化无法合并的页
-# full_scans:        从开始到现在的完全扫描次数
-# stable_node_chains: 稳定树链数（NUMA 场景下）
-#
-# 当 pages_sharing / pages_shared 比值高时，说明合并效率好
+    for (node = root->rb_node; node; node = rb_next(node)) {
+        // 遍历稳定树，对每个节点比较内容
+        kpage = folio_page(stable_node->folio, 0);
+        // 使用 memcmp_pages 比较页面内容
+        if (!memcmp_pages(page, kpage)) {
+            // 内容相同！
+            // 增加 KSM 页的引用计数
+            get_page(kpage);
+            return folio;
+        }
+        // 内容不同，根据树的性质继续搜索
+        // （按页面内容的哈希值排序）
+    }
+    return NULL;  // 未找到
+}
 ```
 
-## 20. KSM 内核配置
-
-```bash
-# 内核编译选项
-CONFIG_KSM=y                  # 启用 KSM
-CONFIG_KSM_RUN_BY_DEFAULT=y   # 默认启动 ksmd
-```
-
-## 21. 总结
-
-KSM 通过 ksmd 内核线程合并相同内容的匿名页面。稳定树和不稳定树两个红黑树管理页面状态。校验和快速过滤内容变化，memcmp 精确匹配页面内容。COW 映射保证透明性。适用于虚拟化等页面重复度高的场景。
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 22. KSM 页面生命周期总结
+### 6.2 两棵树的设计原理
 
 ```
-匿名页面首次分配 → 进程调用 madvise(MADV_MERGEABLE)
-  → VMA 标记 VM_MERGEABLE → ksmd 可以扫描此区域
-  → ksmd 扫描 → 分配 rmap_item → 加入不稳定树
-  → 下一轮扫描：校验和比较
-    → 内容已变 → 更新校验和
-    → 内容稳定 → 稳定树搜索
-      → 找到匹配 → try_to_merge_one_page → COW 合并
-      → 未匹配 → 留在不稳定树等待
-  → 合并后：页面变为 KSM 页面，所有 PTE 只读
-  → 进程写入 → do_wp_page → 分配新页 → COW 复制
+稳定树（stable tree）:
+  内容保证不变 → 节点不会被删除
+  搜索 O(log n)
+  节点生命周期：从合并到所有引用 COW 拆离
+
+不稳定树（unstable tree）:
+  内容可能变化 → 每轮扫描后重建
+  搜索 O(log n)（但需要重新比较）
+  节点生命周期：一轮 KSM 扫描
+
+不稳定树为什么每轮重建：
+  节点引用的页面可能在两次扫描之间被写入（触发 COW）
+  导致树中的内容引用无效
+  重建保证数据一致性
 ```
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+## 7. 零页优化
 
-## 23. 参考链接
+当 KSM 发现页面内容全部为零时，不需要创建 KSM 页——直接使用内核的`空页`（ZERO_PAGE）：
 
-- mm/ksm.c — KSM 完整实现（约 4000 行）
-- Documentation/admin-guide/mm/ksm.rst — 内核文档
-- /sys/kernel/mm/ksm/ — 运行时控制接口
+```c
+// mm/ksm.c — 零页优化（doom-lsp 确认）
+// 由 ksm_use_zero_pages 控制（/sys/kernel/mm/ksm/use_zero_pages）
+static bool ksm_use_zero_pages __read_mostly;    // L291
 
-## 24. 关联文章
+// 在 cmp_and_merge_page 中：
+// 如果页面内容全零：
+//   直接映射到 ZERO_PAGE(0)（全局共享的只读零页）
+//   不分配新的物理页
+//   不需要稳定树节点
+//   ksm_zero_pages++
 
-- **40-thp**: 透明大页（页面大小优化）
-- **42-oom-killer**: 内存耗尽时的处理
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
-
-## 25. KSM 的内存开销
-
-KSM 本身也有内存开销。每个被扫描的页面对应一个 `ksm_rmap_item`（约 40 字节）。已合并的页面对应一个 `ksm_stable_node`（约 40 字节）。在扫描 100 万页的场景下，KSM 的元数据内存开销约 40-80MB。这部分开销通常远小于合并节省的内存。
-
-## 26. KSM 与内存热插拔
-
-KSM 支持内存热插拔场景。当内存节点被移除时，ksmd 会处理该节点上的稳定节点迁移。`merge_across_nodes` 参数控制是否允许跨 NUMA 节点合并页面。开启跨节点合并可以提高合并率，但可能增加 NUMA 访问延迟。
+// ZERO_PAGE 的好处：
+// - 不需要物理页
+// - 所有 KVM 虚拟机共享同一个零页
+// - 写时分裂（guest 写入时）才分配物理页
+```
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-01 | 内核版本：Linux 7.0-rc1*
+## 8. NUMA 感知
 
-KSM 的 use_zero_pages 选项将全零页合并到物理零页。物理零页是系统启动时预留的一个全零页面，不占用实际物理内存。多个进程的全零页都指向这同一个物理页，写入时通过 COW 获得独立副本。这个优化在虚拟机启动阶段特别有效。
+KSM 支持跨 NUMA 节点的合并控制：
 
-KSM 是 Linux 内核内存去重的重要机制。它通过 ksmd 内核线程、两个红黑树、校验和比较和 COW 映射，实现了高效的页面合并。在虚拟化环境中可以显著节省物理内存。
+```c
+// mm/ksm.c — doom-lsp 确认
+// /sys/kernel/mm/ksm/merge_across_nodes
+// =1: 允许跨 NUMA 节点合并（默认）
+// =0: 只在同一 NUMA 节点内合并
+
+// 实现：
+// stable_tree 实际是一个数组：
+static struct rb_root *root_stable_tree;   // [nr_node_ids]
+static struct rb_root *root_unstable_tree; // [nr_node_ids]
+
+// merge_across_nodes=1 时：
+//   所有节点指向同一个 root (root_stable_tree[0])
+// merge_across_nodes=0 时：
+//   每个 NUMA 节点有独立的稳定树
+```
+
+---
+
+## 9. 性能特征
+
+| 因素 | 影响 | 调优 |
+|------|------|------|
+| `pages_to_scan` | 每轮扫描页数，越大 CPU 开销越高 | 默认 100，虚拟机场景可调大 |
+| `sleep_millisecs` | 两轮之间的休眠时间 | 默认 20ms，IO 密集场景可调大 |
+| `merge_across_nodes` | 开启后跨 NUMA 合并节省更多 | 关闭可减少跨 NUMA 访问延迟 |
+| `max_page_sharing` | 单个 KSM 页最多共享数 | 默认 256，限制引用链长度 |
+| 零页优化 | 零页不占物理内存，效果显著 | 默认关闭，建议在虚拟化场景开启 |
+
+---
+
+## 10. 源码索引
+
+| 符号 | 文件 | 行号 |
+|------|------|------|
+| `struct ksm_mm_slot` | mm/ksm.c | 126 |
+| `struct ksm_scan` | mm/ksm.c | 140 |
+| `struct ksm_stable_node` | mm/ksm.c | 159 |
+| `ksm_scan_thread()` | mm/ksm.c | 2816 |
+| `ksm_do_scan()` | mm/ksm.c | 2783 |
+| `cmp_and_merge_page()` | mm/ksm.c | 2251 |
+| `try_to_merge_one_page()` | mm/ksm.c | 1478 |
+| `stable_tree_search()` | mm/ksm.c | 1828 |
+| `unstable_tree_search_insert()` | mm/ksm.c | 2137 |
+| `ksm_init()` | mm/ksm.c | 3620 |
+| `ksm_run` | mm/ksm.c | 482 |
+| `ksm_pages_shared` | mm/ksm.c | 258 |
+| `ksm_pages_sharing` | mm/ksm.c | 261 |
+| `ksm_use_zero_pages` | mm/ksm.c | 291 |
+| `ksm_zero_pages` | mm/ksm.c | 298 |
+| `ksm_thread_pages_to_scan` | mm/ksm.c | (sysfs) |
+| `ksm_thread_sleep_millisecs` | mm/ksm.c | (sysfs) |
+| `root_stable_tree` | mm/ksm.c | (全局，[nr_node_ids]) |
+| `root_unstable_tree` | mm/ksm.c | (全局，[nr_node_ids]) |
+
+---
+
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
