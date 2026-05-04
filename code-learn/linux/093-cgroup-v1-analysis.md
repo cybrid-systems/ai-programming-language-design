@@ -264,6 +264,39 @@ cgroup v1 通过 `struct cgroup` 层级树 + `struct cgroup_subsys` 控制器插
 // };
 ```
 
+
+## 3. cftype——控制文件注册
+
+每个控制器通过 `struct cftype` 数组注册其控制文件：
+
+```c
+// kernel/cgroup/cgroup.c L243 — doom-lsp 确认
+static struct cftype cgroup_base_files[];
+
+// cftype 结构定义（简化）：
+struct cftype {
+    char name[MAX_CFTYPE_NAME];           // 文件名（如 "memory.limit_in_bytes"）
+    u64 private;                           // 私有数据
+    umode_t mode;                          // 文件权限
+    
+    // IO 操作：
+    int (*write_u64)(struct cgroup_subsys_state *css, struct cftype *cft, u64 val);
+    int (*write_s64)(struct cgroup_subsys_state *css, struct cftype *cft, s64 val);
+    int (*write_string)(struct cgroup_subsys_state *css, struct cftype *cft, const char *buf);
+    u64 (*read_u64)(struct cgroup_subsys_state *css, struct cftype *cft);
+    s64 (*read_s64)(struct cgroup_subsys_state *css, struct cftype *cft);
+};
+
+// 注册示例（memory 控制器）：
+// struct cftype mem_cgroup_files[] = {
+//     { .name = "memory.limit_in_bytes", .write_u64 = mem_cgroup_write, .read_u64 = mem_cgroup_read },
+//     { .name = "memory.usage_in_bytes", .read_u64 = mem_cgroup_read },
+//     { .name = "memory.max_usage_in_bytes", .read_u64 = mem_cgroup_read },
+//     { .name = "memory.failcnt", .read_u64 = mem_cgroup_read },
+//     { }
+// };
+```
+
 ## 源码索引
 
 | 符号 | 文件 | 行号 |
