@@ -494,7 +494,7 @@ V' = V - w_i × vl_i / (W + w_i)
 | `entity_tick()` | kernel/sched/fair.c | 5793 |
 | `pick_next_entity()` | kernel/sched/fair.c | 5752 |
 | `enqueue_task_fair()` | kernel/sched/fair.c | 7168 |
-| `dequeue_task_fair()` | kernel/sched/fair.c | 7402 |
+| `dequeue_task_fair()` | kernel/sched/fair.c | 7402 (2nd def) |
 | `sysctl_sched_base_slice` | kernel/sched/fair.c | (全局) |
 | `calc_delta_fair()` | kernel/sched/fair.c | (内联) |
 | `entity_before()` | kernel/sched/fair.c | 589 |

@@ -406,9 +406,9 @@ fork 的共享策略通过 clone flags 精确控制：
 |------|------|------|
 | `kernel_clone()` | kernel/fork.c | 2672 |
 | `copy_process()` | kernel/fork.c | 1967 |
-| `dup_task_struct()` | kernel/fork.c | 2022 |
+| `dup_task_struct()` | kernel/fork.c | 911 |
 | `copy_thread()` | arch/x86/kernel/process.c | (通过函数指针) |
-| `wake_up_new_task()` | kernel/sched/core.c | 3350 附近 |
+| `wake_up_new_task()` | kernel/sched/core.c | 4824 |
 | `do_exit()` | kernel/exit.c | 895 |
 | `do_group_exit()` | kernel/exit.c | 1092 |
 | `exit_signals()` | kernel/exit.c | 3119 |

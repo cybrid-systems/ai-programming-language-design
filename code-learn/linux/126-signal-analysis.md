@@ -91,7 +91,7 @@ struct sigqueue {
 
 ### ksignal — 信号传递的中间结构
 
-（`include/linux/signal_types.h`，L62）
+（`include/linux/signal_types.h`，L67）
 
 ```c
 struct ksignal {
@@ -358,7 +358,7 @@ void exit_signals(struct task_struct *tsk)
 | `struct sigpending` | include/linux/signal_types.h | 32 |
 | `struct sigqueue` | include/linux/signal_types.h | 22 |
 | `struct k_sigaction` | include/linux/signal_types.h | 48 |
-| `struct ksignal` | include/linux/signal_types.h | 62 |
+| `struct ksignal` | include/linux/signal_types.h | 67 |
 | `task_struct->signal` | include/linux/sched.h | 1197 |
 | `task_struct->sighand` | include/linux/sched.h | 1198 |
 | `task_struct->blocked` | include/linux/sched.h | 1199 |
@@ -380,8 +380,8 @@ void exit_signals(struct task_struct *tsk)
 | `handle_signal()` | arch/x86/kernel/signal.c | 255 |
 | `setup_rt_frame()` | arch/x86/kernel/signal.c | 236 |
 | `arch_do_signal_or_restart()` | arch/x86/kernel/signal.c | 333 |
-| `TIF_SIGPENDING` | include/linux/sched.h | 788 |
-| `SA_IMMUTABLE` | include/linux/signal_types.h | 70 |
+| `TIF_SIGPENDING` | include/asm-generic/thread_info_tif.h | 12 |
+| `SA_IMMUTABLE` | include/linux/signal_types.h | 74 |
 
 ## 调用链总览
 

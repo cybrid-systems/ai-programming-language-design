@@ -385,11 +385,11 @@ security_ptrace_access_check();          // LSM 钩子
 | `ptrace_event()` | kernel/signal.c | 2513 |
 | `arch_ptrace()` | arch/x86/kernel/ptrace.c | 730 |
 | `DO_SYSCALL_64` | arch/x86/entry/common.c | (系统调用入口) |
-| `ptrace_access_vm()` | kernel/ptrace.c | 145 附近 |
+| `ptrace_access_vm()` | kernel/ptrace.c | 44 |
 | `struct task_struct` | include/linux/sched.h | 820 |
 | ptrace 状态位 | include/linux/ptrace.h | (PT_PTRACED 等) |
 | PTRACE_EVENT_* | include/uapi/linux/ptrace.h | (全部事件定义) |
-| `access_process_vm()` | mm/memory.c | 5451 附近 |
+| `access_process_vm()` | mm/memory.c | 7153 |
 
 ## 调试工具对 ptrace 的使用模式
 
