@@ -724,7 +724,7 @@ freeze_consume_time = memstore_limit × (throttling_pct - freeze_pct) / 100
   compaction: 剩下的    = total - SQL - freeze
 ```
 
-**10 核 × 40GB 场景计算:**
+**单租户 10 核 × 40GB 场景计算:**
 
 ```
 写入占 30% QPS → SQL 至少需要 3 核
@@ -735,17 +735,73 @@ compaction 最多    = 10 - 3 - 2 = 5 核
 → 前台 SQL 实际拿到 10 - 5 = 5 核 (含 2 核 freeze buffer)
 ```
 
-**但你可能想压榨更多：**
-
-如果你观察发现 freeze flush 只需要 1 核就能跟上,
-而 compaction 又可以暂时忍受 (读放大可控),
-可以给 compaction 更多 CPU → 更快完成 merge → 减少读放大 → 提升前台 QPS：
+**你现在是 32u 物理机, 3 个租户各 10 核:**
 
 ```text
-激进型:  global_background_cpu_quota = 7  → SQL 3 核
-平衡型:  global_background_cpu_quota = 5  → SQL 5 核  ← 推荐起点
-保守型:  global_background_cpu_quota = 3  → SQL 7 核
+每个租户 unit_max_cpu = 10 → 前台 cgroup 硬限制 10 核/租户
+3 个租户前台并发峰值 = 30 核
+物理机共 32 核
+
+计算逻辑:
+  当 3 个租户同时满载:
+    总前台占用 + 总后台占用 ≤ 32
+    后台(compaction 跨租户) 设 X 核
+    前台可用 = 32 - X, 分 3 个租户 ≈ (32-X)/3 核/租户
+
+  如果要每个租户的前台都接近 10 核:
+    (32 - X) / 3 ≥ 10 → X ≤ 2  ← 过于保守, compaction 不够
+
+  折中: 每个租户前台拿 ~8 核, 剩下给 compaction:
+    X = 32 - 3 × 8 = 8  ← 推荐起点
 ```
+
+**多租户推荐:**
+
+```text
+平衡型:  global_background_cpu_quota = 8   ← 推荐起点
+         → 前台共享 24 核, 每租户 ~8 核 (接近 unit limit)
+         → 后台 compaction 跨 3 个租户共享 8 核
+
+激进型:  global_background_cpu_quota = 12
+         → 前台共享 20 核, 每租户 ~6.7 核
+         → compaction 更快, 但前台受限明显
+
+保守型:  global_background_cpu_quota = 5
+         → 前台共享 27 核, 每租户 ~9 核
+         → compaction 受限, 可能读放大
+```
+
+**多租户的核心差异:**
+
+单租户场景 compaction 只服务一个租户的写入。
+3 个租户各 30% 写入 → compaction 负载 ×3。
+所以 `global_background_cpu_quota` 不能太低 (否则 compaction 完全跟不上),
+也不能太高 (否则 3 个前台 SQL 一起吃 CPU)。
+
+**建议你先设为 8, 然后观察:**
+
+```bash
+# compaction 是否积压
+SELECT * FROM oceanbase.GV$OB_COMPACTION_PROGRESS
+WHERE STATUS IN ('COMPACTING', 'SCHEDULING');
+# 如果积压很多 → 逐步提高到 10~12
+
+# 前台 SQL 延迟是否可接受
+SELECT ROUND(AVG(ELAPSED_TIME) / 1000, 1) AS avg_elapsed_ms
+FROM oceanbase.GV$OB_SQL_AUDIT
+WHERE request_time > DATE_SUB(NOW(), INTERVAL 1 MINUTE);
+# 如果延迟飙升 → 降低到 6~5
+```
+
+**关于 3 个租户的类型**: 它们都是 **用户租户 (USER tenant)**。
+
+```
+oceanbase.DBA_OB_TENANTS 查到的 TENANT_TYPE:
+  三个都是 'USER'  ← 那就是纯业务租户
+  如果有 'META' 租户, 那是自动生成的元数据租户 (不计入你的 10 核配置)
+```
+
+sys 租户 (ID=500) 在 cgroup 中被设为 `cpu.cfs_quota = -1` (不限), 走 `cgroup/other/` 路径, 不受 `global_background_cpu_quota` 影响。
 
 **观察指标：**
 
@@ -789,7 +845,7 @@ QPS 抖动 + cache miss 高 → 加层 4 cpuset 绑核
 |------|--------|---------|------|
 | `enable_cgroup` | True | DYNAMIC | 默认就是 True |
 | `enable_global_background_resource_isolation` | True | **需要重启** | 开启后台隔离 |
-| `global_background_cpu_quota` | 5~7 | DYNAMIC | (10核 × 40GB) |
+| `global_background_cpu_quota` | 8 | DYNAMIC | 32u 物理机, 3×10 核租户 (从 8 开始调) |
 | `writing_throttling_trigger_percentage` | 100 | DYNAMIC | 放开限流 |
 
 ### 租户参数
