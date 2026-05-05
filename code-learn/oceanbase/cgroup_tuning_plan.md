@@ -738,47 +738,41 @@ compaction 最多    = 10 - 3 - 2 = 5 核
 **你现在是 32u 物理机, 3 个租户各 10 核:**
 
 ```text
-每个租户 unit_max_cpu = 10 → 前台 cgroup 硬限制 10 核/租户
-3 个租户前台并发峰值 = 30 核
+每个租户 unit_max_cpu = 10    ← 这是上限, 不是预留
+3 个租户并发峰值需求 = 30 核
 物理机共 32 核
 
-计算逻辑:
-  当 3 个租户同时满载:
-    总前台占用 + 总后台占用 ≤ 32
-    后台(compaction 跨租户) 设 X 核
-    前台可用 = 32 - X, 分 3 个租户 ≈ (32-X)/3 核/租户
+关键理解:
+  cpu.cfs_quota_us 是 HARD CAP (硬上限) 而不是 RESERVATION (预留)
+  所以 unit_max_cpu = 10 的意思是"你最多可以用 10 核"
+  而不是"你独占 10 核"
 
-  如果要每个租户的前台都接近 10 核:
-    (32 - X) / 3 ≥ 10 → X ≤ 2  ← 过于保守, compaction 不够
+cgroup 层级: (所有 group 是 sibling 关系)
 
-  折中: 每个租户前台拿 ~8 核, 剩下给 compaction:
-    X = 32 - 3 × 8 = 8  ← 推荐起点
-```
+  /sys/fs/cgroup/cpu/cgroup/
+    ├── background/                 ← quota=8 (global_background_cpu_quota)
+    ├── tenant_1001/OBCG_DEFAULT    ← quota=10 (unit_max_cpu)
+    ├── tenant_1002/OBCG_DEFAULT    ← quota=10
+    ├── tenant_1003/OBCG_DEFAULT    ← quota=10
+    └── other/                      ← sys/meta 租户
 
-**多租户推荐:**
+满载时分时:
 
-```text
-平衡型:  global_background_cpu_quota = 8   ← 推荐起点
-         → 前台共享 24 核, 每租户 ~8 核 (接近 unit limit)
-         → 后台 compaction 跨 3 个租户共享 8 核
+  是否满载    │ T1  │ T2  │ T3  │ Background │ 物理
+  ────────────┼─────┼─────┼─────┼────────────┼─────
+  仅 T1 忙    │ 10  │   0 │   0 │     0~2    │ 32   ← T1 能跑满 10
+  全部满载    │ 8.4  │ 8.4 │ 8.4 │     6.7    │ 32   ← CFS 按 quota 比例分
+  T2 空闲     │ 10  │   0 │ 8.7 │     8.2    │ 32   ← T1 和 T3 弹性使用 T2 余量
 
-激进型:  global_background_cpu_quota = 12
-         → 前台共享 20 核, 每租户 ~6.7 核
-         → compaction 更快, 但前台受限明显
+**如果你给每个租户只配 8 核 (不 over-provision):**
 
-保守型:  global_background_cpu_quota = 5
-         → 前台共享 27 核, 每租户 ~9 核
-         → compaction 受限, 可能读放大
-```
+  满载: 8 + 8 + 8 + 8 = 32 ✔ 刚刚好
+  但 T2 空闲时: T1 和 T3 也不能超过 8 ← 浪费弹性
 
-**多租户的核心差异:**
+结论: **保留 10 核 unit, 靠 global_background_cpu_quota=8 做满载保护。**
+  空闲 CPU 自动分给需要的租户, 满载时每租户 ~8 核 + compaction 够用。
 
-单租户场景 compaction 只服务一个租户的写入。
-3 个租户各 30% 写入 → compaction 负载 ×3。
-所以 `global_background_cpu_quota` 不能太低 (否则 compaction 完全跟不上),
-也不能太高 (否则 3 个前台 SQL 一起吃 CPU)。
-
-**建议你先设为 8, 然后观察:**
+**建议起点 8, 然后观察:**
 
 ```bash
 # compaction 是否积压
