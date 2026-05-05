@@ -1,0 +1,561 @@
+# OceanBase CPU 满载优化方案：cgroup 隔离 + 参数调优
+
+> 环境: OB 4.2.5.6 | 单租户 10 核 CPU / 40GB 内存 | 70:30 读写比 | 高 QPS | CPU 打满
+> 问题: freeze 耗时 60s+, 不断触写限流, QPS 断崖下降
+
+---
+
+## 目录
+
+1. [根因分析：LSM-Tree CPU 自锁](#1-根因分析lsm-tree-cpu-自锁)
+2. [源码层面的证明](#2-源码层面的证明)
+3. [方案全景](#3-方案全景)
+4. [步骤一：内存参数调整（立即生效）](#4-步骤一内存参数调整立即生效)
+5. [步骤二：Compaction 线程优先级调整（立即生效）](#5-步骤二compaction-线程优先级调整立即生效)
+6. [步骤三：cgroup 全局后台隔离（需重启）](#6-步骤三cgroup-全局后台隔离需重启)
+7. [步骤四：DBMS_RESOURCE_MANAGER 精细隔离](#7-步骤四dbms_resource_manager-精细隔离)
+8. [步骤五：监控与验证](#8-步骤五监控与验证)
+9. [量化分析：CPU 压榨的数学依据](#9-量化分析cpu-压榨的数学依据)
+10. [推荐参数总结](#10-推荐参数总结)
+
+---
+
+## 1. 根因分析：LSM-Tree CPU 自锁
+
+### 1.1 核心问题链路
+
+```
+freeze 触发 (memstore = freeze_trigger_percentage × memstore_limit)
+  → 需要 CPU 做 flush + 写 SSTable
+  → 但 CPU 已经被 100% 占满 (compaction + SQL 等分)
+  → flush 线程抢不到 CPU → SQL 响应变慢
+  → write_ref_cnt 降不下来
+
+等待 write_ref_cnt == 0 (08-memtable-freezer.md: §2.5)
+  → freeze 卡在 ready_for_flush
+  → memstore 在等待期间还在接收写入数据
+  → 撞 writing_throttling → QPS 断崖 ↓
+```
+
+### 1.2 核心矛盾
+
+```text
+write rate > flush rate 的本质:
+  CPU 是一个 finite resource → SQL 和 compaction 都在抢
+  compaction 越抢 CPU → SQL 越慢 → write_ref_cnt 越难清空
+  → freeze 越慢 → memstore 涨越快 → 限流
+
+这跟 freeze_trigger 调到多少无关 —— 只要 CPU 满载,
+compaction 和 SQL 就必然互相争抢, 触发自锁。
+```
+
+### 1.3 cgroup 为何能打破
+
+```text
+cgroup 不优化 CFS 公平性, 而是主动制造不公平:
+  
+  ┌── 没有 cgroup ──────────────────┐
+  │  SQL threads     ████████░░░░   │  ← CFS 公平平分
+  │  compaction      ████████░░░░   │     各占 ~50%
+  │  互相拖慢                       │
+  └──────────────────────────────────┘
+
+  ┌── 有 cgroup (background=70%) ───┐
+  │  SQL threads     ██████████████ │  ← 独占剩余 CPU
+  │  ─── cgroup limit line ─────────│  ← 30% 留给 foreground
+  │  compaction      ██████████     │  ← 最多 70%
+  │  SQL 不受影响 ✓                │
+  └──────────────────────────────────┘
+
+效果链:
+  SQL 拿到保证的 CPU → 请求快速完成 → write_ref_cnt 快速归零
+  → freeze 条件快速满足 → memtable 快速 flush
+  → 不限流 → QPS 稳定
+```
+
+---
+
+## 2. 源码层面的证明
+
+### 2.1 Compaction 线程的完整 cgroup 链路
+
+从源码 tracing 出来的完整路径:
+
+```
+ObTenantDagScheduler::process_task()          ← ob_tenant_dag_scheduler.cpp
+  │
+  ├─ DAG_PRIO_COMPACTION_HIGH = Mini Merge    ← dag_scheduler_config.h:62
+  ├─ DAG_PRIO_COMPACTION_MID  = Minor Merge   ← dag_scheduler_config.h:64
+  └─ DAG_PRIO_COMPACTION_LOW  = Major/Medium  ← dag_scheduler_config.h:66
+         │
+         ▼
+  ret_worker->set_function_type(
+      OB_DAG_PRIOS[priority].function_type_)   ← ob_tenant_dag_scheduler.cpp:5374
+         │
+         ▼
+  CONSUMER_GROUP_FUNC_GUARD(function_type_)    ← ob_tenant_dag_scheduler.cpp:2259
+         │
+         ▼
+  CONVERT_FUNCTION_TYPE_TO_GROUP_ID()          ← ob_cgroup_ctrl.cpp
+   → get_group_id_by_function_type()           ← ob_resource_mapping_rule_manager.h:152
+   → get_group_id_by_function()
+         │
+         ▼
+  SET_GROUP_ID(group_id)                       ← ob_cgroup_ctrl.cpp:38
+   → add_self_to_cgroup_(tenant_id, group_id, is_background)
+         │                          │
+         ▼                          ▼
+  write TID → /sys/fs/cgroup/cpu/       ← 当 enable_global_background_
+    cgroup/[background]/tenant_1004/          resource_isolation=true 时
+    OBCG_STORAGE/tasks                        写 background 路径
+```
+
+### 2.2 ready_for_flush 的三个前置条件
+
+06-memtable-freezer-analysis.md §2.5:
+
+```cpp
+bool ObMemtable::ready_for_flush_()
+{
+  bool bool_ret = is_frozen &&               // ① 已冻结
+                  0 == write_ref_cnt &&       // ② 无正在写入 ← CPU 满载下最慢
+                  0 == unsubmitted_cnt;       // ③ 无未提交日志
+```
+
+**write_ref_cnt 只有在 SQL 请求实际完成后才会递减。**
+CPU 被 compaction 抢走 → SQL 慢 → write_ref_cnt 不降 → 这就是自锁点。
+
+### 2.3 三档 Compaction 优先级
+
+34-sstable-merge-analysis.md + 源码:
+
+```
+DAG_PRIO_COMPACTION_HIGH → compaction_high_thread_score → Mini Merge (最紧急)
+DAG_PRIO_COMPACTION_MID  → compaction_mid_thread_score  → Minor Merge
+DAG_PRIO_COMPACTION_LOW  → compaction_low_thread_score  → Major/Medium Merge (可推迟)
+```
+
+每个优先级的 `function_type_` 会被 `CONSUMER_GROUP_FUNC_GUARD` 捕获,
+最终通过 `SET_GROUP_ID` 将当前线程写入对应的 cgroup。
+
+### 2.4 cgroup 目录结构
+
+```
+enable_global_background_resource_isolation = true 时:
+
+/sys/fs/cgroup/cpu/cgroup/
+├── other/                        ← 系统租户 (500)
+├── background/                   ← 后台任务 (global_background_cpu_quota)
+│   └── tenant_1004/
+│       ├── OBCG_STORAGE/tasks    ← compaction 线程在此
+│       ├── OBCG_CLOG/tasks       ← CLOG 后台
+│       └── OBCG_LQ/tasks         ← 大查询
+│
+└── tenant_1004/                  ← 前台任务 (剩下的 CPU)
+    ├── OBCG_ID_SQL_REQ_LEVEL1/   ← SQL concurrency=4
+    ├── OBCG_ID_SQL_REQ_LEVEL2/   ← SQL concurrency=4
+    ├── OBCG_WR/tasks             ← 写请求 (CRITICAL)
+    └── OBCG_DEFAULT/tasks        ← 默认组
+```
+
+---
+
+## 3. 方案全景
+
+四层递进，每层解决不同维度的问题：
+
+```
+层 1: 内存参数                    立即生效   → 扩大 memstore 安全窗口
+层 2: Compaction 线程分权         立即生效   → 降低 compaction CPU 争抢
+层 3: cgroup 全局后台隔离         需重启     → 从 OS 级别限制 compaction CPU
+层 4: DBMS_RESOURCE_MANAGER      无重启     → 精细到用户/query 级别的隔离
+```
+
+---
+
+## 4. 步骤一：内存参数调整（立即生效）
+
+```sql
+-- 1. 扩大 memstore 空间 (30% 写需要更多 buffer)
+ALTER SYSTEM SET memstore_limit_percentage = 75;
+
+-- 2. 提前触发 freeze, 给 throttling 留足够窗口
+ALTER SYSTEM SET freeze_trigger_percentage = 50;
+
+-- 3. 放开写限流阈值, 让 freeze 自行调节
+ALTER SYSTEM SET writing_throttling_trigger_percentage = 100;
+
+-- 4. 立即触发一次 minor freeze, 降低当前水位
+ALTER SYSTEM MINOR FREEZE;
+```
+
+**为什么这组参数？**  
+10核 × 40GB：memstore_limit = 75% → 30GB。  
+freeze_trigger = 50% → freeze 在 15GB 触发。  
+throttling = 100% → 不限流。  
+
+freeze 到 memstore 满之间的 **15GB buffer** 是安全窗口。  
+以之前观测的 60s freeze 耗时计算, 只要写入速率 < 250MB/s
+就不会撞限流。如果还撞 → 说明根本问题是 CPU, 往下走。
+
+---
+
+## 5. 步骤二：Compaction 线程优先级调整（立即生效）
+
+OB 4.x 内部有三档 compaction 优先级：
+
+```text
+compaction_high_thread_score → Mini Merge     ← freeze flush 后的合并
+compaction_mid_thread_score  → Minor Merge    ← L0→L1 合并
+compaction_low_thread_score  → Major/Medium   ← 全局合并 (可推迟)
+```
+
+**思路：压缩 low 和 mid 的线程数, 给 SQL 让路。**
+
+```sql
+ALTER SYSTEM SET compaction_high_thread_score = 6;   -- Mini Merge: 保持 6 线程
+ALTER SYSTEM SET compaction_mid_thread_score  = 4;   -- Minor Merge: 减到 4
+ALTER SYSTEM SET compaction_low_thread_score  = 2;   -- Major: 减到 2 (合并期间可临时放开)
+```
+
+> 注意: `compaction_*_thread_score` 不是固定线程数,
+> 而是 DAG 调度器根据当前负载和 score 计算的权重。
+> 降低 score 会让这些类型的 compaction 任务**排队更久**。
+
+### 量化影响
+
+```text
+原始: 高=6, 中=6, 低=6  → 最多 18 个 compaction 线程抢 CPU
+调整: 高=6, 中=4, 低=2  → 最多 12 个 compaction 线程
+节省: 6 个线程 ≈ 0.6 核 × 2 hyperthread = 对 10 核约 6% CPU
+```
+
+---
+
+## 6. 步骤三：cgroup 全局后台隔离（需重启）
+
+### 6.1 配置
+
+```sql
+-- enable_cgroup 默认=True, 确认一下
+SHOW PARAMETERS LIKE 'enable_cgroup';
+-- 应该为 True
+
+-- 开启全局后台隔离 (需要重启 observer)
+ALTER SYSTEM SET enable_global_background_resource_isolation = True;
+
+-- 设置后台任务最多使用 70% CPU (10核 = 7核留给 compaction, 3核留给 SQL)
+ALTER SYSTEM SET global_background_cpu_quota = 7;  -- 单位: vCPU
+```
+
+### 6.2 重启后验证
+
+```bash
+# 检查 cgroup 目录
+ls -la /sys/fs/cgroup/cpu/cgroup/
+# 应该有: background/  tenant_1004/  other/
+
+# 查看 background CPU 配额
+cat /sys/fs/cgroup/cpu/cgroup/background/cpu.cfs_quota_us
+cat /sys/fs/cgroup/cpu/cgroup/background/cpu.cfs_period_us
+# quota / period = 核数  → 确认 7 核
+
+# 查看 compaction 线程是否被正确归入 background
+cat /sys/fs/cgroup/cpu/cgroup/background/tenant_1004/OBCG_STORAGE/tasks
+
+# 查 tenant 默认组的 CPU (SQL 在这里)
+cat /sys/fs/cgroup/cpu/cgroup/tenant_1004/OBCG_DEFAULT/tasks
+```
+
+### 6.3 原理
+
+`enable_global_background_resource_isolation` 为 true 时:
+
+```text
+ob_cgroup_ctrl.cpp:add_thread_to_cgroup_():
+  写 TID 到 /sys/fs/cgroup/cpu/cgroup/[background/]<tenant>/<group>/tasks
+                                ↑
+                      is_background=true 时插入 background 路径
+
+resource_manager_plan.cpp:refresh_global_background_cpu():
+  设置 cgroup/background/ 的 cpu.cfs_quota_us = global_background_cpu_quota × period
+```
+
+这意味着所有标记为 is_background=true 的任务线程 (包括 compaction 的
+OBCG_STORAGE group) 都会受到 **cpu.cfs_quota_us** 的硬限制,
+最多使用 `global_background_cpu_quota` 个 vCPU。
+
+---
+
+## 7. 步骤四：DBMS_RESOURCE_MANAGER 精细隔离
+
+如果你要精细化到不同用户/不同 query 类型, 用资源计划。
+
+### 7.1 创建资源计划
+
+```sql
+-- 创建计划
+BEGIN
+  DBMS_RESOURCE_MANAGER.CREATE_PLAN(
+    PLAN    => 'PROD_PLAN',
+    COMMENT => '70:30 workload - SQL high, compaction low'
+  );
+
+  -- 组 1: 在线事务 (High)
+  DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP(
+    CONSUMER_GROUP => 'OLTP_HIGH',
+    COMMENT        => 'OLTP foreground',
+    MGMT_MTH       => 'cpu',
+    CPU_WEIGHT     => 7
+  );
+
+  -- 组 2: 后台 + compaction (Low)
+  DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP(
+    CONSUMER_GROUP => 'BATCH_LOW',
+    COMMENT        => 'Batch/Compaction background',
+    MGMT_MTH       => 'cpu',
+    CPU_WEIGHT     => 3
+  );
+END;
+/
+
+-- 创建计划指令 (将组分配给计划)
+BEGIN
+  DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(
+    PLAN              => 'PROD_PLAN',
+    GROUP_OR_SUBPLAN  => 'OLTP_HIGH',
+    COMMENT           => 'OLTP has 70% CPU weight',
+    CPU_WEIGHT        => 7,
+    MIN_IOPS          => 100,
+    MAX_IOPS          => 10000,
+    WEIGHT_IOPS       => 700
+  );
+
+  DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(
+    PLAN              => 'PROD_PLAN',
+    GROUP_OR_SUBPLAN  => 'BATCH_LOW',
+    COMMENT           => 'Background has 30% CPU weight',
+    CPU_WEIGHT        => 3,
+    MIN_IOPS          => 10,
+    MAX_IOPS          => 5000,
+    WEIGHT_IOPS       => 300
+  );
+END;
+/
+```
+
+### 7.2 将用户映射到组
+
+```sql
+-- 业务用户 → OLTP_HIGH
+BEGIN
+  DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP(
+    USER  => 'app_user',
+    GROUP => 'OLTP_HIGH'
+  );
+END;
+/
+
+-- 只读报表 → BATCH_LOW
+BEGIN
+  DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP(
+    USER  => 'report_user',
+    GROUP => 'BATCH_LOW'
+  );
+END;
+/
+
+-- 激活计划
+SET GLOBAL resource_manager_plan = 'PROD_PLAN';
+
+-- 验证
+SHOW VARIABLES LIKE 'resource_manager_plan';
+```
+
+---
+
+## 8. 步骤五：监控与验证
+
+### 8.1 cgroup 级别监控
+
+```bash
+# 实时查看 cgroup CPU 使用
+cat /sys/fs/cgroup/cpu/cgroup/background/cpuacct.usage
+# vs
+cat /sys/fs/cgroup/cpu/cgroup/tenant_1004/OBCG_DEFAULT/cpuacct.usage
+
+# 看是否被 throttled (限流)
+cat /sys/fs/cgroup/cpu/cgroup/background/tenant_1004/OBCG_STORAGE/cpu.stat
+# nr_periods, nr_throttled, throttled_time
+# nr_throttled > 0 说明 compaction 被 cgroup 限制过
+
+# 查 cgroup 目录创建情况
+find /sys/fs/cgroup/cpu/cgroup -name "tasks" -exec echo "=== {} ===" \; -exec cat {} \;
+```
+
+### 8.2 OB 级别监控
+
+```sql
+-- 1. Memstore 水位
+SELECT TENANT_ID,
+       ROUND(ACTIVE_MEMSTORE_USED / 1024 / 1024, 1) AS active_mb,
+       ROUND(TOTAL_MEMSTORE_USED / MEMSTORE_LIMIT * 100, 1) AS memstore_pct,
+       ROUND(FREEZE_TRIGGER_MEMSTORE_USED / 1024 / 1024, 1) AS freeze_trigger_mb
+FROM oceanbase.GV$OB_MEMSTORE;
+
+-- 2. 是否有写限流
+SELECT COUNT(*) FROM oceanbase.GV$OB_SQL_AUDIT
+WHERE request_time > DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+  AND ret_code = -4038;
+
+-- 3. Freeze 历史
+SELECT FROM_UNIXTIME(FREEZE_TIME / 1000000) AS freeze_at,
+       IS_FREEZE, RETCODE
+FROM oceanbase.__all_virtual_freeze_info
+ORDER BY FREEZE_TIME DESC LIMIT 5;
+
+-- 4. cgroup 配置状态
+SELECT * FROM oceanbase.GV$OB_CGROUP_CONFIG;
+
+-- 5. Compaction 进展
+SELECT * FROM oceanbase.GV$OB_COMPACTION_PROGRESS
+WHERE STATUS IN ('COMPACTING', 'SCHEDULING');
+
+-- 6. 限流详情
+SELECT * FROM oceanbase.__all_virtual_memstore_throttle;
+
+-- 7. 当前参数确认
+SELECT NAME, VALUE FROM oceanbase.__all_tenant_parameter
+WHERE NAME IN ('freeze_trigger_percentage',
+               'writing_throttling_trigger_percentage',
+               'memstore_limit_percentage',
+               'compaction_high_thread_score',
+               'compaction_mid_thread_score',
+               'compaction_low_thread_score');
+```
+
+### 8.3 SQL 性能对比
+
+```sql
+-- 调整前后的 SQL 延迟对比
+SELECT ROUND(AVG(ELAPSED_TIME) / 1000, 1) AS avg_elapsed_ms,
+       ROUND(AVG(QUEUE_TIME) / 1000, 1) AS avg_queue_ms,
+       ROUND(AVG(EXECUTE_TIME) / 1000, 1) AS avg_exec_ms,
+       COUNT(*) AS executions,
+       ROUND(SUM(ELAPSED_TIME) / 1000000, 1) AS total_cpu_sec
+FROM oceanbase.GV$OB_SQL_AUDIT
+WHERE request_time > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+  AND TENANT_ID = 1004;
+```
+
+---
+
+## 9. 量化分析：CPU 压榨的数学依据
+
+### 9.1 怎么设 global_background_cpu_quota
+
+公式:
+
+```text
+memstore_write_rate = QPS_write × avg_row_size
+
+freeze_consume_time = memstore_limit × (throttling_pct - freeze_pct) / 100
+                      ──────────────────────────────────────────────
+                                  memstore_write_rate
+
+需要的 CPU 预算:
+  SQL:     必须保证的 CPU = (100% - write_pct) × total_CPU
+  freeze:  需要的 CPU   = freeze_concurrency (≈4 线程)
+  compaction: 剩下的    = total - SQL - freeze
+```
+
+**10 核 × 40GB 场景计算:**
+
+```
+写入占 30% QPS → SQL 至少需要 3 核
+freeze flush 需要 ~2 核 (保守)
+compaction 最多    = 10 - 3 - 2 = 5 核
+
+→ global_background_cpu_quota = 5  (留给 compaction + 后台)
+→ 前台 SQL 实际拿到 10 - 5 = 5 核 (含 2 核 freeze buffer)
+```
+
+**但你可能想压榨更多：**
+
+如果你观察发现 freeze flush 只需要 1 核就能跟上,
+而 compaction 又可以暂时忍受 (读放大可控),
+可以给 compaction 更多 CPU → 更快完成 merge → 减少读放大 → 提升前台 QPS：
+
+```text
+激进型:  global_background_cpu_quota = 7  → SQL 3 核
+平衡型:  global_background_cpu_quota = 5  → SQL 5 核  ← 推荐起点
+保守型:  global_background_cpu_quota = 3  → SQL 7 核
+```
+
+**观察指标：**
+
+```
+分配后观察:
+  1. QPS 是否稳定 (不再断崖)
+  2. freeze 耗时 是否从 60s 降回 30s+
+  3. compaction 进度是否停滞 → 读放大是否上升
+
+如果 compaction 停滞:
+  → 调大 compaction_low_thread_score
+  → 或建计划窗口: 低峰期调大 global_background_cpu_quota
+```
+
+### 9.2 为什么 CPU 还能被"压榨"
+
+cgroup 的硬限制 (`cpu.cfs_quota_us`) 只限制 compaction 在 CPU 满载时的上限。
+如果 SQL 侧没有把 CPU 吃完:
+
+- compaction 仍然可以用剩余的 CPU 空转
+- 只有 SQL 全满载时, cgroup 才会把 compaction 压下去
+
+**这就是"弹性隔离"——平时不浪费, 争抢时保 SQL。**
+
+---
+
+## 10. 推荐参数总结
+
+### 集群参数
+
+| 参数 | 推荐值 | 生效方式 | 说明 |
+|------|--------|---------|------|
+| `enable_cgroup` | True | DYNAMIC | 默认就是 True |
+| `enable_global_background_resource_isolation` | True | **需要重启** | 开启后台隔离 |
+| `global_background_cpu_quota` | 5~7 | DYNAMIC | (10核 × 40GB) |
+| `writing_throttling_trigger_percentage` | 100 | DYNAMIC | 放开限流 |
+
+### 租户参数
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `memstore_limit_percentage` | 75 | 30% 写入需要大 memstore |
+| `freeze_trigger_percentage` | 50 | 提前触发, 留 buffer |
+| `compaction_high_thread_score` | 6 | Mini Merge (保持) |
+| `compaction_mid_thread_score` | 4 | Minor Merge (降低) |
+| `compaction_low_thread_score` | 2 | Major (大幅降低) |
+| `resource_manager_plan` | PROD_PLAN | 可选精细隔离 |
+
+### 部署后验证 checklist
+
+- [ ] `cat /sys/fs/cgroup/cpu/cgroup/background/cpu.cfs_quota_us` = 预期
+- [ ] SQL CPU 使用维持在预期范围内 (pidstat -p <observer_pid> 1)
+- [ ] `GV$OB_SQL_AUDIT` 中 `ret_code = -4038` 归零
+- [ ] freeze 耗时 < 30s
+- [ ] QPS 不再断崖下降
+
+---
+
+## 参考文献
+
+- `25-memory-management-analysis.md` — 内存管理, ObMemAttr, 租户内存隔离
+- `06-memtable-freezer-analysis.md` — freeze 机制, ready_for_flush 条件
+- `34-sstable-merge-analysis.md` — Mini/Minor/Major/Medium 合并路径
+- `51-block-cache-analysis.md` — 缓存体系, Row Cache / Bloom Filter / Micro Block Cache
+- `58-thread-model-analysis.md` — 线程池, TGMgr, NUMA 感知
+- `ob_cgroup_ctrl.cpp` — cgroup 控制: init, add_thread_to_cgroup_, get_group_path
+- `ob_resource_plan_manager.cpp` — 资源计划刷新, background CPU 隔离
+- `ob_tenant_dag_scheduler.cpp` — DAG 调度, function_type, CONSUMER_GROUP_FUNC_GUARD
