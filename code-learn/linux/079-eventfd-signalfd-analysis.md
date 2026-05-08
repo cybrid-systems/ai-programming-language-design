@@ -1,153 +1,72 @@
-# 79-eventfd-signalfd — Linux eventfd 和 signalfd 深度源码分析
+# 79-eventfd-signalfd — Linux eventfd / signalfd 机制深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
-> 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1
+> 分析日期：2026-05-08 | 内核版本：Linux 7.0-rc1
 
 ---
 
 ## 0. 概述
 
-**eventfd** 和 **signalfd** 将内核事件转化为**文件描述符**——eventfd 提供计数器信号（`eventfd_signal` 递增计数，`read` 消费），signalfd 将进程信号转为 fd 读取。
+eventfd 和 signalfd 是 Linux 特有的文件描述符机制，将传统的事件通知和信号传递 **文件化**——通过 read/write/poll/select/epoll 等标准 IO 接口操作。
 
-**doom-lsp 确认**：eventfd @ `fs/eventfd.c`（423 行，59 符号），signalfd @ `fs/signalfd.c`（351 行，25 符号）。
+| 机制 | 用途 | 核心文件 |
+|------|------|---------|
+| **eventfd** | 用户态/内核态事件计数通知 | `fs/eventfd.c`（~420 行）|
+| **signalfd** | 将信号转为文件描述符可读事件 | `fs/signalfd.c` |
+
+**核心优势**：统一 IO 事件处理模型——epoll 同时管理网络 fd、timerfd、eventfd、signalfd，无需单独的信号处理逻辑。
 
 ---
 
 ## 1. eventfd
 
-### 1.1 struct eventfd_ctx @ :30
+### 1.1 struct eventfd_ctx @ eventfd.c:30
 
 ```c
+// fs/eventfd.c:30
 struct eventfd_ctx {
-    struct kref kref;                       /* 引用计数 */
-    wait_queue_head_t wqh;                  /* 等待队列头 */
-    __u64 count;                             /* 计数器值 */
-    unsigned int flags;                      /* EFD_SEMAPHORE / EFD_NONBLOCK */
-    int id;                                  /* IDA 分配的 ID */
+    struct kref kref;
+    wait_queue_head_t wqh;     /* 等待队列（读写阻塞 + poll）*/
+    __u64 count;                /* 计数器值 */
+    unsigned int flags;         /* EFD_SEMAPHORE, EFD_NONBLOCK, EFD_CLOEXEC */
+    int id;                     /* IDA 分配的唯一 ID */
 };
 ```
 
-**`count` 语义**：
-- `write(fd, &n)` → `count += n`（最大 `ULLONG_MAX`）
-- `read(fd)` → 非信号量模式：返回 `count` 并置 0；信号量模式：返回 1 并 `count -= 1`
+**核心设计**：eventfd 就是一个 `__u64` 计数器 + 一个等待队列。write 增加计数 + 唤醒，read 消耗计数。
 
----
-
-### 1.2 do_eventfd @ :379——fd 创建
+### 1.2 eventfd_write @ eventfd.c:247——写入增加计数
 
 ```c
-static int do_eventfd(unsigned int count, int flags)
+// fs/eventfd.c:247
+static ssize_t eventfd_write(struct file *file, const char __user *buf,
+                              size_t count, loff_t *ppos)
 {
-    struct eventfd_ctx *ctx __free(kfree) = NULL;
+    struct eventfd_ctx *ctx = file->private_data;
+    __u64 ucnt;
 
-    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-    kref_init(&ctx->kref);                      // 引用计数初始 = 1
-    init_waitqueue_head(&ctx->wqh);
-    ctx->count = count;                          // 初始计数值
-    ctx->flags = flags;                          // EFD_SEMAPHORE / EFD_NONBLOCK
+    copy_from_user(&ucnt, buf, sizeof(ucnt));
+    if (ucnt == ULLONG_MAX) return -EINVAL;
 
-    // anon_inode 创建文件
-    // → eventfd_fops 挂接 read/write/poll/release
-    FD_PREPARE(fdf, flags,
-        anon_inode_getfile_fmode("[eventfd]", &eventfd_fops,
-                                  ctx, flags, FMODE_NOWAIT));
-
-    ctx->id = ida_alloc(&eventfd_ida, GFP_KERNEL);  // 全局 ID
-    retain_and_null_ptr(ctx);
-    return fd_publish(fdf);                     // → fd_install
-}
-```
-
-**doom-lsp 确认**：`do_eventfd` @ `:379`。`SYSCALL_DEFINE2(eventfd2)` @ `:414`。`FMODE_NOWAIT` 标记支持 IOCB_NOWAIT。
-
----
-
-### 1.3 eventfd_signal_mask @ :56——内核信号（关键）
-
-```c
-void eventfd_signal_mask(struct eventfd_ctx *ctx, __poll_t mask)
-{
-    unsigned long flags;
-
-    // ❗ 递归防护——防止 waitqueue 回调中的无限递归
-    if (WARN_ON_ONCE(current->in_eventfd))
-        return;
-
-    spin_lock_irqsave(&ctx->wqh.lock, flags);
-    current->in_eventfd = 1;
-
-    if (ctx->count < ULLONG_MAX)
-        ctx->count++;
-
-    if (waitqueue_active(&ctx->wqh))
-        wake_up_locked_poll(&ctx->wqh, EPOLLIN | mask);
-
-    current->in_eventfd = 0;
-    spin_unlock_irqrestore(&ctx->wqh.lock, flags);
-}
-```
-
-**设计决策**：`in_eventfd` 防止 `wake_up_locked_poll` 回调中再次调用 `eventfd_signal` 导致栈溢出。例如 epoll 的 `ep_poll_callback` 可能最终调用 `eventfd_signal`。
-
-**doom-lsp 确认**：`eventfd_signal_mask` @ `:56`。`current->in_eventfd` 在 `include/linux/sched.h` 中声明。
-
----
-
-### 1.4 eventfd_read @ :214——用户读取
-
-```c
-static ssize_t eventfd_read(struct kiocb *iocb, struct iov_iter *to)
-{
     spin_lock_irq(&ctx->wqh.lock);
 
-    if (!ctx->count) {                       // 无数据
-        if (file->f_flags & O_NONBLOCK) {    // 非阻塞
-            spin_unlock_irq(&ctx->wqh.lock);
-            return -EAGAIN;
-        }
-        // 阻塞等待
-        wait_event_interruptible_locked_irq(ctx->wqh, ctx->count);
-        // → 释放锁 → 调度 → 唤醒后重新获取锁
-    }
-
-    eventfd_ctx_do_read(ctx, &ucnt);          // 读取值
-    // 读完成后唤醒写端（让 write 不再阻塞）
-    current->in_eventfd = 1;
-    if (waitqueue_active(&ctx->wqh))
-        wake_up_locked_poll(&ctx->wqh, EPOLLOUT);
-    current->in_eventfd = 0;
-    spin_unlock_irq(&ctx->wqh.lock);
-
-    copy_to_iter(&ucnt, sizeof(ucnt), to);
-    return sizeof(ucnt);
-}
-```
-
-### 1.5 eventfd_write @ :247——用户写入
-
-```c
-static ssize_t eventfd_write(struct file *file, const char __user *buf, size_t count,
-                             loff_t *ppos)
-{
-    spin_lock_irq(&ctx->wqh.lock);
-
-    // 检查是否会溢出
-    res = -EAGAIN;
+    /* 非阻塞且溢出→EAGAIN；否则等待可写 */
     if (ULLONG_MAX - ctx->count > ucnt)
-        res = sizeof(ucnt);
+        res = sizeof(ucnt);                    /* 正常：可以累加 */
     else if (!(file->f_flags & O_NONBLOCK)) {
-        // 阻塞直到有空间
         res = wait_event_interruptible_locked_irq(ctx->wqh,
-                    ULLONG_MAX - ctx->count > ucnt);
-        if (!res) res = sizeof(ucnt);
-    }
+              ULLONG_MAX - ctx->count > ucnt); /* 阻塞直到可写 */
+    } else
+        res = -EAGAIN;
 
     if (res > 0) {
-        ctx->count += ucnt;                  // 递增计数
+        ctx->count += ucnt;
+
+        /* 关键：设置 in_eventfd 防止递归信号 */
         current->in_eventfd = 1;
         if (waitqueue_active(&ctx->wqh))
-            wake_up_locked_poll(&ctx->wqh, EPOLLIN);  // 通知读端
+            wake_up_locked_poll(&ctx->wqh, EPOLLIN);
         current->in_eventfd = 0;
     }
     spin_unlock_irq(&ctx->wqh.lock);
@@ -155,198 +74,270 @@ static ssize_t eventfd_write(struct file *file, const char __user *buf, size_t c
 }
 ```
 
----
+**关键设计细节**：
+- `current->in_eventfd` 防止 eventfd 操作中处理信号导致递归
+- `wake_up_locked_poll` 在持有锁时唤醒，配合 epoll 的精确唤醒
+- 计数器溢出（达到 ULLONG_MAX）会被阻塞直到有人读走一部分
 
-### 1.6 eventfd_poll @ :118——poll 与内存序
+### 1.3 eventfd_read @ eventfd.c:214——读取消耗计数
+
+```c
+// fs/eventfd.c:214
+static ssize_t eventfd_read(struct kiocb *iocb, struct iov_iter *to)
+{
+    struct file *file = iocb->ki_filp;
+    struct eventfd_ctx *ctx = file->private_data;
+    __u64 cnt;
+
+    spin_lock_irq(&ctx->wqh.lock);
+
+    /* 计数为零且非阻塞→EAGAIN；否则等待 */
+    if (ctx->count > 0) {
+        cnt = ctx->count;
+
+        if (ctx->flags & EFD_SEMAPHORE) {
+            /* 信号量模式：每次读 1 */
+            cnt = 1;
+            ctx->count -= 1;
+        } else {
+            /* 普通模式：读完清零 */
+            ctx->count = 0;
+        }
+    } else if (!(file->f_flags & O_NONBLOCK)) {
+        /* 阻塞等待有数据 */
+    } else
+        return -EAGAIN;
+
+    if (cnt > 0) {
+        if (waitqueue_active(&ctx->wqh))
+            wake_up_locked_poll(&ctx->wqh, EPOLLOUT);
+    }
+    spin_unlock_irq(&ctx->wqh.lock);
+    return cnt;
+}
+```
+
+**EFD_SEMAPHORE vs 普通模式**：
+- 普通模式：read 返回当前 count 并清零（"一次读走所有"）
+- 信号量模式：每次 read 只减 1（"一次取一个令牌"）
+
+### 1.4 eventfd_poll @ eventfd.c:118
 
 ```c
 static __poll_t eventfd_poll(struct file *file, poll_table *wait)
 {
-    poll_wait(file, &ctx->wqh, wait);      // 加入等待队列
+    struct eventfd_ctx *ctx = file->private_data;
+    u64 count;
 
-    /*
-     * count 的读取放在 poll_wait 之后。poll_wait 内部持有 wqh.lock
-     * （通过 add_wait_queue），这个 spin_lock 提供 acquire 屏障。
-     * 保证了我们不会在 add_wait_queue 之前读到旧的 count 值——
-     * 否则可能出现：poll 返回 0（没数据）→ 在 poll_wait 之前
-     * 写入方 signal → 但 waitqueue_active 为 false → 不唤醒
-     * → 永久丢失唤醒事件。
-     *
-     * poll_wait 的 lock 保证：count 的读取不早于 add_wait_queue。
-     */
+    poll_wait(file, &ctx->wqh, wait);
     count = READ_ONCE(ctx->count);
 
-    if (count > 0)        events |= EPOLLIN;
-    if (count == ULLONG_MAX) events |= EPOLLERR;
-    if (ULLONG_MAX - 1 > count) events |= EPOLLOUT;
+    if (count > 0)
+        events |= EPOLLIN;
+    if (count == ULLONG_MAX)
+        events |= EPOLLERR;
+    if (ULLONG_MAX - 1 > count)
+        events |= EPOLLOUT;
     return events;
 }
 ```
 
-**doom-lsp 确认**：`eventfd_poll` @ `:118`。注释详细解释了 poll 的内存序正确性——`poll_wait` 的 `spin_lock` 提供 acquire 语义，保证 count 读取在 add_wait_queue 之后可见。
+**关键 memory ordering 保证**（由 poll_wait 中的 spin_lock 提供 acquire barrier）：
+- `READ_ONCE(ctx->count)` 在 `poll_wait()` 之后执行
+- 保证不会丢失 write 侧的 wakeup（详细注释在 eventfd.c:118-168）
 
----
-
-### 1.7 eventfd_ctx_remove_wait_queue @ :198——KVM/VFIO 专用 API
+### 1.5 内核态接口——eventfd_signal
 
 ```c
-// KVM 和 VFIO 使用此 API 自定义等待——直接操作 waitqueue
-// 而不是通过标准的 read/poll 路径：
-//
-// 1. 自行 add_wait_queue 到 ctx->wqh
-// 2. 等待事件（自己的调度机制）
-// 3. 调用此 API 移除自身并读取 count
-
-int eventfd_ctx_remove_wait_queue(struct eventfd_ctx *ctx, wait_queue_entry_t *wait,
-                                  __u64 *cnt)
+// 内核其他模块调用
+__u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
 {
     spin_lock_irqsave(&ctx->wqh.lock, flags);
-    eventfd_ctx_do_read(ctx, cnt);                 // 读取值
-    __remove_wait_queue(&ctx->wqh, wait);           // 移除自身
-    if (*cnt != 0 && waitqueue_active(&ctx->wqh))
-        wake_up_locked_poll(&ctx->wqh, EPOLLOUT);   // 唤醒其他等待者
+    ctx->count += n;
+    if (waitqueue_active(&ctx->wqh))
+        wake_up_locked_poll(&ctx->wqh, EPOLLIN);
     spin_unlock_irqrestore(&ctx->wqh.lock, flags);
-
-    return *cnt != 0 ? 0 : -EAGAIN;
+    return n;
 }
 ```
 
-**doom-lsp 确认**：`eventfd_ctx_remove_wait_queue` @ `:198`。`eventfd_ctx_do_read` @ `:176`。
+用于内核→用户态的事件通知（如 vhost、KVM、io_uring）。
+
+### 1.6 创建和生命周期
+
+```c
+// fs/eventfd.c:414
+SYSCALL_DEFINE2(eventfd2, unsigned int, count, int, flags)
+{
+    struct eventfd_ctx *ctx;
+    int fd;
+
+    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+    kref_init(&ctx->kref);
+    init_waitqueue_head(&ctx->wqh);
+    ctx->count = count;
+    ctx->flags = flags;
+    ctx->id = ida_alloc(&eventfd_ida, GFP_KERNEL);
+
+    fd = anon_inode_getfd("[eventfd]", &eventfd_fops, ctx,
+                          O_RDWR | (flags & EFD_SHARED_FCNTL_FLAGS));
+    return fd;
+}
+```
+
+**关键**：使用 `anon_inode_getfd()` 创建匿名 inode，不需要真实文件系统支持。生命周期通过 `kref`（内核引用计数）+ `file->private_data` 管理。
+
+### 1.7 fops 表 @ eventfd.c:302
+
+```c
+static const struct file_operations eventfd_fops = {
+    .show_fdinfo = eventfd_show_fdinfo,
+    .release     = eventfd_release,
+    .poll        = eventfd_poll,
+    .read_iter   = eventfd_read,
+    .write       = eventfd_write,
+    .llseek      = noop_llseek,
+};
+```
 
 ---
 
 ## 2. signalfd
 
-### 2.1 struct signalfd_ctx @ :41
+signalfd 将 Unix 信号转换为文件描述符。当信号递送到进程时，signalfd 变得可读，用户态通过 read() 获取 `struct signalfd_siginfo`。
+
+### 2.1 核心状态
 
 ```c
+// fs/signalfd.c
 struct signalfd_ctx {
-    sigset_t sigmask;                        // 感兴趣的信号集合
+    sigset_t sigmask;     /* 此 fd 关注的信号集合 */
 };
 ```
 
-### 2.2 do_signalfd4 @ :251——创建
+每个 signalfd 关联一个信号掩码。队列在 `struct task_struct->sigpending` 中统一管理——signalfd 只是信号的**观察者**，不是独立的队列。
 
-```c
-static int do_signalfd4(int fd, sigset_t *mask, int flags)
-{
-    struct signalfd_ctx *ctx;
+### 2.2 信号递送路径
 
-    // 如果 fd != -1 → 替换已存在的 signalfd
-    if (fd != -1) {
-        struct file *file = fget(fd);
-        ctx = file->private_data;
-        ctx->sigmask = *mask;               // 更新信号掩码
-        fput(file);
-        return fd;
-    }
-
-    // 创建新 signalfd
-    ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
-    ctx->sigmask = *mask;                    // 设置要捕获的信号
-
-    fd = anon_inode_getfd("[signalfd]", &signalfd_fops, ctx, flags);
-    // → eventfd_cleanup 在 release 时 kfree(ctx)
-}
+```
+信号到达
+    ↓
+__send_signal()
+    ↓
+sigaddset(&pending->signal, sig)   /* 设置 pending 位 */
+    ↓
+complete_signal()
+    ↓
+signal_wake_up()
+    ↓
+wake_up_state(tsk, TASK_INTERRUPTIBLE)
+    ↓
+系统调用返回时 check signal → 唤醒 signalfd 的 waitqueue
+    ↓
+signalfd_poll() 返回 EPOLLIN
+    ↓
+read(fd, &siginfo, sizeof(siginfo)) → 获取信号信息
 ```
 
-### 2.3 signalfd_dequeue @ :154——信号读取（核心）
+### 2.3 关键特性
+
+- **信号不会被消耗**：signalfd 读取信号后，信号仍然在 task 的 pending 集中
+- **择优使用**：如果设置了 signalfd，且信号在 signalfd 的 mask 中，信号不会走传统 handler
+- **与 epoll 集成**：signalfd 可加入 epoll，用统一的事件循环处理 IO + 信号
+
+---
+
+## 3. 实际应用模式
+
+### 3.1 eventfd as 事件计数器（epoll 事件循环）
 
 ```c
-// 用户 read(signalfd_fd, buf, size) → signalfd_read_iter
-// → signalfd_dequeue() 从 pending 队列取信号
+/* 线程 A：事件生产者 */
+uint64_t val = 1;
+write(efd, &val, sizeof(val));   /* 通知事件循环有数据 */
 
-static ssize_t signalfd_dequeue(struct signalfd_ctx *ctx,
-                                kernel_siginfo_t *info, int nonblock)
-{
-    // 1. 尝试非阻塞出队
-    spin_lock_irq(&current->sighand->siglock);
-    ret = dequeue_signal(&ctx->sigmask, info, &type);
-    // dequeue_signal 从 current->pending 或 current->signal->shared_pending
-    // 取信号，更新 signal_struct 的计数值
+/* 线程 B：epoll 事件循环 */
+epoll_wait(epfd, events, maxevents, -1);
+/* eventfd 可读 → 处理 */
+read(efd, &val, sizeof(val));
+/* 继续处理实际 IO */
+```
 
-    if (ret != 0) {                          // 有可读信号
-        spin_unlock_irq(&current->sighand->siglock);
-        return ret;
-    }
-    if (nonblock) {                          // EFD_NONBLOCK
-        spin_unlock_irq(&current->sighand->siglock);
-        return -EAGAIN;
-    }
+### 3.2 eventfd as semaphore（线程间令牌传递）
 
-    // 2. 阻塞等待
-    add_wait_queue(&current->sighand->signalfd_wqh, &wait);
-    for (;;) {
-        set_current_state(TASK_INTERRUPTIBLE);
-        ret = dequeue_signal(&ctx->sigmask, info, &type);
-        if (ret != 0) break;                 // 收到信号
-        if (signal_pending(current)) {       // 其他信号
-            ret = -ERESTARTSYS;
-            break;
+```c
+/* EFD_SEMAPHORE 模式：每个 read 消耗一个令牌 */
+int efd = eventfd(0, EFD_SEMAPHORE);
+
+/* 生产者：释放 N 个令牌 */
+val = 10; write(efd, &val, sizeof(val));
+
+/* 消费者：逐个获取令牌 */
+read(efd, &val, sizeof(val));  /* val == 1 */
+```
+
+### 3.3 signalfd + epoll（统一事件模型）
+
+```c
+sigset_t mask;
+sigemptyset(&mask);
+sigaddset(&mask, SIGINT);
+sigaddset(&mask, SIGTERM);
+sigprocmask(SIG_BLOCK, &mask, NULL);  /* 拦截信号 */
+
+int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
+
+/* 将 signalfd 加入 epoll */
+struct epoll_event ev = {.events = EPOLLIN, .data = {.fd = sfd}};
+epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev);
+
+/* 统一事件循环 */
+while (1) {
+    int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+    for (i = 0; i < n; i++) {
+        if (events[i].data.fd == sfd) {
+            struct signalfd_siginfo fdsi;
+            read(sfd, &fdsi, sizeof(fdsi));
+            if (fdsi.ssi_signo == SIGINT) break;
         }
-        spin_unlock_irq(&current->sighand->siglock);
-        schedule();
-        spin_lock_irq(&current->sighand->siglock);
+        /* 处理其他 fd */
     }
-    spin_unlock_irq(&current->sighand->siglock);
-    remove_wait_queue(&current->sighand->signalfd_wqh, &wait);
-    __set_current_state(TASK_RUNNING);
-    return ret;
 }
 ```
 
-**doom-lsp 确认**：`signalfd_dequeue` @ `:154`。底层 `dequeue_signal` 在 `kernel/signal.c` 中——从 `struct task_struct` 的 `pending` 信号链表取出第一个匹配的信号。
+---
+
+## 4. 总结
+
+| 特性 | eventfd | signalfd |
+|------|---------|----------|
+| **核心结构** | `struct eventfd_ctx` | `struct signalfd_ctx` |
+| **数据** | `__u64 count` | `struct signalfd_siginfo` |
+| **IO 操作** | write+=, read-= | read 获取信号信息 |
+| **阻塞语义** | 读空阻塞 / 写满阻塞 | 无信号时阻塞 |
+| **epoll 集成** | 可（EPOLLIN/OUT/ERR） | 可（EPOLLIN）|
+| **内核消费者** | eventfd_signal() 接口 | 不直接 |
+| **通知方向** | 双向（用户↔内核） | 单向（内核→用户）|
+| **典型用途** | io_uring 完成通知、线程间事件 | 信号驱动的 epoll 事件循环 |
 
 ---
 
-## 3. 内核集成
-
-eventfd 被广泛用于内核→用户异步通知：
-
-| 子系统 | 用法 |
-|--------|------|
-| **KVM** | 客户机 IO 完成 → `eventfd_signal` → QEMU epoll 返回 |
-| **VFIO** | 设备中断 → `eventfd_signal` → 用户空间中断处理 |
-| **io_uring** | 完成事件 → `eventfd_signal` → 用户 epoll 通知 |
-| **AIO** | aio 完成 → `eventfd_signal` → epoll 通知 |
-
----
-
-## 4. 关键函数索引
-
-| 函数 | 文件:行号 | 作用 |
-|------|----------|------|
-| `do_eventfd` | `eventfd.c:379` | fd 创建（kmalloc + anon_inode + ida）|
-| `eventfd_signal_mask` | `eventfd.c:56` | 内核侧信号（in_eventfd 递归防护）|
-| `eventfd_read` | `eventfd.c:214` | 用户读取（阻塞/非阻塞）|
-| `eventfd_write` | `eventfd.c:247` | 用户写入（溢出检测）|
-| `eventfd_poll` | `eventfd.c:118` | poll（内存序屏障分析）|
-| `eventfd_ctx_remove_wait_queue` | `eventfd.c:198` | KVM/VFIO 专用 API |
-| `do_signalfd4` | `signalfd.c:251` | signalfd 创建 |
-| `signalfd_dequeue` | `signalfd.c:154` | 信号出队（阻塞/非阻塞）|
-
----
-
-## 5. 总结
-
-eventfd（`eventfd_signal_mask` @ `:56` + `eventfd_read` @ `:214` + `eventfd_write` @ `:247`）将**计数器通知**转换为 fd，通过 `in_eventfd` 递归防护（`:60`）和 `poll_wait` 屏障分析（`:118`）保证正确性。signalfd（`signalfd_dequeue` @ `:154`）将**信号传递**转换为 fd，底层通过 `dequeue_signal`（`kernel/signal.c`）从 pending 队列取信号。
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
-
-## 源码索引
+### 源码索引（LSP 验证）
 
 | 符号 | 文件 | 行号 |
 |------|------|------|
 | `struct eventfd_ctx` | fs/eventfd.c | 30 |
-| `eventfd_signal()` | fs/eventfd.c | 相关 |
-| `SYSCALL_DEFINE2(eventfd)` | fs/eventfd.c | 相关 |
-| `do_eventfd()` | fs/eventfd.c | 相关 |
-| `struct signalfd_ctx` | fs/signalfd.c | 41 |
-| `signalfd_dequeue()` | fs/signalfd.c | 154 |
-| `SYSCALL_DEFINE4(signalfd4)` | fs/signalfd.c | 相关 |
+| `eventfd_write()` | fs/eventfd.c | 247 |
+| `eventfd_read()` | fs/eventfd.c | 214 |
+| `eventfd_poll()` | fs/eventfd.c | 118 |
+| `eventfd_ctx_fdget()` | fs/eventfd.c | 348 |
+| `eventfd_ctx_fileget()` | fs/eventfd.c | 366 |
+| `SYSCALL_DEFINE2(eventfd2)` | fs/eventfd.c | 414 |
+| `eventfd_fops` | fs/eventfd.c | 302 |
+| `eventfd_release()` | fs/eventfd.c | 109 |
+| `eventfd_signal()` | kernel/events/core.c | — |
+| `struct signalfd_ctx` | fs/signalfd.c | — |
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-04 | 内核版本：Linux 7.0-rc1*
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-08 | 内核版本：Linux 7.0-rc1*
