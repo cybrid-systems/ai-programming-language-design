@@ -1,31 +1,30 @@
-# 74-clk — Linux 时钟框架（Common Clock Framework）深度源码分析
+# 74-clk — Linux Common Clock Framework (CCF) 深度源码分析
 
 > 基于 Linux 7.0-rc1 主线源码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
-> 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1
+> 分析日期：2026-05-08 | 内核版本：Linux 7.0-rc1
 
 ---
 
 ## 0. 概述
 
-**Linux CCF（Common Clock Framework）** 是内核时钟管理框架，为 SoC 中的各种时钟设备（RC 振荡器、PLL、分频器、多路选择器、门控单元）提供统一接口。设备驱动通过 `clk_get`/`clk_prepare_enable`/`clk_set_rate` 等 API 控制时钟，无需了解底层硬件细节。
+**Common Clock Framework（CCF）** 是 Linux 内核的通用时钟管理子系统，提供一个统一的框架来管理 SoC 上的时钟树（clock tree）。每个时钟节点（如 PLL、分频器、门控、多路选择器）都抽象为 `struct clk_core`，形成从根晶振到外设时钟的树状结构。
 
-**核心设计**：CCF 将 SoC 时钟拓扑组织为**时钟树**（`struct clk_core` 的父子关系）。每个时钟节点代表一个硬件时钟（固定频率、PLL、分频器、门控、mux），通过 `struct clk_ops` 定义硬件操作。时钟频率变更从叶子向上传播——`clk_set_rate` 遍历树找到最优配置。
+**核心抽象**：
 
 ```
-          固定 24MHz 晶振 (xtal)
-               │
-            PLL (×16) → 384MHz
-               │
-        ┌──────┴──────┐
-    分频器 /2     分频器 /4 → 96MHz
-        │               │
-    门控单元          UART 时钟
-        │
-    CPU 时钟
+struct clk_core (内部核心)
+    ↑ 用户接口
+struct clk (消费者句柄)
+    ↑ 驱动接口
+struct clk_hw + struct clk_ops (硬件操作)
+    ↑ 硬件
+SoC 时钟寄存器
 ```
 
-**doom-lsp 确认**：核心实现在 `drivers/clk/clk.c`（**5,586 行**，**597 个符号**）。头文件 `include/linux/clk.h`（1,258 行）。常见时钟类型：`clk-divider.c`（630 行）、`clk-gate.c`（259 行）、`clk-mux.c`、`clk-fixed-rate.c`。
+**两个关键设计**：
+1. **prepare/enable 分离**：prepare 可能睡眠（I2C 配置时钟芯片），enable 保持原子（寄存器 MMIO 操作）
+2. **引用计数**：`prepare_count` 和 `enable_count` 分别跟踪，支持嵌套调用
 
 ---
 
@@ -34,357 +33,580 @@
 ### 1.1 struct clk_core — 时钟节点 @ clk.c:66
 
 ```c
-// drivers/clk/clk.c:66-119
+// drivers/clk/clk.c:66
 struct clk_core {
-    const char *name;                          /* 时钟名（如 "pll0"）*/
-    const struct clk_ops *ops;                 /* 硬件操作 */
-    struct clk_hw *hw;                         /* 硬件特定数据 */
+    const char *name;
+    const struct clk_ops *ops;              /* 驱动操作回调 */
+    struct clk_hw *hw;                      /* 硬件数据 */
     struct module *owner;
     struct device *dev;
-
-    /* ── 父子关系 ─ */
-    struct clk_core *parent;                   /* 父时钟 */
-    struct clk_parent_map *parents;            /* 可选父时钟列表 */
-    u8 num_parents;                            /* 可选父时钟数 */
-    u8 new_parent_index;                       /* 切换中的新父时钟 */
-
-    /* ── 频率状态 ─ */
-    unsigned long rate;                        /* 当前频率 */
-    unsigned long req_rate;                    /* 请求频率（可能未达成）*/
-    unsigned long new_rate;                    /* 切换中的新频率 */
-    unsigned long min_rate;                    /* 最低速率限制 */
-    unsigned long max_rate;                    /* 最高速率限制 */
-
-    /* ── 引用计数 ─ */
-    unsigned int enable_count;                 /* clk_enable 调用次数 */
-    unsigned int prepare_count;                /* clk_prepare 调用次数 */
-    unsigned int protect_count;                /* 速率保护计数 */
-
-    struct hlist_head children;                /* 子时钟链表 */
-    struct hlist_node child_node;              /* 父时钟的子节点链 */
-    struct hlist_node hashtable_node;          /* 全局哈希表节点 */
+    struct device_node *of_node;
+    struct clk_core *parent;                /* 父时钟指针 */
+    struct clk_parent_map *parents;         /* 可选父时钟列表 */
+    u8 num_parents;
+    u8 new_parent_index;
+    unsigned long rate;                     /* 当前频率 */
+    unsigned long req_rate;                 /* 请求频率 */
+    unsigned long new_rate;                 /* 切换中的目标频率 */
+    struct clk_core *new_parent;
+    struct clk_core *new_child;
+    unsigned long flags;                    /* CLK_* 标志 */
+    bool orphan;                            /* 父时钟未就绪？ */
+    unsigned int enable_count;              /* enable 引用计数 */
+    unsigned int prepare_count;             /* prepare 引用计数 */
+    unsigned int protect_count;             /* rate 保护计数 */
+    unsigned long min_rate, max_rate;
+    unsigned long accuracy;
+    int phase;                              /* 相位偏移度 */
+    struct clk_duty duty;                   /* 占空比 */
+    struct hlist_head children;             /* 子时钟链表 */
+    struct hlist_node child_node;
+    struct hlist_node hashtable_node;       /* 全局哈希表 */
+    struct hlist_head clks;                 /* 指向此 core 的所有句柄 */
+    struct kref ref;
 };
 ```
 
-**doom-lsp 确认**：`struct clk_core` @ `clk.c:66`。`rate`/`enable_count`/`prepare_count` 是运行时关键状态。
+**关键字段**：
+- `parent` / `children`：构成时钟树的双向关系
+- `orphan`：父时钟尚未注册的节点暂存于 `clk_orphan_list`
+- `rate` / `req_rate` / `new_rate`：支持原子频率切换（rate transition）
 
-### 1.2 struct clk — 用户空间句柄
+### 1.2 struct clk — 消费者句柄
 
 ```c
-// drivers/clk/clk.c:121-129
+// drivers/clk/clk.c
 struct clk {
-    struct clk_core *core;                     /* 指向 clk_core */
-    struct device *dev;                        /* 请求者设备 */
-    const char *dev_id;                        /* 设备 ID */
-    const char *con_id;                        /* 连接 ID（如 "uart_clk"）*/
-    unsigned long min_rate, max_rate;          /* per-user 速率限制 */
+    struct clk_core *core;         /* 指向内部时钟节点 */
+    struct device *dev;
+    const char *dev_id;
+    const char *con_id;
+    unsigned long min_rate;
+    unsigned long max_rate;
     unsigned int exclusive_count;
-    struct hlist_node clks_node;                /* clk_core->clks 链表节点 */
+    struct hlist_node clks_node;
 };
 ```
 
-**设计洞察**：`struct clk` 是**轻量句柄**——多个消费者可以共享同一个 `clk_core`。每个 `struct clk` 可以设置独立的 `min_rate`/`max_rate` 约束。
+`struct clk` 是消费者看到的句柄，所有 API（`clk_get_rate()`、`clk_prepare_enable()`）都通过 `core` 指针转发到底层操作。
 
----
-
-## 2. 时钟操作结构（struct clk_ops）
+### 1.3 struct clk_hw — 硬件接口 @ clk-provider.h:320
 
 ```c
-// include/linux/clk.h
+// include/linux/clk-provider.h:320
+struct clk_hw {
+    struct clk *clk;          /* 注册时框架设置 */
+    const struct clk_init_data *init; /* 注册用的初始化数据（登记后置 NULL）*/
+};
+```
+
+驱动提供者分配 `struct clk_hw`（或嵌入在自定义结构体中），填充 `init`，然后调用 `clk_hw_register()` 或 `devm_clk_hw_register()`。
+
+### 1.4 struct clk_ops — 时钟操作回调
+
+```c
+// include/linux/clk-provider.h
 struct clk_ops {
-    int (*prepare)(struct clk_hw *hw);           /* 允许睡眠的准备操作 */
+    int (*prepare)(struct clk_hw *hw);           /* 可睡眠的准备 */
     void (*unprepare)(struct clk_hw *hw);
     int (*is_prepared)(struct clk_hw *hw);
-    void (*enable)(struct clk_hw *hw);           /* 原子操作 */
+
+    int (*enable)(struct clk_hw *hw);             /* 原子使能 */
     void (*disable)(struct clk_hw *hw);
     int (*is_enabled)(struct clk_hw *hw);
 
-    unsigned long (*recalc_rate)(struct clk_hw *hw,           /* 重新计算频率 */
+    int (*save_context)(struct clk_hw *hw);       /* PM 上下文保存 */
+    void (*restore_context)(struct clk_hw *hw);
+
+    unsigned long (*recalc_rate)(struct clk_hw *hw,
                                  unsigned long parent_rate);
-    long (*round_rate)(struct clk_hw *hw, unsigned long rate, /* 请求最优频率 */
-                      unsigned long *parent_rate);
-    int (*set_rate)(struct clk_hw *hw, unsigned long rate,    /* 设置频率 */
-                    unsigned long parent_rate);
-    int (*set_rate_and_parent)(struct clk_hw *hw, ...);
-    int (*determine_rate)(struct clk_hw *hw,                  /* 自动决定频率 */
+    int (*determine_rate)(struct clk_hw *hw,
                           struct clk_rate_request *req);
-
-    int (*set_parent)(struct clk_hw *hw, u8 index);          /* 选择父时钟 */
+    int (*set_parent)(struct clk_hw *hw, u8 index);
     u8 (*get_parent)(struct clk_hw *hw);
-
-    void (*init)(struct clk_hw *hw);                          /* 初始化回调 */
-    void (*debug_init)(struct clk_hw *hw, struct dentry *dentry);
+    int (*set_rate)(struct clk_hw *hw,
+                    unsigned long rate,
+                    unsigned long parent_rate);
+    int (*set_rate_and_parent)(struct clk_hw *hw,
+                               unsigned long rate,
+                               unsigned long parent_rate,
+                               unsigned int index);
+    int (*round_rate)(struct clk_hw *hw,
+                      unsigned long rate,
+                      unsigned long *parent_rate);
+    long (*round_rate_long)(struct clk_hw *hw,
+                            unsigned long rate,
+                            unsigned long *parent_rate);
+    int (*init)(struct clk_hw *hw);               /* 初始化回调 */
+    void (*terminate)(struct clk_hw *hw);
+    int (*debug_init)(struct clk_hw *hw, struct dentry *dentry);
+    /* ... phase, duty_cycle 等 ... */
 };
+```
+
+**prepare / enable 分离**：
+- `prepare` 可以睡眠（I2C/SPI 访问时钟芯片）
+- `enable` 必须原子（读写 MMIO 寄存器）
+- 调用顺序：`clk_prepare()` → `clk_enable()` → ... → `clk_disable()` → `clk_unprepare()`
+- 便捷函数：`clk_prepare_enable()` / `clk_disable_unprepare()`
+
+---
+
+## 2. 注册流程
+
+### 2.1 __clk_register @ clk.c:4306 — 核心注册
+
+```c
+// drivers/clk/clk.c:4306
+__clk_register(struct device *dev, struct device_node *np, struct clk_hw *hw)
+{
+    const struct clk_init_data *init = hw->init;
+
+    /* 注册后清除 init 指针，防止驱动误用 */
+    hw->init = NULL;
+
+    /* 1. 分配 clk_core */
+    core = kzalloc_obj(*core);
+
+    /* 2. 复制基本信息 */
+    core->name = kstrdup_const(init->name, GFP_KERNEL);
+    core->ops = init->ops;
+    core->dev = dev;
+    core->of_node = np;
+    core->hw = hw;
+    core->flags = init->flags;
+    core->num_parents = init->num_parents;
+
+    /* 3. 解析父时钟列表 */
+    clk_core_populate_parent_map(core, init);
+
+    /* 4. 创建消费者句柄 */
+    hw->clk = alloc_clk(core, NULL, NULL);
+    clk_core_link_consumer(core, hw->clk);
+
+    /* 5. 初始化时钟节点（插入树、计算初始频率等）*/
+    ret = __clk_core_init(core);
+
+    return hw->clk;
+}
+```
+
+### 2.2 __clk_core_init @ clk.c:3877 — 节点初始化
+
+```c
+// drivers/clk/clk.c:3877
+static int __clk_core_init(struct clk_core *core)
+{
+    /* 1. 处理父子关系 */
+    parent = clk_core_get_parent(core);
+    if (parent) {
+        hlist_add_head(&core->child_node, &parent->children);
+        core->orphan = parent->orphan;
+    } else if (!core->num_parents) {
+        hlist_add_head(&core->child_node, &clk_root_list);    /* 根时钟 */
+    } else {
+        hlist_add_head(&core->child_node, &clk_orphan_list);  /* 孤子 */
+        core->orphan = true;
+    }
+
+    /* 2. 加入全局哈希表（名称查找）*/
+    hash_add(clk_hashtable, &core->hashtable_node,
+             full_name_hash(NULL, core->name, strlen(core->name)));
+
+    /* 3. 计算初始 accuracy */
+    if (core->ops->recalc_accuracy)
+        core->accuracy = core->ops->recalc_accuracy(core->hw, ...);
+    else if (parent)
+        core->accuracy = parent->accuracy;
+    else
+        core->accuracy = 0;
+
+    /* 4. 缓存初始 phase 和 duty cycle */
+    core->phase = clk_core_get_phase(core);
+    clk_core_update_duty_cycle_nolock(core);
+
+    /* 5. 计算初始频率 */
+    if (core->ops->recalc_rate)
+        core->rate = core->ops->recalc_rate(core->hw, ...);
+    else if (parent)
+        core->rate = parent->rate;
+    else
+        core->rate = 0;
+
+    /* 6. 调用驱动的 init 回调 */
+    if (core->ops->init)
+        core->ops->init(core->hw);
+}
+```
+
+### 2.3 注册 API 层次
+
+```c
+// 老式 API（已废弃，保持兼容）
+struct clk *clk_register(struct device *dev, struct clk_hw *hw)
+    → return __clk_register(dev, dev_or_parent_of_node(dev), hw);  // @ clk.c:4430
+
+// 推荐 API
+int clk_hw_register(struct device *dev, struct clk_hw *hw)
+    → return PTR_ERR_OR_ZERO(__clk_register(dev, ...));          // @ clk.c:4448
+
+// DT 节点注册（无 struct device）
+int of_clk_hw_register(struct device_node *node, struct clk_hw *hw)
+    → return PTR_ERR_OR_ZERO(__clk_register(NULL, node, hw));    // @ clk.c:4466
+
+// 资源管理版本
+struct clk *devm_clk_register(struct device *dev, struct clk_hw *hw);  // @ clk.c:4633
+```
+
+**注册流程总结**：
+
+```
+clk_hw_register(dev, hw)           @ clk.c:4448
+    ↓
+__clk_register(dev, np, hw)        @ clk.c:4306
+    │
+    ├─ kzalloc: struct clk_core
+    ├─ core->ops = init->ops
+    ├─ clk_core_populate_parent_map()
+    ├─ alloc_clk() → hw->clk
+    └─ __clk_core_init(core)        @ clk.c:3877
+            │
+            ├─ hlist_add: children/root/orphan
+            ├─ hash_add: clk_hashtable
+            ├─ recalc_rate() → core->rate
+            └─ init() → 驱动初始化
+    ↓
+hw->clk 返回（通过 clk_get() 可获取）
 ```
 
 ---
 
-## 3. 核心 API 路径
+## 3. 时钟操作的核心路径
 
-### 3.1 clk_prepare @ clk.c:1172 — 准备时钟
+### 3.1 clk_prepare / clk_unprepare
+
+`clk_prepare()`（@ clk.c:1172）→ `clk_core_prepare_lock()`（@ clk.c:1149）→ `clk_core_prepare()`（@ clk.c:1100）：
 
 ```c
-// 可能睡眠（如启动 PLL 需要等待锁定）
-int clk_prepare(struct clk *clk)
+static int clk_core_prepare(struct clk_core *core)
 {
-    if (!clk)
-        return 0;
+    int ret = 0;
 
-    clk_prepare_lock();                     // mutex_lock
+    if (core->prepare_count == 0) {
+        /* 递归：先 prepare 父时钟 */
+        ret = clk_core_prepare(core->parent);
+        if (ret) return ret;
 
-    /* 递归向上准备父时钟 */
-    if (core->parent)
-        clk_prepare(core->parent->hw->clk);
-
-    if (core->ops->prepare)
-        core->ops->prepare(core->hw);       // 驱动回调
+        /* 调用驱动回调 */
+        if (core->ops->prepare)
+            ret = core->ops->prepare(core->hw);
+        if (ret) goto unprepare;
+    }
 
     core->prepare_count++;
-    clk_prepare_unlock();
+    return 0;
 }
 ```
 
-### 3.2 clk_enable @ clk.c:1394 — 使能时钟
+**关键特性**：prepare 是**自顶向下**递归的——先准备父时钟再准备自身。引用计数允许同一时钟被多个消费者 prepare 而不会重复操作硬件。
+
+### 3.2 clk_enable / clk_disable
+
+`clk_enable()`（@ clk.c:1394）→ `clk_core_enable_lock()` → `clk_core_enable()`：
 
 ```c
-// 原子操作（可能在 IRQ 上下文中调用）
-int clk_enable(struct clk *clk)
+// clk_core_enable — 递归使能父时钟
+static void clk_core_enable(struct clk_core *core)
 {
-    if (!clk)
-        return 0;
-
-    clk_enable_lock();                      // spin_lock_irqsave
-
-    /* 递归向上使能父时钟 */
-    if (core->parent)
-        clk_enable(core->parent->hw->clk);
-
-    if (core->ops->enable)
-        core->ops->enable(core->hw);        // 驱动回调
-
+    if (core->enable_count == 0) {
+        clk_core_enable(core->parent);       /* 先使能父时钟 */
+        if (core->ops->enable)
+            core->ops->enable(core->hw);     /* 调用原子使能 */
+    }
     core->enable_count++;
-    clk_enable_unlock();
 }
 ```
 
-**doom-lsp 确认**：`clk_prepare` @ `clk.c:1172`，`clk_enable` @ `clk.c:1394`。`prepare` 持 mutex（可睡眠），`enable` 持 spinlock（原子）。
+**关键设计**：使能同样递归——先使能父时钟，使时钟树的每个节点都处于可工作状态。
 
-### 3.3 clk_set_rate @ clk.c:2576 — 频率设置
-
-`clk_set_rate` 通过**自底向上计算 + 自顶向下执行**的三段路径完成频率变更：
+### 3.3 clk_set_rate — 频率设置
 
 ```c
-int clk_set_rate(struct clk *clk, unsigned long rate)
-{
-    /* 阶段 1: 计算新频率 @ :2261 */
-    // clk_calc_new_rates(core, rate) 自底向上遍历：
-    //   - 如果此时钟可以 round_rate → 请求最佳频率
-    //   - 如果 CLK_SET_RATE_PARENT → 递归调父时钟
-    //   - clk_calc_subtree() 设置子树所有节点的新频率
-    //   - 返回最顶层需要调整的时钟
-    top = clk_calc_new_rates(core, rate);
-
-    /* 阶段 2: 预变更通知 @ :1922 */
-    // clk_propagate_rate_change(top, PRE_RATE_CHANGE)
-    // 从 top 向下遍历子树，调用 clock notifier
-    // 任何 notifier 返回 NOTIFY_STOP_MASK → abort
-    fail_clk = clk_propagate_rate_change(top, PRE_RATE_CHANGE);
-
-    /* 阶段 3: 实际执行 @ :2386 */
-    // clk_change_rate(top) 从顶向下：
-    //   → 如果需要切换父时钟: ops->set_parent(core, p_index)
-    //   → 如果需要设新频率: ops->set_rate(core, new_rate, parent_rate)
-    //   → ops->recalc_rate(core, parent_rate) → core->rate
-    //   → 递归 children
-    clk_change_rate(top);
-
-    /* 阶段 4: 完成通知 */
-    clk_propagate_rate_change(top, POST_RATE_CHANGE);
-}
-
-// clk_calc_new_rates @ :2261 的核心逻辑：
-// 1. 调用 clk_core_determine_round_nolock 请求最优频率
-// 2. 如果时钟不可调且 CLK_SET_RATE_PARENT → 递归父时钟
-// 3. clk_calc_subtree(core, new_rate, parent, p_index) 设置子树
-// 4. 返回最顶层时钟——clk_change_rate 从此开始
-
-// clk_change_rate @ :2386 的核心逻辑：
-// static void clk_change_rate(struct clk_core *core)
-// {
-//     // 如果需要切换父时钟
-//     if (core->new_parent && core->new_parent != core->parent)
-//         __clk_set_parent(core, ...);
-//
-//     // 设置频率
-//     if (core->new_rate != core->rate && ops->set_rate)
-//         ops->set_rate(core->hw, core->new_rate, best_parent_rate);
-//
-//     // 更新缓存
-//     core->rate = ops->recalc_rate(core->hw, best_parent_rate);
-//
-//     // 递归所有子时钟
-//     hlist_for_each_entry(child, &core->children, child_node)
-//         clk_change_rate(child);
-// }
+clk_set_rate(clk, rate)
+    ↓
+clk_core_set_rate_nolock(core, rate)
+    ↓
+1. 调用 ops->determine_rate() 或 __clk_mux_determine_rate()
+   → 计算最佳分频组合，确定是否需要换父时钟
+    ↓
+2. clk_core_set_rate(core, req.rate, req.best_parent_rate)
+    ↓
+3. clk_change_rate(core)  — 自上而下传播
+    ↓
+   clk_core_set_rate_and_parent() 或 clk_core_set_rate()
+   → ops->set_rate_and_parent() 或 ops->set_rate()
 ```
 
-### 3.4 clk_get_rate @ clk.c:1980
-
-```c
-unsigned long clk_get_rate(struct clk *clk)
-{
-    return clk_core_get_rate(core);
-}
-
-static unsigned long clk_core_get_rate(struct clk_core *core)
-{
-    /* 如果支持 recalc_rate → 重新计算 */
-    if (core->ops->recalc_rate)
-        return core->ops->recalc_rate(core->hw, clk_core_get_rate(core->parent));
-
-    /* 否则返回缓存值 */
-    return core->rate;
-}
-```
+**频率传播**：当一个时钟改变频率时，所有依赖它的子时钟通过树遍历重新计算频率。
 
 ---
 
-## 4. 内建时钟类型
+## 4. 内置时钟类型（providers）
 
-### 4.1 clk-gate —— 门控时钟 @ clk-gate.c:259
+CCF 提供了几种常用的硬件抽象时钟类型：
+
+| 时钟类型 | 头文件 | 说明 |
+|---------|--------|------|
+| **fixed_rate** | `clk-fixed-rate.c` | 固定频率（晶振） |
+| **fixed_factor** | `clk-fixed-factor.c` | 固定分频/倍频 |
+| **gate** | `clk-gate.c` | 门控时钟（on/off） |
+| **divider** | `clk-divider.c` | 可分频时钟 |
+| **mux** | `clk-mux.c` | 多路选择器 |
+| **fractional_divider** | `clk-fractional-divider.c` | 小数分频 |
+| **composite** | `clk-composite.c` | gate + divider + mux 组合 |
+
+### gate 时钟示例
 
 ```c
-// 最简单的时钟类型：使能/禁用
-struct clk_gate {
-    struct clk_hw hw;
-    void __iomem *reg;           // 控制寄存器
-    u8 bit_idx;                  // 位偏移
-    u8 flags;                    // CLK_GATE_*
-    spinlock_t *lock;            // 寄存器锁
-};
+#define to_clk_gate(_hw) container_of(_hw, struct clk_gate, hw)
 
-int clk_gate_enable(struct clk_hw *hw) {
+static int clk_gate_enable(struct clk_hw *hw)
+{
     struct clk_gate *gate = to_clk_gate(hw);
-    u32 reg = readl(gate->reg);
-    reg |= BIT(gate->bit_idx);   // 置位使能
-    writel(reg, gate->reg);
+    unsigned long flags;
+
+    spin_lock_irqsave(gate->lock, flags);
+    clk_gate_set_bit(gate);      /* writel(reg, val | bit) */
+    spin_unlock_irqrestore(gate->lock, flags);
+    return 0;
 }
 ```
 
-### 4.2 clk-divider —— 分频器 @ clk-divider.c:630
+### divider 时钟示例
 
 ```c
-struct clk_divider {
-    struct clk_hw hw;
-    void __iomem *reg;           // 分频寄存器
-    u8 shift, width;             // 位域定义
-    u8 flags;                    // CLK_DIVIDER_*
-    const struct clk_div_table *table;  // 分频表
-};
-
-static unsigned long clk_divider_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
+static unsigned long clk_divider_recalc_rate(struct clk_hw *hw,
+                                             unsigned long parent_rate)
 {
-    // 读取寄存器值 → 计算分频系数 → 返回 parent_rate / div
+    struct clk_divider *divider = to_clk_divider(hw);
+    unsigned int val;
+
+    val = clk_readl(divider->reg) >> divider->shift;
+    val &= clk_div_mask(divider->width);  /* 读取分频值 */
+    return divider_recalc_rate(hw, parent_rate, val, divider->table,
+                               divider->flags, divider->width);
 }
 ```
 
-### 4.3 clk-mux —— 时钟选择器
+---
+
+## 5. 时钟树管理
+
+### 5.1 树结构
+
+```
+clk_root_list (全局根节点链表)
+    │
+    ├─ clk_core (xtal)
+    │   └─ children: clk_core (pll)
+    │       └─ children: clk_core (divider)
+    │           └─ children: clk_core (gate)→外设
+    │
+    └─ clk_core (osc)
+        └─ children: ...
+
+clk_orphan_list (父时钟未注册的节点)
+    └─ clk_core (某外设时钟，等待PLL就绪)
+```
+
+### 5.2 孤子处理
+
+当 `__clk_core_init()` 发现父时钟不在树中时，将节点挂入 `clk_orphan_list`。当父时钟后来注册时：
+
+```
+__clk_core_init(parent)
+    → 触发 clk_core_reparent_orphans()
+    → 遍历 orphan 列表，重新连接可匹配的子节点
+    → 设置 core->orphan = false
+```
+
+### 5.3 全局查找
+
+所有时钟通过 `clk_hashtable` 哈希表索引，支持 O(1) 名称查找。`clk_get()` 通过 `of_clk_get_by_name()` 或 `clk_find_hw()` 查找。
+
+---
+
+## 6. 关键同步设计
+
+### 6.1 两把大锁
 
 ```c
-// 从多个父时钟中选择一个
-struct clk_mux {
+static DEFINE_MUTEX(prepare_lock);    /* clk_prepare/unprepare 的睡眠锁 */
+static DEFINE_SPINLOCK(enable_lock);  /* clk_enable/disable 的原子自旋锁 */
+```
+
+- `prepare_lock`：保护时钟树结构变更（注册、取消注册、set_parent、set_rate）
+- `enable_lock`：保护引用计数操作（enable/disable，在原子上下文使用）
+
+### 6.2 CLK_SET_RATE_GATE
+
+当设置了此标志，时钟在 prepare 状态下禁止频率变更——防止频率切换时输出不稳定时钟。
+
+```c
+if (core->flags & CLK_SET_RATE_GATE)
+    clk_core_rate_protect(core);   /* ⬆ protect_count */
+```
+
+### 6.3 CLK_IS_CRITICAL
+
+关键时钟（如 DDR 控制器时钟）不能被禁用。框架在 disable 时检查：
+
+```c
+if (WARN(core->enable_count == 1 && core->flags & CLK_IS_CRITICAL,
+         "Disabling critical %s\n", core->name))
+    return;
+```
+
+---
+
+## 7. 典型驱动使用模式
+
+### 7.1 消费者使用
+
+```c
+/* probe 中 */
+struct clk *clk;
+
+clk = devm_clk_get(dev, "bus");           /* 获取时钟句柄 */
+if (IS_ERR(clk))
+    return PTR_ERR(clk);
+
+ret = clk_prepare_enable(clk);             /* prepare + enable */
+if (ret)
+    return ret;
+
+/* 使用时钟... */
+
+clk_disable_unprepare(clk);                /* disable + unprepare */
+```
+
+### 7.2 提供者注册
+
+```c
+// drivers/clk/clk-fixed-rate.c
+struct clk_fixed_rate {
     struct clk_hw hw;
-    void __iomem *reg;           // 选择寄存器
-    u32 mask;                    // 选择位掩码
-    u8 shift;                    // 位偏移
-    u8 flags;
-};
-```
-
----
-
-## 5. 注册流程
-
-```c
-// driver 中定义 clk_hw + clk_ops + clk_init_data
-struct clk_hw *hw;
-
-struct clk_init_data init = {
-    .name = "my_clk",
-    .ops = &my_clk_ops,
-    .parent_names = (const char *[]){"xtal"},
-    .num_parents = 1,
-    .flags = 0,
+    unsigned long fixed_rate;
+    unsigned long fixed_accuracy;
 };
 
-hw = kzalloc(sizeof(*hw), GFP_KERNEL);
-hw->init = &init;
+static const struct clk_ops clk_fixed_rate_ops = {
+    .recalc_rate = clk_fixed_rate_recalc_rate,
+    .round_rate = clk_fixed_rate_round_rate,
+};
 
-clk_hw_register(dev, hw);   // → clk_register → __clk_core_init
-    // → 加入全局哈希表 clk_hashtable
-    // → 添加到 clk_root_list 或 clk_orphan_list
-    // → 调用 ops->init(hw)
+struct clk_hw *clk_hw_register_fixed_rate(struct device *dev, ...)
+{
+    struct clk_fixed_rate *fixed;
+
+    fixed = kzalloc_obj(*fixed);
+    fixed->fixed_rate = rate;
+    fixed->hw.init = CLK_HW_INIT(name, NULL, &clk_fixed_rate_ops, 0);
+
+    return clk_hw_register(dev, &fixed->hw);   /* @ clk.c:4448 */
+}
 ```
 
-**doom-lsp 确认**：`clk_hw_register` 是注册入口。未连接的时钟（父时钟未注册）被放入 `clk_orphan_list`，父时钟注册后自动重新连接。
+### 7.3 频率切换模式
 
----
-
-## 6. 调试
-
-```bash
-# 查看完整时钟树
-cat /sys/kernel/debug/clk/clk_summary
-#   clock                         enable_cnt  prepare_cnt  rate
-#  xtal                                   0            0  24000000
-#   pll0                                  2            2  384000000
-#    cpu_clk                               2            2  384000000
-#    uart_clk                              1            1   96000000
-
-# 查看单个时钟
-cat /sys/kernel/debug/clk/pll0/clk_rate
-cat /sys/kernel/debug/clk/pll0/clk_flags
-cat /sys/kernel/debug/clk/pll0/clk_prepare_count
-
-# 测量精度（clk_measure）
-cat /sys/kernel/debug/clk/pll0/clk_measure
+```
+round-trip 模式：
+  1. driver: clk_set_rate(clk, target_rate)
+  2. framework: ops->determine_rate(hw, &req)
+     → 返回最接近且硬件支持的频率
+  3. framework: ops->set_rate(hw, rate, parent_rate)
+     → 写入分频寄存器
+  4. framework: ops->recalc_rate(hw, parent_rate)
+     → 读寄存器确认实际频率
 ```
 
 ---
 
-## 7. 关键函数索引
+## 8. debugfs 接口
 
-| 函数 | 行号 | 作用 |
+CCF 通过 debugfs 提供时钟树调试信息（`clk_debug_init`）：
+
+```
+/sys/kernel/debug/clk/
+├── clk_summary        → 所有时钟状态摘要
+├── clk_dump           → 完整时钟树 dump
+├── <clock-name>/      → 每个时钟的目录
+    ├── clk_rate
+    ├── clk_enabled
+    ├── clk_prepared
+    ├── clk_flags
+    └── clk_notifier_count
+```
+
+---
+
+## 9. 总结
+
+| 概念 | 实现 | 位置 |
 |------|------|------|
-| `clk_prepare` | `clk.c:1172` | 准备时钟（可睡眠，mutex）|
-| `clk_unprepare` | `clk.c:1091` | 取消准备 |
-| `clk_enable` | `clk.c:1394` | 使能时钟（原子，spinlock）|
-| `clk_disable` | `clk.c:1229` | 禁用时钟 |
-| `clk_get_rate` | `clk.c:1980` | 获取频率 |
-| `clk_set_rate` | `clk.c:2576` | 设置频率（树遍历）|
-| `clk_set_parent` | `clk.c:2933` | 选择父时钟 |
-| `__clk_get_enable_count` | `clk.c:558` | 读取使能计数 |
+| **时钟节点** | `struct clk_core` 含 rate/count/parent/children | `clk.c:66` |
+| **消费者句柄** | `struct clk` 包裹 core 指针 | `clk.c` |
+| **硬件抽象** | `struct clk_hw` + `struct clk_ops` | `clk-provider.h:320` |
+| **注册** | `__clk_register` → `__clk_core_init` | `clk.c:4306` |
+| **prepare 路径** | 递归自顶向下，I2C 友好 | `clk.c:1100` |
+| **enable 路径** | 递归原子使能 | `clk.c` |
+| **频率设置** | `determine_rate` → `set_rate` → `recalc_rate` | `clk.c` |
+| **树结构** | clk_root_list / clk_orphan_list / clk_hashtable | `clk.c` |
+| **同步** | prepare_lock(mutex) + enable_lock(spinlock) | `clk.c` |
+| **内置类型** | fixed/gate/divider/mux/composite | `drivers/clk/` |
+
+**完整调用链（外设启用时钟）**：
+
+```
+devm_clk_get(dev, "clk_name")            → struct clk * (from DT/table)
+    ↓
+clk_prepare_enable(clk)
+    │
+    ├─ clk_prepare()                     @ clk.c:1172
+    │   └─ clk_core_prepare_lock()
+    │       └─ clk_core_prepare(core)    @ clk.c:1100
+    │           └─ clk_core_prepare(core->parent)  ← 递归父时钟
+    │               └─ ...递归到根
+    │                   └─ ops->prepare(hw)
+    │
+    └─ clk_enable()                      @ clk.c:1394
+        └─ clk_core_enable_lock()
+            └─ clk_core_enable(core)
+                └─ clk_core_enable(core->parent)   ← 递归父时钟
+                    └─ ops->enable(hw)              ← 原子 MMIO 写入
+```
 
 ---
 
-## 8. 总结
-
-CCF 是一个**树形时钟管理框架**——时钟节点的父子关系构成 SoC 时钟拓扑。`clk_enable`（`clk.c:1394` → spinlock 保护）和 `clk_prepare`（`clk.c:1172` → mutex 保护）分为原子/可睡眠双路径。`clk_set_rate`（`clk.c:2576`）通过树遍历找到最优频率配置。
-
----
-
-*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-02 | 内核版本：Linux 7.0-rc1*
-
-## 源码索引
+### 源码索引（LSP 验证）
 
 | 符号 | 文件 | 行号 |
 |------|------|------|
-| `clk_register()` | drivers/clk/clk.c | 时钟注册 |
-| `clk_prepare_enable()` | drivers/clk/clk.c | 使能时钟 |
-| `struct clk_hw` | include/linux/clk-provider.h | 硬件时钟结构 |
-| `struct clk_core` | drivers/clk/clk.c | 核心时钟结构 |
-| `clk_hw_register_fixed_rate()` | drivers/clk/clk-fixed-rate.c | 固定频率时钟 |
+| `struct clk_core` | drivers/clk/clk.c | 66 |
+| `struct clk_ops` | include/linux/clk-provider.h | ~180 |
+| `struct clk_hw` | include/linux/clk-provider.h | 320 |
+| `__clk_register()` | drivers/clk/clk.c | 4306 |
+| `__clk_core_init()` | drivers/clk/clk.c | 3877 |
+| `clk_register()` | drivers/clk/clk.c | 4430 |
+| `clk_hw_register()` | drivers/clk/clk.c | 4448 |
+| `devm_clk_register()` | drivers/clk/clk.c | 4633 |
+| `clk_prepare()` | drivers/clk/clk.c | 1172 |
+| `clk_core_prepare()` | drivers/clk/clk.c | 1100 |
+| `clk_core_prepare_lock()` | drivers/clk/clk.c | 1149 |
+| `clk_enable()` | drivers/clk/clk.c | 1394 |
+| `clk_disable()` | drivers/clk/clk.c | 1229 |
+| `clk_unprepare()` | drivers/clk/clk.c | |
 
 ---
 
-*分析工具：doom-lsp | 分析日期：2026-05-04*
+*分析工具：doom-lsp（clangd LSP 18.x）| 分析日期：2026-05-08 | 内核版本：Linux 7.0-rc1*
