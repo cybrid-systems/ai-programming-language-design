@@ -6,18 +6,24 @@
 
 ## 文章列表
 
-| # | 标题 | 核心文件 | 状态 |
-|---|------|---------|------|
-| 01 | InnoDB 架构总览与核心数据结构 | `storage/innobase/include/` | 📝 规划 |
-| 02 | InnoDB Buffer Pool — 页面管理与 LRU 淘汰 | `storage/innobase/buf/buf0buf.cc`, `buf0lru.cc` | 📝 规划 |
-| 03 | InnoDB Redo Log — WAL 与 Crash Recovery | `storage/innobase/log/log0log.cc`, `log0recv.cc` | 📝 规划 |
-| 04 | InnoDB Undo Log — MVCC 与回滚段 | `storage/innobase/trx/`, `row/row0undo.cc` | 📝 规划 |
-| 05 | InnoDB 锁系统 — 行锁、Gap 锁、Next-Key | `storage/innobase/lock/lock0lock.cc` | 📝 规划 |
-| 06 | InnoDB B+Tree 索引 — 页分裂、合并、AHI | `storage/innobase/btr/btr0btr.cc`, `btr0cur.cc` | 📝 规划 |
-| 07 | InnoDB 事务系统 — ACID 实现 | `storage/innobase/trx/trx0trx.cc`, `trx0purge.cc` | 📝 规划 |
-| 08 | InnoDB 数据页格式与行格式 | `storage/innobase/data/data0type.cc`, `page/page0page.cc` | 📝 规划 |
-| 09 | MySQL SQL 层 — 解析、优化、执行 | `sql/sql_lexer.cc`, `sql/sql_optimizer.cc`, `sql/sql_executor.cc` | 📝 规划 |
-| 10 | MySQL 复制 — Binlog 与 Group Commit | `sql/binlog.cc`, `sql/rpl_*` | 📝 规划 |
+| # | 标题 | 核心文件 | 行数 | 状态 |
+|---|------|---------|------|------|
+| 01 | InnoDB 架构总览与核心数据结构 | `storage/innobase/include/` | 1552 | ✅ |
+| 02 | InnoDB Buffer Pool — 页面管理与 LRU 淘汰 | `storage/innobase/buf/buf0buf.cc`, `buf0lru.cc` | 1640 | ✅ |
+| 03 | InnoDB Redo Log — WAL 与 Crash Recovery | `storage/innobase/log/log0log.cc`, `log0recv.cc` | 1972 | ✅ |
+| 04 | InnoDB Undo Log — MVCC 与回滚段 | `storage/innobase/trx/`, `row/row0undo.cc` | 1464 | ✅ |
+| 05 | InnoDB 锁系统 — 行锁、Gap 锁、Next-Key | `storage/innobase/lock/lock0lock.cc` | 1559 | ✅ |
+| 06 | InnoDB B+Tree 索引 — 页分裂、合并、AHI | `storage/innobase/btr/btr0btr.cc`, `btr0cur.cc` | 1555 | ✅ |
+| 07 | InnoDB 事务系统 — ACID 实现 | `storage/innobase/trx/trx0trx.cc`, `trx0purge.cc` | 1390 | ✅ |
+| 08 | InnoDB 数据页格式与行格式 | `storage/innobase/data/data0type.cc`, `page/page0page.cc` | 1116 | ✅ |
+| 09 | MySQL SQL 层 — 解析、优化、执行 | `sql/sql_lexer.cc`, `sql/sql_optimizer.cc`, `sql/sql_executor.cc` | 1039 | ✅ |
+| 10 | MySQL 复制 — Binlog 与 Group Commit | `sql/binlog.cc`, `sql/rpl_*` | 1171 | ✅ |
+| 11 | EXPLAIN 与执行计划分析 | `sql/sql_explain.cc` | 1894 | ✅ |
+| 12 | 索引设计与优化策略 | — | 1660 | ✅ |
+| 13 | InnoDB 性能调优 | — | 1348 | ✅ |
+| 14 | 锁诊断与死锁分析 | `storage/innobase/lock/lock0lock.cc` | 1423 | ✅ |
+| 15 | 备份与恢复 | `storage/innobase/log/log0recv.cc` | 1281 | ✅ |
+| 16 | InnoDB Change Buffer | `storage/innobase/ibuf/ibuf0ibuf.cc` | ~500 | ✅ |
 
 ## 写作标准（参考 OceanBase 分析质量）
 
