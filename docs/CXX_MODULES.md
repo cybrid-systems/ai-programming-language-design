@@ -282,3 +282,5 @@ cmake --build . -j$(nproc)
 
 > **文件结构就是架构。**
 > 从 `aura.core` 到 `aura.query` 的单向依赖链决定了编译器的增量编译边界，也决定了多 Agent 共享编译服务的模块隔离粒度。
+>
+> 实现仓库：[github.com/cybrid-systems/aura](https://github.com/cybrid-systems/aura)

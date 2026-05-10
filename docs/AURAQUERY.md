@@ -347,4 +347,6 @@ Compiler Service 暴露的查询相关接口：
 > **"查询就是代码，代码就是数据。"**
 > AuraQuery 是 Aura homoiconicity 的自然延伸——如果代码是数据，那么查询代码的操作也应该是代码的一部分。
 >
-> 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md) | [SERIALIZATION.md](./SERIALIZATION.md) | [DESIGN_PHILOSOPHY.md](./philosophy/DESIGN_PHILOSOPHY.md)
+> 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md) | [SERIALIZATION.md](./SERIALIZATION.md) | [CXX_MODULES.md](./CXX_MODULES.md) | [DESIGN_PHILOSOPHY.md](./philosophy/DESIGN_PHILOSOPHY.md)
+>
+> 实现仓库：[github.com/cybrid-systems/aura](https://github.com/cybrid-systems/aura)

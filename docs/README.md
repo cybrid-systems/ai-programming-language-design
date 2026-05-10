@@ -23,6 +23,10 @@ docs/
 | `AURAQUERY.md` | AI 交互层 | 原生 eDSL 查询与变换 |
 | `CXX_MODULES.md` | 工程层 | C++26 模块文件结构、CMake 构建配置 |
 
+## 实现仓库
+
+设计文档对应的具体实现见 **[Aura](https://github.com/cybrid-systems/aura)** — Racket #lang 原型 + C++26 Compiler as a Service。
+
 ## 学习路径
 
 1. 先读 `philosophy/DESIGN_PHILOSOPHY.md` 理解窄门哲学
@@ -31,3 +35,4 @@ docs/
 4. 并行参考 `cpp26/` 跟踪后端标准演进
 5. 理解序列化和查询：`SERIALIZATION.md` + `AURAQUERY.md`
 6. 参考 `CXX_MODULES.md` 了解 C++26 后端的模块划分
+7. 到 [Aura 仓库](https://github.com/cybrid-systems/aura) 查看实现状态

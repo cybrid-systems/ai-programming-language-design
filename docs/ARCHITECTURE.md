@@ -427,3 +427,5 @@ AuraIR → CodeGen → C++26 源码生成
 
 > **The Narrow Gate.**
 > Aura 不兼容旧生态、不优化给人读。它的唯一目标是：在给定算力下，让 AI 最大程度地理解、验证、重写并统一整个软件栈。
+>
+> 实现仓库：[github.com/cybrid-systems/aura](https://github.com/cybrid-systems/aura)

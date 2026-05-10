@@ -497,4 +497,5 @@ Racket 端负责生成 ABF v2 二进制数据。Racket 不直接实现零拷贝�
 
 ---
 
-> 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md) | [DESIGN.md](./DESIGN.md) | [ROADMAP.md](./ROADMAP.md)
+> 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md) | [AURAQUERY.md](./AURAQUERY.md) | [CXX_MODULES.md](./CXX_MODULES.md)
+> 实现仓库：[github.com/cybrid-systems/aura](https://github.com/cybrid-systems/aura)
