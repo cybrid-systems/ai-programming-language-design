@@ -117,42 +117,23 @@ lang/
 
 ---
 
-### 3.2 ABF — Alien Binary Format
+### 3.2 ABF v2 — Alien Binary Format
+
+完整规范见 [SERIALIZATION.md](./SERIALIZATION.md)。此处仅列关键设计要点。
 
 **设计目标**：零拷贝 + Delta 增量传输 + 跨语言边界的极高性能序列化。
 
-**格式概览**（完整规范见 [SERIALIZATION.md](./SERIALIZATION.md)）：
-
-```
-┌───────────────────────────────────┐
-│  Header (64 bytes)               │
-│  - Magic: "ABF1"                 │
-│  - Version, Flags, NodeCount    │
-│  - StringTableOffset             │
-│  - DeltaBaseVersion              │
-├───────────────────────────────────┤
-│  Node Table (每个节点 32 bytes)   │
-│  - node_id, parent_id           │
-│  - kind, flags                  │
-│  - payload_offset, payload_size │
-│  - source_pos (file:line:col)   │
-├───────────────────────────────────┤
-│  Payload Region (节点负载)        │
-├───────────────────────────────────┤
-│  String Table (去重字符串池)      │
-├───────────────────────────────────┤
-│  Delta Patch (可选)              │
-│  - Base version ref              │
-│  - Changed node IDs              │
-│  - New payload segments          │
-└───────────────────────────────────┘
-```
+**核心设计**（详细格式见 SERIALIZATION.md §4）：
+- 每个节点以 **varint 编码**，支持 Tag + ExtensionID + ExtensionLength + Payload 变长结构
+- ExtensionID 和长度前缀提供向前兼容：老版本跳过未知扩展
+- 节点级 ExtensionLength 支持零拷贝：以 `std::span` 直接切片扩展数据
+- Magic: `"ABF2"`
 
 **关键特性**：
-- **零拷贝**：Node Table 固定大小条目，可直接 mmap 读取
-- **Delta 增量**：只传输变化的子树，大幅减少通信量
-- **源位置保留**：每个节点携带精确的 `file:line:col`
-- **预分配内存池**：避免序列化时的内存碎片和 GC 压力
+- **零拷贝**：ExtensionLength 支持 span 切片，无需逐节点反序列化
+- **Delta 增量**：只传输变化的子树，基于版本号比较
+- **向前兼容**：未知 ExtensionID 自动跳过，未知 Tag 存入 ExtendedNode
+- **反射驱动**：C++26 P2996 `std::meta` 自动序列化 extension 字段
 
 ---
 
@@ -162,28 +143,36 @@ lang/
 
 **核心设计**（完整实现见 [SERIALIZATION.md](./SERIALIZATION.md)）：
 
-```cpp
-// 不同阶段携带不同扩展数据
-struct ParsedPhase  { using extension_type = std::monostate;    static constexpr uint32_t id = 0; };
-struct TypedPhase   { using extension_type = TypeInfo;          static constexpr uint32_t id = 1; };
-struct LocatedPhase { using extension_type = SourceLocation;    static constexpr uint32_t id = 2; };
+每个构造器（节点类型）**独立携带自己的扩展数据**，而非整个 AST 共用同一个扩展类型：
 
-// 每个节点类型独立可扩展
+```cpp
+// 每个节点类型有自己的 XExtension
+// ParsedPhase 下扩展为空（monostate），TypedPhase 下携带类型信息
 template <Extension E>
-struct Expr : std::variant<
-    LiteralInt<E>, Variable<E>, Call<E>,
-    IfExpr<E>, Lambda<E>, ExtendedNode<E>
-> {};
+struct LiteralInt { int64_t value;  [[no_unique_address]] typename E::literal_int_ext ext; };
+template <Extension E>
+struct Variable   { Symbol name;    [[no_unique_address]] typename E::variable_ext ext; };
+template <Extension E>
+struct Call       { ExprPtr<E> func; std::vector<ExprPtr<E>> args;  [[no_unique_address]] typename E::call_ext ext; };
+template <Extension E>
+struct IfExpr     { ExprPtr<E> cond, then, else;  [[no_unique_address]] typename E::if_ext ext; };
+template <Extension E>
+struct Lambda     { std::vector<Symbol> params; ExprPtr<E> body;  [[no_unique_address]] typename E::lambda_ext ext; };
+
+template <Extension E>
+struct Expr : std::variant<LiteralInt<E>, Variable<E>, Call<E>, IfExpr<E>, Lambda<E>> {};
 ```
 
-| 阶段 | Extension 携带的信息 |
-|------|---------------------|
-| Parsed | 裸语法结构 |
-| Expanded | 宏展开绑定信息、作用域链 |
-| Typed | 类型标注、类型约束 |
-| Lowered | AuraIR 映射信息 |
-| Optimized | 优化标记、内联决策 |
-| CodeGen | 代码生成元数据 |
+各 Phase 的扩展定义示例（每个节点类型可独立 specialize）：
+
+| 阶段 | Phase ID | `LiteralInt` 扩展 | `Call` 扩展 | `Lambda` 扩展 |
+|------|----------|-------------------|-------------|---------------|
+| `ParsedPhase` | 0 | `monostate`（无） | `monostate` | `monostate` |
+| `TypedPhase` | 1 | `{min_val, max_val}` | `{overload_id, arg_types}` | `{param_types, caputred_vars}` |
+| `LocatedPhase` | 2 | `SourceLocation` | `SourceLocation` | `SourceLocation` |
+| `ExpandedPhase` | 3 | `monostate` | `{scope_id, macro_history}` | `{scope_id}` |
+
+这种设计允许每个编译阶段按需为不同节点类型添加不同扩展数据，且完全类型安全。
 
 ---
 
@@ -246,27 +235,30 @@ AuraQueryEngine
 
 **AuraQuery eDSL 示例**：
 
+完整语法见 [AURAQUERY.md](./AURAQUERY.md)。此处仅列示例概览。
+
 ```lisp
 ;; 查找所有递归调用
-(aura-query
-  (select (node :kind 'Lambda)
-          (where (exists (child :kind 'Call
-                               (where (target :name 'self)))))))
+(query
+  (node-type Lambda)
+  (exists (child (node-type Call)
+                 (= (callee :parent) :context))))
 
 ;; 查找未使用的函数定义
-(aura-query
-  (select (node :kind 'Define)
-          (where (= (use-count :node) 0))))
+(query
+  (node-type Define)
+  (= (use-count :node) 0))
 
-;; 给函数调用添加日志
-(aura-transform
-  (select (node :kind 'Call) (where (not (target :name 'log))))
-  (transform (wrap-with 'with-logging)))
+;; 查找并修复所有类型错误的调用
+(query-and-fix
+  (node-type Call)
+  (has-error? #t)
+  (fix (replace-argument 1 (cast (argument 1) Integer))))
 
 ;; 替换特定子树
-(aura-patch
-  :target (select (node :id 42))
-  :replacement '(lambda (x) (* x x)))
+(query-and-transform
+  (= (node-id) 42)
+  (transform (replace-with '(lambda (x) (* x x)))))
 ```
 
 ---

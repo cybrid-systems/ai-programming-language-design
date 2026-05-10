@@ -269,7 +269,7 @@ cmake --build . -j$(nproc)
 | 设计文档 | 对应源代码模块 |
 |----------|---------------|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) §3.1 Racket Frontend | — (Racket 端) |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.2 ABF | `aura.serialization` |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.2 ABF v2 | `aura.core.ast` + `aura.binary.*` |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) §3.3 AST 层 | `aura.core.ast` |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) §3.4 AuraIR 层 | `aura.compiler.optimizer` (IR 定义) |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) §3.5 AuraQueryEngine | `aura.query.*` |
