@@ -7,7 +7,8 @@ docs/
 ├── cpp26/            ← 高性能后端：C++26 标准跟踪、行业分析
 ├── ARCHITECTURE.md   ← 系统架构：三层分解、模块接口、数据流
 ├── AURAQUERY.md      ← AuraQuery eDSL：原生查询语法、变换、AI 交互
-└── SERIALIZATION.md  ← ABF v2 协议：Trees that Grow + C++26 零拷贝序列化
+├── SERIALIZATION.md  ← ABF v2 协议：Trees that Grow + C++26 零拷贝序列化
+└── CXX_MODULES.md    ← C++26 模块结构：.ixx 模块划分、CMake 配置
 ```
 
 ## 三层架构对应关系
@@ -20,6 +21,7 @@ docs/
 | `cpp26/` | 后端（性能层） | IR → 零开销 C++26 代码生成 + 编译期验证 |
 | `SERIALIZATION.md` | 通信层 | ABF v2 零拷贝二进制协议 |
 | `AURAQUERY.md` | AI 交互层 | 原生 eDSL 查询与变换 |
+| `CXX_MODULES.md` | 工程层 | C++26 模块文件结构、CMake 构建配置 |
 
 ## 学习路径
 
@@ -28,3 +30,4 @@ docs/
 3. 按番号顺序读 `racket/day-01.md` 到 `racket/day-14.md`
 4. 并行参考 `cpp26/` 跟踪后端标准演进
 5. 理解序列化和查询：`SERIALIZATION.md` + `AURAQUERY.md`
+6. 参考 `CXX_MODULES.md` 了解 C++26 后端的模块划分
