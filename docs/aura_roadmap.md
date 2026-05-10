@@ -1,575 +1,670 @@
-# Aura — Ghuloum 增量构建路线图
+# Aura — 三轨并行增量构建路线图
 
 **方法**：《An Incremental Approach to Compiler Construction》（Ghuloum, ICFP 2006）
-**原则**：每一步增加一个最小功能，系统始终可运行、可测试。每步新增代码不超过约 20 行核心逻辑。
-**结构**：共 4 Phase × 3 层 = 37 步。每步一个**可验证红线**。
+**原则**：每一步增加一个最小功能，系统始终可运行、可测试。
+**三轨并行**：架构 / 语言 / 基建 三个轨道同时推进，每个里程碑产生一个可用的垂直切片。
+
+---
+
+## 三轨定义
+
+| 轨道 | 范围 | 产出物 | 核心文档 |
+|------|------|--------|----------|
+| **🏗 架构 (Arch)** | Compiler Service、ABF 协议、IPC、模块系统、三层运行时 | 系统骨架与通信管道 | `aura_architecture.md`、`aura_serialization.md`、`aura_modules.md` |
+| **🗣 语言 (Lang)** | Lisp 核心、编译管线、AuraIR、宏、反射、类型系统 | 语言本身 | `aura_architecture.md §3`、`aura_query.md` |
+| **🔧 基建 (Infra)** | 构建系统、CI、测试框架、基准、包管理、自举 | 开发者工具链 | `aura_modules.md` |
 
 ---
 
 ## 总览
 
 ```
-Phase 0: Racket #lang 原型 ───────────────────────────────── (Steps 01-08) ✅
-Phase 1a: C++26 最小求值器   ──────────────────────────────── (Steps 09-16) ← NOW
-Phase 1b: 编译管线 + IR      ──────────────────────────────── (Steps 17-24)
-Phase 1c: 查询引擎            ──────────────────────────────── (Steps 25-30)
-Phase 2:  反射与热更新        ──────────────────────────────── (Steps 31-34)
-Phase 3:  宏系统               ──────────────────────────────── (Steps 35-36)
-Phase 4:  生产化               ──────────────────────────────── (Steps 37+)
+                      M0         M1         M2          M3         M4         M5
+ Seed               C++ Eval    Pipeline   Query       Growth     Ship
+───────────────────────────────────────────────────────────────────────────→
+🏗 Arch   ────[0]───[1a]───[1b]───[2a]───[2b]───[3a]───[3b]───[4a]───[4b]───
+🗣 Lang   ────[0]───[1a]───[1b]───[2a]───[2b]───[3a]───[3b]───[4a]───[4b]───
+🔧 Infra  ────[0]───[1a]───[1b]───[2a]───[2b]───[3a]───[3b]───[4a]───[4b]───
+          ↑                                            ↑              ↑
+    当前起点                                   AI 修复闭环        自举成功
 ```
+
+每个里程碑 === 三条轨道各完成一个 Step。**不"先搭架构再写语言"**，而是每次 Sprint 三条线同时产出可验证结果。
 
 ---
 
-## Phase 0：Racket #lang 原型 (已完成)
+## 里程碑 0：种子 (已完成)
 
-遵循 Ghuloum Step 1-6 精神，用 Racket 实现最小 Lisp 核心。
+### 🏗 Arch-0 — Racket #lang 骨架
 
-| Step | 特性 | 红线验证 | 状态 |
-|------|------|----------|------|
-| 01 | 整数字面量 | `(eval 42)` → `42` | ✅ |
-| 02 | 变量引用 (lexical) | `(eval 'x '{x 10})` → `10` | ✅ |
-| 03 | lambda + 函数应用 | `(eval '((lambda (x) x) 1))` → `1` | ✅ |
-| 04 | if 条件 | `(eval '(if #t 1 2))` → `1` | ✅ |
-| 05 | let (sugar) + letrec | `(eval '(let ((x 5)) x))` → `5` | ✅ |
-| 06 | quote + 基本数据 | `(eval '(quote (a b)))` → `(a b)` | ✅ |
-| 07 | define (Hyperstatic) | `(eval '(define x 5) env)` → env has x→5 | ✅ |
-| 08 | REPL 循环 | `racket -l aura` → 可交互 | ✅ |
+| Step | 新增 | 红线 |
+|------|------|------|
+| A0.1 | `#lang aura` reader + expander 基本结构 | `racket -l aura` 启动不崩溃 |
+| A0.2 | `lang/private/core.rkt` 最小求值器 | 可运行 `42` → `42` |
+| A0.3 | 基本 REPL 循环 | 交互式 read-eval-print |
 
-**关键约束验证**：`(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))` → `120`
+### 🗣 Lang-0 — 最小 Lisp 核心
 
----
+| Step | 新增 | 红线 |
+|------|------|------|
+| L0.1 | 整数字面量 | `(eval 42)` → `42` |
+| L0.2 | 变量引用 (lexical scoping) | `(eval 'x '{x 10})` → `10` |
+| L0.3 | lambda + 函数应用 | `(eval '((lambda (x) x) 1))` → `1` |
+| L0.4 | if 条件 | `(eval '(if #t 1 2))` → `1` |
+| L0.5 | let (lambda sugar) + letrec | `(eval '(let ((x 5)) x))` → `5` |
+| L0.6 | quote + 基本数据 | `(eval '(quote (a b)))` → `(a b)` |
+| L0.7 | Hyperstatic define | `(eval '(define x 5) env)` → env 绑定 x=5 |
+| L0.8 | REPL 集成 | `racket -l aura` 可交互 |
 
-## Phase 1a：C++26 最小求值器 (Steps 09-16)
+### 🔧 Infra-0 — 项目脚手架
 
-**目标**：C++26 Compiler Service 能运行 Phase 0 完整语义。
-**策略**：不装管线，直接用 C++ tree-walking interpreter 跑起来，**后续再分层降级到 IR**。
+| Step | 新增 | 红线 |
+|------|------|------|
+| I0.1 | Git 仓库 + MIT/Apache 2.0 许可证 | `git init` + `LICENSE` |
+| I0.2 | Racket 包结构 (`info.rkt`, `raco test`) | `raco test` 通过 |
+| I0.3 | 设计文档骨架 (DESIGN + ROADMAP) | `docs/` 目录完整 |
 
-### Step 09 — 编译器骨架 + 整数求值
-
-```
-新增：CMakeLists.txt, src/main.cpp, empty CompilerService
-      src/core/arena.ixx (ASTArena 骨架)
-      src/core/ast.ixx (Expr 节点定义, ParsedPhase)
-      #lang aura → ABF 序列化 → C++ 反序列化 → 求值
-```
-
-**红线验证**：
-```bash
-echo '(print 42)' | racket -l aura --abf | ./aura --eval
-# 输出: 42
-```
-
-**依赖**：`docs/aura_architecture.md §3.1-3.2` + `docs/aura_serialization.md §4`
-
-### Step 10 — 变量引用与环境
-
-```
-新增：SymbolTable 类
-      Env 结构 (vector<Binding>)
-      Variable 节点求值: env.lookup(name)
-```
-
-**红线验证**：
-```
-输入: (let ((x 10)) x)
-输出: 10
-```
-
-**参考**：Ghuloum Step 2
-
-### Step 11 — 算术原语
-
-```
-新增：算术节点类型 + 内置函数表
-      支持: + - * / = < >
-```
-
-**红线验证**：
-```
-输入: (+ 1 (* 2 3))
-输出: 7
-```
-
-**参考**：Ghuloum Step 3
-
-### Step 12 — 条件分支
-
-```
-新增：If 节点求值
-```
-
-**红线验证**：
-```
-输入: (if (> 3 2) 1 0)
-输出: 1
-```
-
-**参考**：Ghuloum Step 4
-
-### Step 13 — 闭包 + 函数应用
-
-```
-新增：Closure 结构 (code + env)
-      Call 节点求值: 创建闭包 → 扩展环境 → 求值 body
-```
-
-**红线验证**：
-```
-输入: ((lambda (x) (* x 2)) 5)
-输出: 10
-```
-
-**参考**：Ghuloum Step 5-6
-
-### Step 14 — let / letrec 展开
-
-```
-新增：let → lambda apply 的宏展开 (Racket 端)
-      letrec → 循环引用环境 (C++ 端)
-```
-
-**红线验证**：
-```
-输入: (letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))
-输出: 120
-```
-
-**参考**：Ghuloum Step 5
-
-### Step 15 — Hyperstatic define + 模块
-
-```
-新增：define 绑定 → 全局环境 (不可覆盖)
-      模块级状态持久化
-```
-
-**红线验证**：
-```
-输入: (define x 5) → (eval 'x) → 5
-      尝试 (define x 6) → error: cannot redefine
-```
-
-**参考**：LiSP Ch2
-
-### Step 16 — C++26 REPL + 完整语言
-
-```
-新增：交互式 REPL 循环
-      read-eval-print 一体化
-```
-
-**红线验证**：
-```bash
-$ ./aura
-aura> (define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))
-aura> (fact 5)
-120
-aura>
-```
-
-**里程碑**：C++26 Compiler Service 可以用解释模式跑通 Phase 0 全语义。
+**里程碑红线**：`(letrec ((fact (lambda (n) ...))) (fact 5))` → `120` ✅
 
 ---
 
-## Phase 1b：编译管线 + AuraIR (Steps 17-24)
+## 里程碑 1：C++ 求值器 (当前)
 
-**目标**：从 tree-walking 解释器进化为 AST → AuraIR → 优化的编译管线。
+**时间**：6-8 周（含 Step 细分项）
+**目标**：C++26 Compiler Service 以解释模式运行 Phase 0 完整语义。
+**并行策略**：C++ 端先以文本 S 表达式 bootstrap（绕过 ABF），Racket 端重建源码后打通 ABF 通道。
 
-### Step 17 — AuraIR 定义 + 基本降级
-
-```
-新增：src/compiler/ir.ixx — IR 指令定义
-      Lowering Pass — Expr → IR
-      验证降级后的 IR 语义等价
-```
-
-**红线验证**：
-```
-输入: (+ 1 2)
-IR:  Const 1, Const 2, Add, Return
-执行 IR → 3
-```
-
-### Step 18 — AuraIR 解释器
+### 🏗 Arch-1 — Compiler Service 骨架
 
 ```
-新增：IRInterpreter — 执行降级后的 IR 指令
-      用 IR 解释器替换 tree-walker（保留 tree-walker 作为 fallback）
+A1.1: CMake 构建系统 + 模块骨架
+├── CMakeLists.txt (C++26 modules support)
+├── src/core/arena.ixx              — ASTArena 内存池 (monotonic bump)
+├── src/core/ast.ixx                — Expr 节点定义 (ParsedPhase)
+├── src/core/diagnostics.ixx        — DiagnosticEngine 骨架
+├── src/core/source_location.ixx    — SourceManager 骨架
+├── src/core/core.ixx               — 聚合导出
+└── src/main.cpp                    — 空壳入口
+红线: cmake -B build && cmake --build build → 成功
 ```
 
-**红线验证**：
 ```
-所有 Step 09-16 的测试用例通过 IR 解释器仍然正确
-```
-
-### Step 19 — 闭包变换 (Closure Conversion)
-
-```
-新增：闭包分析 Pass
-      识别自由变量 → 生成 Closure 结构
-      将 Lambda 节点变换为 flat closure 表示
-```
-
-**红线验证**：
-```
-输入: (let ((x 1)) (lambda (y) (+ x y)))
-闭包: {code=... free=(x=1)}
-应用: (let ((f (let ((x 1)) (lambda (y) (+ x y))))) (f 2))
-输出: 3
+A1.2: Compiler Service 进程框架
+├── src/compiler/compiler_service.ixx — 进程主循环
+│   ├── accept_input()  — stdin / UDS / 共享内存
+│   ├── compile()       — 编译入口
+│   └── evaluate()      — 求值入口
+├── src/parser/lexer.ixx + lexer_impl.cpp — S 表达式词法分析器
+│   └── read S-exp from text (bootstrap 路径)
+├── src/parser/parser.ixx + parser_impl.cpp — S 表达式解析器
+│   └── text → Expr<ParsedPhase>
+红线: echo '(+ 1 2)' | ./aura → 解析不崩溃
 ```
 
-**参考**：Ghuloum Step 7
-
-### Step 20 — compute-kind + arity 检查
-
 ```
-新增：compute-kind Pass — 分类 value/function/macro
-      arity 检查 Pass — 静态检测参数数量错误
-```
-
-**红线验证**：
-```
-输入: ((lambda (x y) x) 1)  → error: wrong number of arguments
+A1.3: ABF v2 序列化器 (Racket 端)
+├── lang/private/abf-serialize.rkt
+│   ├── serialize-expr → ABF bytes
+│   └── serialize-delta → ABF Delta bytes
+红线: (serialize-expr '(+ 1 2)) → 可验证二进制
 ```
 
-### Step 21 — 常量折叠 + DCE
-
 ```
-新增：ConstantFolding Pass — 编译期计算常量表达式
-      DeadCodeElimination Pass — 移除不可达代码
-```
-
-**红线验证**：
-```
-降级前: (+ 1 2) → 3 条 IR 指令
-降级后: (+ 1 2) → 1 条 IR 指令 (Const 3)
+A1.4: ABF v2 反序列化器 (C++26 端)
+├── src/binary/deserializer.ixx
+│   └── ABF bytes → Expr<ParsedPhase>
+红线: Racket 产 ABF → C++ 反序列化 → 结构等价
 ```
 
-### Step 22 — 源位置追踪
-
 ```
-新增：每个 AST 节点携带 SourceLocation
-      降级到 IR 时传递源位置
-      LocatedPhase 扩展数据
-```
-
-**红线验证**：
-```
-输入: 源文件 line 15 col 3 的 (+ 1 2)
-IR 指令: Add, source=(15,3,"main.aura")
+A1.5: 共享内存传输层
+├── src/runtime/ipc.ixx
+│   ├── SharedMemoryChannel — mmap-backed 传输
+│   └── UdsChannel — Unix Domain Socket (fallback)
+红线: Racket → mmap 写 ABF → C++ 读 ABF → 求值 → 结果返回
 ```
 
-**参考**：`docs/aura_serialization.md §3` (Trees that Grow LocatedPhase)
-
-### Step 23 — 增量编译框架
+### 🗣 Lang-1 — C++26 Tree-Walking 解释器
 
 ```
-新增：版本化编译单元 (每个 define/expression 一个版本)
-      变更检测 — 只重新编译变化的部分
-      编译缓存 — 避免重复工作
+L1.1: 整数字面量求值
+├── src/compiler/frontend.ixx — 最简求值器
+│   └── eval(MakeLit(42)) → IntegerValue(42)
+红线: echo 42 | ./aura --eval → 42
+
+L1.2: 变量引用 + 环境
+├── src/compiler/env.ixx
+│   └── Env: vector<Binding>, lookup, extend
+红线: echo x | ./aura --env 'x=10' → 10
+
+L1.3: 算术原语 (+ - * / = < >)
+├── src/compiler/primitives.ixx — 内置函数表
+红线: echo '(+ 1 (* 2 3))' | ./aura --eval → 7
+
+L1.4: if 条件
+├── 条件分支求值
+红线: echo '(if (> 3 2) 1 0)' | ./aura --eval → 1
+
+L1.5: 闭包 + 函数应用
+├── Closure 结构 (code ptr + captured env)
+├── Call 节点求值
+红线: echo '((lambda (x) (* x 2)) 5)' | ./aura --eval → 10
+
+L1.6: let + letrec
+├── let → lambda apply 展开
+├── letrec → 循环引用环境 (先绑定 placeholder 再填值)
+红线: echo '(letrec ((fact ...)) (fact 5))' | ./aura --eval → 120
+
+L1.7: Hyperstatic define + 模块状态
+├── GlobalEnv (不可覆盖)
+├── 序列化/反序列化环境
+红线: (define x 5) → (eval 'x) → 5; (define x 6) → error
+
+L1.8: C++ REPL 循环
+├── read-eval-print 一体化
+红线: ./aura 交互式 → 可运行所有 Phase 0 程序
 ```
 
-**红线验证**：
-```
-编译 module: 1000 lines, time = T
-修改 1 行 -> 增量编译 time = T/100
-```
-
-### Step 24 — 诊断引擎 + 静态错误报告
+### 🔧 Infra-1 — 构建 + 测试
 
 ```
-新增：DiagnosticEngine — 结构化错误报告
-      未绑定变量检测
-      类型不匹配初步检测
+I1.1: CTest 基础测试框架
+├── tests/ 目录结构
+│   ├── unit/       — 单步测试 (每个 Step 的红线)
+│   ├── integration/— 跨组件测试 (Racket→ABF→C++→结果)
+│   └── regress/    — 回归测试 (所有历史 Step 的红线)
+红线: ctest --test-dir build → 所有已完成的 Step 测试通过
+
+I1.2: 混合构建 (Racket + C++)
+├── CMake ExternalProject 或 Makefile wrapper
+│   ├── raco setup 自动运行
+│   └── C++ 端构建自动拉取 Racket
+红线: make && make test → 全部通过
+
+I1.3: CI 管线骨架
+├── .github/workflows/ci.yml
+│   ├── ubuntu-latest + Racket 9.1
+│   ├── cmake -B build
+│   └── ctest --test-dir build
+红线: PR → CI 自动运行所有测试
+
+I1.4: 性能基准框架
+├── benchmarks/
+│   ├── bench-eval.cpp — 求值吞吐量
+│   └── bench-abf.cpp  — ABF 序列化/反序列化吞吐量
+红线: ./benchmark --benchmark_format=csv → 可记录
+
+I1.5: 回归测试自动化
+├── regress.py — 扫描所有 Step，验证红线
+│   ├── step-09/test.bat → 编译并运行
+│   └── step-10/test.bat → ...
+红线: python regress.py → ALL 37 STEPS PASSING
 ```
 
-**红线验证**：
-```
-输入: (define x (+ y 1))  (y 未定义)
-输出: error: test.aura:1:14: undefined variable 'y'
-```
-
-**里程碑**：Compiler Service 具备增量编译管线 + 静态诊断。
-
----
-
-## Phase 1c：查询引擎 (Steps 25-30)
-
-**目标**：AuraQueryEngine 可接受查询计划，在 AST/IR 索引上执行。
-
-### Step 25 — AST 倒排索引 (Kind + Name)
-
-```
-新增：ASTIndex — 按 NodeKind 和 Symbol Name 的倒排索引
-      构建索引：遍历 AST 填充 hash tables
-```
-
-**红线验证**：
-```
-索引: (Call → [42, 57]), (Define → [3, 15])
-查询: (query (node-type Call))  → [42, 57]
-```
-
-**参考**：`docs/aura_query.md §5.4`
-
-### Step 26 — 源位置 + Def-Use 索引
-
-```
-新增：SourceIndex — file:line → NodeID 映射
-      DefUseChain — 定义→使用 链追踪
-```
-
-**红线验证**：
-```
-查询: (query (location (line 42)))
-查询: (query (= (use-count :node) 0)) → 未使用定义
-```
-
-### Step 27 — AuraQuery eDSL 解析器 (Racket 端)
-
-```
-新增：query / query-and-fix 宏 (Racket lang/private/query.rkt)
-      宏展开为内部查询计划 (S 表达式)
-      ABF 序列化查询计划
-```
-
-**红线验证**：
-```
-输入: (query (node-type Call) (has-error? #t))
-展开: (query-plan (filter (node-kind :eq 'Call)) (filter (has-error :eq #t)))
-```
-
-**参考**：`docs/aura_query.md §5.2`
-
-### Step 28 — 查询执行引擎 (C++26 端)
-
-```
-新增：QueryPlanner — 查询计划 → 可执行计划树
-      QueryExecutor — 在索引上执行计划树
-      支持 filter/project/join 原语
-```
-
-**红线验证**：
-```
-Racket → ABF查询计划 → C++26 → 执行 → 结果节点ID列表
-```
-
-### Step 29 — 变换引擎 + 补丁生成
-
-```
-新增：PatchGenerator — 查询结果 → 增量补丁
-      变换原语: replace-with, wrap-with, insert-before/after
-      补丁格式: ABF Delta
-```
-
-**红线验证**：
-```
-(query-and-fix (node-type Call) (has-error? #t) (fix ...))
-→ 生成 ABF Delta → 应用补丁 → 热更新
-```
-
-### Step 30 — Hot Swap 引擎原型
-
-```
-新增：HotSwapEngine — 函数级替换
-      变异点追踪 (哪些函数依赖变更的函数)
-      替换策略: 下次调用时替换
-```
-
-**红线验证**：
-```
-运行中的程序：替换函数定义 → 下次调用使用新版本
-回滚：替换回旧版本 → 恢复原行为
-```
-
-**里程碑**：AI 修复闭环 — `query → fix → incremental compile → hot swap`
+**里程碑 1 红线**：`./aura` REPL 中 factorial(10) == 3628800，CTest 全部通过。
 
 ---
 
-## Phase 2：反射 (Steps 31-34)
+## 里程碑 2：编译管线 + IR
 
-**目标**：AI Agent 可运行时自我修改。
+**时间**：8-10 周
+**目标**：从 tree-walking 解释器进化为 AST → AuraIR → Pass Chain 的编译管线。
+**核心架构决策**：这步做完后，语言求值路径变成 `text → parse → lower → optimize → execute`，为增量编译和查询引擎打下基础。
 
-### Step 31 — export + eval/b
-
-```
-新增：export — 将环境序列化为可传输对象
-      eval/b — 在指定环境中求值
-```
-
-**红线验证**：
-```
-(define env (export)) → (eval/b '(+ 1 2) env) → 3
-```
-
-**参考**：LiSP Ch8
-
-### Step 32 — flambda (FEXPR)
+### 🏗 Arch-2 — AuraIR + Pass Infrastructure
 
 ```
-新增：flambda — 未求值参数 + 当前环境
-      自定义求值策略
+A2.1: AuraIR 指令集定义
+├── src/compiler/ir.ixx
+│   ├── IROpcode 枚举 (Const, Arg, Local, Add, Sub, ..., Branch, Call, MakeClosure, Return)
+│   ├── IRInstruction 结构 (opcode + operands + source_pos)
+│   └── BasicBlock 结构 (id, instructions, predecessors, successors)
+红线: IR 指令定义编译通过，可构造 IR 片段
+
+A2.2: Lowering Pass — 将 Expr 降级为 IR
+├── LowerExprToIR(Expr<ParsedPhase>) → IRFunction
+│   ├── LiteralInt → Const
+│   ├── Variable → Local/Arg lookup
+│   ├── Call → instructions + Call
+│   ├── Lambda → MakeClosure
+│   ├── If → Branch
+│   └── Let/Letrec → 展开后的 IR
+红线: (+ 1 2) → Const(1), Const(2), Add, Return
+
+A2.3: Pass Manager
+├── src/compiler/pass_manager.ixx
+│   ├── Pass 基类 (run(IRModule) → IRModule)
+│   ├── 增量标记 (哪些 Function 需要重新 pass)
+│   └── Pass 排序与依赖
+红线: 空 Pass Chain 通过 → IR 不变
+
+A2.4: 增量编译核心
+├── src/compiler/incr.ixx
+│   ├── CompilationUnit — 每个 define/expression 一个单元
+│   ├── VersionStamp — 每次编译递增
+│   ├── DependencyGraph — 单元间依赖 (A calls B)
+│   └── DirtyPropagation — A 变 → 依赖 A 的全部标记 dirty
+红线: (define a 1) → (define b (+ a 2)) → 改 a → 只有 b 标记 dirty
+
+A2.5: 编译缓存
+├── src/compiler/cache.ixx
+│   ├── IRCache — version → cached IR
+│   ├── SerializedCache — 磁盘缓存 (ABF 格式)
+│   └── CacheHit/Miss 统计
+红线: 第二次编译同一程序 → cache hit → 零重复工作
 ```
 
-**红线验证**：
-```
-(define my-if (flambda (cond then else)
-                 (if (eval/b cond env)
-                     (eval/b then env)
-                     (eval/b else env))))
-(my-if #t 1 2) → 1
-```
-
-### Step 33 — reflective-lambda
+### 🗣 Lang-2 — 编译 Passes
 
 ```
-新增：reflective-lambda — 可访问自身求值环境的 lambda
-      安全的运行时反射
+L2.1: AuraIR 解释器
+├── src/runtime/interpreter.ixx
+│   ├── execute(IRFunction, Env) → Value
+│   └── 替换 tree-walker 为 IR 解释器 (保留 fallback)
+红线: 所有 L1.x 测试用例通过 IR 解释器仍正确
+
+L2.2: 闭包变换 (Closure Conversion)
+├── 4 个子步:
+│   2.2a: 自由变量分析 — 遍历 AST，收集每个 lambda 的自由变量
+│   2.2b: 环境扁平化 — 嵌套 env → flat vector + offset 访问
+│   2.2c: 闭包分配 — 在 lambda 创建点生成 MakeClosure IR
+│   2.2d: 引用更新 — 所有变量访问改为 env[n] 偏移量
+红线: (let ((x 1)) (lambda (y) (+ x y))) → 闭包含 {x=1}
+
+L2.3: compute-kind 分析
+├── 分类每个表达式: value / function / macro
+├── 用于: 调用约定选择、宏展开时机
+红线: (define x 5) → kind=value; (define f (lambda (x) x)) → kind=function
+
+L2.4: Arity 检查
+├── 静态检测函数调用的参数数量
+├── 报告: wrong number of arguments: expected 2, got 3
+红线: ((lambda (x y) x) 1) → 编译期错误
+
+L2.5: 常量折叠
+├── ConstantFoldingPass: (+ 2 3) → 5 (编译期)
+├── 传播到使用站点: (let ((x (+ 2 3))) (* x 2)) → (* 5 2)
+红线: 折叠后 IR 指令数减少
+
+L2.6: 死代码消除 (DCE)
+├── DeadCodeEliminationPass: 移除不可达的基本块和无用的 let 绑定
+红线: (let ((x 1)) 2) → 降级后没有 x 相关 IR
+
+L2.7: 源位置追踪 (贯穿式)
+├── LocatedPhase Extension — 每个节点携带 file:line:col
+├── 降级到 IR 时传递源位置
+├── 错误报告: test.aura:15:3: undefined variable 'y'
+红线: (define x (+ y 1)) → error: test.aura:1:14
+
+L2.8: 静态错误报告 + 诊断
+├── UnboundVariablePass — 编译期检测未绑定变量
+├── 结构化 Diagnostic: severity + message + source_range
+红线: 所有编译期错误带精确源位置
 ```
 
-**红线验证**：
-```
-Agent 输出代码 → eval/b 加载 → 运行 → 动态修改行为
-```
-
-### Step 34 — C++26 反射运行时 + 跨语言互操作
+### 🔧 Infra-2 — CI + 基准
 
 ```
-新增：C++26 端 export/eval/b 实现
-      Racket ↔ C++26 环境序列化/反序列化
-      flambda 在 C++26 运行时中的对应实现
+I2.1: CI 扩展: 多平台构建
+├── ubuntu-latest, macos-latest (Arm), ubuntu-24.04-arm
+├── Racket 9.1 + C++26 enabled toolchain
+├── 测试矩阵: Debug / Release / ASan / UBSan
+红线: PR 合并前所有平台通过
+
+I2.2: 性能基准 CI
+├── benchmarks/ 扩展:
+│   ├── bench-eval-throughput    — 求值吞吐量 (ops/sec)
+│   ├── bench-compile-latency    — 编译延迟 (ms per function)
+│   ├── bench-incr-speedup       — 增量 vs 全量编译加速比
+│   └── bench-abf               — ABF 序列化/反序列化带宽
+├── 基准结果存入 bench-results/ (版本化)
+红线: PR 不降低基准性能 (或人工审查)
+
+I2.3: 文档生成管线
+├── 根据 Step 定义自动生成"当前能力"文档
+├── 红线列表自动导出为可读文档
+红线: git push → 文档自动更新
+
+I2.4: 增量编译压力测试
+├── 生成 1000 函数、10000 行代码
+├── 全量编译计时
+├── 修改 1 行 → 增量编译计时
+├── 验证加速比 >= 50x
+红线: 1000 函数全量 < 5s, 增量 < 100ms
 ```
 
-**红线验证**：
-```
-Racket 端 export env → ABF序列化 → C++26 eval/b → 结果返回 Racket
-```
-
-**里程碑**：AI Agent 能运行时加载、修改、执行代码。自修改闭环打通。
+**里程碑 2 红线**：`(define x (+ y 1))` → 编译期 `error: line 1:14`；1000 行全量 < 5s，1 行增量 < 100ms。
 
 ---
 
-## Phase 3：宏系统 (Steps 35-36)
+## 里程碑 3：查询引擎 + AI 修复闭环
 
-**目标**：语言学会生长语法。
+**时间**：8-10 周
+**目标**：AI 能通过 AuraQuery 查询 AST、生成补丁、触发增量编译、热更新运行时代码。
+**这是 Aura 区别于传统编译器的核心差异化能力。**
 
-### Step 35 — 卫生宏系统
-
-```
-新增：syntax-rules 风格的卫生宏
-      expander Pass — 编译期宏展开
-      macro 环境与普通环境分离
-```
-
-**红线验证**：
-```
-(define-syntax-rule (twice x) (* 2 x))
-(twice 5) → 10
-```
-
-**参考**：LiSP Ch9, Racket syntax-parse 文档
-
-### Step 36 — with-aliases + 持久 AST + Code Walking
+### 🏗 Arch-3 — AuraQueryEngine
 
 ```
-新增：with-aliases 逃生舱 — 受控标识符捕获
-      持久 AST — 从解析到运行时全程保留
-      Code Walking — 宏可遍历任意深度 AST
+A3.1: 倒排索引核心
+├── src/query/index.ixx
+│   ├── KindIndex:  NodeKind → vector<NodeID>
+│   ├── NameIndex:  Symbol → vector<NodeID>
+│   ├── SourceIndex: SourceLocation → vector<NodeID>
+│   └── ErrorIndex: error_flag → vector<NodeID>
+红线: (node-type Call) 查询 → 返回所有 Call 节点 ID
+
+A3.2: Def-Use 链索引
+├── DefUseIndex: Def → vector<Use>, Use → vector<Def>
+│   ├── 构建: 遍历 AST 收集定义和使用
+│   └── 增量更新: 仅重建变更部分
+红线: (query (= (use-count :node) 0)) → 未使用定义
+
+A3.3: 查询计划执行引擎
+├── src/query/executor.ixx
+│   ├── 接受 QueryPlan 树 (filter/project/join)
+│   └── 在索引上执行
+红线: Racket 宏展开的查询计划 → C++26 执行 → 结果一致
+
+A3.4: 补丁生成器
+├── src/query/patch.ixx
+│   ├── PatchGenerator: 查询结果 → ABF Delta 补丁
+│   ├── 变换原语: replace-with, wrap-with, insert-before/after
+│   └── 补丁验证: 应用后 AST 语义等价
+红线: (query-and-fix ...) → ABF Delta → 应用后 AST 正确
+
+A3.5: Compiler Service 集成查询接口
+├── src/compiler/compiler_service.ixx 扩展
+│   ├── query(AuraQuery) → QueryResult
+│   ├── apply_patch(ASTPatch) → CompileResult
+│   └── ai_query(sexpr) → QueryResult (AI 友好版)
+红线: 所有 Compiler Service API 端到端测试通过
 ```
 
-**红线验证**：
+### 🗣 Lang-3 — AuraQuery eDSL + 热更新
+
 ```
-;; Agent 定义 DSL 并立即使用
-(define-syntax-rule (my-dsl expr)
-  (with-aliases (begin) expr))
-(my-dsl (print "hello"))
+L3.1: AuraQuery 宏 (Racket 端)
+├── lang/private/query.rkt
+│   ├── (query ...) — 纯查询
+│   ├── (query-and-fix ...) — 查询 + 自动修复
+│   ├── (query-and-transform ...) — 通用变换
+│   └── 宏展开为内部查询计划 S 表达式
+红线: (query (node-type Call) (has-error? #t)) → 展开为 query-plan
+
+L3.2: AuraQuery 宏扩展
+├── (define-syntax-rule (find-empty-functions) (query ...))
+├── (define-syntax-rule (find-potential-infinite-loops) (query ...))
+红线: 用户可定义自己的查询 DSL
+
+L3.3: Hot Swap 引擎 (解释器模式)
+├── src/runtime/hotswap.ixx
+│   ├── FunctionRegistry — 所有可替换函数的注册表
+│   ├── SwapPoint — 函数级替换点 (函数指针间接调用)
+│   ├── AtomicSwap — 替换后确保旧版本无 inflight 调用
+│   └── Rollback — 替换失败时恢复旧版本
+红线: 运行中 hot_swap "fact" → 下次调用 (fact 5) 用新版本
+
+L3.4: Hot Swap 追踪
+├── SwapDependencyTracker — 函数 A 调用 B → B 替换后 A 也需更新
+├── CoherentSwapSet — 一批函数一起替换，保证一致性
+红线: 替换 B → 所有调用 B 的函数自动重编译
+
+L3.5: Aura 源文件格式 + 模块导入
+├── .aura 文件读取
+├── (import "module.aura") — 加载并编译另一个文件
+├── 模块作用域隔离
+红线: (import "math.aura") → (math/sqrt 9) → 3
 ```
 
-**参考**：`docs/aura_query.md §4.3` 宏抽象示例
+### 🔧 Infra-3 — 查询测试 + 集成
 
-**里程碑**：Agent 能动态生成 DSL → 展开 → 使用。
+```
+I3.1: AuraQuery 测试套件
+├── tests/query/
+│   ├── test-basic.rkt     — 基本查询
+│   ├── test-transform.rkt — 变换/修复
+│   ├── test-fixpoint.rkt  — 多次修复不退化
+│   └── test-hotswap.rkt   — 热更新正确性
+红线: 所有查询测试通过
+
+I3.2: AI 交互模拟器
+├── tools/ai-sim.py — 模拟 Agent 执行 query→fix→compile→swap 闭环
+├── 输入: 自然语言描述的修复任务
+├── 输出: 修复后的程序 + 执行结果
+红线: "修复 factorial 的参数检查" → 自动完成
+
+I3.3: 端到端集成测试
+├── tests/integration/
+│   ├── e2e-basic.aura     — 基础程序运行
+│   ├── e2e-query.aura     — 查询 + 修复
+│   ├── e2e-hotswap.aura   — 热更新
+│   └── e2e-module.aura    — 多模块
+红线: 每个 e2e 测试在 CI 中运行
+```
+
+**里程碑 3 红线**：`query → fix → incremental compile → hot swap` 闭环可演示。模拟 Agent 自动修复一个 bug。
 
 ---
 
-## Phase 4：生产化 (Steps 37+)
+## 里程碑 4：反射 + 宏
 
+**时间**：8-10 周
+**目标**：AI Agent 可运行时自我修改（反射），语言可生长新语法（宏）。
+
+### 🏗 Arch-4 — 反射运行时
+
+```
+A4.1: 环境序列化 (Env → ABF)
+├── src/runtime/env.ixx
+│   ├── export — 当前环境 → 可传输的数据结构
+│   ├── import — 恢复环境
+│   └── 跨语言: Racket env ↔ C++ env
+红线: Racket export env → ABF → C++ import → eval/b 一致
+
+A4.2: C++26 eval/b + enrich
+├── eval/b(expr, env) — 在指定环境中求值
+├── enrich(env, bindings) — 扩展环境
+红线: (eval/b '(+ 1 2) (export)) → 3
+
+A4.3: flambda 运行时支持
+├── flambda 参数: (expr, env) → 控制求值
+├── 运行时: 传递未求值的参数 AST + 当前环境
+红线: flambda 实现自定义求值策略
+
+A4.4: 安全沙箱
+├── reflective-lambda — 安全受限的反射
+├── 权限系统: 哪些绑定可读/可写/可调用
+红线: sandbox 内无法访问 unsafe 操作
+```
+
+### 🗣 Lang-4 — 宏 + 自举
+
+```
+L4.1: 卫生宏系统 (Racket 端)
+├── lang/private/macro.rkt
+│   ├── syntax-rules 风格模式匹配
+│   ├── hygiene — 自动重命名避免捕获
+│   └── expander Pass — 编译期宏展开
+红线: (define-syntax-rule (twice x) (* 2 x)) → (twice 5) → 10
+
+L4.2: with-aliases 逃生舱
+├── 受控标识符捕获 — DSL 友好
+红线: DSL 宏生成绑定 → 可被用户代码引用
+
+L4.3: 持久 AST
+├── 从解析到运行时全程保留 AST
+├── 序列化: ABF 格式保存完整元数据
+├── 反序列化: 恢复完整 AST 结构
+红线: 编译 → 序列化 → 反序列化 → AST 结构等价
+
+L4.4: Code Walking
+├── macro 可遍历任意深度的 AST 子树
+├── 支持: 查找、变换、统计
+红线: (walk-ast '(lambda (x) (+ x 1)) '(+ ...)) → 找到所有加法
+
+L4.5: 宏 → 查询引擎集成
+├── 宏定义在 AuraQuery 索引中可见
+├── 可查询宏的展开历史和用途
+红线: (query (node-type Macro) (name "twice")) → 展开结果
+
+L4.6: Sound Gradual Typing (可选)
+├── (define (add : Int -> Int) (x : Int) (y : Int) (+ x y))
+├── 未标注类型 → 动态检查
+├── 已标注类型 → 静态验证
+红线: 类型错误在编译期捕获，未标注代码在运行时检查
+```
+
+### 🔧 Infra-4 — 文档 + 示例
+
+```
+I4.1: 自托管文档系统
+├── docs/ 自动化生成
+├── 每个宏/内置函数的文档字符串
+红线: (help define) → 显示文档
+
+I4.2: 示例代码库
+├── examples/
+│   ├── hello.aura           — Hello World
+│   ├── factorial.aura       — 阶乘
+│   ├── query-fix-demo.aura  — AI 修复演示
+│   ├── self-modify.aura     — 反射自修改
+│   └── dsl-demo.aura        — 宏 DSL 演示
+红线: 每个 demo 可运行
+
+I4.3: 性能回归告警
+├── CI 自动比较基准结果
+├── 性能退化 > 10% → 告警
+红线: 基准结果版本化，退化自动检测
+```
+
+**里程碑 4 红线**：Agent 写出宏 → 展开 → 使用；Agent eval/b 自修改行为。
+
+---
+
+## 里程碑 5：生产化
+
+**时间**：12-16 周
 **目标**：从原型走向可替代旧生态的生产级系统。
 
-| Step | 特性 | 红线验证 |
-|------|------|----------|
-| 37 | LLVM IR 后端 | `AuraIR → LLVM IR → native code` |
-| 38 | AOT 编译路径 | `clang++ -ffreestanding → 独立二进制` |
-| 39 | Sound Gradual Typing | `(define (add x y) (+ x y))` 等价于 `(add : Int Int -> Int)` |
-| 40 | 安全沙箱 | `(with-sandbox (lambda () (unsafe ...))) → error: permission denied` |
-| 41 | 包管理器 | `(import "http://pkg/foo.aura")` |
-| 42 | 自举 (Bootstrap) | `Aura 编译器用 Aura 自己编译` |
-| 43+ | 分布 Agent 运行时 | 多 Agent 共享 Compiler Service |
+### 🏗 Arch-5 — LLVM + AOT + 分布式
+
+```
+A5.1: AuraIR → LLVM IR 后端
+├── src/compiler/codegen.ixx
+│   ├── IRFunction → llvm::Function
+│   └── LLVM ORC JIT 集成
+红线: (fact 10) → LLVM IR → JIT → 3628800
+
+A5.2: AOT 编译路径
+├── src/compiler/aot.ixx
+│   ├── IR → C++26 源码生成
+│   └── clang++ -ffreestanding → 独立二进制
+红线: aura build program.aura → ./program 运行
+
+A5.3: 分布式 Compiler Service
+├── gRPC 接口扩展
+├── 多 Agent 共享编译缓存
+├── 模块注册表 (中央仓库)
+红线: Agent A compile → Agent B import → 缓存命中
+
+A5.4: 包管理器
+├── aura pkg install <name>
+├── aura pkg publish <dir>
+红线: 安装包 → import → 使用
+```
+
+### 🗣 Lang-5 — 自举
+
+```
+L5.1: Aura 编译器用 Aura 写
+├── 将 C++26 Compiler Service 的逻辑翻译为 Aura
+├── src/ → *.aura 文件
+红线: Aura 编译器编译自己
+
+L5.2: 自举验证
+├── 用 Aura 编译器编译 Aura 编译器
+├── 结果与 C++26 版本行为一致
+红线: 自举一次后，不再需要 C++26 版本
+
+L5.3: 性能对标
+├── Aura 自举版本 vs Racket 原型
+├── 性能目标: 自举版本 >= Racket 版本 2x
+红线: 基准测试对比通过
+```
+
+### 🔧 Infra-5 — 生态
+
+```
+I5.1: LSP 服务器
+├── aura lsp — 基于 AuraQueryEngine 的语言服务器
+├── 代码补全、跳转定义、查找引用、诊断
+红线: VS Code 中编辑 .aura 文件
+
+I5.2: 调试器
+├── aura debug program.aura
+├── 断点、单步、变量查看
+红线: 可调试 factorial
+
+I5.3: 包注册表
+├── registry.aura-lang.org
+├── 包搜索、版本管理、依赖解析
+红线: aura pkg search "json" → 结果
+```
+
+**里程碑 5 红线**：`Aura 编译器编译 Aura 编译器` → 自举成功。
+
+---
+
+## 时间线（并行三轨）
+
+```
+里程碑   │ 时间      │ 架构 Step  │ 语言 Step  │ 基建 Step
+─────────┼───────────┼───────────┼───────────┼───────────
+M0 种子   │ 已完成     │ A0.1-0.3   │ L0.1-0.8   │ I0.1-0.3
+M1 C++求值│ 第 1-8 周  │ A1.1-1.5   │ L1.1-1.8   │ I1.1-1.5
+M2 管线   │ 第 9-18 周 │ A2.1-2.5   │ L2.1-2.8   │ I2.1-2.4
+M3 查询   │ 第 19-28周│ A3.1-3.5   │ L3.1-3.5   │ I3.1-3.3
+M4 反射   │ 第 29-38周│ A4.1-4.4   │ L4.1-4.6   │ I4.1-4.3
+M5 生产   │ 第 39-54周│ A5.1-5.4   │ L5.1-5.3   │ I5.1-5.3
+```
+
+总工期：约 54 周（持续演进，非固定截止日期）。
+
+每个里程碑的跨度 = 三个轨道中最慢的那个完成的时间。**允许架构比语言快**（建好骨架等语言填内容），但不允许基建拖后腿。
+
+---
+
+## 关键风险与缓解
+
+| 风险 | 概率 | 影响 | 缓解 |
+|------|------|------|------|
+| Racket #lang 源码丢失需重建 | 高 | M1 延迟 1-2 周 | C++ 端先用文本 bootstrap, 并行重建 Racket |
+| ABF 跨语言调试困难 | 中 | A1.3-1.4 延迟 | 先以 JSON 作为中间交换格式验证语义, 再切 ABF |
+| 增量编译性能不达标 | 中 | M2 延迟 | 允许 T/20 (非 T/100) 作为过渡目标 |
+| 热更新导致状态不一致 | 中 | M3 延迟 | 解释器模式先做, JIT 模式后做 |
+| P2996 std::meta 编译器支持不足 | 高 | A2 序列化 | fallback: 手动写序列化代码, 反射做 optional |
+| AuraQuery 表达力不足 (对 LLM 生成) | 中 | M3 延迟 | 先支持 80% 用例, 不足的通过宏扩展 |
 
 ---
 
 ## 增量构建红线汇总
 
 ```
-Step 09: ./aura --eval '(+ 1 2)'                    → 3
-Step 13: ./aura --eval '((lambda (x) (* x 2)) 5)'    → 10
-Step 14: ./aura --eval '(letrec ((fact ...)) (fact 5))' → 120
-Step 16: ./aura 交互式 REPL                            → 可用
-Step 22: ./aura --eval '(undefined-var)'              → error: line 1:14
-Step 23: 1000行, 改1行, 增量编译 time < 10ms          → 通过
-Step 28: (query (node-type Call))                     → [42, 57]
-Step 30: 热替换函数 → 下次调用用新版本                   → 通过
-Step 32: flambda 自定义求值策略                         → 通过
-Step 35: 宏展开 (twice 5) → 10                         → 通过
-Step 42: Aura 编译自身                                  → 通过
+M0  Step 08: (letrec ((fact ...)) (fact 5)) → 120
+M1  Step 16: ./aura REPL 可交互                    → 通过
+M2  Step 24: 未绑定变量编译期错误 + 精确源位置       → error: line 1:14
+M2  Step 23: 1000行, 改1行, 增量 < 100ms            → 通过
+M3  Step 28: (query (node-type Call)) → [42, 57]    → 通过
+M3  Step 30: 热替换函数 → 下次调用用新版本            → 通过
+M4  Step 32: flambda 自定义求值策略                   → 通过
+M4  Step 35: (twice 5) → 10 (宏展开)                → 通过
+M4  Step 36: 持久 AST 序列化 → 反序列化 → 等价     → 通过
+M5  Step 42: Aura 编译自身                           → 自举成功
+Step 43: vs Racket 原型 2x 性能                      → 通过
 ```
 
 ---
 
-## 时间线（按 Ghuloum 节奏）
-
-```
-Phase 0: 已完成
-
-Phase 1a (Step 09-16): 第 1-3 周    ← 当前起点
-  Week 1:  Step 09-10  环境 + 整数/变量
-  Week 2:  Step 11-13  算术 + 条件 + 闭包
-  Week 3:  Step 14-16  letrec + define + REPL
-
-Phase 1b (Step 17-24): 第 4-7 周
-  Week 4:  Step 17-18  AuraIR 定义 + 解释器
-  Week 5:  Step 19-20  闭包变换 + 静态检查
-  Week 6:  Step 21-22  优化 + 源位置
-  Week 7:  Step 23-24  增量编译 + 诊断
-
-Phase 1c (Step 25-30): 第 8-10 周
-  Week 8:  Step 25-26  索引构建
-  Week 9:  Step 27-28  AuraQuery 解析 + 执行
-  Week 10: Step 29-30  补丁生成 + 热更新
-
-Phase 2   (Step 31-34): 第 11-13 周
-Phase 3   (Step 35-36): 第 14-16 周
-Phase 4   (Step 37-43): 第 17-24 周
-```
-
-每步之间留 1 天缓冲。完成一个 Step 的标志：**红线验证通过，测试覆盖 > 90%。**
-
----
-
-## 与设计文档的对应
-
-| Roadmap 阶段 | 对应设计文档 |
-|-------------|-------------|
-| Phase 0 Racket 原型 | `docs/aura_architecture.md §3.1` |
-| Phase 1a C++26 求值器 | `docs/aura_architecture.md §3.3` + `docs/aura_modules.md` |
-| Phase 1b 编译管线 | `docs/aura_architecture.md §3.4` (AuraIR) |
-| Phase 1c 查询引擎 | `docs/aura_query.md §5` + `docs/aura_architecture.md §3.5` |
-| Phase 2 反射 | `docs/aura_architecture.md §2` (反射决策) |
-| Phase 3 宏系统 | `docs/aura_architecture.md §3.1` (Racket 宏) |
-| Phase 4 生产化 | `docs/aura_architecture.md §3.6-3.7` (Service + Runtime) |
-| 序列化 (贯穿所有阶段) | `docs/aura_serialization.md` |
-| 模块结构 | `docs/aura_modules.md` |
-
----
-
-> **"向前走，门会自己打开。"**
-> 每一步都是可运行的。没有大跃进，没有不可测试的阶段。
+> **"不着力。向前走，门会自己打开。"**
+> 每一步可运行，每个里程碑可用。三轨并行，从种子长成它能长成的样子。
