@@ -268,15 +268,15 @@ cmake --build . -j$(nproc)
 
 | 设计文档 | 对应源代码模块 |
 |----------|---------------|
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.1 Racket Frontend | — (Racket 端) |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.2 ABF v2 | `aura.core.ast` + `aura.binary.*` |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.3 AST 层 | `aura.core.ast` |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.4 AuraIR 层 | `aura.compiler.optimizer` (IR 定义) |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.5 AuraQueryEngine | `aura.query.*` |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.6 Compiler as a Service | `aura.compiler.compiler_service` |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) §3.7 三层运行时 | `aura.runtime.*` |
-| [SERIALIZATION.md](./SERIALIZATION.md) | `aura.core.ast` + `aura.binary.*` |
-| [AURAQUERY.md](./AURAQUERY.md) | `aura.query.*` |
+| [aura_architecture.md](./aura_architecture.md) §3.1 Racket Frontend | — (Racket 端) |
+| [aura_architecture.md](./aura_architecture.md) §3.2 ABF v2 | `aura.core.ast` + `aura.binary.*` |
+| [aura_architecture.md](./aura_architecture.md) §3.3 AST 层 | `aura.core.ast` |
+| [aura_architecture.md](./aura_architecture.md) §3.4 AuraIR 层 | `aura.compiler.optimizer` (IR 定义) |
+| [aura_architecture.md](./aura_architecture.md) §3.5 AuraQueryEngine | `aura.query.*` |
+| [aura_architecture.md](./aura_architecture.md) §3.6 Compiler as a Service | `aura.compiler.compiler_service` |
+| [aura_architecture.md](./aura_architecture.md) §3.7 三层运行时 | `aura.runtime.*` |
+| [aura_serialization.md](./aura_serialization.md) | `aura.core.ast` + `aura.binary.*` |
+| [aura_query.md](./aura_query.md) | `aura.query.*` |
 
 ---
 

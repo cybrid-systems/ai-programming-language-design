@@ -270,9 +270,9 @@ Racket 端的宏将 `query` 展开为内部查询计划：
 
 展开后的查询计划是一个 S 表达式，可 ABF 序列化后传输到 C++26 Compiler Service。
 
-### 5.3 与 ARCHITECTURE.md 的对应
+### 5.3 与 aura_architecture.md 的对应
 
-| ARCHITECTURE.md 模块 | AuraQuery 上下文 |
+| aura_architecture.md 模块 | AuraQuery 上下文 |
 |----------------------|-----------------|
 | 3.5 AuraQueryEngine | 查询执行引擎（索引构建、查询执行） |
 | 3.5 Index Layer | AST / IR / Def-Use / Source 四种倒排索引 |
@@ -347,6 +347,6 @@ Compiler Service 暴露的查询相关接口：
 > **"查询就是代码，代码就是数据。"**
 > AuraQuery 是 Aura homoiconicity 的自然延伸——如果代码是数据，那么查询代码的操作也应该是代码的一部分。
 >
-> 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md) | [SERIALIZATION.md](./SERIALIZATION.md) | [CXX_MODULES.md](./CXX_MODULES.md) | [DESIGN_PHILOSOPHY.md](./philosophy/DESIGN_PHILOSOPHY.md)
+> 相关文档：[aura_architecture.md](./aura_architecture.md) | [aura_serialization.md](./aura_serialization.md) | [aura_modules.md](./aura_modules.md) | [design_philosophy.md](./philosophy/design_philosophy.md)
 >
 > 实现仓库：[github.com/cybrid-systems/aura](https://github.com/cybrid-systems/aura)

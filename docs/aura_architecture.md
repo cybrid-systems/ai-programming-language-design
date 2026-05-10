@@ -119,11 +119,11 @@ lang/
 
 ### 3.2 ABF v2 — Alien Binary Format
 
-完整规范见 [SERIALIZATION.md](./SERIALIZATION.md)。此处仅列关键设计要点。
+完整规范见 [aura_serialization.md](./aura_serialization.md)。此处仅列关键设计要点。
 
 **设计目标**：零拷贝 + Delta 增量传输 + 跨语言边界的极高性能序列化。
 
-**核心设计**（详细格式见 SERIALIZATION.md §4）：
+**核心设计**（详细格式见 aura_serialization.md §4）：
 - 每个节点以 **varint 编码**，支持 Tag + ExtensionID + ExtensionLength + Payload 变长结构
 - ExtensionID 和长度前缀提供向前兼容：老版本跳过未知扩展
 - 节点级 ExtensionLength 支持零拷贝：以 `std::span` 直接切片扩展数据
@@ -141,7 +141,7 @@ lang/
 
 **技术选型**：C++26 `std::variant` + Concepts + Trees that Grow 模式
 
-**核心设计**（完整实现见 [SERIALIZATION.md](./SERIALIZATION.md)）：
+**核心设计**（完整实现见 [aura_serialization.md](./aura_serialization.md)）：
 
 每个构造器（节点类型）**独立携带自己的扩展数据**，而非整个 AST 共用同一个扩展类型：
 
@@ -235,7 +235,7 @@ AuraQueryEngine
 
 **AuraQuery eDSL 示例**：
 
-完整语法见 [AURAQUERY.md](./AURAQUERY.md)。此处仅列示例概览。
+完整语法见 [aura_query.md](./aura_query.md)。此处仅列示例概览。
 
 ```lisp
 ;; 查找所有递归调用
@@ -408,7 +408,7 @@ AuraIR → CodeGen → C++26 源码生成
 
 | 内容 | ai-programming-language-design | aura |
 |------|-------------------------------|------|
-| 设计哲学 | DESIGN_PHILOSOPHY.md | 精炼版 → [DESIGN.md](./DESIGN.md) |
+| 设计哲学 | design_philosophy.md | 精炼版 → [DESIGN.md](./DESIGN.md) |
 | 架构设计 | 多篇分阶段 | 整合版 → 本文档 |
 | Racket 学习 | racket/day-01 ~ day-14 | 已内化为 #lang aura 实现 |
 | C++26 标准跟踪 | cpp26/ | 已内化为 Compiler Service 实现 |

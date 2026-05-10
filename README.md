@@ -6,7 +6,7 @@
 
 ```
 docs/
-├── philosophy/          DESIGN_PHILOSOPHY.md（唯一的设计哲学）
+├── philosophy/          design_philosophy.md（唯一的设计哲学）
 ├── racket/              01 代码即数据 / 02 语言生长 / 03 可编程编程
 └── cpp26/               01 Modules / 02 std::meta / 03 Contracts
 
@@ -19,15 +19,15 @@ code-learn/linux/        代码库语义分析
 
 | 设计文档 | 对应实现模块 |
 |-----------|------------|
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | aura 项目的整体架构蓝图 |
-| [SERIALIZATION.md](docs/SERIALIZATION.md) | AST 序列化协议 (ABF v2) |
-| [AURAQUERY.md](docs/AURAQUERY.md) | AuraQuery eDSL 查询引擎 |
-| [CXX_MODULES.md](docs/CXX_MODULES.md) | C++26 后端模块骨架 |
+| [aura_architecture.md](docs/aura_architecture.md) | aura 项目的整体架构蓝图 |
+| [aura_serialization.md](docs/aura_serialization.md) | AST 序列化协议 (ABF v2) |
+| [aura_query.md](docs/aura_query.md) | AuraQuery eDSL 查询引擎 |
+| [aura_modules.md](docs/aura_modules.md) | C++26 后端模块骨架 |
 
 ## 开始
 
 ```
-open docs/philosophy/DESIGN_PHILOSOPHY.md
+open docs/philosophy/design_philosophy.md
 ```
 
 ## 许可证
