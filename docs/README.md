@@ -28,6 +28,7 @@ docs/
 | `aura_ast_dod.md` | AST 层 | SoA 扁平 AST + 四维综合设计 |
 | `aura_memory_pool.md` | 运行时层 | pmr 高性能 AST 内存池 |
 | `aura_caas.md` | CaaS 层 | CompilerService 接口与生命周期 |
+| `aura_query_engine.md` | M2 查询层 | AuraQuery 引擎设计草案 |
 
 ## 实现仓库
 
