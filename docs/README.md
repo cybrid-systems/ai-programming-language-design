@@ -10,6 +10,7 @@ docs/
 ├── aura_query.md          ← AuraQuery eDSL：原生查询语法、变换、AI 交互
 ├── aura_serialization.md  ← ABF v2 协议：Trees that Grow + C++26 零拷贝序列化
 └── aura_modules.md        ← C++26 模块结构：.ixx 模块划分、CMake 配置
+| `aura_ast_dod.md` | AST 层 | SoA 扁平 AST + 四维综合设计 |
 ```
 
 ## 三层架构对应关系
@@ -24,6 +25,7 @@ docs/
 | `aura_serialization.md` | 通信层 | ABF v2 零拷贝二进制协议 |
 | `aura_query.md` | AI 交互层 | 原生 eDSL 查询与变换 |
 | `aura_modules.md` | 工程层 | C++26 模块文件结构、CMake 构建配置 |
+| `aura_ast_dod.md` | AST 层 | SoA 扁平 AST + 四维综合设计 |
 | `aura_memory_pool.md` | 运行时层 | pmr 高性能 AST 内存池 |
 | `aura_caas.md` | CaaS 层 | CompilerService 接口与生命周期 |
 
@@ -39,5 +41,6 @@ docs/
 4. 并行参考 `cpp26/` 跟踪后端标准演进
 5. 理解序列化和查询：`aura_serialization.md` + `aura_query.md`
 6. 参考 `aura_modules.md` 了解 C++26 后端的模块划分
+| `aura_ast_dod.md` | AST 层 | SoA 扁平 AST + 四维综合设计 |
 7. 参考 `aura_roadmap.md` 了解开发路线图
 8. 到 [Aura 仓库](https://github.com/cybrid-systems/aura) 查看实现状态
