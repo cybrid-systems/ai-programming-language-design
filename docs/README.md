@@ -14,7 +14,8 @@ docs/
 ├── aura_memory_pool.md      ← pmr 高性能 AST 内存池
 ├── aura_caas.md             ← CompilerService 接口与生命周期
 ├── aura_cpp26_guide.md      ← C++26 现代化编码指南
-└── aura_query_engine.md     ← M2 AuraQuery 引擎设计
+├── aura_query_engine.md     ← M2 AuraQuery 引擎设计
+└── aura_reflection.md       ← M3 反射规划方案
 ```
 
 ## 三层架构对应关系
@@ -34,6 +35,7 @@ docs/
 | `aura_caas.md` | CaaS 层 | CompilerService 接口与生命周期 |
 | `aura_cpp26_guide.md` | 编码规范 | C++26 现代化指南 |
 | `aura_query_engine.md` | M2 查询层 | AuraQuery 引擎设计草案 |
+| `aura_reflection.md` | M3 反射层 | P2996 + 运行时反射 + 宏系统规划 |
 
 ## 实现仓库
 
