@@ -195,7 +195,7 @@ aura_architecture.md 中的 "Compiler Service (C++26)" 框
          │
          ▼
   CompilerService          ← 本文档定义
-  ├─ ASTArena              ← memory_pool.md 定义
+  ├─ ASTArena              ← aura_memory_pool.md 定义
   ├─ Parser
   ├─ Evaluator (tree-walk)
   ├─ LoweringPass → IR
@@ -225,6 +225,6 @@ aura_architecture.md 中的 "Compiler Service (C++26)" 框
 
 ## 引用
 
-- 内存池设计：[memory_pool.md](./memory_pool.md)
+- 内存池设计：[aura_memory_pool.md](./aura_memory_pool.md)
 - 架构总览：[aura_architecture.md](./aura_architecture.md)
 - 实现代码：`aura/src/compiler/service.ixx`

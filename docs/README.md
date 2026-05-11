@@ -24,8 +24,8 @@ docs/
 | `aura_serialization.md` | 通信层 | ABF v2 零拷贝二进制协议 |
 | `aura_query.md` | AI 交互层 | 原生 eDSL 查询与变换 |
 | `aura_modules.md` | 工程层 | C++26 模块文件结构、CMake 构建配置 |
-| `memory_pool.md` | 运行时层 | pmr 高性能 AST 内存池 |
-| `caas_integration.md` | CaaS 层 | CompilerService 接口与生命周期 |
+| `aura_memory_pool.md` | 运行时层 | pmr 高性能 AST 内存池 |
+| `aura_caas.md` | CaaS 层 | CompilerService 接口与生命周期 |
 
 ## 实现仓库
 
