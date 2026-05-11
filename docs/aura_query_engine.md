@@ -175,6 +175,9 @@ struct SymRefIndex {
 | `not P` | 非 | `(not (node-type LiteralInt))` |
 | `exists P` | 子树中存在 | `(exists (node-type Call))` |
 | `ref-count N` | 引用计数 | `(= (ref-count :node) 0)` |
+| `callee name` | 调用特定函数 | `(callee "fact")` |
+| `has-error?` | 有编译错误 | `(has-error? #t)` |
+| `arg-type N type` | 参数类型 | `(arg-type 0 Integer)` |
 
 ### 4.3 查询执行引擎
 
