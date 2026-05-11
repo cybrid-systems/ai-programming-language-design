@@ -53,15 +53,15 @@
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-| 层 | 位置 | 技术栈 | 核心职责 |
-|----|------|--------|----------|
-| **Racket Frontend** | Racket | #lang + syntax-parse | 宏展开、语义验证、Homoiconic AST 输出 |
-| **ABF** | 通信层 | 自定义二进制 | 零拷贝序列化、Delta 增量传输 |
-| **AST 层** | C++26 | Trees that Grow + Concepts | 早期处理、静态反射、源位置保留 |
-| **AuraIR 层** | C++26 | 自定义 SSA-like IR | 优化核心、代码生成入口 |
-| **AuraQueryEngine** | C++26 | 倒排索引 + eDSL | 子树查询、变换、AI 接口 |
-| **Compiler Service** | C++26 | 长驻进程 | 编译 + 执行 + 热更新 + 状态 |
-| **三层运行时** | C++26 | 解释/JIT/AOT | 执行 + 热更新 + 性能分层 |
+| 层 | 位置 | 技术栈 | 核心职责 | 设计文档 |
+|----|------|--------|----------|----------|
+| **Racket Frontend** | Racket | #lang + syntax-parse | 宏展开、语义验证、Homoiconic AST 输出 | — |
+| **ABF** | 通信层 | 自定义二进制 | 零拷贝序列化、Delta 增量传输 | [serialization.md](./aura_serialization.md) |
+| **AST 层** | C++26 | Trees that Grow + Concepts | 早期处理、静态反射、源位置保留 | [memory_pool.md](./memory_pool.md) |
+| **AuraIR 层** | C++26 | 自定义 SSA-like IR | 优化核心、代码生成入口 | — |
+| **AuraQueryEngine** | C++26 | 倒排索引 + eDSL | 子树查询、变换、AI 接口 | [query.md](./aura_query.md) |
+| **Compiler Service** | C++26 | 长驻进程 | 编译 + 执行 + 热更新 + 状态 | [caas_integration.md](./caas_integration.md) |
+| **三层运行时** | C++26 | 解释/JIT/AOT | 执行 + 热更新 + 性能分层 | — |
 
 ---
 
@@ -138,6 +138,8 @@ lang/
 ---
 
 ### 3.3 AST 层 (Trees that Grow)
+
+**内存管理**：所有 AST 节点通过 pmr 内存池 (`ASTArena`) 分配，支持 O(1) 整树回收和零碎片的 bump 分配。详细设计见 [memory_pool.md](./memory_pool.md)。
 
 **技术选型**：C++26 `std::variant` + Concepts + Trees that Grow 模式
 
@@ -264,6 +266,10 @@ AuraQueryEngine
 ---
 
 ### 3.6 Compiler as a Service
+
+**完整实现方案见 [caas_integration.md](./caas_integration.md)**。本文仅列核心接口与架构分解。
+
+Compiler Service 基于 pmr 内存池（[memory_pool.md](./memory_pool.md)）构建，每个编译请求使用独立 `ASTArena`，支持增量编译、多租户隔离和 AI Agent 实时代码变异。
 
 **服务架构**：
 
@@ -410,6 +416,8 @@ AuraIR → CodeGen → C++26 源码生成
 |------|-------------------------------|------|
 | 设计哲学 | design_philosophy.md | 精炼版 → [DESIGN.md](./DESIGN.md) |
 | 架构设计 | 多篇分阶段 | 整合版 → 本文档 |
+| 内存池 | [memory_pool.md](./memory_pool.md) | `src/core/arena.ixx` |
+| CaaS 集成 | [caas_integration.md](./caas_integration.md) | `src/compiler/service.ixx` |
 | Racket 学习 | racket/day-01 ~ day-14 | 已内化为 #lang aura 实现 |
 | C++26 标准跟踪 | cpp26/ | 已内化为 Compiler Service 实现 |
 | 内核分析 | code-learn/linux/ | 提取语义约束供类型/IR 设计 |
