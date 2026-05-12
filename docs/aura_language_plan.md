@@ -383,3 +383,77 @@ L6        31-35   类型系统启蒙      EvalValue variant         5 天
 
 每个语言特性必须穿透 12 层 Trees that Grow 管线：AST → SoA → 解析器(×2) → 求值器 → ABF(×2) → Lowering → Reconstruct → 查询引擎 → Flatten → 测试。
 详见 [kernel_iteration_standard.md](./kernel_iteration_standard.md)。
+
+---
+
+## Phase L6: 类型系统起航 — 当前 Sprint 追加
+
+（此 Phase 是收到 5 月设计评审后追加，原 L6 作为 EvalValue variant 重构计划不变）
+
+### Step 31: EvalValue variant — 1 天
+
+当前：`int64_t` 通用值
+目标：`std::variant<std::int64_t, double, std::string*, Pair*, Vector*, bool>`
+
+**影响面**：
+- `frontend_impl.cpp` — `eval_in` 返回 `EvalResult` (= `expected<EvalValue, Diagnostic>`)
+- `Primitives` — `PrimFn` 从 `int64_t(vector<int64_t>)` 改为 `EvalValue(vector<EvalValue>)`  
+- `ir_interpreter_impl.cpp` — IR 解释器的 `int64_t` 局部变量
+- `CompilerService` — 返回值类型
+- `main.cpp` — 输出格式
+
+**这是类型系统的前置依赖，做完 EvalValue variant 后才能承载多种类型。**
+
+### Step 32: TypeId 骨架 — 1 天
+
+```scheme
+(: x Int)       → 解析类型标注
+(type? Int)     → #t
+(type-of 42)    → Int
+(type-of "hi")  → String
+```
+
+实现：
+- `TypeId` 枚举（Int/Bool/String/Float/Pair/Void/Any）
+- `TypeRegistry` — 类型注册 + 名称查询
+- 解析器接收 `: Type` 标注语法（`parse_type_annotation`）
+- Evaluator 中 `type_of(EvalValue)` 返回 TypeId
+
+### Step 33: 基础类型检查 — 1 天
+
+```scheme
+(x : Int 42)         → 通过
+(x : String 42)      → TypeError（运行时 catch）
+(+ 1 2)              → 推断为 Int
+(+ "a" 1)            → 运行时 TypeError
+
+(+ 1 2.5)            → 类型提升（Int → Float）
+```
+
+实现：
+- 类型检查作为 `after-eval` hook 插入
+- 基于 TypeId 的简单 EvalValue 检查
+- `+: Int→Int→Int` vs `+. Float→Float→Float` 重载
+
+### Step 34: Query 类型支持 — 1 天
+
+```scheme
+(query (node-type Call) (return-type Int))    → 匹配
+(query (node-type Variable) (has-type? Int))  → 匹配
+```
+
+实现：
+- QueryEngine 新增 `return-type`, `has-type?` 等 clause
+- SymRefIndex 扩展类型查询
+
+### Step 35: Coercion 框架 — 2 天
+
+```scheme
+(: f (-> Int String))
+(display (if cond 42 "hi"))  → 插入 (cast ... String)
+```
+
+实现：
+- `CoercionNode` + `CastOp` IR 指令
+- `CoercionInsertionPass` lowering pass
+- 非可忽略 cast 运行时验证
