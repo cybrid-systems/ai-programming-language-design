@@ -217,9 +217,9 @@ aura_architecture.md 中的 "Compiler Service (C++26)" 框
 | eval_ir() 路径 | ✅ | `service.ixx` |
 | REPL 集成 | ✅ | `src/main.cpp` |
 | pipe 模式集成 | ✅ | `src/main.cpp` |
-| `--serve` 模式 | ⬜ | 后续 |
-| 多 arena 管理器 | ⬜ | 后续 |
-| ABF 集成至 service | ⬜ | 后续 |
+| `--serve` 模式 | ✅ v2 | `main.cpp` |
+| 多 arena 管理器 | ✅ v1 | `arena.ixx` (ArenaGroup) |
+| ABF 集成至 service | ✅ | `service.ixx` |
 
 ---
 
@@ -228,3 +228,29 @@ aura_architecture.md 中的 "Compiler Service (C++26)" 框
 - 内存池设计：[aura_memory_pool.md](./aura_memory_pool.md)
 - 架构总览：[aura_architecture.md](./aura_architecture.md)
 - 实现代码：`aura/src/compiler/service.ixx`
+## 8. 实现状态 (v2.0 补充)
+
+### 增量编译管线
+
+通过 5 个 Phase 实现增量编译：
+
+| Phase | 组件 | 状态 | 位置 |
+|-------|------|------|------|
+| 1 | 定义分离 — try_extract_define | ✅ | `service.ixx` |
+| 2 | IR 缓存 — cache-aware lowering | ✅ | `lowering_flat_impl.cpp` |
+| 3 | 依赖追踪 — BFS 传递闭包失效 | ✅ | `service.ixx` |
+| 4 | 增量 Pass — per-function compute-kind + fold | ✅ | `pass_manager.ixx` |
+| 5 | --serve JSON 协议 — define/exec/redefine | ✅ | `main.cpp` |
+
+### Agent 接入
+
+| 组件 | 状态 | 位置 |
+|------|------|------|
+| --serve JSON 协议 | ✅ | `main.cpp` |
+| Hot swap CLI | ✅ | `main.cpp` |
+| mutation_loop.py (随机变异) | ✅ | `tests/mutation_loop.py` |
+| LLM 驱动变异 (--ai) | ✅ | `tests/mutation_loop.py` |
+| Benchmark 基线 + 回归 | ✅ | `tests/benchmark.py` |
+| 统一测试框架 | ✅ | `build.py` (5 suites, 147 tests) |
+
+## 9. 参考

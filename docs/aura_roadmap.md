@@ -9,11 +9,15 @@
 
 ```
 M0 Racket原型    ✅  #lang aura + 全语义求值器 + ABF 序列化
-M1 C++ 求值器   ✅  树遍历器 + IR 管线 (Ghuloum Step 1-8)
+M1 C++ 求值器   ✅  EvalValue variant + IR 管线 (Ghuloum Step 1-8)
 M2 查询引擎     ✅  Query/Transform/AutoFix/HotSwap/--serve
 M3a 语言补全    ✅  布尔/序对/begin/set!/quote/cond (Ghuloum Step 9-14)
-M3b 宏系统      🔨  defmacro ✅ → 卫生宏/编译期验证 ⬜
+M3b 宏系统      ✅  defmacro + 卫生宏 gensym + 编译期验证
 M3c 反射        ✅  P2996 auto_to_json + dispatch 表 + 结构验证
+M3d 类型系统    ✅  L6.1-L6.7 全线完成 (TypeChecker + 渐进类型 + Occurrence)
+M3e 工具链      ✅  Benchmark + EvalValue + IR 递归修复
+M3f 增量编译    ✅  定义缓存 → 依赖追踪 → 增量 Pass → --serve 协议
+M3g AI 闭环     ✅  mutation_loop.py + LLM --ai 驱动变异
 M4 生产         ⬜  LLVM JIT / AOT / 类型系统 / 自举
 ```
 
@@ -195,7 +199,7 @@ LLVM/M4          ⬜                    0%
 ## 测试
 
 ```
-CTest: 37 tests ✅
+CTest: 61 tests ✅ (147 total including benchmark + integ + smoke)
   - 9 step tests       (语言语义)
   - 1 ir_basic         (IR 管线)
   - 9 IR mode tests    (--ir flag)
@@ -208,4 +212,8 @@ CTest: 37 tests ✅
   - 1 validate_abf_nodes (P2996 结构验证)
   - 1 reflect_ir_instruction
   - 1 reflect_schema
+  - 42 benchmark cases (eval/IR/typecheck)
+  - 33 integration tests (build.py integ)
+  - 6 mutation tests (mutation_loop.py)
+  - 5 smoke tests (build.py smoke)
 ```
