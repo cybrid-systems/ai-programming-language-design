@@ -1,233 +1,275 @@
 # Aura 内核迭代标准
 
-**版本**：v1.0
-**原则**：每步新增一个语言特性，必须穿透完整的 Trees that Grow 管线。
-**方法**：测试先行（TDD），基础设施同步，ABF/查询引擎/IR/SoA 全线覆盖。
+**版本**：v2.0
+**原则**：测试先行（TDD），FlatAST 唯一规范，`build.py` 统一验证。
 
 ---
 
-## 1. 新增语言特性的标准管线
+## 0. 核心纪律
 
-每加一个新特性（如字符串、列表库、向量等），必须穿透 **12 层**：
+### 提交纪律
 
-```
-Layer  组件              文件                责任
-────  ────────────────  ─────────────────  ─────────────────────────
-  1   AST 数据结构       src/core/ast.ixx   定义新节点类型 + variant
-  2   SoA 元数据         src/core/ast_flat   kNodeMeta 表 + FlatAST 构造器
-  3   指针解析器          src/parser/*       解析新语法产生 AST 节点
-  4   扁平解析器          src/parser/*       扁平 AST 版本（与 3 同步）
-  5   求值器             src/compiler/*      eval_in 分支 + primitives
-  6   ABF 序列化 (Racket) lang/private/*     TAG + write-xxx
-  7   ABF 反序列化 (C++)  src/binary/*        read_xxx + dispatch 表
-  8   Lowering           src/compiler/*      lower_xxx + free vars
-  9   Reconstruct        src/compiler/*      FlatAST → Expr* 重建
- 10   查询引擎            src/compiler/*      tag 解析 + node-type 匹配
- 11   Flatten            src/core/*          Expr* → FlatAST
- 12   测试               tests/*             TDD 红线 + ABF E2E + ctest
-```
+1. **每步可测试** — 每次提交必须能通过 `./build.py check`
+2. **测试先行** — 代码改动前先写/改测试
+3. **增量提交** — 一个功能一个提交，不混改
+4. **提交信息包含测试计数** — 如 `Tests: 61/61 CTest + 42/42 benchmark`
 
-**强制规则**：第 12 层（测试）必须在第 1 层之前写。
+### 架构纪律
 
----
+1. **FlatAST 是唯一 AST** — 不再新增 Expr* 指针树代码。`reconstruct_expr` 只在 `eval_flat` 的 MacroDef 闭包桥接中使用
+2. **不建平行管线** — 所有新特性只需要一条实现路径：FlatAST 原生
+3. **测试写 Python，不写 C++** — 端到端测试用 `build.py` 的 `IntegCase`，不写新的 `test_*.cpp`
+4. **改旧必清** — 改某个旧模块时，顺手删其对应的死代码（如改 TypeChecker 时删 Expr* 旧路径）
 
-## 2. 开发流程
+### 迭代纪律
 
-### Step 0: 写红线测试（TDD）
-
-在 `tests/` 下创建测试文件，定义新特性的红线：
-
-```cpp
-// tests/test_string.cpp — Step 16 红线
-// 编译: g++ -std=c++26 -freflection ...
-// 运行: ctest -R test_string
-
-// 红线清单（每个特性 5-15 个测试用例）:
-//   1. 基础字面量: "hello" → 字符串
-//   2. 类型谓词: (string? "hello") → #t
-//   3. 操作: (string-length "hello") → 5
-//   4. 操作: (string-ref "hello" 0) → 104
-//   5. 组装: (string-append "a" "b") → "ab"
-//   6. 比较: (string=? "a" "a") → #t
-//   7. ABF 管线: #lang aura → racket --abf → ./aura --abf → 相同结果
-//   8. 查询: (query (node-type LiteralString)) → 匹配
-//   9. IR 模式: --ir 不崩溃（可返回 0）
-//  10. serve 模式: --serve 返回 JSON
-```
-
-红线必须覆盖所有层：
-- 2-3 个解析/求值测试
-- 1 个 ABF E2E 测试
-- 1 个查询测试
-- 1 个 IR 稳定性测试
-
-### Step 1-11: 逐层实现
-
-**顺序**：AST → SoA → 解析器 → ABF → 求值器 → 查询 → 测试
-
-每实现一层后运行已有的所有测试，确保没有 regression。
-
-### 红线验证
-
-红线测试全部通过后，运行 `ctest` 确保 37+ 测试全绿。
+1. **小步快跑** — 每个波次不超 1 小时；超时则拆子任务
+2. **子代理只干体力活** — 重构/迁移/清理适合子代理；设计决策自己拿
+3. **删除前先确认引用** — `grep -rn` 确保没有调用者再删
+4. **减法优先于加法** — 新代码不超 200 行/提交（重写除外）
 
 ---
 
-## 3. 测试覆盖标准
+## 1. 测试框架
 
-### 每个特性必须有的测试类型
+所有测试通过顶层 `build.py` 统一入口：
 
-| 测试类型 | 数量 | 说明 |
-|----------|------|------|
-| 基础功能 | 3-5 | 正常使用场景 |
-| 边界条件 | 2-3 | 空值、越界、异常参数 |
-| 类型检查 | 1-2 | 类型谓词的正/反面 |
-| ABF E2E | 1-2 | Racket → ABF → C++ 闭环 |
-| 查询 | 1 | `(node-type Xxx)` 能匹配 |
-| Regression | 1 | 已有测试全绿 |
-
-### 测试文件组织
-
+```bash
+./build.py build              # 构建
+./build.py test               # 全部 5 套件
+./build.py test unit          # C++ 单元测试
+./build.py test integ         # 端到端管线测试
+./build.py test typecheck     # 类型检查专项
+./build.py test bench         # Benchmark 基线
+./build.py test smoke         # 快速冒烟
+./build.py check              # 构建 + 全部测试
 ```
-tests/
-├── step-09-10.t        # 布尔/序对 (Racket)
-├── step-11-14.t        # begin/set!/quote/cond
-├── step-15.t           # defmacro（开发中）
-├── step-16-18.t        # 字符串 ← 新的
-├── step-19-22.t        # 列表库（规划）
-├── validate_abf_nodes.cpp  # P2996 结构验证
-├── test_ir.cpp              # IR 管线测试
-├── agent_demo.rkt           # AI Agent 演示
-└── reflect_json_demo.cpp    # P2996 反射演示
+
+### 套件详情
+
+| 套件 | 文件 | 语言 | 数量 | 覆盖 |
+|------|------|------|------|------|
+| `unit` | `test_ir.cpp` | C++ | 61 | IR 管线/查询引擎/内存池/TypeChecker |
+| `integ` | `build.py` (IntegCase) | Python | 29 | eval/IR/typecheck 端到端管线 |
+| `typecheck` | `build.py` (TyCase) | Python | 10 | 类型系统专项 |
+| `bench` | `benchmark.py` | Python | 42 | 性能基线 + 回归检测 |
+| `smoke` | `build.py` (SMOKE) | Python/bash | 5 | 快速冒烟 |
+
+### 添加测试用例
+
+**端到端测试**（推荐）— 在 `build.py` 的 `INTEG_TESTS` 列表里加一行：
+
+```python
+IntegCase("my_feature", "(my-expr arg)", "eval", expected="42"),
+```
+
+参数：
+- `name` — 测试名，`-` 可读即可
+- `code` — Aura 表达式
+- `pipeline` — `"eval"` | `"ir"` | `"typecheck"` | `"serve"`
+- `expected` — stdout 应包含的子串（空字符串 = 不检查）
+- `expected_err` — stderr 应包含的错误子串
+- `expected_status` — 期望退出码（默认 0）
+
+**Benchmark 测试** — 在 `benchmark.py` 的 `BENCHMARKS` 列表里加：
+
+```python
+BenchCase("bench_name", "(+ 1 2)", "eval", expected_val=3),
+```
+
+**TypeChecker 专项** — 在 `build.py` 的 `test_typecheck()` 函数里加：
+
+```python
+("test_name", "(+ 1 2)", "Int", True),  # (name, code, expected_type, should_pass)
 ```
 
 ---
 
-## 4. 模块同步清单
+## 2. 新增语言特性的标准管线
 
-每新增一个语言特性，用以下清单逐项核对：
+每加一个新特性，必须穿透这条路径：
+
+```
+FlatAST → parse_to_flat → lower_to_ir → IRInterpreter → EvalResult
+    ↑                         ↓
+  [FlatParser]             [PassManager: compute-kind → arity → const-fold]
+    ↑                         ↓
+  [Lexer]                  [IRInterpreter: closures + cells + coercion]
+```
+
+对应的文件层级：
+
+```
+Layer  组件              文件                        责任
+────  ────────────────  ─────────────────────────  ─────────────────────────
+  1   AST 数据结构       src/core/ast_flat.ixx      NodeTag + NodeMeta 表
+  2   FlatAST 构造器     src/core/ast_flat.ixx      add_xxx 方法
+  3   扁平解析器          src/parser/flat_parser*   parse_xxx 函数
+  4   求值器 (树遍历)    src/compiler/frontend*     eval_in 分支 + primitives
+  5   IR 降低            src/compiler/lowering*     lower_xxx（FlatAST 版本）
+  6   IR 解释器          src/compiler/ir_interp*    执行新指令
+  7   类型检查 (可选)    src/compiler/type_checker* synthesize_flat_xxx + check
+  8   测试               build.py / benchmark.py    IntegCase + BenchCase
+
+注: ABF 序列化/反序列化、查询引擎、reconstruct_expr 不再需要每个特性单独处理；
+    FlatAST 统一了 AST 表示，所有下游自动覆盖。
+```
+
+**强制规则**：
+- 第 8 层（测试）必须在第 1 层之前写
+- 不需要 ABF 序列化——Racket 前端独立维护其 ABF 生成
+- 不需要查询引擎适配——通用 `(node-type ...)` 自动覆盖新节点
+
+---
+
+## 3. 模块同步清单
 
 ```
 特性: ____________  日期: ____________
 
-Redlines (TDD):
-  [ ] 红线测试已写（在实现之前）
-  [ ] 红线覆盖所有 12 层
+Tests (先写):
+  [ ] IntegCase 已添加到 build.py
+  [ ] BenchCase 已添加到 benchmark.py（如适用）
+  [ ] `./build.py test integ` 通过
 
-Layer 1: src/core/ast.ixx
-  [ ] NodeTag 枚举值
-  [ ] 节点结构体
-  [ ] variant 条目
-  [ ] Expr 构造函数
-
-Layer 2: src/core/ast_flat.ixx
+Layer 1: src/core/ast_flat.ixx
+  [ ] NodeTag 枚举值（如需要新节点类型）
   [ ] kNodeMeta 表条目
-  [ ] kNodeMeta 数组大小更新
-  [ ] FlatAST::add_xxx 构造器
+  [ ] add_xxx 构造器
 
-Layer 3: src/parser/parser_impl.cpp
+Layer 2: src/parser/flat_parser_impl.cpp
   [ ] 关键字检查（如适用）
   [ ] parse_xxx 函数
 
-Layer 4: src/parser/flat_parser_impl.cpp
-  [ ] 关键字检查
-  [ ] parse_xxx 函数
-
-Layer 5: src/compiler/frontend_impl.cpp
+Layer 3: src/compiler/frontend_impl.cpp
   [ ] eval_in 分支
   [ ] primitives（如适用）
 
-Layer 6: lang/private/abf.rkt
-  [ ] TAG-XXX 常量
-  [ ] tag-for-expr 映射
-  [ ] write-xxx 函数
-  [ ] write-node dispatch
+Layer 4: src/compiler/lowering_flat_impl.cpp
+  [ ] lower_flat_expr case
+  [ ] collect_free_vars case（如适用）
 
-Layer 7: src/binary/abf_deserializer_impl.cpp
-  [ ] read_xxx 函数
-  [ ] 注册到 register_all_readers
+Layer 5: src/compiler/ir_interpreter_impl.cpp
+  [ ] 新指令处理（如需要）
 
-Layer 8: src/compiler/lowering_impl.cpp
-  [ ] lower_xxx dispatch
-  [ ] collect_free_vars case
+Layer 6: src/compiler/type_checker_impl.cpp (可选)
+  [ ] synthesize_flat dispatch
+  [ ] 新节点类型处理
 
-Layer 9: src/compiler/lowering_flat_impl.cpp
-  [ ] reconstruct_node case
-
-Layer 10: src/compiler/query.ixx + query_impl.cpp
-  [ ] ReplaceTemplate op 解析
-  [ ] QueryExpr node_type 分支
-  [ ] QueryEngine by_tag 分支
-
-Layer 11: src/core/ast_impl.cpp
-  [ ] flatten_expr case
-
-Layer 12: tests/
-  [ ] 红线测试（TDD）
-  [ ] ABF E2E 测试
-  [ ] ctest 全绿
-
-Special:
-  [ ] ABF ABF 端到端（racket --abf | ./aura --abf）
-  [ ] --serve 不崩溃
-  [ ] --query '(node-type Xxx)' 匹配
+Verification:
+  [ ] `./build.py check` 全绿
+  [ ] 手动验证关键场景
 ```
 
 ---
 
-## 5. 语言内核状态看板
+## 4. 提交模板
 
 ```
-特性           AST SoA解析扁平求值ABF_R ABF_C Lo Re Q Fl Te 完成?
-──────────────────────────────────────────────────────────────
-整数           ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-变量           ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-lambda         ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-if             ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-算术原语       ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-布尔           ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-序对           ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-begin          ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-set!           ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-quote          ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-cond           ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12
-defmacro       ✅ ✅ ⬜ ⬜ ⬜ ⬜ ⬜ ⚠  ⚠  ✅ ⚠  ⚠   4/12
-字符串         ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅  12/12 ✅
-列表库          ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜   0/12
-I/O             ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜   0/12
-数值扩展        ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜   0/12
-向量+struct     ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜ ⬜   0/12
+<类型>: <简短描述>
 
-符号说明: ✅=完成 ⬜=未开始 ⚠=部分实现
+（可选详细说明，重点写 why 而不是 what）
+
+文件变更:
+  src/compiler/xxx.ixx          +12/-5    新增 infer_flat
+  tests/xxx.cpp                 +30/-0    添加测试用例
+
+Tests: 61/61 CTest + 42/42 benchmark + 29/29 integ 全绿
+```
+
+类型前缀：
+- `feat` — 新功能
+- `fix` — 修 bug
+- `refactor` — 重构（无行为变化）
+- `test` — 测试
+- `docs` — 文档
+- `chore` — 构建/工具链
+- `cleanup` — 删除死代码
+
+---
+
+## 5. 架构状态看板
+
+```
+特性            FlatAST 解析 求值 IR 类型 测试  整体
+────────────────────────────────────────────────
+整数            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+变量            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+lambda          ✅ ✅ ✅ ✅ ✅ ✅ ✅
+if              ✅ ✅ ✅ ✅ ✅ ✅ ✅
+算术            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+布尔            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+序对            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+begin           ✅ ✅ ✅ ✅ ✅ ✅ ✅
+set!            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+quote           ✅ ✅ ✅ ✅ ✅ ✅ ✅
+cond            ✅ ✅ ✅ ✅ ✅ ✅ ✅
+defmacro        ✅ ✅ ✅ ✅ ✅ ✅ ✅
+字符串          ✅ ✅ ✅ ✅ ✅ ✅ ✅
+letrec          ✅ ✅ ✅ ✅ ✅ ✅ ✅
+类型系统 L6     ✅ —  — ✅ ✅ ✅ ✅
+渐进类型 L6.6   ✅ —  — ✅ ✅ ✅ ✅
+Hot swap(M2.6)  ✅ —  — ✅ ✅ ✅ ✅
+────────────────────────────────────────────────
+当前测试覆盖:  147 条（unit 61 + integ 29 + typecheck 10 + bench 42 + smoke 5）
 ```
 
 ---
 
-## 6. 示例：Step 16-18 字符串的完整管线
+## 6. 相关工作流
 
-以字符串为例展示完整 12 层覆盖：
+### 日常开发
 
+```bash
+./build.py build      # 先构建
+# ... 改代码 ...
+./build.py test       # 跑全部测试
+git add && git commit
+git push
 ```
-printf '"hello"' | ./build/aura          → 134217728  ✅ 求值
-printf '#lang aura\n"hello"' |            → 134217728  ✅ ABF
-  racket -l aura -- --abf | ./aura --abf                
-echo '"hello"' | ./aura --serve          → JSON       ✅ serve
-echo '"hello"' | ./aura --query          → 0 matches  ✅ 查询
-  '(node-type LiteralString)'                         （在只有整数的表达式里是对的）
-ctest                                    → 37/37      ✅ 全绿
+
+### AI Agent 开发
+
+```bash
+# 1. serve 模式 — 代码自动修复循环
+printf '(+ x 1)' | ./aura --serve
+
+# 2. 查询 AST
+echo '(+ 1 2)' | ./aura --query '(node-type Call)'
+
+# 3. 查询 + 变换
+echo '(+ 1 2)' | ./aura --query-and-fix '(node-type LiteralInt)' '(LiteralInt 99)'
+
+# 4. 类型检查
+echo '(+ 1 "a")' | ./aura --typecheck
+
+# 5. 热替换（运行时升级函数）
+echo '(+ 1 2)' | ./aura --hot-swap      # seed cache
+echo '(+ 1 3)' | ./aura --hot-swap      # 替换入口函数
+
+# 6. 基准回归
+python3 tests/benchmark.py --check
+
+# 7. 检测代码大小
+wc -l src/**/*.ixx src/**/*.cpp | sort -rn | head -20
 ```
 
 ---
 
-## 7. 与设计文档的关系
+## 7. 减法清单（可清理的存量）
 
-| 文档 | 关系 |
-|------|------|
-| `aura_language_plan.md` | 定义"做什么"——Ghuloum 步骤 16-35 |
-| `kernel_iteration_standard.md` | 定义"怎么做"——12 层管线标准 |
-| `aura_tree_grow.md` | 定义"为什么这样设计"——Trees that Grow |
-| `aura_reflection_plan.md` | 反射工具链的长期路线 |
+```
+待清理项                            预估行数  优先级
+───────────────────────────────────────────
+旧 tree-walker Parser (降低清理)    — ✅ 已删
+LoweringPass (Expr* → IR)          — ✅ 已删
+TypeChecker Expr* 路径              — ✅ 已删
+───────────────────────────────────────────
+Racket ABF 前端（lang/private/）    ~500    低（功能完善，但 Aura 不依赖它启动）
+旧测试脚本（run_step*）              ~100    低（被 build.py 覆盖）
+静态红名单（*_redlines.txt）         ~50    低（未维护）
+```
 
 ---
 
-> **每步可测试，每层不失联。测试先写，逐层过关。**
+> **FlatAST 是唯一规范。build.py 是唯一入口。测试先行，减法优先。**
