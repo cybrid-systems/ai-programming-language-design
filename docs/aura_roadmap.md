@@ -45,8 +45,11 @@ Step  C++    特性                         交付日
 14    ✅     cond 语法糖                    Phase 3a D2
 ── 语言完备 ──
 15    ✅     defmacro 宏定义                Phase 3b D1
-16    ⬜     卫生宏 (gensym)               Phase 3b D2
+16    ⬜     卫生宏 (hygienic macros)       Phase 3b D2
 17    ⬜     编译期 AST 验证                Phase 3b D3
+18    ⬜     文件 I/O                       P0 — 当前
+19    ⬜     cond / and / or                P0 — 当前
+20    ⬜     向量/哈希表                     P1 — 后续
 ```
 
 ---
@@ -144,7 +147,10 @@ LLVM/M4          ⬜                    0%
 | defmacro 解析器 | ✅ | Phase 3b D1 |
 | 模板替换展开 | ✅ | Phase 3b D1 |
 | 持久化 arena | ✅ | 避免 reset 后 body 失效 |
-| 卫生宏 (gensym) | ⬜ | Phase 3b D2 |
+| 卫生宏 (hygienic) | ⬜ | Phase 3b D2 — P1 |
+| 文件 I/O | 🔜 | P0 — 当前 |
+| cond / and / or | ⬜ | P0 — 当前 |
+| 向量/哈希表 | ⬜ | P1 |
 | 编译期 AST 验证 | ⬜ | Phase 3b D3 |
 
 ### M3c — 反射 ✅
