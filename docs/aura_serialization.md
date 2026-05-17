@@ -1,6 +1,10 @@
-# Aura — ABF v2 序列化协议设计
+# Aura — ABF v2 序列化协议设计（历史文档）
 
-**版本**：v2.0
+> ⚠️ **2026-05-18**：Racket 前端已于 2026-05-14 移除，ABF 协议同步废弃。
+> 当前 C++26 CompilerService 使用 JSON 协议 (`--serve`) 与 AI Agent 交互。
+> 本文保留供历史参考。
+
+**版本**：v2.0（已废弃）
 **定位**：本文档描述 Aura 的 AST 序列化协议——融合 "Trees that Grow" 模式 + C++26 Concepts + 自定义零拷贝二进制格式。
 
 ---

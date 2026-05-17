@@ -1,8 +1,12 @@
 # Aura — 架构设计
 
-**版本**：v1.0
-**对应**：Phase 0 已完成 → Phase 1 工程化进行中
-**定位**：本文档描述 Aura 语言的系统架构、模块分解、接口约定和数据流。设计哲学与核心决策见 [DESIGN.md](./DESIGN.md)，演进计划见 [ROADMAP.md](./ROADMAP.md)。
+**版本**：v2.0（2026-05-18 更新）
+**对应**：Phase 3 工程化持续演进中
+**定位**：本文档描述 Aura 语言的系统架构、模块分解、接口约定和数据流。
+
+> ⚠️ **2026-05-18 更新**：Racket 前端已于 5/14 移除，ABF 协议层同步废弃。
+> 当前架构仅含 C++26 CompilerService：解析→IR 管线→求值。
+> 设计哲学与核心决策见 [DESIGN.md](./DESIGN.md)，演进计划见 [ROADMAP.md](./ROADMAP.md)。
 
 ---
 
@@ -86,54 +90,34 @@
 
 ## 3. 模块详细设计
 
-### 3.1 Racket Frontend
+### 3.1 Racket Frontend（已废弃）
 
-**模块结构**：
+> ⚠️ Racket 前端已于 2026-05-14 移除。C++26 解析器+宏展开器+IR 管线已完全取代其功能。
+> 本文保留该节仅作历史参考。
 
-```
-lang/
-├── reader.rkt        # #lang aura 读取器 (S 表达式入口)
-├── expander.rkt      # 宏展开器 + 核心求值器
-├── compiler.rkt      # ABF 序列化输出
-└── private/
-    ├── core.rkt      # 最小核心原语 (Phase 0 语法规范)
-    ├── macro.rkt     # 卫生宏系统 (Phase 3 起)
-    └── types.rkt     # 可选类型标注 (Phase 2 起)
-```
+**历史职责**（Phase 0-3 原型阶段）：
+- 将 S 表达式源码解析为 Homoiconic AST
+- 通过 `syntax-parse` 执行宏展开
+- 将展开后的 AST 序列化为 ABF 二进制格式
 
-**职责**：
-- 将人类/AI 的 S 表达式源码解析为 Homoiconic AST
-- 通过 `syntax-parse` 执行宏展开（卫生宏、with-aliases 逃生舱）
-- 将展开后的 AST 序列化为 ABF 二进制格式，通过共享内存传输到 C++26 Compiler Service
-
-**与 Compiler Service 的关系**：
-
-```
-┌──────────────────────┐       ABF + Delta        ┌────────────────────────┐
-│  Racket Frontend     │ ────── 共享内存 ──────→   │  Compiler Service      │
-│  (#lang aura)        │ ←──── 结果/错误 ─────── │  (C++26 长驻进程)      │
-└──────────────────────┘     Unix Domain Socket   └────────────────────────┘
-```
+**替代方案**：所有上述功能现由 C++26 CompilerService 原生实现：
+- `Parser` — S 表达式→FlatAST 解析
+- `macro_expand_all` — 编译期宏展开
+- `IR Pipeline` — 增量编译→IR 解释执行
+- `--serve JSON 协议` — AI Agent 交互接口
 
 ---
 
-### 3.2 ABF v2 — Alien Binary Format
+### 3.2 ABF v2 — Alien Binary Format（已废弃）
 
-完整规范见 [aura_serialization.md](./aura_serialization.md)。此处仅列关键设计要点。
+> ⚠️ ABF 协议随 Racket 前端于 2026-05-14 移除。当前 C++26 端使用 JSON 协议 (`--serve`) 与 AI Agent 交互。
+> 完整历史规范见 [aura_serialization.md](./aura_serialization.md)。
 
-**设计目标**：零拷贝 + Delta 增量传输 + 跨语言边界的极高性能序列化。
+**设计目标（历史）**：零拷贝 + Delta 增量传输 + 跨语言边界的极高性能序列化。
 
-**核心设计**（详细格式见 aura_serialization.md §4）：
-- 每个节点以 **varint 编码**，支持 Tag + ExtensionID + ExtensionLength + Payload 变长结构
-- ExtensionID 和长度前缀提供向前兼容：老版本跳过未知扩展
-- 节点级 ExtensionLength 支持零拷贝：以 `std::span` 直接切片扩展数据
-- Magic: `"ABF2"`
-
-**关键特性**：
-- **零拷贝**：ExtensionLength 支持 span 切片，无需逐节点反序列化
-- **Delta 增量**：只传输变化的子树，基于版本号比较
-- **向前兼容**：未知 ExtensionID 自动跳过，未知 Tag 存入 ExtendedNode
-- **反射驱动**：C++26 P2996 `std::meta` 自动序列化 extension 字段
+**替代方案**：
+- 序列化：`cache.ixx` 的 mmap-backed `write_cache()`/`open_cache()` 提供模块级磁盘缓存
+- Agent 交互：`--serve` JSON 协议 (exec/define/mutate/rollback/session/module)
 
 ---
 
@@ -331,45 +315,59 @@ public:
 
 ---
 
-### 3.7 三层运行时
+### 3.7 运行时
 
-| 层级 | 名称 | 启动 | 执行速度 | 热更新 | 场景 |
-|------|------|------|----------|--------|------|
-| Layer 1 | 动态解释器 | 即时 | 最慢 | 完全支持 | 开发、REPL、AI 快速迭代 |
-| Layer 2 | LLVM ORC JIT | ~ms | 中等 | 部分支持 | 日常运行、中等负载 |
-| Layer 3 | 静态 AOT (C++26) | 编译时 | 最快 | 不支持 | 生产发布、性能关键路径 |
+> ⚠️ 三层运行时（interpret/JIT/AOT）为远期规划，尚未实现。
 
-**热更新引擎策略**：
-- 函数在解释器中运行 → 直接替换下次调用
-- 函数被 JIT 编译 → 使 JIT 代码无效，下次调用重新编译
-- 函数被 AOT 编译 → 记录热补丁表，每次调用检查
+**当前运行时**：Layer 1 动态解释器（IRInterpreter + tree-walker fallback）
+- 纯 C++26 解释执行
+- 通过 `invalidate_function()` 实现函数级热替换
+- 通过 `ir_cache_` + `dep_graph_` 实现增量重编译
+
+**规划（M4 — 未来）**：
+| 层级 | 名称 | 场景 |
+|------|------|------|
+| Layer 1 | 动态解释器 | 当前已实现 |
+| Layer 2 | LLVM ORC JIT | 性能优化 |
+| Layer 3 | 静态 AOT | 生产发布 |
 
 ---
 
 ## 4. 主要数据流
 
-### 4.1 正常执行流
+### 4.1 正常执行流（当前实现）
 
 ```
-Racket 源码 → 宏展开 → Homoiconic AST → ABF 序列化
-→ 共享内存传输 → Compiler Service 反序列化
-→ AuraIR → 增量优化 → 三层运行时
+Aura 源码 → Parser (FlatAST) → 宏展开 (macro_expand_all)
+→ needs_tree_walker_fallback?
+  ├── yes → Tree-walker Evaluator
+  └── no  → IR pipeline: Lower → Passes → IRInterpreter
 ```
 
-### 4.2 AI 修复 / 增量编译流 ← 核心 AI-native 能力
+### 4.2 AI 修复 / 增量编译流
 
 ```
-错误/需求发生 → QueryEngine 查询目标子树
-→ AI 用 AuraQuery eDSL 提交修复补丁
-→ 直接修改 AuraIR (或 AST)
-→ 增量优化 Pass → 热更新引擎 → 运行时无缝替换
+错误/需求发生 → --serve JSON 协议
+→ AI Agent 发送 define/exec/mutate/rollback 命令
+→ CompilerService eval() 增量缓存 + 依赖追踪
+→ 自动重编译 (invalidate_function / reload_module)
 ```
 
-### 4.3 AOT 发布流
+### 4.3 模块编译流（ArenaGroup）
 
 ```
-AuraIR → CodeGen → C++26 源码生成
-→ clang++ -ffreestanding -O3 → 裸机/独立二进制
+compile_module(name, source)
+→ 模块级 arena (arena_group_.module_arena(name))
+→ 解析 → 宏展开 → 缓存每个 define → tree-walker eval → IR cache
+→ write_cache() → 磁盘持久化
+
+reload_module(name):
+→ 检查 ModuleState.dirty
+→ clean → no-op
+→ dirty → compile_module(name, stored_source)
+
+unload_module(name):
+→ reset arena → 清除 ir_cache_ → 删除缓存文件
 ```
 
 ---

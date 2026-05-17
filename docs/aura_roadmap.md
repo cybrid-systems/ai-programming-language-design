@@ -8,7 +8,7 @@
 ## 里程碑状态
 
 ```
-M0 Racket原型    ✅  #lang aura + 全语义求值器 + ABF 序列化
+M0 Racket原型    ✅  #lang aura + 全语义求值器（已退役，2026-05-14）
 M1 C++ 求值器   ✅  EvalValue variant + IR 管线 (Ghuloum Step 1-8)
 M2 查询引擎     ✅  Query/Transform/AutoFix/HotSwap/--serve
 M3a 语言补全    ✅  布尔/序对/begin/set!/quote/cond (Ghuloum Step 9-14)
@@ -18,6 +18,8 @@ M3d 类型系统    ✅  L6.1-L6.7 全线完成 (TypeChecker + 渐进类型 + Oc
 M3e 工具链      ✅  Benchmark + EvalValue + IR 递归修复
 M3f 增量编译    ✅  定义缓存 → 依赖追踪 → 增量 Pass → --serve 协议
 M3g AI 闭环     ✅  mutation_loop.py + LLM --ai 驱动变异
+M3h 多模块      ✅  ArenaGroup (compile_module/unload_module/reload_module)
+M3i 磁盘缓存    ✅  mmap-backed write_cache/open_cache (进程重启加速)
 M4 生产         ⬜  LLVM JIT / AOT / 类型系统 / 自举
 ```
 
@@ -61,7 +63,7 @@ Step  C++    特性                         交付日
 ```
 设计层           实现                覆盖率   质量
 ────────────────────────────────────────────────────
-Racket Frontend  👻 #lang aura + ABF  65%     可用
+Racket Frontend  ❌ 已移除 (2026-05-14)   —     —
 AST Layer        🟢 Expr* + FlatAST   90%     通过 37 测试
 AuraIR Layer     🟢 27 opcodes       95%     测试全覆盖
 IR Lowering      🟢 LoweringPass→    90%     逐步函数化
@@ -71,11 +73,14 @@ AuraQuery        🟢 Index/Query/     95%     经过优化
                    Transform/Fix
 IR Interpreter   🟢 闭包/letrec/     95%     稳定
                    27 opcodes
-ABF Ser/Deser    🟢 12 节点类型      95%     P2996 验证
-CompilerService  🟢 eval/eval_ir/    90%     API 稳定
-                   --serve
+Disk Cache       🟢 mmap cache.ixx    —      已集成到 compile_module
+CompilerService  🟢 eval/eval_ir/    95%     API 稳定
+                   --serve/module
 Reflection       🟢 P2996/kNodeMeta  90%     4 个组件
 Contracts        🟢 arena + emit     15%     试点阶段
+模块系统       🟢 require/import   90%     稳定
+多模块管理     🟢 ArenaGroup         —      compile/unload/reload
+增量编译       🟢 ir_cache_ + dep  95%     函数级 + 模块级
 宏系统           🔨 defmacro          30%     Day 1/3
 LLVM/M4          ⬜                    0%
 ```
@@ -104,9 +109,8 @@ LLVM/M4          ⬜                    0%
 |------|------|------|
 | CMake 4.0 + C++26 模块骨架 | ✅ | 稳定 |
 | CLI 文本模式 + REPL | ✅ | 稳定 |
-| ABF v2 反序列化 | ✅ | 12 节点 + dispatch 表 |
-| pmr 内存池 (ASTArena) | ✅ | 4-tier |
-| CompilerService | ✅ | 双路径（eval + eval_ir） |
+| pmr 内存池 (ASTArena) | ✅ | 4-tier + SmallObjectPool |
+| CompilerService | ✅ | eval + eval_ir + typecheck + define/mutate |
 | 树遍历器 (Expr* → FlatAST) | ✅ | Phase 4 桥接 |
 | 扁平 AST + SoA (FlatAST) | ✅ | 9 pmr::vector |
 | AuraIR (27 opcodes) | ✅ | 含环境/单元/闭包 |
@@ -114,6 +118,9 @@ LLVM/M4          ⬜                    0%
 | IR Interpreter | ✅ | closures + cells |
 | PassManager | ✅ | concepts fold |
 | 常量折叠 / 类型分析 | ✅ | 3 passes |
+| ArenaGroup 多模块管理 | ✅ | compile/unload/reload |
+| 磁盘缓存 (mmap) | ✅ | write_cache/open_cache (cache.ixx) |
+| 模块级增量编译 | ✅ | ModuleState dirty + dep_graph_ |
 | contracts | 🔨 | arena + emit 试点 |
 
 ### M2 — 查询引擎 ✅
