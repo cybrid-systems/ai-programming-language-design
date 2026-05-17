@@ -1,7 +1,7 @@
 # Aura — Compiler as a Service 集成方案
 
-**版本**：v1.0
-**对应**：M1 Phase 1 (C++26 Compiler Service)
+**版本**：v2.0
+**最后更新**：2026-05-18
 **定位**：定义 CompilerService 的接口、生命周期、内存管理策略，支撑 AI Agent 实时变异 + 增量编译场景。
 
 ---
@@ -211,15 +211,21 @@ aura_architecture.md 中的 "Compiler Service (C++26)" 框
 
 | 组件 | 实现 | 位置 |
 |------|------|------|
-| ASTArena (pmr) | ✅ v1 | `src/core/arena.ixx` |
-| CompilerService | ✅ v1 | `src/compiler/service.ixx` |
-| eval() 路径 | ✅ | `service.ixx` |
-| eval_ir() 路径 | ✅ | `service.ixx` |
-| REPL 集成 | ✅ | `src/main.cpp` |
-| pipe 模式集成 | ✅ | `src/main.cpp` |
-| `--serve` 模式 | ✅ v2 | `main.cpp` |
-| 多 arena 管理器 | ✅ v1 | `arena.ixx` (ArenaGroup) |
-| ABF 集成至 service | ✅ | `service.ixx` |
+| ASTArena (pmr + SmallObjectPool) | ✅ v3 | `arena.ixx` | 16/32/64 三级小对象池 |
+| CompilerService | ✅ v2 | `service.ixx` | eval/define/mutate/typecheck |
+| eval() IR-first + fallback | ✅ | `service.ixx` | 统一入口，自动降级 |
+| eval_ir() + Pass Manager | ✅ | `service.ixx` | 纯 IR 管线 + debug 输出 |
+| `--serve` JSON 协议 | ✅ v2 | `main.cpp` | exec/define/mutate/rollback/session |
+| 多会话 (multi-session) | ✅ | `main.cpp` | session create/switch |
+| ArenaGroup 基础设施 | ✅ v2 | `arena.ixx` | module_arena + reset + stats |
+| ArenaGroup 集成到 eval | 🟡 | `service.ixx` | API 暴露但 eval 路径未使用 |
+| 增量编译 (函数级) | ✅ v1 | `service.ixx` | cache_define + dep_graph + invalidate |
+| 增量编译 (模块级) | 🟡 | `service.ixx` | cache_module 存在但无模块 dirty 标记 |
+| 磁盘缓存 (mmap) | 🟡 | `cache.ixx` | write_cache/open_cache 存在但未启用 |
+| Level 2 类型检查 | ✅ | `pass_manager.ixx` | TypeCheckWrap (non-fatal) |
+| 函数热替换 + 依赖追踪 | ✅ | `service.ixx` | invalidate_function BFS re-lower |
+| EDSL mutation | ✅ | `evaluator.ixx` | 15+ primitives |
+| IR 管线默认启用 | ✅ | `service.ixx` | eval() 统一 IR-first |
 
 ---
 
