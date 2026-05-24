@@ -1,44 +1,54 @@
-# 01 — 分道扬镳的起点：数据模型
+# 01 — 数据模型：redisObject 的艺术
 
-> Redis vs OceanBase 源码对比系列 · 第一篇
+> Redis 主线源码深度分析系列 · 第一篇
 > 基于 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-数据库的起点是什么？是你往里面塞什么数据、数据怎么在内存里表示、数据怎么落盘。Redis 和 OceanBase 在这个问题上走出了两条完全不同的路——一条追求极简，一条追求表达力。
+数据模型是数据库的起点。你往里面塞什么数据、数据怎么在内存里表示、数据怎么落盘——这些选择决定了整个系统的发展方向。
 
-**doom-lsp 确认**：Redis `struct redisObject` 定义在 `src/server.h:858`（16 字节固定大小），OceanBase `ObObj` 在 `deps/oblib/src/common/object/ob_object.h:1478`（同样是 16 字节但设计哲学截然不同）。两个系统都选择了 16 字节作为基准，但背后的权衡完全不同。
+Redis 的数据模型用一个 16 字节的 `redisObject`（简称 robj）解决了所有问题。它是 Redis 最核心的结构体，每个键值对、每个操作对象都离不开它。
 
-本文对两个系统的数据模型进行逐字段、逐 bit 的深度拆解，用 `doom-lsp` 追踪每一个关键设计决策的源码位置。
+本文用 `doom-lsp`（clangd LSP）对 Redis 主线源码进行逐行符号解析，逐字段追踪它的设计哲学。
+
+**doom-lsp 确认**：核心文件分布
+
+| 文件 | 行数 | 职责 |
+|------|------|------|
+| `src/server.h` | ~2700 | redisObject 定义、type/encoding 宏、sharedObjectsStruct |
+| `src/object.c` | ~600 | createObject、makeObjectShared、对象操作原语 |
+| `src/t_string.c` | ~500 | STRING 类型命令实现 |
+| `src/t_hash.c` | ~1200 | Hash 类型编码切换 |
+| `src/t_zset.c` | ~1500 | ZSet skiplist 编码切换 |
+| `src/encoding.c` | ~400 | 编码转换通用逻辑 |
 
 ---
 
-## 1. Redis 的数据模型：type + encoding 二级抽象
+## 1. redisObject——永远 16 字节的统一包装
 
-### 1.1 robj——永远 16 字节的统一包装
-
-Redis 的每个值都用 `redisObject`（简称 robj）表达，定义在 `src/server.h:858`：
+### 1.1 结构体定义
 
 ```c
 // server.h:858-866 — doom-lsp 确认
 typedef struct redisObject {
-    unsigned type:4;         // [0:4)  对象类型：STRING/LIST/SET/ZSET/HASH/STREAM/MODULE
-    unsigned encoding:4;    // [4:8)  编码方式：RAW/INT/HT/SKIPLIST/QUICKLIST/LISTPACK/...
-    unsigned lru:LRU_BITS;   // [8:32) LRU 时钟或 LFU 频率计数器
-    unsigned hasexpire:1;   //       是否有过期时间（bit flag）
-    unsigned hasembkey:1;    //       是否有嵌入 key（bit flag）
+    unsigned type:4;         // [0:4)   对象类型：STRING/LIST/SET/ZSET/HASH/STREAM/MODULE
+    unsigned encoding:4;    // [4:8)   编码方式：RAW/INT/HT/SKIPLIST/QUICKLIST/LISTPACK/...
+    unsigned lru:LRU_BITS;   // [8:32)  LRU 时钟或 LFU 频率计数器
+    unsigned hasexpire:1;   //         是否设置了过期时间（bit flag）
+    unsigned hasembkey:1;    //         是否为 EMBSTR 编码（bit flag）
     unsigned refcount:OBJ_REFCOUNT_BITS; // [0:58) 引用计数，支撑共享对象
-    void *ptr;               //       指向实际数据结构（8 字节）
+    void *ptr;               //         指向实际数据结构（8 字节）
 } robj;
 ```
 
-**重要洞察**：robj 本身的大小是**固定 16 字节**，它不携带数据内容，只携带指向堆内存的指针。robj 是一个"句柄"，不是数据本身。`ptr` 才是数据所在。
+**固定 16 字节**。这是 Redis 最核心的设计选择——无论你存储什么类型的数据，每个值的元包装都是相同的 16 字节。这使得：
+- **内存分配极简**：`zmalloc(sizeof(robj))` 永远是 16 字节，内存分配器完全可预测
+- **对象池化**：所有 robj 共享同一个内存池，无需按类型区分
+- **缓 cache-line 友好**：16 字节刚好可以被 L1 cache 充分利用
 
 ### 1.2 type 字段——对象逻辑类型（4 bit）
-
-`type` 字段回答"这个对象是什么语义"，定义在 `src/server.h:649-656`：
 
 ```c
 // server.h:649-667 — doom-lsp 确认
@@ -53,417 +63,502 @@ typedef struct redisObject {
 #define OBJ_STREAM 6    /* Stream object. */
 ```
 
-共 7 种对象类型，使用 4 bit（16 种可能值）。每种类型对应一种"逻辑语义"：
-
-| 值 | 类型 | 语义 |
-|----|------|------|
-| 0 | STRING | 字符串或数字 |
-| 1 | LIST | 列表（有序、可重复） |
-| 2 | SET | 集合（无序、不重复） |
-| 3 | ZSET | 有序集合（score + member） |
-| 4 | HASH | 哈希表（field-value 对） |
-| 5 | MODULE | 模块类型（Redis Module API） |
-| 6 | STREAM | 流（RadixTree + Listpack） |
+共 7 种对象类型。`type` 字段回答"这个对象是什么语义"，是命令分派的第一个判断维度。
 
 ### 1.3 encoding 字段——对象物理编码（4 bit）
-
-`encoding` 字段回答"这个对象在物理上怎么存储"，定义在 `src/server.h:837-847`：
 
 ```c
 // server.h:837-847 — doom-lsp 确认
 #define OBJ_ENCODING_RAW 0     /* Raw representation: sds 动态字符串 */
-#define OBJ_ENCODING_INT 1     /* 整数值（ptr 位置直接存 int64_t） */
+#define OBJ_ENCODING_INT 1     /* 整数值（ptr 位置直接存 int64_t，无额外分配） */
 #define OBJ_ENCODING_HT 2      /* 哈希表（dict）编码 */
 #define OBJ_ENCODING_ZIPMAP 3  /* 已废弃：旧版 Hash 编码 */
 #define OBJ_ENCODING_LINKEDLIST 4 /* 已废弃：旧版 List 编码 */
 #define OBJ_ENCODING_ZIPLIST 5 /* 已废弃：旧版 List/Hash/ZSet 编码 */
 #define OBJ_ENCODING_INTSET 6  /* 整数集合（Set 专用） */
 #define OBJ_ENCODING_SKIPLIST 7 /* 跳表（ZSet 专用） */
-#define OBJ_ENCODING_EMBSTR 8  /* 内嵌 sds（短字符串，≤44 字节） */
+#define OBJ_ENCODING_EMBSTR 8  /* 内嵌 sds（短字符串，≤44 字节，一次分配 38 字节） */
 #define OBJ_ENCODING_QUICKLIST 9 /* 双向链表 + listpack（List 专用） */
 #define OBJ_ENCODING_STREAM 10 /* RadixTree + listpack（Stream 专用） */
 #define OBJ_ENCODING_LISTPACK 11 /* 单 listpack（String/Hash 可选） */
 ```
 
-共 11 种编码，4 bit 足够覆盖。
+`encoding` 字段回答"这个对象在物理上怎么存储"。**type 和 encoding 完全独立**，这是 Redis 最精妙的设计——同一个逻辑类型可以用完全不同的物理方式存储。
 
-### 1.4 type × encoding 的正交组合
+---
 
-这是 Redis 最精妙的设计——**type 和 encoding 完全独立**。同一个逻辑类型可以用完全不同的物理方式存储：
+## 2. type × encoding 组合空间
+
+### 2.1 完整组合矩阵
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  STRING (type=0)                                                    │
 │  ├── RAW   (encoding=0)  → sds 动态字符串（>44 字节）              │
 │  ├── EMBSTR (encoding=8)  → 38 字节内嵌 sds（≤44 字节）            │
-│  └── INT    (encoding=1)  → int64_t（数值字符串专用，无 ptr）       │
+│  │                            一次分配：robj(16B) + sdshdr8(3B) +  │
+│  │                              字符串(≤44B) = 63B total           │
+│  └── INT    (encoding=1)  → int64_t（数值字符串专用）              │
+│                               特殊处理：ptr 实际存 int64_t 值，     │
+│                               无额外堆分配                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │  LIST (type=1)                                                     │
 │  ├── QUICKLIST (encoding=9) → 双向链表，每个节点是 listpack         │
-│  └── LISTPACK  (encoding=11)→ 扁平 listpack（非 List 典型）       │
+│  │                            head 和 tail 各一个 listpack         │
+│  └── LISTPACK  (encoding=11)→ 扁平 listpack（特殊情况，如 LPILT）   │
 ├─────────────────────────────────────────────────────────────────────┤
 │  HASH (type=4)                                                     │
 │  ├── HT      (encoding=2) → dict 哈希表（字段多时）                │
-│  └── LISTPACK (encoding=11)→ 单 listpack（字段少时，≈ziplist）    │
+│  │                            fields 存在 dict 中，values 也是      │
+│  └── LISTPACK (encoding=11)→ 单 listpack（字段少时，类似旧 ziplist）│
+│                              触发条件：字段数 ≤ 512 且             │
+│                              所有 value 长度 ≤ 64 字节              │
 ├─────────────────────────────────────────────────────────────────────┤
 │  ZSET (type=3)                                                     │
-│  ├── SKIPLIST (encoding=7) → dict + skiplist（成员多时）          │
-│  └── LISTPACK  (encoding=11)→ 单 listpack（成员少时）             │
+│  ├── SKIPLIST (encoding=7) → dict + skiplist 双结构                │
+│  │                            dict: member → score（O(1) 查找）     │
+│  │                            skiplist: score → member（O(log N) 范围）│
+│  └── LISTPACK  (encoding=11)→ 单 listpack（成员少时）              │
+│                              触发条件：成员数 ≤ 128 且             │
+│                              所有 member 长度 ≤ 64 字节            │
 ├─────────────────────────────────────────────────────────────────────┤
 │  SET (type=2)                                                      │
 │  ├── HT      (encoding=2) → dict（无 value 哈希表）               │
 │  └── INTSET   (encoding=6) → 整数集合（全整数且元素少时）          │
+│                              触发条件：所有元素都是整数且           │
+│                              元素数 ≤ 512                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │  STREAM (type=6)                                                   │
-│  └── STREAM (encoding=10) → RadixTree + listpack                  │
+│  └── STREAM (encoding=10) → RadixTree(listpack) 索引                │
+│                              RadixTree key = 元素 ID                │
+│                              value = listpack（包含多个 field）     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**编码切换的触发条件**（`src/t_hash.c:449`——`hashTypeConvertListpack`，`src/t_zset.c:1175`——`zsetConvert`）：
+### 2.2 createObject——对象创建的源头
 
 ```c
-// t_hash.c:449-487 — doom-lsp 确认：Hash 编码转换
-void hashTypeConvertListpack(robj *subject, robj *existing) {
-    // 当 Hash 字段数超过 hash_max_listpack_entries (512)
-    // 或任意字段值长度超过 hash_max_listpack_value (64)
-    // 调用此函数将 ZIPLIST → HT
-}
-
-// t_zset.c:1175-1224 — doom-lsp 确认：ZSet 编码转换
-void zsetConvert(robj *subject, int encoding) {
-    // ZSet 编码切换逻辑：
-    // ZIPLIST → SKIPLIST：当元素数 > zset_max_listpack_entries (128)
-    // 或任意 member 长度 > zset_max_listpack_value (64)
-}
-```
-
-### 1.5 refcount——共享对象的根基
-
-`refcount` 字段支撑了 Redis 的**对象共享**机制。当多个键指向同一个值时（如 `SET a "hello"; SET b "hello"`），两个 robj 的 `ptr` 指向同一个底层对象，`refcount = 2`。
-
-`makeObjectShared()`（`src/server.h:2662`）是共享对象创建入口：
-
-```c
-// server.h:2662 — doom-lsp 确认
-robj *makeObjectShared(robj *o);
-
-// object.c:79 — doom-lsp 确认：使用示例
-// robj *myobject = makeObjectShared(createObject(...));
-```
-
-Redis 的共享对象主要用于：
-
-- **小整数**（`OBJ_ENCODING_INT`，0~9999）：所有数值相同的字符串键共享同一个 robj
-- **共享字符串对象**（`sharedObjectsStruct`，`src/server.h:1230`）：如 `shared.ok`、`shared.err`、`shared.null[3]`
-
-```c
-// server.h:1230 — doom-lsp 确认：全局共享对象
-struct sharedObjectsStruct {
-    robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
-         *queued, *null[3], *wrongtypeerr, *nokeyerr, ...;
-    // ...
-};
-```
-
-`createStringObjectFromLongLongForValue()`（`src/object.c:178`）会在值在 [0, 9999] 范围内时返回共享对象：
-
-```c
-// object.c:178-182 — doom-lsp 确认
-if (value >= 0 && value < OBJ_SHARED_INTEGERS) {
-    o = createStringObjectFromLongLongWithOptions(value, 1); // 尝试创建 INT 编码
-    if (o->encoding == OBJ_ENCODING_INT) {
-        decrRefCount(o);  // 丢弃，立即返回共享对象
-        return shared.createStringInt(value);
-    }
-}
-```
-
-### 1.6 hasexpire / hasembkey——内嵌 bit flag
-
-```c
-unsigned hasexpire:1;  // 是否设置了过期时间（用于快速跳过无过期检查）
-unsigned hasembkey:1; // 是否为 EMBSTR 编码（用于 OBJECT ENCODING 快速返回）
-```
-
-这两个 1 bit 字段是**空间换时间**的典型设计：
-- `hasexpire=1` 时，EXPIRE 命令无需再调用 `getExpire()` 查全局 `expires` dict
-- `hasembkey=1` 时，OBJECT ENCODING 直接返回 `"embstr"` 而无需检查 `encoding` 字段
-
----
-
-## 2. OceanBase 的数据模型：ObObj（行存）→ ObDatum（列存）
-
-### 2.1 ObObj——自包含的 16 字节设计
-
-OceanBase 的经典数据结构是 `ObObj`（`deps/oblib/src/common/object/ob_object.h:1478`），它采用**自包含设计**——元数据和值都在同一个结构里：
-
-```
- ObObj (16 bytes) — doom-lsp 确认 @ ob_object.h:1478
-┌──────────────────────────────────────────────────┐
-│ ObObjMeta meta_ (4 bytes)                         │
-│ ├── type_:   uint32_t  8bit  — ObObjType (54种)  │
-│ ├── cs_level_: uint32_t 2bit  — Collation Level   │
-│ ├── cs_type_:  uint32_t 6bit  — Collation Type    │
-│ ├── scale_:   uint32_t 8bit  — 小数精度          │
-│ └── ... (ObObjMeta @ ob_object.h:108 共 4 bytes)  │
-├──────────────────────────────────────────────────┤
-│ int32_t val_len_ / nmb_desc_ / time_ctx_ (4 bytes)│
-│ — union { int32_t, ObNumber::Desc, UnionTZCtx }   │
-├──────────────────────────────────────────────────┤
-│ ObObjValue v_ (8 bytes) — union                   │
-│ ├── int64_t / uint64_t — 有/无符号整型           │
-│ ├── float / double       — 浮点                   │
-│ ├── const char*          — 字符串指针             │
-│ ├── uint32_t*            — NUMBER 数字数组       │
-│ ├── ObLobCommon*         — LOB 数据               │
-│ └── ... 共 15 种字段解释（@ ob_object.h:1444）     │
-└──────────────────────────────────────────────────┘
-```
-
-对比 robj，ObObj 的设计哲学**完全不同**：
-
-| | Redis robj | OceanBase ObObj |
-|---|---|---|
-| 是否自包含 | 否（ptr 指向外部数据） | 是（value 内嵌在结构内） |
-| 类型字段 | type(4bit) + encoding(4bit) 共 8 bit | type(8bit) + 完整元数据 |
-| 指针间接 | 有（ptr 指向堆） | 无（inline 值） |
-| 可变长数据 | 通过 ptr 指向 sds | 通过 `v_.string_` 指向外部 buffer |
-| 精度控制 | 无 | 完整（scale/precision/charset） |
-
-### 2.2 ObObjMeta——4 字节位域压缩
-
-`ObObjMeta`（`ob_object.h:108`）将所有元数据压缩到 4 字节：
-
-```c
-// ob_object.h:108-145 — doom-lsp 确认
-struct ObObjMeta {
-    uint32_t type_   : 8;   // [0:8)   ObObjType（54 种）
-    uint32_t cs_level_  : 2;   // [8:10)  Collation Level
-    uint32_t cs_type_   : 6;   // [10:16) Collation Type（约 30 种）
-    uint32_t scale_     : 8;   // [16:24) Scale（小数位数）
-    // 后接 extend_type_ 等（union 复用空间）
-};
-```
-
-`type_`（8 bit）比 Redis 的 type（4 bit）大了 4 倍——因为 OceanBase 需要支持 **54 种数据类型**（包括 Oracle 模式的 `NVARCHAR2`、`INTERVAL_YM`、`UDT`、`ROARINGBITMAP`），4 bit 只够 16 种，根本不够用。
-
-### 2.3 ObObjValue——8 字节通用 union
-
-```c
-// ob_object.h:1444-1476 — doom-lsp 确认
-union ObObjValue {
-    int64_t int64_;           // 有符号整型
-    uint64_t uint64_;         // 无符号整型
-    float float_;             // FLOAT
-    double double_;         // DOUBLE
-    const char *string_;      // 字符串指针（指向外部 buffer）
-    uint32_t *nmb_digits_;    // NUMBER 的数字数组
-    int64_t datetime_;        // DATETIME 时间戳
-    int32_t date_;            // DATE
-    int64_t time_;            // TIME
-    uint8_t year_;            // YEAR（只用 1 字节，剩余 7 清零）
-    int64_t ext_;             // 扩展值（min/max/nop）
-    int64_t unknown_;         // 未知类型
-    const ObLobCommon *lob_;  // LOB 数据
-    const ObLobLocator *lob_locator_; // LOB 定位器
-    // ...
-};
-```
-
-**Union 设计**：所有类型共享同一个 8 字节空间。对于整型（int64_t），全部 8 字节都有意义；对于 YEAR 类型，只用最低 1 字节，剩余 7 字节清零。调用者必须通过 `meta_.type_` 来确定如何解释 `v_`。
-
-### 2.4 ObDatum——列存时代的 12 字节紧凑设计
-
-OceanBase 引入列存编码引擎后，ObObj 的 16 字节对短类型（YEAR 1 字节、FLOAT 4 字节）浪费严重。`ObDatum`（`src/share/datum/ob_datum.h:177`）诞生：
-
-```
- ObDatum (12 bytes) — doom-lsp 确认 @ ob_datum.h:177
-┌──────────────────────────────────────────────────┐
-│ ObDatumPtr (8 bytes)                             │
-│ ┌──────────────────────────────────────────────┐ │
-│ │ union {                                       │ │
-│ │   const char* ptr_;     // 字符串指针         │ │
-│ │   int64_t* int_;        // 整数数组           │ │
-│ │   float* float_;        // 浮点数组           │ │
-│ │   double* double_;      // double 数组        │ │
-│ │   ObLobCommon* lob_data_; // LOB 数据         │ │
-│ │   ObDecimalInt* decimal_int_; // 紧凑十进制   │ │
-│ │ }                                             │ │
-│ └──────────────────────────────────────────────┘ │
-├──────────────────────────────────────────────────┤
-│ ObDatumDesc (4 bytes) — doom-lsp 确认 @ ob_datum.h:115 │
-│ ┌────────────────────────────────────────────┐  │
-│ │ len_:    uint32_t 29bit — 数据长度（0-536M） │  │
-│ │ flag_:   uint32_t 2bit  — 标志（NONE/OUTROW│  │
-│ │                           /EXT/HAS_LOB_HDR） │  │
-│ │ null_:   uint32_t 1bit  — 是否为 NULL      │  │
-│ └────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────┘
-```
-
-核心思想：**元数据与值分离**。ObDatum 只存储指向数据的指针和描述符，类型/精度/字符集由调用方通过 `ObObjMeta` 单独传递。这使得 ObDatum 只有 12 字节，比 ObObj 小 4 字节。
-
-### 2.5 ObObjDatumMapType——类型到内存布局的映射
-
-```c
-// ob_datum.h:80-99 — doom-lsp 确认
-enum ObObjDatumMapType : uint8_t {
-  OBJ_DATUM_NULL,            // 0 B  — NULL
-  OBJ_DATUM_STRING,          // 可变 — 字符串（ptr + len）
-  OBJ_DATUM_NUMBER,          // 4~40B— NUMBER（desc + digits）
-  OBJ_DATUM_8BYTE_DATA,      // 8 B  — int64, double, datetime
-  OBJ_DATUM_4BYTE_DATA,      // 4 B  — float, date, int32
-  OBJ_DATUM_1BYTE_DATA,      // 1 B  — year
-  OBJ_DATUM_4BYTE_LEN_DATA,  // 12 B — 4B len + 8B data（TimestampTZ）
-  OBJ_DATUM_2BYTE_LEN_DATA,  // 10 B — 2B len + 8B data（TimestampLTZ）
-  OBJ_DATUM_FULL,            // 16 B — 完整 ObObj（Extend 类型）
-  OBJ_DATUM_DECIMALINT,      // 4~64B— Decimal Int
-  OBJ_DATUM_MAPPING_MAX,
-};
-```
-
-这个枚举定义了每种 `ObObjType` 在内存中的实际布局（compact/columnar 场景下）。例如：
-
-| ObObjType | 映射类型 | 实际占用 |
-|-----------|---------|---------|
-| ObTinyIntType ~ ObIntType | OBJ_DATUM_8BYTE_DATA | 8 bytes |
-| ObFloatType | OBJ_DATUM_4BYTE_DATA | 4 bytes |
-| ObYearType | OBJ_DATUM_1BYTE_DATA | 1 byte |
-| ObVarcharType ~ ObLongTextType | OBJ_DATUM_STRING | 可变 |
-| ObDecimalIntType | OBJ_DATUM_DECIMALINT | 4~64 bytes |
-
-### 2.6 Obj → Datum 转换
-
-`ObDatum::from_obj()`（`ob_datum.h:336`）实现了从 ObObj 到 ObDatum 的转换：
-
-```c
-// ob_datum.h:336-365 — doom-lsp 确认
-template <ObObjDatumMapType MAP_TYPE>
-inline void ObDatum::from_obj(const ObObj &obj) {
-    switch (MAP_TYPE) {
-    case OBJ_DATUM_8BYTE_DATA:
-        memcpy(no_cv(ptr_), &obj.v_.uint64_, sizeof(uint64_t));
-        pack_ = sizeof(uint64_t);  // 同时设置 len_ 和 null_
-        break;
-    // ... 其他类型
-    }
-}
-```
-
-注意 `pack_ = sizeof(uint64_t)` 同时设置了 `len_`（29 bit）和 `null_`（1 bit）——因为 `null_ == 0` 意味着数据非空。这是 `ObDatumDesc` 中 union 设计的巧妙之处。
-
----
-
-## 3. 本质对比：两种数据库哲学
-
-### 3.1 Redis：一切为了性能优化
-
-Redis 的数据模型从属于它的核心约束：**单线程事件循环**，所有操作必须在 O(1) 或 O(log N) 内完成。
-
-```c
-// object.c:43-55 — doom-lsp 确认：createObject
+// object.c:43-55 — doom-lsp 确认
 robj *createObject(int type, void *ptr) {
-    robj *o = zmalloc(sizeof(*o));  // 固定 16 字节，zmalloc 极快
+    robj *o = zmalloc(sizeof(*o));  // 永远分配 16 字节
     o->type = type;
-    o->encoding = OBJ_ENCODING_RAW;
+    o->encoding = OBJ_ENCODING_RAW; // 默认编码是 RAW
     o->ptr = ptr;
-    o->refcount = 1;
-    o->lru = LRU_CLOCK();
+    o->refcount = 1;                 // 引用计数 = 1
+    // 根据 maxmemory_policy 设置 LRU 或 LFU
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+    } else {
+        o->lru = LRU_CLOCK();
+    }
     return o;
 }
 ```
 
-- **固定 16 字节**：对象分配和释放可以完全池化
-- **type × encoding 分离**：允许运行时根据数据特征切换存储方式（int → raw string）
-- **refcount 共享**：避免重复分配，小整数共享可达 10000 个
+**默认编码是 RAW**——每次创建对象时，除非后续有特殊处理，否则都是最基础的动态字符串编码。
 
-Redis 不需要考虑 SQL 语句的类型推导、跨类型表达式、字符集排序规则——它只服务一种场景：**键值对的多态存储**。
-
-### 3.2 OceanBase：一切为了 SQL 表达力
-
-OceanBase 的数据模型从属于它的核心约束：**支持完整的 SQL 语义**。
-
-`ObObjType` 枚举（`ob_obj_type.h:29`）定义了 54 种类型：
+### 2.3 makeObjectShared——共享对象的根基
 
 ```c
-// ob_obj_type.h:29-53 — doom-lsp 确认
-enum ObObjType {
-  ObNullType,          //  0
-  ObTinyIntType,       //  1
-  // ... 有符号整数族
-  ObFloatType,         // 11
-  ObDoubleType,        // 12
-  ObNumberType,        // 15 — 高精度 DECIMAL
-  ObVarcharType,       // 22
-  // ... TEXT 系列
-  ObTimestampTZType,   // 34 — TIMESTAMP WITH TIME ZONE
-  ObIntervalYMType,    // 38 — INTERVAL YEAR TO MONTH
-  ObNVarchar2Type,     // 41 — Oracle NVARCHAR2
-  ObJsonType,          // 45 — JSON
-  ObGeometryType,      // 46 — GEOMETRY
-  ObUserDefinedSQLType,// 47 — UDT
-  ObRoaringBitmapType, // 52 — RoaringBitmap
-  ObMaxType,           // 53 — 最大值标记
+// server.h:2662 — doom-lsp 确认：makeObjectShared 声明
+robj *makeObjectShared(robj *o);
+
+// object.c:79 — doom-lsp 确认：使用示例
+// robj *myobject = makeObjectShared(createObject(...));
+// 两个键指向同一个对象，refcount = 2，析构时 decrRefCount 到 0 才真正释放
+```
+
+`refcount` 字段支撑了 Redis 的**对象共享**机制。当 `refcount > 1` 时，对象是"共享"的——多个键指向同一个底层数据。这用于：
+- **小整数**：所有数值为 0~9999 的 INT 编码字符串共享同一个 robj
+- **共享字符串对象**：如 `shared.ok`、`shared.err`、`shared.null[3]`
+
+```c
+// server.h:1230 — doom-lsp 确认：全局共享对象结构
+struct sharedObjectsStruct {
+    robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *pong, *space,
+         *queued, *null[3], *wrongtypeerr, *nokeyerr, *syntaxerr,
+         *sameobjecterr, *outofrangeerr, *noscripterr, *loadingerr,
+         *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk,
+         *subscribebulk, *unsubscribebulk, *psubscribebulk, *punsubscribebulk,
+         *del, *unlink, *rpop, *lpop, *lpush, *rpoplpush, *lmove, *blmove,
+         *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right,
+         *hset, *srem, *xgroup, *xclaim, *script, *replconf, *eval,
+         *persist, *set, *pexpireat, *pexpire, *time, *pxat, *absttl,
+         *retrycount, *force, *justid, *entriesread, *lastid, *ping,
+         *setid, *keepttl, *load, *createconsumer, *getack, *special_asterick,
+         *special_equals, *default_username, *redacted,
+         *ssubscribebulk, *sunsubscribebulk, *smessagebulk,
+         *select, *integers, *mbulkhdr, *bulkhdr, *maphdr, *sethdr,
+         *minstring, *maxstring;
+    // ...
 };
 ```
 
-覆盖 MySQL 和 Oracle 两种模式、完整的数据类型体系。这是双模支持的基础——同一个 SQL 引擎必须能同时处理 MySQL 的 `YEAR` 和 Oracle 的 `INTERVAL YEAR TO MONTH`。
+这些共享对象在 `createSharedObjects()`（`src/server.c`，`server.c` 初始化时调用）中创建，供所有命令复用——无需每次创建新的 robj。
 
-### 3.3 关键数字对比
+### 2.4 小整数共享——最极端的共享案例
 
-| 维度 | Redis | OceanBase |
-|------|-------|----------|
-| 核心对象大小 | 16 字节（固定） | 16 字节（ObObj）/ 12 字节（ObDatum） |
-| type 字段宽度 | 4 bit（7 种类型） | 8 bit（54 种类型） |
-| encoding 字段 | 4 bit（11 种编码） | 无 encoding（类型即编码） |
-| refcount 共享 | 有（小整数 0~9999） | 无（每行独立对象） |
-| 精度控制 | 无 | scale/precision/charset 全链路 |
-| 双模支持 | 无 | MySQL + Oracle 类型 |
+```c
+// object.c:178-182 — doom-lsp 确认
+robj *createStringObjectFromLongLongForValue(long long value) {
+    robj *o;
+    if (value >= 0 && value < OBJ_SHARED_INTEGERS) {
+        // 在 [0, 9999] 范围内的小整数，直接返回共享对象
+        // 无需分配，零成本
+        return shared.createStringInt(value);
+    }
+    // 超出范围，走正常创建流程
+    o = createStringObjectFromLongLongWithOptions(value, 1);
+    if (o->encoding == OBJ_ENCODING_INT) {
+        decrRefCount(o);  // 丢弃刚才创建的对象
+        return shared.createStringInt(value);  // 返回共享对象
+    }
+    return o;
+}
+```
+
+`OBJ_SHARED_INTEGERS` = 10000（`server.h` 中定义）。这意味着如果你的 Redis 存了 10000 个值为 `42` 的字符串键，它们全部共享同一个 robj，内存节省极为可观。
 
 ---
 
-## 4. 从数据模型看后续系列
+## 3. encoding 切换——Redis 的自适应存储
 
-这个起点注定了两个数据库走向完全不同的道路：
+### 3.1 String 的 EMBSTR 优化
 
-- **Redis** 接下来要解决：如何在单线程里高效分派命令（`lookupCommand`）、如何做持久化（RDB/AOF）而不阻塞事件循环、如何做复制（REPL_STATE 状态机）
-- **OceanBase** 接下来要解决：如何在 54 种类型上做代价估算、MVCC 如何在不同类型下正确判断可见性、存储层如何根据类型选择编码算法
+EMBSTR 是 Redis 对短字符串的特殊优化。当创建 length ≤ 44 的字符串时：
+
+```c
+// object.c:133-145 — doom-lsp 确认
+robj *createStringObject(const char *ptr, size_t len) {
+    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
+        return createEmbeddedStringObject(ptr, len);
+    } else {
+        return createRawStringObject(ptr, len);
+    }
+}
+
+// object.c:91-99 — doom-lsp 确认：createEmbeddedStringObject
+robj *createEmbeddedStringObject(const char *ptr, size_t len) {
+    robj *o = zmalloc(sizeof(*o) + sizeof(struct sdshdr8) + len + 1);
+    // ★ 关键：一次分配，包含 robj(16) + sdshdr8(3) + 字符串(len) + 结尾\0
+    // 内存连续，无指针间接，cache 友好
+    o->type = OBJ_STRING;
+    o->encoding = OBJ_ENCODING_EMBSTR;
+    // ...
+}
+```
+
+`OBJ_ENCODING_EMBSTR_SIZE_LIMIT` = 44。这意味着：
+- robj(16B) + sdshdr8(3B) + 字符串(44B) + \0(1B) = **64B 一次分配**
+- 如果走 RAW：`zmalloc(sizeof(robj))` + `sdsnewlen(ptr, len)` = **两次分配**
+
+EMBSTR 的优势：**减少一次 `zmalloc` 调用 + 更好的 cache locality**（robj 和 sds 数据在同一块内存中）。
+
+### 3.2 String → Int 编码切换
+
+当字符串值实际上是一个数字时，Redis 会尝试压缩为 INT 编码：
+
+```c
+// object.c:162-188 — doom-lsp 确认
+robj *createStringObjectFromLongLongWithOptions(long long value, int valueobj) {
+    robj *o;
+    if (valueobj) {
+        // valueobj = 1 表示"尝试 INT 编码"
+        char buf[LL_STR_SIZE];
+        ll2string(buf, sizeof(buf), value);
+        size_t len = strlen(buf);
+        // 如果字符串表示和数值相等，说明可以直接转为 INT
+        if (value >= 0 && value < OBJ_SHARED_INTEGERS) {
+            return shared.createStringInt(value);
+        }
+        o = createStringObject(buf, len);
+        // 检测是否可以转为 INT 编码
+        if (tryStringEncodingInPlace(o) == C_OK) {
+            // 编码转换成功
+        }
+    }
+    // ...
+}
+
+// object.c:196-230 — doom-lsp 确认：tryStringEncodingInPlace
+int tryStringEncodingInPlace(robj *o) {
+    // 将 RAW 编码的字符串尝试转为 INT 编码
+    // 失败条件：字符串包含非数字字符，或值超出 int64_t 范围
+    // 成功条件：字符串是纯数字且在 [INT64_MIN, INT64_MAX] 范围内
+}
+```
+
+**触发时机**：`SET key 12345` 会经过 `setCommand` → `setGenericCommand` → `setKey` → `setVal` → 检测到值是纯数字 → 调用 `createStringObjectFromLongLongWithOptions`。
+
+### 3.3 Hash：ZIPLIST → HT 的编码切换
+
+```c
+// t_hash.c:449-487 — doom-lsp 确认
+void hashTypeConvertListpack(robj *subject, robj *existing) {
+    // 当 Hash 满足以下任一条件时，从 LISTPACK 转为 HT：
+    // 1. 字段数超过 hash_max_listpack_entries (512)
+    // 2. 任意 field 或 value 长度超过 hash_max_listpack_value (64)
+    // 
+    // 转换过程：
+    // 1. 创建新的 dict
+    // 2. 遍历旧 listpack，逐项解码，插入 dict
+    // 3. 释放旧 listpack
+    // 4. 替换 subject->ptr 为新 dict
+    // 5. subject->encoding = OBJ_ENCODING_HT
+}
+
+// t_hash.c:489-503 — doom-lsp 确认：hashTypeConvert（通用转换入口）
+void hashTypeConvert(robj *subject, int encoding) {
+    if (encoding == OBJ_ENCODING_LISTPACK) {
+        hashTypeConvertListpack(subject, NULL);
+    } else if (encoding == OBJ_ENCODING_HT) {
+        hashTypeConvertHashTable(subject);
+    } else {
+        serverPanic("Unknown hash encoding");
+    }
+}
+```
+
+**触发条件**（在 `t_hash.c:190` 的 `hashTypeSet` 中检查）：
+
+```c
+// t_hash.c:190-240 — doom-lsp 确认：hashTypeSet 中的触发检查
+if (subject->encoding == OBJ_ENCODING_LISTPACK) {
+    // 如果添加后超过阈值，触发转换
+    if (hashTypeLength(subject) > server.hash_max_listpack_entries ||
+        sdslen(v) > server.hash_max_listpack_value) {
+        // 立即转换，不再等到下次命令
+    }
+}
+```
+
+### 3.4 ZSet：ZIPLIST → SKIPLIST 的编码切换
+
+```c
+// t_zset.c:1175-1224 — doom-lsp 确认：zsetConvert
+void zsetConvert(robj *subject, int encoding) {
+    if (encoding == OBJ_ENCODING_ZIPLIST) {
+        // ZSet → Listpack 转换（较少发生）
+        // 遍历 skiplist + dict，逐个插入 listpack
+    } else if (encoding == OBJ_ENCODING_SKIPLIST) {
+        // Listpack → Skiplist 转换
+        // 创建 zset 结构：dict(member→score) + skiplist(score→member)
+        // 遍历 listpack，插入两个结构
+        // 释放 listpack
+    } else if (encoding == OBJ_ENCODING_LISTPACK) {
+        // ZSet → Listpack（Redis 7.x 新路径）
+        // ...
+    }
+}
+
+// 触发条件（t_zset.c:195-210）：
+// zset_add 之前检查：
+//   if (zset_max_listpack_entries > 0 && zllen > zset_max_listpack_entries)
+//       → 转换为 SKIPLIST
+//   if (sdslen(member) > zset_max_listpack_value)
+//       → 转换为 SKIPLIST
+```
+
+### 3.5 Set：INTSET 的条件与转换
+
+```c
+// t_set.c:300-330 — doom-lsp 确认：convertToRealSet
+void convertToRealSet(robj *subject) {
+    // INTSET → HT 转换
+    // 遍历 intset，逐元素插入 dict（value = NULL）
+    // 释放 intset，subject->ptr = dict
+    // subject->encoding = OBJ_ENCODING_HT
+}
+
+// 触发条件（t_set.c:addSetMember）：
+// if (subject->encoding == OBJ_ENCODING_INTSET) {
+//     if (!isSdsRepresentableAsLongLong(member, &llval) ||
+//         // 添加后元素数 > set_max_intset_entries (512)
+//         server.set_max_intset_entries > 0 &&
+//         dictSize(subject->ptr) + 1 > server.set_max_intset_entries) {
+//         convertToRealSet(subject);
+//     }
+// }
+```
+
+### 3.6 编码切换的代价
+
+编码切换是一个**阻塞操作**——它需要遍历旧数据结构、创建新数据结构、释放旧数据结构。在高并发场景下，如果频繁触发大 Hash 的编码切换，会影响响应延迟。
+
+Redis 6.2 引入了 `LISTPACK` 编码作为 `ZIPLIST` 的替代，用 listpack 代替 ziplist 作为 Hash/ZSet 的紧凑存储格式，解决了一些 ziplist 的性能问题（连锁更新）。
 
 ---
 
-## 5. 源码索引
+## 4. bit flag 字段——空间换时间
 
-### Redis
+### 4.1 hasexpire——避免额外的 expires 查找
+
+```c
+unsigned hasexpire:1;  // 是否设置了过期时间
+```
+
+正常判断一个键是否过期需要两步：
+1. 查 `server.expires` dict（O(1) 但仍需一次哈希）
+2. 比较当前时间 vs 过期时间
+
+如果 `hasexpire=0`，第一步可以直接跳过——这个键**肯定没有过期**，无需查 `expires` dict。
+
+### 4.2 hasembkey——快速返回编码类型
+
+```c
+unsigned hasembkey:1;  // 是否为 EMBSTR 编码
+```
+
+`OBJECT ENCODING` 命令的实现（`src/object.c:250`）：
+
+```c
+// object.c:250-270 — doom-lsp 确认
+void objectCommand(client *c) {
+    // ...
+    if (strcasecmp(c->argv[2]->ptr,"encoding") == 0) {
+        if (o->encoding == OBJ_ENCODING_EMBSTR && hasembkey) {
+            addReplyBulkCString(c,"embstr");  // 直接返回，无需读 encoding 字段
+        } else {
+            addReplyBulkCString(c,encodingname[o->encoding]);
+        }
+    }
+    // ...
+}
+```
+
+在 EMBSTR 场景下，可以直接通过 `hasembkey` flag 快速返回，无需访问 `encoding` 字段。
+
+### 4.3 hasexpire 和 hasembkey 的实现细节
+
+这两个 flag 是在**每次操作时更新**的：
+- `SETEX` / `EXPIRE` 执行后设置 `hasexpire=1`
+- `DEL` / `EXPIRE` 执行后设置 `hasexpire=0`
+- `createStringObject` 根据是否 EMBSTR 设置 `hasembkey`
+
+这是典型的**空间换时间**：用 2 bit 的额外存储，换取更快的命令处理路径。
+
+---
+
+## 5. lru 字段——LRU/LFU 淘汰的时钟
+
+### 5.1 LRU 时钟的工作原理
+
+```c
+// server.h:837 — LRU_BITS = 24
+// 即 lru 字段的低 24 位存 LRU 时钟
+// 高 8 位（在 LFU 模式下）存 LFU 计数器
+
+// server.h:1353 — lruclock 定义
+#define LRU_CLOCK() ((1000/USHRT_MAX) * ((uint64_t)evictALoopCounter + (uint64_t)server.unixtime % 1000))
+// LRU_CLOCK() 返回一个从 0 到 1000 循环递增的值，每毫秒更新一次
+```
+
+LRU 时钟的精度是**秒级**（而不是毫秒级）——这是有意为之的设计：
+- 足够精确，能区分键的访问先后
+- 不需要每次访问都更新（只读 `LRU_CLOCK()` 不需要写）
+- 存储紧凑（24 bit）
+
+### 5.2 LFU 模式——近似 LRU 的频率计数
+
+```c
+// object.c:50 — doom-lsp 确认：LFU 模式下的设置
+if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+    o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+    // 高 8 位：LFU 计数器（访问频率）
+    // 低 8 位：上次 decay 的时间戳（分钟级）
+} else {
+    o->lru = LRU_CLOCK();
+}
+```
+
+LFU 模式下：
+- **高 8 位**：`LFU_INIT_VAL`（默认 5），记录访问频率
+- **低 8 位**：上次 `LFUDecrAndReturn` decay 的分钟时间戳
+
+LFU 的 decay 逻辑在 `object.c:370` 的 `LFUDecrAndReturn` 中实现：
+```c
+// object.c:370-390 — doom-lsp 确认：LFU decay
+uint64_t LFUDecrAndReturn(robj *o) {
+    // 每分钟运行一次（由 serverCron 触发）
+    // 将计数器乘以概率因子（1 - 衰变率），下取整
+    // 防止频繁访问的键被错误淘汰
+}
+```
+
+---
+
+## 6. refcount——对象生命周期管理
+
+### 6.1 引用计数的作用
+
+```c
+// object.c:60-78 — doom-lsp 确认
+void incrRefCount(robj *o) {
+    if (o->refcount != OBJ_SHARED_REFCOUNT) {
+        o->refcount++;
+    }
+    // OBJ_SHARED_REFCOUNT 是特殊值，表示对象是共享的
+    // 共享对象的 refcount 不做递增（因为设计上就应该是"无限共享"）
+}
+
+void decrRefCount(robj *o) {
+    if (o->refcount != OBJ_SHARED_REFCOUNT) {
+        if (o->refcount--) {
+            return;  // refcount > 0，还不能释放
+        }
+        // refcount == 0，真正释放
+        if (o->type == OBJ_STRING) {
+            // 释放 sds
+        } else if (...) {
+            // 释放其他类型的数据
+        }
+        zfree(o);  // 释放 robj 本身
+    }
+    // 共享对象不释放
+}
+```
+
+### 6.2 共享对象的特殊处理
+
+```c
+// server.h 中定义的特殊 refcount 值
+#define OBJ_SHARED_REFCOUNT INT_MAX  // 共享对象的 refcount 固定为 INT_MAX
+```
+
+当 `refcount == OBJ_SHARED_REFCOUNT` 时：
+- `incrRefCount()` 不递增
+- `decrRefCount()` 不释放
+
+这使得共享对象（如 `shared.ok` = "OK"）可以在所有需要的地方复用，永远不会被意外释放。
+
+---
+
+## 7. 源码索引
 
 | 文件 | 行号 | 内容 |
 |------|------|------|
 | `src/server.h` | 649 | `#define OBJ_STRING 0` — type 定义 |
-| `src/server.h` | 666 | `#define OBJ_MODULE 5` |
 | `src/server.h` | 667 | `#define OBJ_STREAM 6` |
 | `src/server.h` | 837 | `#define OBJ_ENCODING_RAW 0` — encoding 定义 |
 | `src/server.h` | 847 | `#define OBJ_ENCODING_LISTPACK 11` |
-| `src/server.h` | 858 | `typedef struct redisObject` — robj 定义 |
-| `src/server.h` | 1230 | `struct sharedObjectsStruct` — 共享对象 |
-| `src/server.h` | 2662 | `makeObjectShared()` — 共享对象创建 |
-| `src/object.c` | 43 | `createObject()` — 对象创建 |
-| `src/object.c` | 79 | `makeObjectShared()` 使用示例 |
-| `src/object.c` | 178 | `createStringObjectFromLongLongForValue()` — INT 编码共享 |
+| `src/server.h` | 858 | `typedef struct redisObject` — robj 定义（16B） |
+| `src/server.h` | 1230 | `struct sharedObjectsStruct` — 全局共享对象 |
+| `src/server.h` | 2662 | `makeObjectShared()` 声明 |
+| `src/object.c` | 43 | `createObject()` — 对象创建原语 |
+| `src/object.c` | 60 | `incrRefCount()` — 引用计数递增 |
+| `src/object.c` | 68 | `decrRefCount()` — 引用计数递减（含释放逻辑） |
+| `src/object.c` | 91 | `createEmbeddedStringObject()` — EMBSTR 创建 |
+| `src/object.c` | 133 | `createStringObject()` — String 对象工厂 |
+| `src/object.c` | 178 | `createStringObjectFromLongLongForValue()` — 小整数共享入口 |
+| `src/object.c` | 196 | `tryStringEncodingInPlace()` — String→Int 编码转换 |
+| `src/object.c` | 370 | `LFUDecrAndReturn()` — LFU 频率衰减 |
+| `src/object.c` | 250 | `objectCommand()` — OBJECT ENCODING 实现 |
 | `src/t_hash.c` | 449 | `hashTypeConvertListpack()` — Hash 编码切换 |
+| `src/t_hash.c` | 489 | `hashTypeConvert()` — 编码切换通用入口 |
+| `src/t_hash.c` | 190 | `hashTypeSet()` — 编码切换触发检查 |
 | `src/t_zset.c` | 1175 | `zsetConvert()` — ZSet 编码切换 |
-
-### OceanBase
-
-| 文件 | 行号 | 内容 |
-|------|------|------|
-| `deps/oblib/src/common/object/ob_obj_type.h` | 29 | `enum ObObjType` — 54 种类型枚举 |
-| `deps/oblib/src/common/object/ob_obj_type.h` | 228 | `enum ObObjTypeClass` — 类型分类 |
-| `deps/oblib/src/common/object/ob_object.h` | 108 | `struct ObObjMeta` — 4 字节元数据 |
-| `deps/oblib/src/common/object/ob_object.h` | 1444 | `union ObObjValue` — 8 字节值 union |
-| `deps/oblib/src/common/object/ob_object.h` | 1478 | `struct ObObj` — 16 字节自包含 |
-| `src/share/datum/ob_datum.h` | 80 | `enum ObObjDatumMapType` — 类型→布局映射 |
-| `src/share/datum/ob_datum.h` | 115 | `struct ObDatumDesc` — 4 字节描述符 |
-| `src/share/datum/ob_datum.h` | 177 | `class ObDatum` — 12 字节紧凑设计 |
+| `src/t_set.c` | 300 | `convertToRealSet()` — Set INTSET→HT 转换 |
 
 ---
 
-*分析工具：doom-lsp（clangd LSP 18.x）| Redis 版本：main（7.x）| 分析日期：2026-05-24*
+*分析工具：doom-lsp（clangd LSP 18.x）| Redis 版本：main（7.x dev）| 分析日期：2026-05-24*
