@@ -33,7 +33,7 @@
 | 23 | MySQL 存储过程 | `sql/sp_head.cc`, `sql/sp_instr.h`, `sql/sp_pcontext.h`, `sql/sp.cc` | 917 | ✅ |
 | 24 | InnoDB 全文索引 | `storage/innobase/fts/fts0fts.cc`, `fts0opt.cc` | 907 | ✅ |
 | 25 | InnoDB 在线 DDL | `storage/innobase/handler/handler0alter.cc`, `row0log.cc`, `log0ddl.cc` | 738 | ✅ |
-| 26 | MySQL 连接与线程池 | `sql/conn_handler/`, `sql/mysqld.cc` | 192 | ✅ |
+| 26 | MySQL 连接与线程池 | `sql/sql_connect.cc`, `sql/sql_parse.cc`, `sql/mysqld.cc` | 631 | ✅ |
 | 27 | MySQL Performance Schema | `storage/perfschema/` | 180 | ✅ |
 | 28 | InnoDB 页面压缩 | `page0zip.cc` | 166 | ✅ |
 | 29 | MySQL 分区表 | `sql/partitioning/` | 143 | ✅ |
