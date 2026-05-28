@@ -29,7 +29,7 @@
 | 19 | InnoDB 文件空间管理 | `fil0fil.cc`, `fsp0fsp.cc` | 398 | ✅ |
 | 20 | InnoDB 内存管理 | `mem0mem.h`, `mem0mem.ic` | 381 | ✅ |
 | 21 | InnoDB 外键与约束 | `dict0dict.cc`, `row0ins.cc`, `row0upd.cc` | 337 | ✅ |
-| 22 | MySQL 查询优化器 | `sql/sql_optimizer.cc`, `sql/planner.cc` | 294 | ✅ |
+| 22 | MySQL 查询优化器 | `sql/sql_optimizer.cc`, `sql/sql_planner.cc` | 832 | ✅ |
 | 23 | MySQL 存储过程 | `sql/sp_head.cc`, `sql/sp.cc` | 230 | ✅ |
 | 24 | InnoDB 全文索引 | `fts0fts.cc`, `fts0types.h` | 211 | ✅ |
 | 25 | InnoDB 在线 DDL | `ha_innodb.cc`, `ddl/` | 157 | ✅ |
@@ -39,7 +39,7 @@
 | 29 | MySQL 分区表 | `sql/partitioning/` | 143 | ✅ |
 | 30 | InnoDB 检查点 | `log0chkp.cc`, `log0log.cc` | 231 | ✅ |
 
-## 写作标准（参考 OceanBase 分析质量）
+## 写作标准
 
 每篇文章 v1 标准：
 - **行数**：300-500 行（先出骨架，不要追求一步到位）
