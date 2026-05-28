@@ -1,192 +1,326 @@
-# 26. MySQL 连接与线程池 (Connection & Thread Pool)
+# 26. MySQL 连接与线程池（Connection & Thread Pool）— 源码分析
 
-> 本文分析 MySQL 的连接管理与线程模型，包括监听/接受线程、连接分发、Per-Thread 模型和 Thread Pool 扩展。核心文件：`sql/conn_handler/`、`sql/mysqld.cc`、`sql/sql_parse.cc`。
-
----
-
-## 1. 概述
-
-MySQL 传统上使用**一个线程处理一个连接**（one-thread-per-connection）模型。连接管理由 `Connection_handler_manager` 统一调度，通过 `Channel_info` 抽象支持多种传输协议。MySQL Enterprise 提供 Thread Pool 插件作为替代。
-
-| 实现 | 类 | 说明 |
-|------|----|------|
-| Per-Thread | `Per_thread_connection_handler` | 每个连接创建一个新 pthread（默认） |
-| Thread Pool | Plugin `connection_control.so` | 复用少量工作线程处理多个连接 |
-| Socket | `Channel_info_socket` | TCP/IP / Unix Socket 传输 |
-| Named Pipe | `Channel_info_named_pipe` | Windows Named Pipe |
-| Shared Memory | `Channel_info_shared_mem` | Windows Shared Memory |
+> 本文分析 MySQL 的连接管理、线程模型和线程池实现，包括连接协议、认证握手、线程调度、线程池插件和连接超时处理。核心源文件：`sql/mysqld.cc`、`sql/sql_connect.cc`、`sql/sql_parse.cc`、`sql/conn_handler/`。
 
 ---
 
-## 2. 连接接受与分发
+## 0. 概述
 
-### 2.1 mysqld_main 主循环
+MySQL 采用**每个连接一个线程（One-Thread-Per-Connection）**的模型。每个客户端连接对应一个操作系统线程（或线程池中的一个工作线程），由 MySQL 服务器进程统一管理。
+
+### MySQL 连接模型演进
+
+```
+MySQL 5.6 及以前:
+  ┌────────────┐     ┌──────────┐     ┌───────┐
+  │  Client 1  │────→│  Thread 1 │────→│  SQL   │
+  │  Client 2  │────→│  Thread 2 │────→│  Core  │
+  │  Client N  │────→│  Thread N │────→│        │
+  └────────────┘     └──────────┘     └───────┘
+  (每个连接一个线程，简单但资源消耗大)
+
+MySQL 8.0 (Enterprise + Percona):
+  ┌────────────┐     ┌──────────┐     ┌───────┐
+  │  Client 1  │────→│          │     │       │
+  │  Client 2  │────→│  Thread  │────→│  SQL   │
+  │  Client N  │────→│   Pool   │     │  Core  │
+  └────────────┘     └──────────┘     └───────┘
+  (线程池：有限线程数，大量连接共享)
+```
+
+---
+
+## 1. 连接管理
+
+### 1.1 连接建立流程
+
+```
+客户端: mysql -h host -u user -p
+
+MySQL 服务器:
+  └─ mysqld 主循环:
+      ├─ poll(port, backlog)           ← 监听 TCP 端口
+      ├─ accept()                      ← 接受新连接
+      ├─ create_thread_to_handle_connection()
+      │   ├─ create_new_thread(thd)    ← 创建线程 / 从池中分配
+      │   ├─ thd_prepare_connection()  ← 准备连接上下文
+      │   └─ check_user()              ← 认证握手
+      └─ do_command()                  ← 主命令循环
+```
+
+### 1.2 认证握手
 
 ```cpp
-// mysqld.cc — 主循环
-mysqld_main() {
-  // Step 1: 初始化网络监听
-  mysql_socket_listen(listen_socket, bind_address, port);
+// sql/sql_connect.cc
+bool check_user(THD *thd, ...) {
+  /* 步骤 1: 发送服务器握手包 */
+  /* 包括: 服务器版本、连接 ID、认证插件、salt */
 
-  // Step 2: 主循环：接受连接，创建 Channel_info
+  /* 步骤 2: 接收客户端响应 */
+  /* 包括: 用户名、加密后的密码、客户端标志 */
+
+  /* 步骤 3: 查找用户 */
+  /* 查询 mysql.user 系统表 */
+  ACL_USER *acl_user = find_acl_user(thd, user, host, ...);
+
+  /* 步骤 4: 验证密码 */
+  if (!acl_user) return ER_ACCESS_DENIED_ERROR;
+
+  /* 支持多种认证插件: */
+  /* - mysql_native_password (默认, SHA1 加密) */
+  /* - caching_sha2_password (8.0 默认, SHA256 加密) */
+  /* - sha256_password */
+
+  /* 步骤 5: 设置线程上下文 */
+  thd->set_user(acl_user);
+  thd->security_ctx->skip_grants();
+  thd->variables = acl_user->user_variables;
+}
+```
+
+### 1.3 连接参数
+
+```cpp
+// sql/mysqld.cc — 连接相关参数
+
+/* 最大连接数 */
+uint max_connections = 151;             /* 默认值 */
+uint max_user_connections = 0;          /* 默认无限制 */
+uint extra_max_connections = 1;         /* 保留一个给管理员 */
+
+/* 超时 */
+uint connect_timeout = 10;              /* 连接超时秒数 */
+uint wait_timeout = 28800;              /* 空闲连接超时（8小时）*/
+uint interactive_timeout = 28800;       /* 交互式会话超时 */
+
+/* 连接拒绝 */
+uint max_connect_errors = 100;          /* 最大连接错误数 */
+```
+
+---
+
+## 2. 线程模型
+
+### 2.1 主调度线程
+
+```cpp
+// sql/mysqld.cc — 主线程循环
+void mysqld_main(int argc, char **argv) {
+  /* 初始化 */
+  mysqld_get_one_option(argc, argv);
+  init_server_components();
+
+  /* 创建监听 socket */
+  setup_connection_port(port);
+
+  /* 主循环：接受新连接 */
   while (!abort_loop) {
-    Channel_info *channel_info = Channel_info_socket::create(...);
-    Connection_handler_manager::process_new_connection(channel_info);
-  }
-
-  // Step 3: 关闭监听
-  mysql_socket_close(listen_socket);
-}
-```
-
-### 2.2 连接分发 `process_new_connection`
-
-```cpp
-// connection_handler_manager.cc
-bool Connection_handler_manager::process_new_connection(
-    Channel_info *channel_info) {
-  switch (connection_handler_type) {
-    case CONN_HANDLER_PER_THREAD:
-      Per_thread_connection_handler::add_connection(channel_info);
-      break;
-    case CONN_HANDLER_POOL:
-      One_thread_connection_handler::add_connection(channel_info);
-      break;
+    fd = accept(port);
+    if (fd >= 0) {
+      /* 每个新连接创建一个线程 */
+      create_new_thread(new THD());
+    }
   }
 }
 ```
 
-### 2.3 Per-Thread 线程创建
+### 2.2 THD（线程描述符）
+
+每个客户端连接对应一个 `THD` 对象：
 
 ```cpp
-// connection_handler_impl.cc
-void Per_thread_connection_handler::add_connection(
-    Channel_info *channel_info) {
-  pthread_t thread_id;
-  mysql_thread_create(key_thread_one_connection,
-                      &thread_id, &connection_attrib,
-                      handle_one_connection,     // 线程入口
-                      (void *)channel_info);
-  ++thread_count;
-}
-```
-
----
-
-## 3. 命令循环
-
-`handle_one_connection` 作为线程入口，调用 `do_command()` 进入命令循环：
-
-```cpp
-// sql_parse.cc
-bool do_command(THD *thd) {
-  for (;;) {
-    /* Step 1: 读取客户端命令包 */
-    if (thd->get_protocol()->get_command(&com_data))
-      break;  // 连接断开
-
-    /* Step 2: 分发执行命令 */
-    dispatch_command(thd, com_data);
-
-    /* Step 3: 重置会话状态 */
-    thd->update_charset();
-    thd->clear_error();
-  }
-  // 连接结束，清理资源
-}
-```
-
-`dispatch_command` 根据命令类型调用对应处理：
-
-```
-dispatch_command()
- ├─ COM_QUERY → mysql_parse() → mysql_execute_command()
- ├─ COM_STMT_EXECUTE → Prepared Statement 执行
- ├─ COM_PING → 回包
- ├─ COM_QUIT → 退出循环
- └─ COM_INIT_DB → 切换当前数据库
-```
-
----
-
-## 4. Channel_info 抽象
-
-```cpp
-// channel_info.h:47
-class Channel_info {
+// sql/mysqld.h
+class THD {
  public:
-  virtual THD *create_thd() = 0;           // 创建 THD 对象
-  virtual void send_server_handshake() = 0; // 发送握手包
-  Vio *m_vio;                              // 虚拟 I/O 层
-};
-```
+  /** 连接信息 */
+  uint thread_id;                    /* 线程 ID（SHOW PROCESSLIST 可见）*/
+  uint net::vio *net_vio;           /* 网络 I/O 虚拟接口 */
+  NET net;                            /* 网络缓冲区 */
 
-子类：
+  /** 安全上下文 */
+  Security_context security_ctx;      /* 用户、权限、SSL */
 
-```cpp
-class Channel_info_socket : public Channel_info {
-  st_mysql_socket m_socket;   // TCP/IP 套接字
-};
+  /** SQL 执行状态 */
+  LEX *lex;                           /* 当前词法分析树 */
+  Query_arena *query_arena;           /* 查询执行内存池 */
+  sp_runtime_context *sp_ctx;         /* 存储过程上下文 */
 
-class Channel_info_named_pipe : public Channel_info {
-  HANDLE m_pipe;              // Windows 管道句柄
-};
+  /** 会话变量 */
+  SV *variables;                      /* 所有会话变量 */
 
-class Channel_info_shared_mem : public Channel_info {
-  // Windows 共享内存通信
-};
-```
+  /** 统计 */
+  ulonglong row_count;                /* 影响行数 */
+  ulonglong last_insert_id;           /* 最后插入 ID */
 
----
-
-## 5. 线程池模型
-
-MySQL Enterprise Thread Pool 替换 `Per_thread_connection_handler`：
-
-- **Listener 线程**：接受新连接并分配给 Worker 线程
-- **Worker 线程组**：每组 N 个 worker，共享一个连接队列
-- **组内复用**：一个 worker 处理多个连接的 SQL 请求，减少上下文切换
-
-```cpp
-// connection_handler.h:39 — 基类
-class Connection_handler {
-  virtual bool add_connection(Channel_info *channel_info) = 0;
+  /** 锁管理 */
+  Locked_tables_list locked_tables;   /* 已锁定表 */
+  MDL_context mdl_context;            /* 元数据锁上下文 */
 };
 ```
 
 ---
 
-## 6. 连接监控
+## 3. 命令循环 — do_command()
+
+```cpp
+// sql/sql_parse.cc
+bool do_command(THD *thd) {
+  /* ──── 步骤 1：等待命令 ──── */
+  /* 检查网络是否有新数据 */
+  /* 使用 poll() / epoll() / kqueue() 网络事件驱动 */
+
+  /* ──── 步骤 2：读取命令包 ──── */
+  NET *net = &thd->net;
+  packet = my_net_read(net);
+
+  /* ──── 步骤 3：解析命令 ──── */
+  /* 第一个字节是命令类型 */
+  enum enum_server_command cmd = packet[0];
+
+  /* ──── 步骤 4：分发执行 ──── */
+  switch (cmd) {
+    case COM_QUERY:
+      dispatch_command(COM_QUERY, thd, packet + 1, packet_length - 1);
+      break;
+    case COM_STMT_EXECUTE:
+      /* 预处理语句执行 */
+      break;
+    case COM_PING:
+      /* 心跳 */
+      net_send_ok(thd);
+      break;
+    case COM_QUIT:
+      /* 断开连接 */
+      end_connection(thd);
+      close_connection(thd);
+      return false;
+  }
+
+  return true;  /* 继续下一个命令 */
+}
+```
+
+---
+
+## 4. 线程池（Thread Pool）
+
+### 4.1 线程池架构（MySQL Enterprise + Percona）
+
+```
+线程池插件按 CPU 核数创建线程组:
+
+  thread_pool_size = number_of_CPUs (默认 16)
+
+  每个组:
+    ┌───── listener thread ─→ 等待新连接/新命令
+    │     ├─ 当连接在组中有命令到达时，唤醒一个 worker thread
+    │     └─ worker threads 从队列中取任务执行
+    │
+    └───── worker threads (0..N)
+           ├─ 执行 SQL 命令
+           └─ 执行完后回到池中等待下一个命令
+```
+
+### 4.2 关键参数
+
+```cpp
+/* 线程池插件参数 */
+ulong thread_pool_size = 16;              /* 线程组数 */
+ulong thread_pool_oversubscribe = 3;      /* 每组最大活动线程数 */
+ulong thread_pool_stall_limit = 60;       /* 监听超时(ms) */
+```
+
+`thread_pool_oversubscribe = 3` 的作用：避免过多的活跃线程争抢 CPU，但保留额外的线程来处理 I/O 等待。
+
+### 4.3 连接分配
+
+```cpp
+// thread_pool.cc — 简化
+void *thread_pool_add_connection(THD *thd) {
+  /* 使用哈希将连接分配到线程组 */
+  /* connection_id % thread_pool_size */
+
+  group_id = thd->thread_id % thread_pool_size;
+  add_connection_to_group(group_id, thd);
+
+  /* 唤醒该组的监听线程 */
+  wake_listener(group_id);
+}
+```
+
+---
+
+## 5. 连接超时处理
+
+### 5.1 空闲连接清理
+
+```cpp
+// sql/sql_connect.cc
+void kill_idle_threads(void) {
+  /* 定期遍历所有连接 */
+  for (THD *thd : all_connections) {
+    if (thd_is_idle(thd)) {
+      time_t idle_time = time(NULL) - thd->last_command_time;
+      if (idle_time > thd->variables.wait_timeout) {
+        /* 超过 idle 超时，断开连接 */
+        kill_thread(thd);
+      }
+    }
+  }
+}
+```
+
+### 5.2 连接错误限制
+
+```cpp
+// sql/sql_connect.cc
+void create_new_thread(THD *thd) {
+  if (connection_errors > max_connect_errors) {
+    /* 超过最大连接错误数 → 阻止主机连接 */
+    my_error(ER_HOST_NOT_PRIVILEGED, ...);
+    close_connection(thd);
+    return;
+  }
+  ...
+}
+```
+
+---
+
+## 6. 性能统计
 
 ```sql
+-- 连接相关状态
+SHOW GLOBAL STATUS LIKE 'Connections%';       -- 总连接数
+SHOW GLOBAL STATUS LIKE 'Threads_%';          -- 线程数
+SHOW GLOBAL STATUS LIKE 'Aborted_connects%';  -- 失败连接
+
+-- 连接池相关
+SHOW GLOBAL STATUS LIKE 'Threadpool_%';       -- 线程池统计（如果启用）
+
+-- 当前连接（processlist 模拟）
 SHOW PROCESSLIST;
-SHOW STATUS LIKE 'Threads_%';
 ```
 
 | 状态变量 | 说明 |
-|----------|------|
-| `Threads_connected` | 当前打开的连接数 |
+|---------|------|
+| `Connections` | 尝试连接的总次数 |
+| `Max_used_connections` | 最大并发连接数 |
+| `Threads_connected` | 当前打开连接数 |
 | `Threads_running` | 正在执行查询的线程数 |
-| `Threads_created` | 自启动以来创建的线程总数 |
-| `Connection_errors_accept` | 接受连接失败次数 |
+| `Aborted_connects` | 连接失败的次数 |
+| `Connection_errors_*` | 各类型连接错误计数 |
 
 ---
 
-## 7. 总结
+## 7. 源码索引
 
-1. **1:1 线程模型**：每个连接一个独立线程，实现简单但高并发时开销大。
-2. **Channel_info 抽象**：支持 TCP/IP、Unix Socket、Named Pipe、Shared Memory 多种传输。
-3. **do_command 循环**：在每个连接线程中循环处理 SQL 直到连接断开。
-4. **线程池扩展**：Plugin 接口允许替换为线程池实现（MySQL Enterprise）。
-5. **Vio 层**：统一的虚拟 I/O 抽象，屏蔽底层网络差异。
-
-### 源码引用汇总
-
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `channel_info.h` | 47 | `class Channel_info` |
-| `connection_handler.h` | 39 | `class Connection_handler` 基类 |
-| `connection_handler_impl.cc` | — | `Per_thread_connection_handler::add_connection()` |
-| `connection_handler_manager.cc` | — | `process_new_connection()` |
-| `sql_parse.cc` | — | `do_command()` 命令循环 |
-| `mysqld.cc` | 2433 | Per-thread handler 引用 |
+| 函数/结构 | 文件 | 关键作用 |
+|-----------|------|---------|
+| `THD` class | `sql/mysqld.h` | 线程描述符 |
+| `do_command()` | `sql/sql_parse.cc` | 命令循环主函数 |
+| `dispatch_command()` | `sql/sql_parse.cc` | 命令分派 |
+| `check_user()` | `sql/sql_connect.cc` | 认证握手 |
+| `kill_idle_threads()` | `sql/sql_connect.cc` | 清理空闲连接 |
+| `create_new_thread()` | `sql/sql_connect.cc` | 创建连接线程 |
+| `thread_pool_add_connection()` | `sql/conn_handler/` | 线程池添加连接 |

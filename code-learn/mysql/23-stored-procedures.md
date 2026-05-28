@@ -1,230 +1,455 @@
-# 23. MySQL 存储过程 (Stored Procedures)
+# 23. MySQL 存储过程（Stored Procedures）— 源码分析
 
-> 本文分析 MySQL 存储过程的实现，包括缓存管理、执行流程、参数传递、递归控制、游标与异常处理。核心文件：`sql/sp_head.cc`、`sql/sp.cc`。
-
----
-
-## 1. 概述
-
-MySQL 存储过程在服务器层实现，其核心是 `sp_head` 类。每个存储过程被解析后编译为一个 `sp_head` 实例，缓存到 `sp_cache` 中，后续调用直接复用缓存的指令序列。存储过程支持 `IN/OUT/INOUT` 参数、游标、声明式异常处理（`HANDLER`）、以及有限递归。
-
-| 组件 | 文件 | 职责 |
-|------|------|------|
-| `class sp_head` | `sp_head.h:389` | 存储过程/函数/触发器的主控类 |
-| `sp_head::execute()` | `sp_head.cc:2009` | 通用执行入口 |
-| `sp_head::execute_procedure()` | `sp_head.cc:2971` | CALL 执行入口 |
-| `sp_head::execute_function()` | `sp_head.cc:2748` | 函数调用入口 |
-| `sp_cache` | `sp.cc` | 存储过程缓存管理 |
+> 本文分析 MySQL 存储过程的实现，包括 SP 缓存/重载、执行流程、参数传递、变量域、游标管理、异常处理和递归控制。核心源文件：`sql/sp_head.cc`、`sql/sp.cc`、`sql/sp_cache.cc`、`sql/sql_prepare.cc`。
 
 ---
 
-## 2. 核心数据结构
+## 0. 概述
 
-`sp_head` 类包含以下关键字段：
+MySQL 存储过程是预编译的 SQL 语句集合，存储在 `mysql.proc` 系统表中。每次调用时，MySQL SP 框架从缓存（`sp_cache`）加载或从系统表反序列化 `sp_head` 对象，解释执行其中的指令。
+
+### 存储过程执行流程
+
+```
+CALL sp_name(@param1, @param2, ...)
+
+  └─ sp_find_routine()                 ← 查找存储过程定义
+  └─ sp_cache_lookup()                 ← 缓存查找
+  └─ sp_head::execute()                ← 主执行入口
+      ├─ sp_head::execute_function()   ← 函数执行
+      └─ sp_lex_keeper::reset_lex()    ← 重置词法分析环境
+```
+
+---
+
+## 1. 核心数据结构
+
+### 1.1 sp_head — 存储过程对象
 
 ```cpp
-// sp_head.h:389
+// sql/sp_head.h
 class sp_head {
-  sp_name m_name;                           // 存储过程名
-  Sp_params m_params;                       // 参数定义（IN/OUT/INOUT）
-  Mem_root_array<Sp_definition> m_body;     // 指令序列（预解析的 sp_instr 数组）
-  Mem_root_array<Sp_handler> m_handlers;    // 声明式异常处理器
+ public:
+  /** 存储过程名 */
+  const char *m_name;
+  /** 返回类型（仅函数） */
+  sp_return_type m_return_type;
+  /** 参数列表 */
+  sp_param_list m_params;          /* List<sp_variable> */
+  /** 局部变量定义 */
+  sp_variable_list m_vars;         /* List<sp_variable> */
+  /** 游标列表 */
+  sp_cursor_list m_cursors;
+  /** 异常处理器列表 */
+  sp_handler_list m_handlers;
+  /** 指令序列（编译后的字节码）*/
+  sp_instr_list m_instructions;
 
-  uint m_flags;                             // 标志（IS_INVOKED 等）
-  sql_mode_t m_sql_mode;                   // 创建时的 SQL_MODE
-  sp_head *m_next_cached_sp;               // 缓存链表中的下一个实例
-  sp_head *m_first_instance;               // 第一个实例
-  int m_recursion_level;                   // 递归深度
+  /** 安全性定义 */
+  enum_sp_suids m_suid;            /* DEFINER / INVOKER */
 
-  Sp_chistics m_chistics;                  // 特征（language, sql access, etc.）
-  sp_resultmap m_result_type;              // 返回结果类型
+  /** SQL 模式 */
+  ulong m_sql_mode;
+  /** character set 客户端 */
+  const CHARSET_INFO *m_charset_client;
+  /** character set 连接 */
+  const CHARSET_INFO *m_charset_connection;
+
+  /** 缓存状态 */
+  uint m_creation_epoch;
+  uint m_last_cached;
+
+  // 方法
+  bool execute(THD *thd, bool *last_spvar);
+  bool execute_function(THD *thd, Item **ret_value);
 };
 ```
 
-**缓存机制**：每个存储过程在 `sp_cache` 中以链表形式缓存多个实例（`m_first_instance → m_next_cached_sp → ...`），用于支持递归调用。
+### 1.2 sp_instr 指令序列
 
-### 指令类型
+每个存储过程语句（BEGIN/END/SET/IF/WHILE/CURSOR...）编译为一条 `sp_instr` 指令：
 
 ```cpp
-// sp_head.h — 指令类型定义
-class sp_instr;
-class sp_instr_jump;        // 无条件跳转（如 LEAVE 标签）
-class sp_instr_hreturn;     // HANDLER 返回
-class sp_instr_stmt;        // SQL 语句执行
-class sp_instr_set;         // SET 变量赋值
-class sp_instr_cpush;       // 打开游标
-class sp_instr_cfetche;     // FETCH 游标
-class sp_instr_cpop;        // 关闭游标
-class sp_instr_creturn;     // RETURN（函数返回值）
+// sql/sp_head.h
+class sp_instr {
+ public:
+  /** 指令在指令列表中的位置 */
+  uint m_ip;
+  /** 源文件/行号信息（用于调试） */
+  const char *m_source;
+  uint m_lineno;
+
+  /** 执行当前指令 */
+  virtual bool exec_core(THD *thd, uint *nextp) = 0;
+
+  /** 解析参数并执行 */
+  bool exec(THD *thd, ...);
+};
+
+/* 具体指令类型 */
+class sp_instr_stmt : public sp_instr {
+  /* SET / SELECT / INSERT / UPDATE / DELETE 等语句 */
+  LEX *m_lex;            /* 词法分析结果 */
+};
+
+class sp_instr_set : public sp_instr {
+  /* SET var = expr */
+  sp_variable_t *m_var;
+  Item *m_value;
+};
+
+class sp_instr_if : public sp_instr {
+  /* IF cond THEN stmt1 ELSE stmt2 */
+  Item *m_cond;
+  uint m_then_ip;    /* 条件真时跳转到 m_then_ip */
+  uint m_else_ip;    /* 条件假时跳转到 m_else_ip */
+};
+
+class sp_instr_jump : public sp_instr {
+  /* 无条件跳转到 m_destination_ip */
+  uint m_destination_ip;
+};
+
+class sp_instr_hpush_jump : public sp_instr {
+  /* 异常处理器压栈（进入 BEGIN/END 块）*/
+  uint m_handler_ip;   /* 处理器入口 IP */
+};
+
+class sp_instr_hpop : public sp_instr {
+  /* 异常处理器出栈 */
+};
+
+class sp_instr_cpush : public sp_instr {
+  /* 打开游标 */
+};
+
+class sp_instr_cpop : public sp_instr {
+  /* 关闭游标 */
+};
+
+class sp_instr_cfetch : public sp_instr {
+  /* FETCH [NEXT FROM] cursor INTO var1, var2, ... */
+};
+```
+
+### 1.3 sp_variable — 变量
+
+```cpp
+// sql/sp.h
+struct sp_variable_t {
+  sp_param_mode mode;    /* IN / OUT / INOUT */
+  const char *name;      /* 变量名 */
+  Item *default_value;   /* DEFAULT 值 */
+  Item **value_ptr;      /* 运行时值指针 */
+  bool local;            /* true=局部变量, false=参数 */
+
+  /* 编译后的类型 */
+  enum_field_types type; /* MYSQL_TYPE_VARCHAR, MYSQL_TYPE_INT, ... */
+};
 ```
 
 ---
 
-## 3. 执行流程
+## 2. 存储过程执行
 
-### 3.1 `sp_head::execute()` — 通用执行入口
+### 2.1 sp_head::execute()
 
 ```cpp
-// sp_head.cc:2009
-bool sp_head::execute(THD *thd, bool merge_da_on_success) {
-  /* Step 1: 设置执行 arena */
-  Query_arena execute_arena(&execute_mem_root,
-                            Query_arena::STMT_INITIALIZED_FOR_SP);
-  Query_arena backup_arena;
+// sql/sp_head.cc
+bool sp_head::execute(THD *thd, bool *last_spvar) {
+  /* ──── 步骤 1：准备执行上下文 ──── */
+  /* 保存/恢复 thd 中的 sql_mode、charset 等 */
 
-  /* Step 2: 栈溢出检查 */
-  // (8~16)×STACK_MIN_SIZE 取决于编译选项
-  const int sp_stack_size = 8 * STACK_MIN_SIZE;
-  if (check_stack_overrun(thd, sp_stack_size, (uchar *)&old_packet))
-    return true;
-
-  /* Step 3: 设置递归标记 */
-  m_flags |= IS_INVOKED;                        // line 2048
-
-  /* Step 4: 链接缓存链中的下一个递归实例 */
-  m_first_instance->m_first_free_instance = m_next_cached_sp;
-
-  /* Step 5: 设置诊断区隔离 */
-  Diagnostics_area sp_da(false);
-  thd->push_diagnostics_area(&sp_da);           // line 2089
-
-  /* Step 6: 逐条执行指令序列 */
-  for (uint ip = 0; ip < m_body.size(); ip++) {
-    m_body[ip]->exec_core(thd);                 // line 2200
-
-    // 指令执行失败时查找匹配的 HANDLER
-    if (err && m_handlers.size() > 0) {
-      for (auto &handler : m_handlers) {
-        if (handler.matches(err_code)) {
-          thd->clear_error();
-          ip = handler.target_ip - 1;           // 跳转
-          break;
-        }
-      }
+  /* ──── 步骤 2：分配参数和局部变量 ──── */
+  /* 在 thd->sp_ctx 中创建 stack frame */
+  sp_ctx->push_frame();
+  for (auto &var : m_vars) {
+    /* 为每个变量分配空间 / 设置默认值 */
+    var->value_ptr = new Item_field(...);
+    if (var->default_value) {
+      *(var->value_ptr) = var->default_value->copy();
     }
   }
 
-  /* Step 7: 重置递归标记 */
-  m_flags &= ~IS_INVOKED;
+  /* ──── 步骤 3：设置参数值 ──── */
+  /* 将 CALL 传递的实际参数赋值给 IN/INOUT 参数 */
+  for (i = 0; i < m_params.size(); i++) {
+    if (m_params[i]->mode == sp_param_mode_t::sp_param_in ||
+        m_params[i]->mode == sp_param_mode_t::sp_param_inout) {
+      *(m_params[i]->value_ptr) = call_args[i]->copy();
+    }
+  }
+
+  /* ──── 步骤 4：执行指令序列 ──── */
+  uint ip = 0;   /* 指令指针 */
+  while (ip < m_instructions.size()) {
+    sp_instr *instr = m_instructions[ip];
+    uint next_ip;
+
+    bool ret = instr->exec(thd, &next_ip);
+    if (ret) {  /* 发生错误 */
+      /* 查找匹配的异常处理器 */
+      ip = sp_find_handler(thd, ...);
+    } else {
+      ip = next_ip;
+    }
+  }
+
+  /* ──── 步骤 5：复制 OUT/INOUT 参数到用户变量 ──── */
+  for (i = 0; i < m_params.size(); i++) {
+    if (m_params[i]->mode != sp_param_in) {
+      /* 将返回值写入 @param1, @param2, ... */
+      set_user_var(thd, call_args[i]->name, *(m_params[i]->value_ptr));
+    }
+  }
+
+  /* ──── 步骤 6：清理 ──── */
+  sp_ctx->pop_frame();
+  return false;
 }
 ```
 
-### 3.2 存储过程调用：`sp_head::execute_procedure`
+### 2.2 指令执行示例—sp_instr_stmt::exec_core()
 
 ```cpp
-// sp_head.cc:2971
-bool sp_head::execute_procedure(THD *thd,
-                                mem_root_deque<Item *> *args) {
-  /* Step 1: 参数绑定 — IN/INOUT/OUT */
-  if (m_params.size() > 0) {
-    sp_param::set_parameters(thd, this, args);  // line 2995
+// sql/sp_head.cc
+bool sp_instr_stmt::exec_core(THD *thd, uint *nextp) {
+  /* ──── 编译 SQL 语句 ──── */
+  /* 使用存储过程上下文的 LEX 编译 */
+  LEX *old_lex = thd->lex;
+  thd->lex = m_lex;
+  mysql_parse(thd, thd->query(), thd->query_length());
+
+  /* ──── 执行 SQL 语句 ──── */
+  bool err = mysql_execute_command(thd);
+
+  /* ──── 是否有结果集？ ──── */
+  if (thd->lex->result && !err) {
+    /* SELECT 语句 → 发送结果集 */
+    /* 但存储过程中的 SELECT 不会返回给客户端 */
+    /* 除非是最后一个语句或游标 FETCH */
+    if (!thd->sp_runtime_ctx->is_last_stmt()) {
+      /* 丢弃结果集 */
+      thd->send_result_metadata(nullptr, 0);
+    }
   }
 
-  /* Step 2: 设置用户变量默认值 */
-  for (auto &var : m_defined_vars) {
-    var->set_default(thd);                      // line 3020
-  }
-
-  /* Step 3: 执行主体 */
-  bool err = execute(thd, false);               // line 3026
-
-  /* Step 4: 写出 OUT/INOUT 参数值到调用者 */
-  sp_param::send_out_parameters(thd);           // line 3034
+  *nextp = m_ip + 1;
+  thd->lex = old_lex;
+  return err;
 }
 ```
 
----
+### 2.3 变量作用域实现
 
-## 4. 递归控制
-
-存储过程的递归通过缓存链中的多实例实现：
-
-```
-CALL sp()
- └─ sp_head::execute_procedure()
-     └─ sp_head::execute()
-         ├─ m_flags |= IS_INVOKED          # 标记为"被调用"
-         ├─ m_first_instance->m_first_free_instance = m_next_cached_sp
-         │   # 下一个递归使用缓存中的下一个实例
-         └─ 执行指令
-             └─ CALL sp()  # 递归
-                 ├─ sp_cache_lookup → m_first_free_instance
-                 ├─ m_recursion_level++
-                 └─ sp_head::execute() ...
-```
-
-`m_recursion_level` 控制递归深度限制。默认 `max_sp_recursion_depth = 0`（禁止递归），用户需显式设置。
-
----
-
-## 5. HANDLER 与异常处理
-
-声明式异常处理器在 `sp_head` 中以 `m_handlers` 链表存储：
+MySQL 存储过程中的变量作用域基于嵌套块结构：
 
 ```sql
-DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
-  SET done = 1;
+CREATE PROCEDURE p()
+BEGIN
+  DECLARE x INT DEFAULT 1;       -- Layer 0: ip=0 到 ip=4
+  BEGIN
+    DECLARE x INT DEFAULT 2;     -- Layer 1: ip=2 到 ip=3
+    SELECT x;  -- 输出 2
+  END;
+  SELECT x;                      -- 输出 1
+END;
 ```
 
-执行时循环检查（`sp_head.cc:2200`）：
-
 ```cpp
-// 伪代码：指令循环中的异常处理
-for (uint ip = 0; ip < m_body.size(); ip++) {
-  auto err = m_body[ip]->exec_core(thd);
-  if (err) {
-    for (auto &handler : m_handlers) {
-      if (handler.condition == err_code) {
-        thd->clear_error();               // 清除错误
-        ip = handler.target_ip;           // 跳转到处理代码
-        break;
-      }
+// sp_head.cc 中变量查找
+sp_variable_t *sp_head::find_variable(THD *thd, const char *name,
+                                       size_t length) {
+  /* 从当前层向上查找变量（类似 C 的作用域规则）*/
+  for (auto frame = sp_ctx->current_frame();
+       frame != nullptr;
+       frame = frame->parent()) {
+    for (auto &var : frame->m_vars) {
+      if (strcmp(var->name, name) == 0)
+        return var;
     }
   }
+  return nullptr;
 }
 ```
 
 ---
 
-## 6. 诊断区隔离
+## 3. 游标管理
 
-每次调用使用独立 `Diagnostics_area`：
+游标的生命周期：
 
-```cpp
-// sp_head.cc:2089
-Diagnostics_area sp_da(false);
-thd->push_diagnostics_area(&sp_da);
+```sql
+DECLARE cur CURSOR FOR SELECT ...;   -- 声明（不执行）
+OPEN cur;                           -- 执行 SELECT，准备结果集
+FETCH cur INTO var1, var2;          -- 取下一行
+CLOSE cur;                          -- 清理
 ```
 
-- 过程中的错误/警告被捕获在 `sp_da` 中，不污染调用者
-- 调用者通过 `GET DIAGNOSTICS` 或 `DECLARE EXIT HANDLER` 获取错误
+实现：
+
+```cpp
+// sp_head.cc — 游标操作
+class sp_cursor_t {
+  /* SELECT 语句的 LEX */
+  LEX *m_lex;
+  /* 执行结果（临时表）*/
+  TABLE *m_result_table;
+  /* 当前读取位置（行号）*/
+  ha_rows m_fetch_position;
+};
+
+// sp_instr_cpush::exec_core — 打开游标
+bool sp_instr_cpush::exec_core(THD *thd, uint *nextp) {
+  /* 执行 SELECT 语句，结果写入临时表 */
+  /* 游标读取时从临时表逐行读取（而非从原始表）*/
+  ...
+}
+
+// sp_instr_cfetch::exec_core — 取下一行
+bool sp_instr_cfetch::exec_core(THD *thd, uint *nextp) {
+  /* 从临时表逐行读取 */
+  int error = cursor->m_result_table->file->ha_rnd_pos(
+      cursor->m_result_table->record[0],
+      cursor->m_fetch_position++);
+  /* 将读取的行复制到目标变量 */
+  for (i = 0; i < m_vars.size(); i++) {
+    copy_value_to_spvar(thd, m_vars[i], cursor->m_result_table->field[i]);
+  }
+  return false;
+}
+```
 
 ---
 
-## 7. 安全上下文
+## 4. 异常处理（Handler）
 
-```cpp
-// sp_head.cc:2009
-opt_trace_disable_if_no_security_context_access(thd);
+```sql
+DECLARE CONTINUE HANDLER FOR SQLEXCEPTION, SQLWARNING, NOT FOUND
+BEGIN
+  -- 异常处理代码
+END;
 ```
 
-按 `SQL SECURITY DEFINER` / `SQL SECURITY INVOKER` 切换安全上下文。`invoker` 模式使用 CALL 用户的权限，`definer` 模式使用创建者的权限。
+实现：
+
+```cpp
+// sp_head.cc — 异常处理
+
+/* 异常处理器压栈/出栈对应 ENTER/EXIT 块 */
+class sp_handler_t {
+  enum handler_type { CONTINUE, EXIT };
+  enum condition_type { SQLEXCEPTION, SQLWARNING, NOT_FOUND, SPECIFIC };
+  uint m_handler_ip;     /* 处理器入口指令号 */
+  uint m_block_start;    /* 处理器覆盖的块起始 IP */
+  uint m_block_end;      /* 处理器覆盖的块结束 IP */
+};
+
+// 执行出错时的异常处理查找
+uint sp_head::sp_find_handler(THD *thd, int sql_errno) {
+  for (auto handler : sp_ctx->handler_stack()) {
+    if (handler->covers(当前 IP) &&
+        handler->matches(sql_errno)) {
+      if (handler->type == EXIT) {
+        /* 退出当前块，跳转到块后的第一条指令 */
+        return handler->m_block_end + 1;
+      } else { /* CONTINUE */
+        /* 处理完成后继续执行下一条指令 */
+        return handler->m_handler_ip;
+      }
+    }
+  }
+  return NOT_FOUND; /* 没有匹配的处理器 → 错误返回给客户端 */
+}
+```
 
 ---
 
-## 8. 总结
+## 5. 递归控制
 
-1. **预解析指令序列**：`CREATE PROCEDURE` 时解析为 `sp_instr` 数组，执行时逐条调用 `exec_core()`。
-2. **缓存链支持递归**：多实例链表避免递归时的数据结构覆盖。
-3. **诊断区隔离**：`push_diagnostics_area` 隔离过程的警告/错误。
-4. **异常处理**：`m_handlers` 链表 + 指令 IP 跳转实现声明式 HANDLER。
-5. **游标处理**：`sp_instr_cpush` / `sp_instr_cfetche` 实现游标逐行读取。
+MySQL 存储过程支持递归调用，但有默认限制：
 
-### 源码引用汇总
+```sql
+SET max_sp_recursion_depth = 255;  -- 默认 0（禁止递归）
+```
 
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `sp_head.h` | 389 | `class sp_head` 定义 |
-| `sp_head.cc` | 2009 | `sp_head::execute()` |
-| `sp_head.cc` | 2748 | `sp_head::execute_function()` |
-| `sp_head.cc` | 2971 | `sp_head::execute_procedure()` |
+```cpp
+// sp_head.cc
+bool sp_head::execute(THD *thd, ...) {
+  /* 递归深度检查 */
+  if (thd->sp_runtime_ctx->recursion_level() >=
+      thd->variables.max_sp_recursion_depth) {
+    my_error(ER_SP_RECURSION_LIMIT, ...);
+    return true;
+  }
+  thd->sp_runtime_ctx->increment_recursion_level();
+  ...
+  thd->sp_runtime_ctx->decrement_recursion_level();
+}
+```
+
+---
+
+## 6. 缓存管理
+
+### 6.1 sp_cache
+
+```cpp
+// sql/sp_cache.cc
+class sp_cache {
+ public:
+  /* 哈希表：name → sp_head* */
+  struct sp_cache_entry {
+    char *name;
+    sp_head *sp;
+    sp_cache_entry *next;  /* 同一哈希槽的下一项 */
+    uint m_creation_epoch; /* 缓存 epoch */
+  };
+  sp_cache_entry **m_array;   /* 哈希桶数组 */
+  uint m_array_size;          /* 桶大小 */
+  uint m_old_epoch_value;     /* 旧缓存清理阈值 */
+
+  sp_head *lookup(const char *name);
+  void insert(const char *name, sp_head *sp);
+  void flush();              /* 清理过期的缓存 */
+};
+```
+
+**缓存验证**：
+
+每次调用 SP 时，检查 `m_creation_epoch` 是否和系统表的版本号一致。如果不一致（有人 ALTER PROCEDURE 修改了定义），强制从系统表重新加载。
+
+```cpp
+// sp_head.cc
+bool sp_head::execute(THD *thd, ...) {
+  /* 检查缓存是否有效 */
+  if (m_creation_epoch != thd->query_epoch()) {
+    /* 缓存过期 → 重新加载 */
+    sp_update_cache(thd, this);
+  }
+  ...
+}
+```
+
+---
+
+## 7. 源码索引
+
+| 函数/结构 | 文件 | 关键作用 |
+|-----------|------|---------|
+| `sp_head` class | `sql/sp_head.h` | 存储过程主对象 |
+| `sp_instr` class | `sql/sp_head.h` | 指令基类 |
+| `sp_instr_stmt` | `sql/sp_head.h` | SQL 语句指令 |
+| `sp_instr_set` | `sql/sp_head.h` | SET 指令 |
+| `sp_instr_if` | `sql/sp_head.h` | IF 分支指令 |
+| `sp_instr_jump` | `sql/sp_head.h` | 跳转指令 |
+| `sp_instr_hpush_jump` | `sql/sp_head.h` | 异常处理器压栈 |
+| `sp_instr_cpush` | `sql/sp_head.h` | 游标打开指令 |
+| `sp_instr_cfetch` | `sql/sp_head.h` | 游标 FETCH 指令 |
+| `sp_variable_t` | `sql/sp.h` | 变量/参数定义 |
+| `sp_handler_t` | `sql/sp_head.h` | 异常处理器 |
+| `sp_cursor_t` | `sql/sp_head.h` | 游标 |
+| `sp_head::execute()` | `sql/sp_head.cc` | 执行入口 |
+| `sp_find_handler()` | `sql/sp_head.cc` | 异常处理查找 |
+| `sp_cache::lookup()` | `sql/sp_cache.cc` | 缓存查找 |
+| `sp_find_routine()` | `sql/sp.cc` | 从系统表加载 |

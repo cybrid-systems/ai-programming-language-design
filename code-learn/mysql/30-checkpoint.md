@@ -1,231 +1,278 @@
-# 30. InnoDB 检查点 (Checkpoint)
+# 30. InnoDB 检查点（Checkpoint）— 源码分析
 
-> 本文分析 InnoDB 检查点机制，包括 Fuzzy Checkpoint、Sharp Checkpoint、自适应调度、检查点写入和崩溃恢复流程。核心文件：`log0chkp.cc`、`log0log.cc`、`log0recv.cc`。
-
----
-
-## 1. 概述
-
-检查点（Checkpoint）是 InnoDB 崩溃恢复的锚点：它标识 redo log 中 `last_checkpoint_lsn` 之前的修改已全部安全地刷入数据文件。故障恢复时只需从 `last_checkpoint_lsn` 处开始回放 redo record。
-
-InnoDB 支持以下检查点策略：
-
-| 类型 | 触发条件 | 说明 |
-|------|----------|------|
-| **Fuzzy Checkpoint** | `log_checkpointer` 后台线程周期性执行 | 仅确保 checkpoint_lsn 之前的脏页已刷盘 |
-| **Sharp Checkpoint** | 服务器正常关闭（`srv_shutdown`） | 刷所有脏页 |
-| **强制 Checkpoint** | redo log 空间不足 | 由 `log_should_checkpoint()` 检测触发 |
+> 本文分析 InnoDB 检查点机制，包括 Fuzzy Checkpoint、Sharp Checkpoint、自适应刷新（Adaptive Flush）、Doublewrite Buffer 和检查点 LSN 的协调。核心源文件：`buf0buf.cc`、`buf0flu.cc`、`log0log.cc`、`log0write.cc`、`srv0srv.cc`。
 
 ---
 
-## 2. 检查点的核心字段
+## 0. 概述
 
-```cpp
-// log0log.h — log_t 中检查点相关字段
-struct log_t {
-  /** 最近一次检查点的 LSN */
-  atomic_lsn_t last_checkpoint_lsn;
+检查点（Checkpoint）是 InnoDB 用于**限制崩溃恢复时间**的核心机制。它告诉 InnoDB：在此之前的所有已提交修改都已经安全写入磁盘，恢复可以从检查点 LSN 开始，无需扫描更早的 redo log。
 
-  /** 最近检查点的完成时间（用于自适应调度） */
-  std::chrono::steady_clock::time_point last_checkpoint_time;
+### 检查点的基本原理
 
-  /** 是否允许做检查点（关闭过程中禁用） */
-  bool m_allow_checkpoints;
-};
+```
+时间线:
+  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+  │ WAL │ WAL │ WAL │ 脏页│ WAL │ 脏页│ 脏页│ WAL │
+  │     │     │     │刷盘 │     │刷盘 │刷盘 │     │
+  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  0    100   200   300   400   500   600   700   800  LSN
+
+  检查点 LSN = 300
+  → 所有 LSN < 300 的 WAL 日志可以删除
+  → 崩溃时从 LSN 300 开始恢复
+  → redo log 只需保留 [300, 800] 部分
 ```
 
 ---
 
-## 3. 检查点线程执行流程
+## 1. 检查点类型
 
-`log_checkpointer` 后台线程调用 `log_checkpoint()` 执行实际的检查点操作：
+### 1.1 Sharp Checkpoint
 
-```cpp
-// log0chkp.cc:132 — log_checkpoint 线程主入口
-// 调用路径：
-// log_checkpointer() → log_consider_checkpoint() → log_checkpoint()
-
-// log0chkp.cc:444
-static void log_checkpoint(log_t &log) {
-  ut_ad(log_checkpointer_mutex_own(log));
-
-  /* Step 1: 确定本次检查点的目标 LSN */
-  const lsn_t checkpoint_lsn = log_determine_checkpoint_lsn(log);
-
-  /* Step 2: 刷 page archive 缓存（如启用） */
-  if (arch_page_sys != nullptr) {
-    arch_page_sys->flush_at_checkpoint(checkpoint_lsn);
-  }
-
-  /* Step 3: 对所有脏页执行 fsync（确保数据落盘） */
-  buf_flush_fsync();                          // line 461
-
-  /* Step 4: 验证 redo log 已刷到 checkpoint_lsn */
-  ut_a(log.flushed_to_disk_lsn.load() >= checkpoint_lsn);
-
-  /* Step 5: 将检查点信息写入 redo log 文件 */
-  const dberr_t err = log_files_next_checkpoint(log, checkpoint_lsn); // line 493
-
-  /* Step 6: 更新检查点统计 */
-  MONITOR_INC(MONITOR_LOG_CHECKPOINTS);        // line 500
-}
-```
-
----
-
-## 4. 检查点调度
-
-### 4.1 是否触发检查点
+将所有脏页刷盘（shutdown 时）：
 
 ```cpp
-// log0chkp.cc:119
-static bool log_should_checkpoint(log_t &log) {
-  // 以下任一条件满足时触发：
-  // 1. 自上次检查点以来写入的 redo 数据超过阈值（~10% log file size）
-  // 2. redo 文件可用空间不足一半
-  //   (由 log_free_check / log_write_up_to 检测)
-  // 3. 管理员执行 FLUSH LOGS / CHECKPOINT
-  // 4. 调用 log_make_latest_checkpoint()
-}
-```
+// log0log.cc
+void log_checkpoint(bool shutdown) {
+  if (shutdown) {
+    /* 关闭时的完整检查点 */
+    /* 1. 等待所有活跃事务完成 */
+    /* 2. 将所有脏页写入磁盘 */
+    /* 3. 将所有 redo log 刷入磁盘 */
+    /* 4. 写入检查点标记到日志文件头 */
+    /* 5. 关闭 redo log */
 
-### 4.2 自适应间隔
-
-```cpp
-// log0chkp.cc:136
-static std::chrono::steady_clock::duration log_checkpoint_time_elapsed(
-    const log_t &log) {
-  // 返回自上次检查点以来的时间间隔
-  // 调度器使用此值动态调整检查点频率：
-  // - 写入压力大 → 缩短间隔
-  // - 空闲 → 延长间隔
-}
-```
-
-### 4.3 请求同步检查点
-
-```cpp
-// log0chkp.cc:581
-void log_request_checkpoint(log_t &log, bool sync) {
-  log_request_checkpoint_low(log, LSN_MAX);    // 请求尽可能高的 LSN
-
-  if (sync) {
-    log_wait_for_checkpoint(
-        log, log.last_checkpoint_lsn.load());   // 同步等待完成
+    /* 这保证了关闭后的恢复 = redo log apply */
   }
 }
 ```
 
----
-
-## 5. 检查点写入
-
-`log_files_next_checkpoint`（`log0chkp.cc:337`）将检查点信息写入 redo log 文件：
-
-### 5.1 文件布局
-
-```
-+-------------------+
-| Block 0: Header   |  ← LOG_HEADER_SIZE
-+-------------------+
-| Block 1: Chkpt 1  |  ← 第一个检查点块
-+-------------------+
-| Block 2: Chkpt 2  |  ← 第二个检查点块（交替写入）
-+-------------------+
-| Block 3+ : Records |  ← 实际 redo record
-+-------------------+
-```
-
-双检查点块的交替策略保证原子性：启动时读取序号更**大**的有效检查点。
-
-### 5.2 检查点内容
+### 1.2 Fuzzy Checkpoint（运行中）
 
 ```cpp
-// log0chkp.cc:427
-dberr_t log_files_write_checkpoint_low(...) {
-  // 写入内容：
-  // 1. checkpoint_lsn（检查点 LSN）
-  // 2. log file 文件的起始 LSN
-  // 3. 校验和（checksum）
-  // 4. 序号（双块交替使用）
+// log0log.cc
+void log_checkpoint(bool shutdown) {
+  if (!shutdown) {
+    /* 运行时模糊检查点 */
+
+    /* ──── 步骤 1：确定 oldest_lsn ──── */
+    /* = 最旧脏页（Buffer Pool 中修改最早但未刷盘）的 LSN */
+    lsn_t oldest_lsn = buf_pool_get_oldest_modification();
+
+    /* ──── 步骤 2：确保所有 LSN < oldest_lsn 的日志已写入 redo log 文件 ──── */
+    /* 这是通过 log_write_up_to(oldest_lsn) 完成的 */
+
+    /* ──── 步骤 3：写入检查点信息到 redo log 文件头 ──── */
+    log_write_checkpoint_info(oldest_lsn);
+
+    /* ──── 步骤 4：截断 redo log ──── */
+    /* = 释放 oldest_lsn 之前的 redo log 空间 */
+    log_files_release_before(oldest_lsn);
+  }
+}
+```
+
+**模糊检查点的关键**：不需要等待所有脏页刷盘——只需确定最旧的脏页 LSN，然后截断之前的日志。
+
+```
+检查点 LSN = 300
+脏页列表（未刷盘）:
+  page 100   LSN: 600  (最近修改)
+  page 200   LSN: 450  (中间修改)
+  page 50    LSN: 300  (最旧的脏页)
+
+→ 最旧脏页 LSN = 300
+→ 截断 LSN < 300 的日志
+→ 但 page 100、200 的日志 LSN > 300 还没有刷盘也没关系
+→ 它们的日志还保留在 redo log 中
+```
+
+---
+
+## 2. 自适应刷新（Adaptive Flush）
+
+为了避免脏页堆积过多导致检查点变慢，InnoDB 在后台线程中执行自适应刷新：
+
+```cpp
+// buf0flu.cc
+ulint buf_flush_page_cleaner_thread(void *arg) {
+
+  while (!shutdown) {
+    /* ──── 步骤 1：计算脏页比例 ──── */
+    ulint dirty_pct = buf_get_modified_ratio_pct();
+    /* = 脏页数量 * 100 / Buffer Pool 总页面数 */
+
+    /* ──── 步骤 2：判断是否需要加速刷新 ──── */
+    if (dirty_pct > srv_max_buf_pool_modified_pct) {
+      /* 脏页比例超过阈值（默认 75%）→ 紧急刷新 */
+      n_pages = PCT_IO(100);  /* 使用全部 IO 容量 */
+    } else {
+      /* 根据最近的 redo log 生成速度估算刷盘速率 */
+      n_pages = af_get_pages_for_flush();
+      /* 公式: n_pages = (recent_log_speed * af_avg_time_per_page) */
+    }
+
+    /* ──── 步骤 3：从 flush_list 中选最旧的脏页 LSN → 批量刷写 ──── */
+    buf_flush_list(n_pages);
+  }
+}
+```
+
+### 自适应刷新算法的细节
+
+```cpp
+// buf0flu.cc — af_get_pages_for_flush()
+ulint af_get_pages_for_flush() {
+  /* 1. 计算最近 redo log 的生成速度 */
+  lsn_t log_lsn = log_get_current_lsn();
+  lsn_t checkpoint_lsn = log_get_checkpoint_lsn();
+  lsn_t lsn_gap = log_lsn - checkpoint_lsn;
+
+  /* 2. 如果 LSN 差距太大 → 加快刷新 */
+  if (lsn_gap > srv_adaptive_flushing_lwm * log_buffer_size) {
+    /* srv_adaptive_flushing_lwm 默认 10% */
+    /* → 强制加速刷新 */
+    return PCT_IO(100);
+  }
+
+  /* 3. 估算需要的刷盘页数 */
+  /* 基于过去 N 秒的日志生成速度 */
+  ulint pages_flushed = buf_flush_get_desired_flush_rate();
+
+  return pages_flushed;
 }
 ```
 
 ---
 
-## 6. 检查点与 flush list
+## 3. redo log 文件管理与检查点协调
 
-Buffer Pool 中的脏页按照修改时间（LSN 顺序）排列在 **flush list** 中：
+### 3.1 redo log 文件组
 
 ```
-Flush List（从 old 到 new）：
-  ┌─────┐   ┌─────┐   ┌─────┐        ┌─────┐
-  │ p1  │ → │ p2  │ → │ p3  │ → ... → │ pN  │
-  │LSN  │   │LSN  │   │LSN  │        │LSN  │
-  │ 100 │   │ 200 │   │ 300 │        │1000 │
-  └─────┘   └─────┘   └─────┘        └─────┘
-    oldest_lsn                              newest_lsn
-     ↑                                       ↑
-  已刷盘区域                              最新修改
-  可以推进 checkpoint_lsn
+ib_logfile0            ← 当前活动的日志文件
+ib_logfile1            ← 备用
+...
+ib_logfileN
+
+日志文件组循环使用:
+
+    检查点 LSN ─┐
+                │
+  [   日志文件组   ]
+  ┌────────┬────────┬────────┐
+  │ 可重用 │ 活跃区│  可重用 │
+  └────────┴────────┴────────┘
+            ↑
+    当前写入位置
 ```
 
-`log_determine_checkpoint_lsn()` 读取 flush list 中 `oldest_lsn`，结合已刷盘的 redo，计算安全的 checkpoint_lsn。
+当检查点发生时，检查点 LSN 之前的日志文件可以被重用。
+
+### 3.2 避免检查点阻塞
+
+```cpp
+// log0write.cc
+void log_checkpoint(bool shutdown) {
+  if (!shutdown) {
+    /* 运行时检查点不应阻塞太久 */
+
+    /* 如果脏页太多 → 检查点可能阻塞 */
+    /* 解决方案: 多次触发小检查点，而不是一次大检查点 */
+
+    /* 阈值: innodb_max_dirty_pages_pct_lwm (默认 10%) */
+    /* 当脏页比例低于此值时，允许更激进的检查点 */
+
+    if (dirty_pct < srv_max_dirty_pages_pct_lwm) {
+      /* 脏页不多 → 执行完整检查点 */
+    } else {
+      /* 脏页较多 → 先加速刷脏再检查点 */
+      buf_flush_ahead();
+    }
+  }
+}
+```
 
 ---
 
-## 7. 崩溃恢复
+## 4. Doublewrite Buffer 与检查点的关系
+
+Doublewrite Buffer 在检查点刷盘时保护页面写入的原子性：
+
+```
+检查点触发 buf_flush_list():
+  1. 脏页写入 doublewrite buffer（连续写入）
+  2. 然后写入实际表空间文件（离散写入）
+  3. 如果步骤 2 崩溃 → 恢复时从 doublewrite buffer 恢复
+
+检查点时间线:
+  LSN 500: 写入 doublewrite buffer (page 100, 200, 300)
+  LSN 510: page 100 完成
+  LSN 520: page 200 完成
+  LSN 530: page 300 完成
+  → 检查点 LSN 更新到 500（所有写入在 doublewrite 中已标记）
+```
+
+---
+
+## 5. 恢复过程
 
 ```cpp
 // log0recv.cc — 恢复入口
-recv_recovery_from_checkpoint_start()
-  ├─ 打开 redo log 文件
-  ├─ Step 1: 读取最后有效的检查点（双块比较序号）
-  │   └─ recv_find_start_point()
-  │       ├─ 读取 LOG_CHECKPOINT_1 / LOG_CHECKPOINT_2
-  │       ├─ 选择序号更大的有效块
-  │       └─ 获得 last_checkpoint_lsn
-  ├─ Step 2: 从 checkpoint_lsn 开始扫描 redo record
-  │   └─ recv_scan_log_recs()
-  │       ├─ 读取 redo block
-  │       ├─ 解析 MLOG 记录
-  │       └─ 应用到 Buffer Pool
-  └─ Step 3: 完成后使所有恢复的页可写入
-      └─ recv_recovery_finish()
+dberr_t recv_recovery_from_checkpoint_start(void) {
+  /* ──── 步骤 1：读取检查点信息 ──── */
+  /* 从 redo log 文件头读取检查点 LSN 和相关信息 */
+
+  /* ──── 步骤 2：扫描 redo log ──── */
+  /* 从检查点 LSN 开始扫描所有 redo 记录 */
+
+  /* ──── 步骤 3：Apply redo log ──── */
+  /* 将每条 redo 记录应用到相应的表空间页面 */
+
+  /* ──── 步骤 4：恢复终点 ──── */
+  /* 当 redo log 扫描到末尾时，恢复完成 */
+  /* 执行 redo 应用后的表空间恢复到崩溃时状态 */
+
+  /* ──── 步骤 5：UNDO 回滚 ──── */
+  /* 回滚崩溃时未提交的事务 */
+}
+```
+
+**恢复时间的决定因素**：
+
+```
+恢复时间 ≈ (检查点 LSN 到日志末尾的距离) / (恢复速度)
+
+检查点频率 × 每次刷脏页数 → 影响检查点 LSN 到当前 LSN 的差距
+如果检查点不频繁 → 恢复时间长
+如果检查点太频繁 → 刷盘 I/O 开销大
 ```
 
 ---
 
-## 8. 参数调优
+## 6. 配置参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `innodb_log_checkpoint_freq` | 自动 | 每写入多少 redo 后触发一次检查点 |
-| `innodb_log_checkpoint_now` | — | 手动触发检查点 |
-| `innodb_flush_log_at_trx_commit` | 1 | 事务提交时的刷盘策略，影响检查点推进 |
-| `innodb_log_file_size` | 504M | redo 日志总大小，越大检查点间隔越长 |
-| `innodb_log_group_home_dir` | ./ | redo 日志文件目录 |
+| `innodb_max_dirty_pages_pct` | 90 | 脏页最大百分比（触紧急刷新） |
+| `innodb_max_dirty_pages_pct_lwm` | 10 | 脏页低水位（触发自适应刷新） |
+| `innodb_adaptive_flushing` | ON | 启用自适应刷新 |
+| `innodb_adaptive_flushing_lwm` | 10 | 自适应刷新低水位（% redo log） |
+| `innodb_flush_neighbors` | 0(8.0) | 是否一起刷新相邻页面 |
+| `innodb_io_capacity` | 200 | 后台 I/O 吞吐估算 |
+| `innodb_io_capacity_max` | 2000 | 后台 I/O 最大吞吐 |
 
 ---
 
-## 9. 总结
+## 7. 源码索引
 
-1. **Fuzzy Checkpoint**：后台线程异步执行，不阻塞用户事务，仅确保 `checkpoint_lsn` 前的脏页已刷盘。
-2. **双检查点块交替写入**：`LOG_CHECKPOINT_1` / `LOG_CHECKPOINT_2` 提供写入原子性，启动时读序号大的有效块。
-3. **自适应调度**：`log_should_checkpoint` + `log_checkpoint_time_elapsed` 动态调整检查点频率。
-4. **Flush List 配合**：脏页按 LSN 排序，`log_determine_checkpoint_lsn()` 使用 `oldest_lsn` 计算可推进点。
-5. **崩溃恢复锚点**：`last_checkpoint_lsn` 是 recovery 起点，检查点越新恢复所需回放的 redo 越少。
-
-### 源码引用汇总
-
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `log0chkp.cc` | 119 | `log_should_checkpoint()` |
-| `log0chkp.cc` | 132 | `log_checkpoint()` 主函数声明 |
-| `log0chkp.cc` | 136 | `log_checkpoint_time_elapsed()` |
-| `log0chkp.cc` | 337 | `log_files_next_checkpoint()` |
-| `log0chkp.cc` | 427 | `log_files_write_checkpoint_low()` |
-| `log0chkp.cc` | 444 | `log_checkpoint()` 完整实现 |
-| `log0chkp.cc` | 536 | `log_wait_for_checkpoint()` |
-| `log0chkp.cc` | 581 | `log_request_checkpoint()` |
-| `log0chkp.cc` | 628 | `log_make_latest_checkpoint()` |
+| 函数/结构 | 文件 | 关键作用 |
+|-----------|------|---------|
+| `log_checkpoint()` | `log0log.cc` | 检查点主入口 |
+| `buf_flush_page_cleaner_thread()` | `buf0flu.cc` | 页面清理线程 |
+| `af_get_pages_for_flush()` | `buf0flu.cc` | 自适应刷页估算 |
+| `buf_get_modified_ratio_pct()` | `buf0buf.cc` | 脏页比例计算 |
+| `log_write_checkpoint_info()` | `log0write.cc` | 写入检查点信息 |
+| `recv_recovery_from_checkpoint_start()` | `log0recv.cc` | 崩溃恢复入口 |
+| `log_files_release_before()` | `log0log.cc` | 截断日志文件 |

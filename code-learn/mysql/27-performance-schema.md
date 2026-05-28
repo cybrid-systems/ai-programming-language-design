@@ -1,180 +1,232 @@
-# 27. MySQL Performance Schema
+# 27. MySQL Performance Schema — 源码分析
 
-> 本文分析 MySQL Performance Schema 的结构化设计，包括事件收集层、摘要统计、内存管理、线程级追踪和配置接口。核心文件：`storage/perfschema/`。
-
----
-
-## 1. 概述
-
-Performance Schema (PFS) 是 MySQL 内置的性能监控框架。它通过在关键路径插入检测点，收集等待事件、语句事件、阶段事件和内存使用等细粒度信息。PFS 基于**预分配内存缓冲区**实现，不涉及系统表 I/O，对 OLTP 性能影响极小。
-
-| 层次 | 说明 |
-|------|------|
-| 消费者（Consumer） | `setup_consumers` 控制是否收集事件 |
-| 仪器（Instrument） | `setup_instruments` 控制哪些检测点启用 |
-| 摘要（Summary） | 按 thread/account/user/host/file/table 等维度聚合 |
-| 实例（Instance） | wait/statement/stage 的当前实例表 |
+> 本文分析 MySQL Performance Schema 的实现，包括采集器架构、消费者模型、内存表存储、仪表化（instrumentation）点和配置机制。核心源文件：`sql/pfs/` 目录下的全部文件。
 
 ---
 
-## 2. 核心对象结构
+## 0. 概述
 
-PFS 使用以下核心类层次：
+Performance Schema（P_S）是 MySQL 内部的一个**事件采集框架**，零成本（插入检查为零——仅当启用时才采集）、低侵入性地监控 MySQL 服务器内部行为。它提供了语句级别、阶段级别、等待级别、事务级别和内存使用级别的监控数据。
+
+### P_S 架构
 
 ```
-PFS_thread            — 线程级事件上下文
-PFS_account           — 账户级统计（pfs_account.h:67）
-PFS_user              — 用户级统计（pfs_user.h）
-PFS_host              — 主机级统计（pfs_host.h）
-PFS_events_waits      — 等待事件记录
-PFS_statement         — 语句事件记录
-PFS_table_share       — 表共享信息
-PFS_digest            — 语句摘要（归一化 SQL）
+MySQL 服务器代码
+    │
+    ├── Instrumentation Points（仪表化点）
+    │   ├── PFS_register_*()      ← 注册事件类型
+    │   ├── PFS_start_*()         ← 开始采集事件
+    │   └── PFS_end_*()           ← 结束采集事件
+    │
+    ▼
+Performance Schema 引擎
+    │
+    ├── Events 缓冲区（内存环形缓冲）
+    ├── Consumers（消费者过滤/汇总）
+    └── Summary 表（聚合数据）
 ```
 
-### 2.1 `PFS_account`
+---
+
+## 1. 仪表化点（Instrumentation）
+
+Performance Schema 在 MySQL 代码中插入宏调用点：
 
 ```cpp
-// pfs_account.h:67
-struct PFS_ALIGNED PFS_account : PFS_connection_slice {
-  PFS_thread *m_threads;        // 该 account 下的线程列表
-  // 等待事件摘要
-  PFS_events_waits_summary *m_events_waits_summary;
-  // 语句事件摘要
-  PFS_events_statements_summary *m_events_statements_summary;
-};
+// sql/pfs/pfs_instr.h
+/* 语句级别 */
+#define PFS_START_STMT(type, thd)        \
+  if (pfs_enabled) {                     \
+    pfs_start_statement_vc(type, thd);   \
+  }
+
+#define PFS_END_STMT(thd)                \
+  if (pfs_enabled) {                     \
+    pfs_end_statement_vc(thd);           \
+  }
+
+/* 等待级别 */
+#define PFS_START_WAIT(class, thd)       \
+  pfs_start_wait_vc(class, thd);
+
+#define PFS_END_WAIT(thd)                \
+  pfs_end_wait_vc(thd);
 ```
 
-### 2.2 缓冲容器
+### 关键仪表化点位置
+
+| 事件类型 | 插入的代码位置 |
+|---------|---------------|
+| `statement/sql/select` | `sql/sql_select.cc — execute_select()` |
+| `statement/sql/insert` | `sql/sql_insert.cc — mysql_insert()` |
+| `wait/sync/mutex/sql/LOCK_open` | `sql/mysqld.cc — thr_lock.c` |
+| `wait/io/file/innodb/innodb_data_file` | `fil0fil.cc — fil_io()` |
+| `memory/sql/THD::main_mem_root` | `sql/mysqld.cc — thd_init()` |
+| `stage/sql/Sending data` | `sql/sql_select.cc — send_data()` |
+
+---
+
+## 2. 消费者模型
+
+消费者决定什么数据被记录：
 
 ```cpp
-// pfs_buffer_container.h:87
-template <typename T, size_t N, typename U>
-class PFS_buffer_default_array {
-  T *m_array[N];                // 固定大小数组
-  size_t m_size;                // 已用元素数
+// sql/pfs/pfs_consumer.h
+struct PFS_consumer {
+  /* 是否启用此消费者 */
+  bool m_enabled;
+
+  /* 过滤器：哪些事件类型通过 */
+  PFS_filter *m_filter;
+
+  /* 写入目标（内存表或摘要表）*/
+  PFS_sink *m_sink;
 };
 
-// pfs_buffer_container.h:231
-class PFS_buffer_scalable_container {
-  // 支持动态增长的分区容器（按 64 分区）
-};
+/* 预定义的消费者 */
+PFS_consumer events_statements_current;   /* 当前语句事件表 */
+PFS_consumer events_statements_history;    /* 语句历史表（环形缓冲，10条/线程）*/
+PFS_consumer events_statements_summary;    /* 语句摘要表 */
+PFS_consumer events_waits_current;         /* 当前等待事件表 */
+PFS_consumer events_waits_history;         /* 等待历史表 */
+PFS_consumer memory_summary;               /* 内存摘要表 */
+```
+
+每个事件的完整流程：
+
+```
+Instrumentation point
+    → if (consumer enabled) → create PFS_event
+    → push to events_*_current (环形缓冲)
+    → if (history consumer) → push to events_*_history
+    → if (summary consumer) → update summary table
+    → if (digest consumer) → update digest table
 ```
 
 ---
 
-## 3. 事件收集路径
+## 3. 内存表存储
 
-### 3.1 等待事件
-
-```
-THD 执行 SQL → 触发检测点
-  → pfs_start_waits_v1()          # 构造等待事件
-  → 执行加锁/IO 操作
-  → pfs_end_waits_v1()            # 结束等待，记录耗时
-  → 写入 events_waits_current 环形缓冲区
-  → 更新 PFS_events_waits_summary_by_thread_by_event_name
-```
-
-### 3.2 语句事件
-
-```
-dispatch_command()
-  → thd->set_query(query_text)       # 设置当前查询
-  → pfs_start_statement_vc()         # 开始语句事件
-  → 执行 SQL（JOIN / 写入 / 返回结果）
-  → pfs_end_statement_vc()           # 结束语句事件
-  → 写入 events_statements_current
-  → 更新 PFS_events_statements_summary_by_digest
-```
-
-### 3.3 阶段事件
-
-```
-pfs_start_statement_vc() 之后：
-  → thd->enter_stage(stage_name)
-  → pfs_start_stage_v1()
-  → thd->exit_stage()
-  → pfs_end_stage_v1()
-```
-
----
-
-## 4. 语句摘要
+P_S 使用特殊的内存表引擎（`PFS_TABLE`），所有数据存储在内存中：
 
 ```cpp
-// digest.h — PFS_digest
-class PFS_digest {
-  // MD5 归一化的 SQL 摘要
-  // 合并参数化后的"模板"SQL
+// sql/pfs/pfs_engine.h
+class PFS_engine_table : public handler {
+ public:
+  /* P_S 表不持久化 */
+  int rnd_init(bool scan) override;
+  int rnd_next(uchar *buf) override;
+  int rnd_pos(uchar *buf, uchar *pos) override;
 
-  ulonglong m_count;            // 执行次数
-  ulonglong m_total_latency;    // 总延迟
-  ulonglong m_lock_time;        // 锁时间
-  ulonglong m_rows_sent;        // 发送行数
-  ulonglong m_rows_examined;    // 扫描行数
+  /* 写入操作 — 对 P_S 表 UPDATE/DELETE 的特殊含义 */
+  /* UPDATE = 清空计数器（重置）*/
+  /* DELETE = 清空事件缓冲区 */
+  int ha_delete_row(const uchar *buf) override;
+  int ha_update_row(const uchar *old_data,
+                    uchar *new_data) override;
 };
 ```
 
-语句摘要通过 `events_statements_summary_by_digest` 表查看：
+**P_S 表的特殊行为**：
 
 ```sql
-SELECT DIGEST_TEXT, COUNT_STAR, SUM_TIMER_WAIT
-FROM performance_schema.events_statements_summary_by_digest
-ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
+-- 重置所有语句计数器
+UPDATE performance_schema.events_statements_summary_by_digest
+  SET COUNT_STAR = 0;
+
+-- 清空历史事件
+DELETE FROM performance_schema.events_statements_history;
+
+-- 启用/禁用消费者
+UPDATE performance_schema.setup_consumers
+  SET ENABLED = 'YES'
+  WHERE NAME = 'events_statements_history';
 ```
 
 ---
 
-## 5. PFS 配置接口
+## 4. 配置管理
 
 ```sql
--- 启用等待事件收集
-UPDATE setup_consumers SET ENABLED='YES'
-WHERE NAME='events_waits_current';
+-- 查看所有仪表化点
+SELECT * FROM performance_schema.setup_instruments;
 
--- 启用锁等待检测
-UPDATE setup_instruments SET ENABLED='YES'
-WHERE NAME LIKE 'wait/synch/mutex/innodb/%';
+-- 查看所有消费者
+SELECT * FROM performance_schema.setup_consumers;
 
--- 设置事件历史表行数
-SET GLOBAL performance_schema_events_waits_history_long_size = 10000;
+-- 查看当前线程设置
+SELECT * FROM performance_schema.threads;
+
+-- 动态启用/禁用
+CALL sys.ps_setup_enable_instrument('statement');
+CALL sys.ps_setup_disable_instrument('statement');
+CALL sys.ps_setup_enable_consumer('events_statements_history');
 ```
 
-| 配置变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `performance_schema` | ON | 是否启用 PFS |
-| `performance_schema_max_thread_instances` | 自动 | 最大线程监控数 |
-| `performance_schema_max_statement_classes` | 222 | 最大语句类数量 |
-| `performance_schema_events_waits_history_size` | 10 | 每个线程的历史事件数 |
-| `performance_schema_events_waits_history_long_size` | 10000 | 全局历史表大小 |
+---
+
+## 5. 内存占用控制
+
+```cpp
+// sql/pfs/pfs_defaults.h
+
+/* 环形缓冲区大小配置 */
+ulong performance_schema_events_waits_history_size = 10;    /* 每线程 */
+ulong performance_schema_events_stages_history_size = 10;
+ulong performance_schema_events_statements_history_size = 10;
+
+/* 最大仪表化对象数 */
+ulong performance_schema_max_mutex_classes = 300;
+ulong performance_schema_max_rwlock_classes = 300;
+ulong performance_schema_max_table_handles = 1000;
+ulong performance_schema_max_file_handles = 1000;
+
+/* 线程类 */
+ulong performance_schema_max_thread_classes = 100;
+ulong performance_schema_max_thread_instances = 1000;
+```
+
+**内存占用估算**：
+
+```
+每个事件记录（PFS_events_statements）约 200 字节
+events_statements_history_size = 10 条/线程
+100 个线程 → 100 × 10 × 200 = 200KB
+
+所有 P_S 组件合计（默认配置）：
+~100-200MB 内存（取决于 performance_schema_max_* 参数）
+```
 
 ---
 
-## 6. 内存使用
+## 6. 与 sys schema 集成
 
-PFS 内存预先分配（启动时确定），运行时不会动态扩容：
+MySQL 的 `sys` schema 提供了一系列方便查询 Performance Schema 的视图：
 
-| 维度 | 内存 |
-|------|------|
-| Thread 实例 | `max_thread_instances × sizeof(PFS_thread)` |
-| 等待事件历史 | `history_size × max_thread_instances × sizeof(PFS_events_waits)` |
-| 摘要统计 | `max_digest_instances × sizeof(PFS_digest)` |
+```sql
+-- 按 Digest（SQL 模板）统计语句延迟
+SELECT * FROM sys.statement_analysis;
+-- 等价于：
+SELECT DIGEST, COUNT_STAR, AVG_TIMER_WAIT/1000000000 as avg_ms
+FROM performance_schema.events_statements_summary_by_digest;
+
+-- 查看锁等待
+SELECT * FROM sys.innodb_lock_waits;
+
+-- 查看 IO 热点
+SELECT * FROM sys.io_global_by_file_by_bytes;
+```
 
 ---
 
-## 7. 总结
+## 7. 源码索引
 
-1. **零系统表开销**：预分配内存缓冲区，运行时不涉及任何 I/O。
-2. **消费者/仪器分离**：`setup_consumers` 控制事件是否记录，`setup_instruments` 控制检测点粒度。
-3. **环形缓冲区**：`events_waits_current` 循环覆盖，确保不会耗尽内存。
-4. **多维度摘要**：支持 thread / account / user / host / digest 多维聚合，便于性能分析。
-5. **归一化摘要**：`PFS_digest` 的 MD5 摘要去除了字面量和参数，聚合"相似"查询。
-
-### 源码引用汇总
-
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `pfs_account.h` | 67 | `struct PFS_account` |
-| `pfs_buffer_container.h` | 87 | `class PFS_buffer_default_array` |
-| `pfs_buffer_container.h` | 231 | `class PFS_buffer_scalable_container` |
+| 函数/结构 | 文件 | 关键作用 |
+|-----------|------|---------|
+| `PFS_start_statement_vc()` | `sql/pfs/pfs_events.cc` | 启动语句事件采集 |
+| `PFS_end_statement_vc()` | `sql/pfs/pfs_events.cc` | 结束语句事件采集 |
+| `PFS_start_wait_vc()` | `sql/pfs/pfs_events_wait.cc` | 启动等待事件采集 |
+| `PFS_end_wait_vc()` | `sql/pfs/pfs_events_wait.cc` | 结束等待事件采集 |
+| `PFS_engine_table` | `sql/pfs/pfs_engine.h` | P_S 内存表引擎 |
+| `setup_instruments` | `sql/pfs/pfs_instr.cc` | 仪表化点配置 |
+| `setup_consumers` | `sql/pfs/pfs_consumer.cc` | 消费者配置 |

@@ -1,143 +1,247 @@
-# 29. MySQL 分区表 (Partitioning)
+# 29. InnoDB 分区表（Partitioning）— 源码分析
 
-> 本文分析 MySQL 分区表的实现，包括分区类型、分区裁剪（Pruning）、分区选择算法、分区维护操作。核心文件：`sql/partitioning/`。
-
----
-
-## 1. 概述
-
-MySQL 分区表在 **SQL 层** 实现，存储引擎（InnoDB）看到的是多个独立的物理表（每个分区一个单独的 `dict_table_t`）。分区操作对用户透明，优化器在查询时通过 **分区裁剪** 排除不相关的分区。
-
-| 类型 | 语法 | 说明 |
-|------|------|------|
-| RANGE | `PARTITION BY RANGE (expr)` | 按值范围分 |
-| LIST | `PARTITION BY LIST (expr)` | 按值列表分 |
-| HASH | `PARTITION BY HASH (expr)` | 按哈希函数取模 |
-| KEY | `PARTITION BY KEY ()` | 按 MySQL 内置哈希 |
-| RANGE COLUMNS | `PARTITION BY RANGE COLUMNS(col1,...)` | 多列范围 |
-| LIST COLUMNS | `PARTITION BY LIST COLUMNS(col1,...)` | 多列列表 |
-| SUBPARTITION | `SUBPARTITION BY HASH/KEY` | 复合分区（分区 → 子分区） |
+> 本文分析 InnoDB 分区表的实现机制，包括分区类型、分区裁剪（pruning）、分区通信（partition exchange）和分区管理（ADD/DROP/TRUNCATE）。核心源文件：`sql/sql_partition.cc`、`sql/partition_info.h`、`ha_partition.cc`。
 
 ---
 
-## 2. 架构
+## 0. 概述
+
+MySQL 的分区表实现位于 **SQL 层**，而不是 InnoDB 层。每个分区实际上是一个独立的 InnoDB 表（有自己的 `.ibd` 文件），SQL 层负责路由查询到正确的分区。
+
+### 分区表的逻辑模型
 
 ```
-MySQL SQL Layer
-  └─ TABLE (分区表的逻辑表示)
-       ├─ partition_info（分区元数据）
-       └─ 实际存储引擎表列表
-            ├─ partition#0 (ha_innopart handler → ha_innobase)
-            ├─ partition#1 (ha_innopart handler → ha_innobase)
-            ├─ ...
-            └─ partition#N (ha_innopart handler → ha_innobase)
+CREATE TABLE t (a INT, b DATE) ENGINE=InnoDB
+  PARTITION BY RANGE (YEAR(b)) (
+    PARTITION p0 VALUES LESS THAN (1990),
+    PARTITION p1 VALUES LESS THAN (2000),
+    PARTITION p2 VALUES LESS THAN (2010),
+    PARTITION p3 VALUES LESS THAN MAXVALUE
+  );
+
+逻辑: t (单个表)
+物理:
+  t#p0.ibd  (分区 p0)
+  t#p1.ibd  (分区 p1)
+  t#p2.ibd  (分区 p2)
+  t#p3.ibd  (分区 p3)
 ```
 
-每个分区通过 `ha_innopart` handler 封装底层的 `ha_innobase`：
+---
+
+## 1. 分区类型
+
+### 1.1 RANGE 分区
+
+```sql
+PARTITION BY RANGE (expr) (
+  PARTITION p0 VALUES LESS THAN (10),
+  PARTITION p1 VALUES LESS THAN (20),
+  PARTITION p2 VALUES LESS THAN (30)
+);
+```
+
+### 1.2 LIST 分区
+
+```sql
+PARTITION BY LIST (expr) (
+  PARTITION p_north VALUES IN ('CN','JP','KR'),
+  PARTITION p_europe VALUES IN ('DE','FR','UK'),
+  PARTITION p_other VALUES IN (DEFAULT)
+);
+```
+
+### 1.3 HASH 分区
+
+```sql
+PARTITION BY HASH (expr) PARTITIONS 8;
+-- 使用 expr % 8 将行路由到不同分区
+```
+
+### 1.4 KEY 分区
+
+```sql
+PARTITION BY KEY (col) PARTITIONS 8;
+-- 使用 MySQL 内置 hash 函数（不是用户定义的表达式）
+```
+
+### 1.5 子分区
+
+```sql
+PARTITION BY RANGE (YEAR(date))
+  SUBPARTITION BY HASH (TO_DAYS(date)) SUBPARTITIONS 4 (
+    PARTITION p2020 VALUES LESS THAN (2021),
+    PARTITION p2021 VALUES LESS THAN (2022)
+  );
+```
+
+---
+
+## 2. 分区裁剪（Pruning）
+
+分区裁剪是分区表性能的关键：优化器通过 WHERE 条件只访问匹配的分区，而不是扫描所有分区。
+
+### 2.1 编译时裁剪
 
 ```cpp
-// ha_innopart.cc — 分区 handler
-class ha_innopart : public handler {
-  // 每个分区一个 ha_innobase 实例
-  // handle 数组：m_innodb_table[index]
-  // 分区裁剪结果：m_part_iter.bitmap
+// sql/partition_info.h
+class Partition_info {
+ public:
+  /* 分区裁剪结果 */
+  Bitmap<64> m_partition_bitmap;  /* 需要访问的分区位图 */
+  Bitmap<64> m_subpartition_bitmap; /* 需要访问的子分区位图 */
+
+  /* 条件分析 */
+  Item *m_partition_func;  /* 分区函数表达式 */
+  List<partition_element> m_templates; /* 分区模板 */
+
+  /* 裁剪 */
+  bool prune_by_conditions(THD *thd);
+  bool prune_by_partition_column(Field *field, Item *cond);
 };
 ```
 
----
+**裁剪示例**：
 
-## 3. 分区裁剪 (Partition Pruning)
-
-### 3.1 裁剪流程
-
-```
-JOIN::optimize()
-  └─ prune_table_partitions()        # sql_partition_admin.cc
-      └─ partition_info::prune_scan_partitions()
-          ├─ 读取 WHERE 条件中的分区键值
-          ├─ 根据分区类型计算匹配分区
-          │   ├─ RANGE: 二分查找
-          │   ├─ LIST: bitmap 查找
-          │   ├─ HASH: hash_value % num_partitions
-          │   └─ KEY: 内置 hash 函数
-          └─ 生成需要扫描的 partition bitmap
+```sql
+SELECT * FROM t WHERE b >= '2000-01-01' AND b < '2010-01-01'
+  └─ 分区函数: YEAR(b)
+  └─ 索引: 从条件推出 YEAR(b) ∈ [2000, 2009]
+  └─ 匹配分区: p1 (2000) 和 p2 (2000-2009)
+  └─ 不匹配: p0 (1990-1999) 和 p3 (2010+)
+  → 只扫描 p1 和 p2 两个分区文件
 ```
 
-### 3.2 分区信息结构
+### 2.2 运行时裁剪
 
 ```cpp
-// partition_element.h — 分区元素
-struct partition_element {
-  List<partition_element> subpartitions;  // 子分区列表
-  longlong range_value;                   // RANGE 分区上限值
-  const char *list_value;                 // LIST 分区值列表
-  uint32_t partition_index;               // 分区号
-  bool is_sub_partition;                  // 是否为子分区
+// ha_partition.cc — 分区表处理函数
+int ha_partition::rnd_next(uchar *buf) {
+  while (true) {
+    /* 先尝试当前分区的 rnd_next */
+    result = m_curr_part_file->rnd_next(buf);
+    if (result != HA_ERR_END_OF_FILE) {
+      return result;  /* 当前分区有下一行 */
+    }
+
+    /* 当前分区读取完毕 → 切换到下一个需要访问的分区 */
+    m_curr_part_id = m_partition_bitmap.get_next_set(m_curr_part_id + 1);
+    if (m_curr_part_id == Bitmap::END) {
+      return HA_ERR_END_OF_FILE;  /* 所有分区都读完了 */
+    }
+
+    /* 打开下一个分区文件 */
+    open_partition_file(m_curr_part_id);
+  }
+}
+```
+
+### 2.3 TRUNCATE/ALTER 的裁剪
+
+```sql
+ALTER TABLE t TRUNCATE PARTITION p0;
+  → 只删除 p0 对应的 .ibd 文件，其他分区不受影响
+
+ALTER TABLE t ADD PARTITION (PARTITION p4 VALUES LESS THAN (2040));
+  → 只创建新的 .ibd 文件，不涉及已有数据
+```
+
+---
+
+## 3. 分区表限制
+
+| 限制 | 说明 |
+|------|------|
+| 最大分区数 | 8192 个分区（含子分区） |
+| 分区列 | 必须是**整数**或返回整数的表达式（RANGE/LIST/HASH）|
+| KEY 分区 | 可以使用其他类型（BLOB/TEXT 除外） |
+| 外键 | 分区表**不支持**外键 |
+| 全文索引 | 分区表**不支持**全文索引 |
+| 唯一索引 | 分区键必须在所有唯一索引中 |
+| 空间索引 | 分区表**不支持**空间索引 |
+| 分区表上的 DDL | 某些 DDL（如 MODIFY PARTITION BY）会阻塞 |
+
+### 分区键与唯一索引的限制
+
+```sql
+CREATE TABLE t (a INT, b INT, UNIQUE KEY (a))
+  PARTITION BY RANGE (b) (              -- 错误！
+    PARTITION p0 VALUES LESS THAN (10),
+    PARTITION p1 VALUES LESS THAN (20)
+  );
+-- 错误: 唯一键 a 不包含分区键 b
+-- 因为 a 的全局唯一性在分区上无法保证
+
+-- 正确:
+CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))
+  PARTITION BY RANGE (b) (...);  -- 分区键 b 在主键中
+```
+
+---
+
+## 4. 分区管理操作
+
+| 操作 | 锁 | 说明 |
+|------|----|------|
+| `ADD PARTITION` | X | 新增分区（RANGE/LIST 的末尾） |
+| `DROP PARTITION` | X | 删除分区及其数据 |
+| `TRUNCATE PARTITION` | X | 清空分区数据 |
+| `REORGANIZE PARTITION` | X | 分区分裂/合并 |
+| `EXCHANGE PARTITION` | X | 分区与非分区表交换 |
+| `COALESCE PARTITION` | X | 减少 HASH/KEY 分区数 |
+| `REBUILD PARTITION` | X | 重建分区（压缩/行格式变化） |
+
+---
+
+## 5. 与 InnoDB 的交互
+
+分区表使用 `ha_partition` 作为 `handler` 层，它将操作委托给每个分区的 `ha_innodb` 实例：
+
+```cpp
+// ha_partition.cc
+class ha_partition : public handler {
+  /* 每个分区对应一个底层 handler 实例 */
+  handler **m_file;           /* 长度 = total_partitions */
+  uint m_tot_parts;           /* 总分区数 */
+
+  /* 当前操作的分区 */
+  uint m_curr_part_id;
+
+  /* 分区裁剪结果 */
+  Bitmap<64> m_partitions_to_scan;
+
+  /* 委托操作 */
+  int write_row(uchar *buf) override {
+    /* 计算行属于哪个分区 */
+    m_curr_part_id = get_partition_id(buf);
+
+    /* 委托给对应分区的 handler */
+    return m_file[m_curr_part_id]->write_row(buf);
+  }
+
+  int update_row(uchar *old_data, uchar *new_data) override {
+    old_part = get_partition_id(old_data);
+    new_part = get_partition_id(new_data);
+    if (old_part == new_part) {
+      /* 同分区更新 → 直接委派 */
+      return m_file[old_part]->update_row(old_data, new_data);
+    } else {
+      /* 跨分区更新 → DELETE + INSERT */
+      m_file[old_part]->delete_row(old_data);
+      m_file[new_part]->insert_row(new_data);
+    }
+  }
 };
-
-// partition_info.h — 分区元数据
-class partition_info {
-  List<partition_element> partitions;    // 分区列表
-  uint num_partitions;                   // 分区总数
-  uint num_subpartitions;                // 子分区数
-  partitioning_func *part_func;          // 分区函数
-};
-```
-
-### 3.3 RANGE 分区选择算法
-
-RANGE 分区通过**二分查找**快速定位：
-
-```
-假设分区定义：
-  p0: VALUES LESS THAN (100)
-  p1: VALUES LESS THAN (200)
-  p2: VALUES LESS THAN (300)
-  p3: VALUES LESS THAN MAXVALUE
-
-查询 WHERE id = 150
-  → 二分查找 [100, 200, 300, MAX] 找到 150
-  → 落在 p1 范围（100 ≤ 150 < 200）
-  → 需要扫描的 partitions = {1}
 ```
 
 ---
 
-## 4. 分区维护操作
+## 6. 源码索引
 
-| 操作 | SQL | 实现方式 |
-|------|-----|----------|
-| TRUNCATE | `ALTER TABLE t TRUNCATE PARTITION p1` | 直接删除分区数据文件 |
-| DROP | `ALTER TABLE t DROP PARTITION p1` | 删除分区及其数据 |
-| ADD | `ALTER TABLE t ADD PARTITION p4` | 创建新分区（不涉及已有数据） |
-| REORGANIZE | `ALTER TABLE t REORGANIZE PARTITION p1,p2 INTO ...` | 重建分区（类似 COPY DDL） |
-| EXCHANGE | `ALTER TABLE t EXCHANGE PARTITION p1 WITH TABLE t2` | 元数据交换（快） |
-| ANALYZE/CHECK/OPTIMIZE | `ALTER TABLE t ANALYZE PARTITION p1` | 作用于单个分区 |
-
----
-
-## 5. 分区表的限制
-
-- **外键**：分区表不支持外键约束
-- **全文索引**：分区表不支持 FTS
-- **唯一索引**：仅当包含所有分区键列时才支持唯一约束
-- **空间索引**：分区表不支持空间索引
-- **分区键列**：`RANGE/LIST` 分区键必须为整数或 COLUMNS 指定类型
-
----
-
-## 6. 总结
-
-1. **SQL 层实现**：分区逻辑在 SQL 层的 `partition_info` 中，InnoDB 不感知分区。
-2. **独立物理表**：每个分区对应一个独立的 InnoDB 表空间/表。
-3. **分区裁剪**：`prune_scan_partitions` 在优化阶段通过 bitmap 排除不相关分区。
-4. **二分查找优化**：RANGE 分区通过 `range_value` 数组二分查找实现 O(log N) 裁剪。
-5. **EXCHANGE 操作**：元数据级别快速交换分区与表。
-
-### 源码引用汇总
-
-| 文件 | 行号 | 关键内容 |
-|------|------|----------|
-| `partition_info.h` | — | `class partition_info` |
-| `partition_element.h` | — | `struct partition_element` |
-| `ha_innopart.cc` | — | `class ha_innopart` 分区 handler |
+| 函数/结构 | 文件 | 关键作用 |
+|-----------|------|---------|
+| `Partition_info` | `sql/partition_info.h` | 分区定义与裁剪 |
+| `ha_partition` | `ha_partition.cc` | 分区表 handler |
+| `prune_by_conditions()` | `sql/partition_info.cc` | 分区裁剪 |
+| `get_partition_id()` | `sql/sql_partition.cc` | 计算行所属分区 ID |
+| `partition_element` | `sql/partition_info.h` | 单个分区描述 |
