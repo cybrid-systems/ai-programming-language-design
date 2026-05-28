@@ -34,7 +34,7 @@
 | 24 | InnoDB 全文索引 | `storage/innobase/fts/fts0fts.cc`, `fts0opt.cc` | 907 | ✅ |
 | 25 | InnoDB 在线 DDL | `storage/innobase/handler/handler0alter.cc`, `row0log.cc`, `log0ddl.cc` | 738 | ✅ |
 | 26 | MySQL 连接与线程池 | `sql/sql_connect.cc`, `sql/sql_parse.cc`, `sql/mysqld.cc` | 631 | ✅ |
-| 27 | MySQL Performance Schema | `storage/perfschema/` | 180 | ✅ |
+| 27 | MySQL Performance Schema | `storage/perfschema/pfs.cc`, `pfs_instr.h` | 633 | ✅ |
 | 28 | InnoDB 页面压缩 | `page0zip.cc` | 166 | ✅ |
 | 29 | MySQL 分区表 | `sql/partitioning/` | 143 | ✅ |
 | 30 | InnoDB 检查点 | `log0chkp.cc`, `log0log.cc` | 231 | ✅ |
