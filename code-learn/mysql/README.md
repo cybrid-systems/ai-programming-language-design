@@ -30,7 +30,7 @@
 | 20 | InnoDB 内存管理 | `mem0mem.h`, `mem0mem.ic` | 381 | ✅ |
 | 21 | InnoDB 外键与约束 | `dict0dict.cc`, `row0ins.cc`, `row0upd.cc` | 337 | ✅ |
 | 22 | MySQL 查询优化器 | `sql/sql_optimizer.cc`, `sql/sql_planner.cc` | 832 | ✅ |
-| 23 | MySQL 存储过程 | `sql/sp_head.cc`, `sql/sp.cc` | 230 | ✅ |
+| 23 | MySQL 存储过程 | `sql/sp_head.cc`, `sql/sp_instr.h`, `sql/sp_pcontext.h`, `sql/sp.cc` | 917 | ✅ |
 | 24 | InnoDB 全文索引 | `fts0fts.cc`, `fts0types.h` | 211 | ✅ |
 | 25 | InnoDB 在线 DDL | `ha_innodb.cc`, `ddl/` | 157 | ✅ |
 | 26 | MySQL 连接与线程池 | `sql/conn_handler/`, `sql/mysqld.cc` | 192 | ✅ |
