@@ -24,6 +24,20 @@
 | 14 | 锁诊断与死锁分析 | `storage/innobase/lock/lock0lock.cc` | 1423 | ✅ |
 | 15 | 备份与恢复 | `storage/innobase/log/log0recv.cc` | 1281 | ✅ |
 | 16 | InnoDB Change Buffer | `storage/innobase/ibuf/ibuf0ibuf.cc` | ~500 | ✅ |
+| 17 | InnoDB 自适应哈希索引 (AHI) | `btr0sea.cc`, `btr0sea.h` | 389 | ✅ |
+| 18 | InnoDB 数据字典 | `dict0mem.h`, `dict0dict.cc`, `dict0dd.cc` | 408 | ✅ |
+| 19 | InnoDB 文件空间管理 | `fil0fil.cc`, `fsp0fsp.cc` | 398 | ✅ |
+| 20 | InnoDB 内存管理 | `mem0mem.h`, `mem0mem.ic` | 381 | ✅ |
+| 21 | InnoDB 外键与约束 | `dict0dict.cc`, `row0ins.cc`, `row0upd.cc` | 337 | ✅ |
+| 22 | MySQL 查询优化器 | `sql/sql_optimizer.cc`, `sql/planner.cc` | 294 | ✅ |
+| 23 | MySQL 存储过程 | `sql/sp_head.cc`, `sql/sp.cc` | 230 | ✅ |
+| 24 | InnoDB 全文索引 | `fts0fts.cc`, `fts0types.h` | 211 | ✅ |
+| 25 | InnoDB 在线 DDL | `ha_innodb.cc`, `ddl/` | 157 | ✅ |
+| 26 | MySQL 连接与线程池 | `sql/conn_handler/`, `sql/mysqld.cc` | 192 | ✅ |
+| 27 | MySQL Performance Schema | `storage/perfschema/` | 180 | ✅ |
+| 28 | InnoDB 页面压缩 | `page0zip.cc` | 166 | ✅ |
+| 29 | MySQL 分区表 | `sql/partitioning/` | 143 | ✅ |
+| 30 | InnoDB 检查点 | `log0chkp.cc`, `log0log.cc` | 231 | ✅ |
 
 ## 写作标准（参考 OceanBase 分析质量）
 
