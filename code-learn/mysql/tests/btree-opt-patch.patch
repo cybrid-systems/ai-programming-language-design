@@ -1,0 +1,308 @@
+diff --git a/.gitignore b/.gitignore
+index f465791e..604ec9a7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -31,3 +31,4 @@ scalability_jobs_*
+ 
+ # Cache directory used by e.g. clangd.
+ .cache/
++compile_commands.json
+diff --git a/storage/innobase/btr/btr0btr.cc b/storage/innobase/btr/btr0btr.cc
+index 40043e97..98135741 100644
+--- a/storage/innobase/btr/btr0btr.cc
++++ b/storage/innobase/btr/btr0btr.cc
+@@ -1230,6 +1230,14 @@ bool btr_page_reorganize_low(bool recovery, ulint z_level, page_cur_t *cursor,
+   page_copy_rec_list_end_no_locks(block, temp_block,
+                                   page_get_infimum_rec(temp_page), index, mtr);
+ 
++
++  /* Populate Hints for BTREE_OPT leaf pages. */
++  if (srv_btree_optimizations && page_is_leaf(page)) {
++    ulint pl = mach_read_from_2(page + PAGE_HEADER + PAGE_LEVEL);
++    if (page_get_format(pl) == PAGE_FORMAT_BTREE_OPT) {
++      page_hints_populate(page);
++    }
++  }
+   /* Multiple transactions cannot simultaneously operate on the
+   same temp-table in parallel.
+   max_trx_id is ignored for temp tables because it not required
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index ee430459..a365164f 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -320,6 +320,11 @@ ulong srv_log_writer_threads_ulong;
+ /* Boolean @@innodb_buffer_pool_in_core_file. */
+ bool srv_buffer_pool_in_core_file = true;
+ 
++/* B-Tree optimization features (SIGMOD 2025 'B-Trees Are Back' adaptation).
++   When enabled, new B-tree pages use FORMAT_BTREE_OPT with Heads optimization.
++   Off by default for backward compatibility. */
++bool srv_btree_optimizations = false;
++
+ /** Percentage of the buffer pool to reserve for 'old' blocks.
+ Connected to buf_LRU_old_ratio. */
+ static uint innobase_old_blocks_pct;
+@@ -22759,6 +22764,13 @@ static MYSQL_SYSVAR_LONG(fill_factor, ddl::fill_factor, PLUGIN_VAR_RQCMDARG,
+                          "Percentage of B-tree page filled during bulk insert",
+                          nullptr, nullptr, 100, 10, 100, 0);
+ 
++static MYSQL_SYSVAR_BOOL(
++    btree_optimizations, srv_btree_optimizations, PLUGIN_VAR_OPCMDARG,
++    "Enable B-Tree node layout optimizations (SIGMOD 2025): Heads for quick "
++    "slot-level key filtering, extended page directory slots. Enabling this "
++    "affects newly created/reorganized pages; existing pages are unaffected.",
++    nullptr, nullptr, false);
++
+ static MYSQL_SYSVAR_BOOL(
+     ft_enable_diag_print, fts_enable_diag_print, PLUGIN_VAR_OPCMDARG,
+     "Whether to enable additional FTS diagnostic printout ", nullptr, nullptr,
+@@ -23769,6 +23781,7 @@ static SYS_VAR *innobase_system_variables[] = {
+     MYSQL_SYSVAR(interpreter),
+     MYSQL_SYSVAR(interpreter_output),
+ #endif /* UNIV_DEBUG */
++    MYSQL_SYSVAR(btree_optimizations),
+     MYSQL_SYSVAR(parallel_read_threads),
+     MYSQL_SYSVAR(segment_reserve_factor),
+     nullptr};
+diff --git a/storage/innobase/include/btr0btr.ic b/storage/innobase/include/btr0btr.ic
+index e7b91b01..b238728d 100644
+--- a/storage/innobase/include/btr0btr.ic
++++ b/storage/innobase/include/btr0btr.ic
+@@ -91,6 +91,7 @@ static inline ulint btr_page_get_level(const page_t *page) {
+   ut_ad(page);
+ 
+   level = mach_read_from_2(page + PAGE_HEADER + PAGE_LEVEL);
++  level = level & PAGE_LEVEL_MASK;
+ 
+   ut_ad(level <= BTR_MAX_NODE_LEVEL);
+ 
+@@ -109,10 +110,10 @@ static inline void btr_page_set_level(
+   ut_ad(level <= BTR_MAX_NODE_LEVEL);
+ 
+   if (page_zip) {
+-    mach_write_to_2(page + (PAGE_HEADER + PAGE_LEVEL), level);
++    mach_write_to_2(page + (PAGE_HEADER + PAGE_LEVEL), page_make_level(srv_btree_optimizations ? PAGE_FORMAT_BTREE_OPT : PAGE_FORMAT_ORIG, level));
+     page_zip_write_header(page_zip, page + (PAGE_HEADER + PAGE_LEVEL), 2, mtr);
+   } else {
+-    mlog_write_ulint(page + (PAGE_HEADER + PAGE_LEVEL), level, MLOG_2BYTES,
++    mlog_write_ulint(page + (PAGE_HEADER + PAGE_LEVEL), page_make_level(srv_btree_optimizations ? PAGE_FORMAT_BTREE_OPT : PAGE_FORMAT_ORIG, level), MLOG_2BYTES,
+                      mtr);
+   }
+ }
+diff --git a/storage/innobase/include/page0page.ic b/storage/innobase/include/page0page.ic
+index d838b178..953302dc 100644
+--- a/storage/innobase/include/page0page.ic
++++ b/storage/innobase/include/page0page.ic
+@@ -523,6 +523,46 @@ static inline page_dir_slot_t *page_dir_get_nth_slot(
+ }
+ #endif /* UNIV_DEBUG */
+ 
++/** Extract 4-byte Head from record key data. */
++static inline uint32_t page_rec_head_compute(const rec_t *rec) {
++  byte buf[4];
++  memcpy(buf, rec, 4);
++  return mach_read_from_4(buf);
++}
++
++/** Read per-slot Head from PAGE_HEADS array. */
++static inline uint32_t page_dir_slot_get_head(const page_t *page, ulint n) {
++  return mach_read_from_4(const_cast<byte *>(page + PAGE_HEADS + n * 4));
++}
++
++/** Write per-slot Head to PAGE_HEADS array. */
++static inline void page_dir_slot_set_head(page_t *page, ulint n, uint32_t head) {
++  mach_write_to_4(page + PAGE_HEADS + n * 4, head);
++}
++
++/** Populate the Hints array (16 sample Heads) from directory slots. */
++static inline void page_hints_populate(const page_t *page) {
++  ulint n = page_dir_get_n_slots(page);
++  if (n <= 1) return;
++  for (ulint i = 0; i < 16; i++) {
++    ulint idx = (i * (n - 1)) / 16;
++    const auto *s = page_dir_get_nth_slot(page, idx);
++    const rec_t *r = page_dir_slot_get_rec(s);
++    mach_write_to_4(const_cast<byte *>(page + PAGE_HINTS + i * 4), page_rec_head_compute(r));
++  }
++}
++
++/** Compute heap start offset (after B-tree header). */
++static inline ulint page_heap_start_offset(const page_t *page) {
++  ulint base = page_is_comp(page) ? PAGE_NEW_SUPREMUM_END : PAGE_OLD_SUPREMUM_END;
++  if (srv_btree_optimizations && page_is_leaf(page)) {
++    ulint pl = mach_read_from_2(page + PAGE_HEADER + PAGE_LEVEL);
++    if (page_get_format(pl) == PAGE_FORMAT_BTREE_OPT)
++      return base + PAGE_BTREE_HDR_SIZE;
++  }
++  return base;
++}
++
+ /** Used to check the consistency of a record on a page.
+  @return true if succeed */
+ static inline bool page_rec_check(const rec_t *rec) /*!< in: record */
+diff --git a/storage/innobase/include/page0types.h b/storage/innobase/include/page0types.h
+index 7f670477..2a8a174b 100644
+--- a/storage/innobase/include/page0types.h
++++ b/storage/innobase/include/page0types.h
+@@ -80,7 +80,44 @@ create */
+ constexpr uint32_t PAGE_HEADER_PRIV_END = 26;
+ /*----*/
+ /** level of the node in an index tree; the leaf level is the level 0.
+-This field should not be written to after page creation. */
++This field should not be written to after page creation.
++
++High byte (bits 8-15) is used to store page format version; the level
++itself fits in the low byte (max BTR_MAX_LEVELS=100 < 256). */
++constexpr uint32_t PAGE_FORMAT_SHIFT = 8;
++constexpr uint32_t PAGE_FORMAT_MASK = 0xFF << PAGE_FORMAT_SHIFT;
++constexpr uint32_t PAGE_LEVEL_MASK = 0xFF;
++
++/** Page format versions (stored in high byte of PAGE_LEVEL).
++    Original InnoDB: slots are 2-byte offsets, no Heads/Hints/PrefixTruncation.
++    OPT_FORMAT: slots are 6-byte (offset+Head), page header has Hints array,
++    records may use Prefix Truncation. */
++enum page_format_t : uint8_t {
++  PAGE_FORMAT_ORIG = 0,
++  PAGE_FORMAT_BTREE_OPT = 1
++};
++
++/** Returns the page format version from PAGE_LEVEL field.
++@param[in]  page_level  raw PAGE_LEVEL field value
++@return format version */
++inline page_format_t page_get_format(ulint page_level) {
++  return static_cast<page_format_t>(
++      (page_level >> PAGE_FORMAT_SHIFT) & 0xFF);
++}
++
++/** Encodes format + level into PAGE_LEVEL field.
++@param[in]  format  page format version
++@param[in]  level   tree level (leaf=0)
++@return encoded value for PAGE_LEVEL field */
++inline ulint page_make_level(page_format_t format, ulint level) {
++  return (static_cast<ulint>(format) << PAGE_FORMAT_SHIFT) |
++         (level & PAGE_LEVEL_MASK);
++}
++
++/** Page directory slot size in bytes, depends on page format.
++    ORIG: 2 bytes (just offset)
++    BTREE_OPT: 6 bytes (2-byte offset + 4-byte Head) */
++
+ constexpr uint32_t PAGE_LEVEL = 26;
+ /** index id where the page belongs. This field should not be written to after
+  page creation. */
+@@ -126,6 +163,59 @@ old-style page */
+ 
+ /*-----------------------------*/
+ 
++/** B-Tree optimization header size.
++    This is placed between the supremum record end and the user record
++    heap start, ONLY in FORMAT_BTREE_OPT pages.
++    Layout:
++      0-3:    PAGE_BTREE_FLAGS (uint32)
++      4-67:   PAGE_HINTS[16] (16 × uint32_t)
++      68-71:  PAGE_PREFIX_LEN (uint32, length of common prefix)
++      72-103: PAGE_PREFIX_BUF (32 bytes of prefix data)
++      104-111: PAGE_FD_BASE_KEY (uint64, min key for fully-dense mode)
++      112-175: PAGE_FD_BITMAP (64 bytes, 512-bit occupancy bitmap) */
++constexpr uint32_t PAGE_HEADS_MAX = 128;
++constexpr uint32_t PAGE_HEADS_AREA = PAGE_HEADS_MAX * 4;
++constexpr uint32_t PAGE_BTREE_HDR_SIZE = 176 + PAGE_HEADS_AREA;
++constexpr uint32_t PAGE_HEADS = 176;
++
++/** Common prefix length field offset (4 bytes). */
++constexpr uint32_t PAGE_PREFIX_LEN = 94 + 4 + 16 * 4;
++
++/** Common prefix data buffer offset (32 bytes). */
++constexpr uint32_t PAGE_PREFIX_BUF = 94 + 4 + 64 + 4 + 4;
++
++/** Max prefix bytes we can store. */
++constexpr uint32_t PAGE_PREFIX_BUF_SIZE = 32;
++
++/** Fully-Dense base key (uint64, min key on this page). */
++constexpr uint32_t PAGE_FD_BASE_KEY = PAGE_PREFIX_BUF + PAGE_PREFIX_BUF_SIZE;
++
++/** Fully-Dense bitmap (64 bytes = 512 bits for occupancy tracking). */
++constexpr uint32_t PAGE_FD_BITMAP = PAGE_FD_BASE_KEY + 8;
++
++/** Number of keys in the FD bitmap (512 = 64 bytes × 8 bits). */
++constexpr uint32_t PAGE_FD_BITMAP_ENTRIES = 512;
++
++/** Fully-dense bitmap size in bytes. */
++constexpr uint32_t PAGE_FD_BITMAP_SIZE = PAGE_FD_BITMAP_ENTRIES / 8;
++
++/** B-Tree flags offset from page start (at SUPREMUM_END for BTREE_OPT). */
++constexpr uint32_t PAGE_BTREE_FLAGS = PAGE_DATA + 26;
++
++/** Hints array offset from page start (4 bytes after BTREE_FLAGS). */
++constexpr uint32_t PAGE_HINTS = PAGE_BTREE_FLAGS + 4;
++
++/** Number of Hints (sampled Heads at the page level). */
++constexpr uint32_t PAGE_HINTS_N = 16;
++
++/** B-Tree flags stored in page[PAGE_BTREE_FLAGS] (32-bit, FORMAT_BTREE_OPT only). */
++enum page_btree_flag_t : uint32_t {
++  /** Semi-Dense: each slot owns 1-2 records (vs 4-8). */
++  PAGE_BTREE_SEMI_DENSE = 1 << 0,
++  /** Fully-Dense: array+bitmap for integer auto_increment PK.
++      When set, PAGE_FD_BASE_KEY and PAGE_FD_BITMAP are valid. */
++  PAGE_BTREE_FULLY_DENSE = 1 << 1
++};
+ /* Heap numbers */
+ /** Page infimum */
+ constexpr ulint PAGE_HEAP_NO_INFIMUM = 0;
+diff --git a/storage/innobase/include/srv0srv.h b/storage/innobase/include/srv0srv.h
+index 602d52e4..f42a8635 100644
+--- a/storage/innobase/include/srv0srv.h
++++ b/storage/innobase/include/srv0srv.h
+@@ -709,6 +709,13 @@ extern bool srv_print_innodb_lock_monitor;
+ extern ulong srv_n_spin_wait_rounds;
+ extern ulong srv_n_free_tickets_to_enter;
+ extern ulong srv_spin_wait_delay;
++
++/** B-Tree optimization features (SIGMOD 2025 'B-Trees Are Back' adaptation).
++    When enabled, new B-tree pages use FORMAT_BTREE_OPT with:
++    - Extended page directory slots carrying 4-byte Head values (PAGE_DIR_SLOT_SIZE_OPT=6)
++    - (Future) Hints array, Prefix Truncation, Semi-Dense leaves
++    Old pages are unchanged; only newly created/index-rebuilt pages use the new format. */
++extern bool srv_btree_optimizations;
+ extern bool srv_priority_boost;
+ 
+ extern ulint srv_truncated_status_writes;
+diff --git a/storage/innobase/include/univ.i b/storage/innobase/include/univ.i
+index d2257274..08b0a708 100644
+--- a/storage/innobase/include/univ.i
++++ b/storage/innobase/include/univ.i
+@@ -636,6 +636,9 @@ typedef void *os_thread_ret_t;
+ extern ulong srv_page_size_shift;
+ extern ulong srv_page_size;
+ 
++/** B-Tree optimization features flag, declared in ha_innodb.cc. */
++extern bool srv_btree_optimizations;
++
+ static const size_t UNIV_SECTOR_SIZE = 512;
+ 
+ /* Dimension of spatial object we support so far. It has its root in
+diff --git a/storage/innobase/page/page0page.cc b/storage/innobase/page/page0page.cc
+index 90ceaaba..a5dec425 100644
+--- a/storage/innobase/page/page0page.cc
++++ b/storage/innobase/page/page0page.cc
+@@ -331,11 +331,16 @@ page_t *page_create_low(buf_block_t *block, ulint comp, page_type_t page_type) {
+   if (comp) {
+     page[PAGE_HEADER + PAGE_N_HEAP] = 0x80; /*page_is_comp()*/
+     page[PAGE_HEADER + PAGE_N_HEAP + 1] = PAGE_HEAP_NO_USER_LOW;
+-    page[PAGE_HEADER + PAGE_HEAP_TOP + 1] = PAGE_NEW_SUPREMUM_END;
++    /* BTREE_OPT: heap starts after B-tree header (flags+heads+hints) */
++    ulint heap_st = (srv_btree_optimizations && page_type == FIL_PAGE_INDEX)
++        ? PAGE_NEW_SUPREMUM_END + PAGE_BTREE_HDR_SIZE
++        : PAGE_NEW_SUPREMUM_END;
++    page[PAGE_HEADER + PAGE_HEAP_TOP] = static_cast<byte>(heap_st >> 8);
++    page[PAGE_HEADER + PAGE_HEAP_TOP + 1] = static_cast<byte>(heap_st & 0xFF);
+     memcpy(page + PAGE_DATA, infimum_supremum_compact,
+            sizeof infimum_supremum_compact);
+-    memset(page + PAGE_NEW_SUPREMUM_END, 0,
+-           UNIV_PAGE_SIZE - PAGE_DIR - PAGE_NEW_SUPREMUM_END);
++    memset(page + heap_st, 0,
++           UNIV_PAGE_SIZE - PAGE_DIR - heap_st);
+     page[UNIV_PAGE_SIZE - PAGE_DIR - PAGE_DIR_SLOT_SIZE * 2 + 1] =
+         PAGE_NEW_SUPREMUM;
+     page[UNIV_PAGE_SIZE - PAGE_DIR - PAGE_DIR_SLOT_SIZE + 1] = PAGE_NEW_INFIMUM;
