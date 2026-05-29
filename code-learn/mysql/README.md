@@ -37,7 +37,7 @@
 | 27 | MySQL Performance Schema | `storage/perfschema/pfs.cc`, `pfs_instr.h` | 633 | ✅ |
 | 28 | InnoDB 页面压缩 | `storage/innobase/page/page0zip.cc`, `fil0fil.h`, `page0zip.h` | 609 | ✅ |
 | 29 | MySQL 分区表 | `sql/sql_partition.cc`, `sql/partition_info.h`, `ha_innopart.cc` | 672 | ✅ |
-| 30 | InnoDB 检查点 | `log0chkp.cc`, `log0log.cc` | 231 | ✅ |
+| 30 | InnoDB 检查点 | `storage/innobase/log/log0chkp.cc`, `log0log.cc`, `log0recv.cc` | 636 | ✅ |
 
 ## 写作标准
 
