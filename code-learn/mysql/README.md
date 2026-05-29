@@ -39,6 +39,8 @@
 | 29 | MySQL 分区表 | `sql/sql_partition.cc`, `sql/partition_info.h`, `ha_innopart.cc` | 672 | ✅ |
 | 30 | InnoDB 检查点 | `storage/innobase/log/log0chkp.cc`, `log0log.cc`, `log0recv.cc` | 636 | ✅ |
 | 31 | SIGMOD 2025 B-Trees Are Back 适配设计 | `page0types.h`, `page0cur.cc`, `page0page.cc`, `btr0cur.cc`, `btr0btr.cc`, `rem0cmp.cc`, `dict0mem.h` | 803 | ✅ |
+| 32 | B-Tree 优化测试计划 | — | 280 | ✅ |
+| 33 | B-Tree 优化基线测试结果 | — | 120 | ✅ |
 
 ## 写作标准
 
