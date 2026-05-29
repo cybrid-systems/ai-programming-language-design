@@ -38,6 +38,7 @@
 | 28 | InnoDB 页面压缩 | `storage/innobase/page/page0zip.cc`, `fil0fil.h`, `page0zip.h` | 609 | ✅ |
 | 29 | MySQL 分区表 | `sql/sql_partition.cc`, `sql/partition_info.h`, `ha_innopart.cc` | 672 | ✅ |
 | 30 | InnoDB 检查点 | `storage/innobase/log/log0chkp.cc`, `log0log.cc`, `log0recv.cc` | 636 | ✅ |
+| 31 | SIGMOD 2025 B-Trees Are Back 适配设计 | `page0types.h`, `page0cur.cc`, `page0page.cc`, `btr0cur.cc`, `btr0btr.cc`, `rem0cmp.cc`, `dict0mem.h` | 803 | ✅ |
 
 ## 写作标准
 
