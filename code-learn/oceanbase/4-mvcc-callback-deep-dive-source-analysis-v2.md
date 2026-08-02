@@ -1,28 +1,28 @@
 # 4-mvcc-callback-deep-dive — OceanBase MVCC Callback 完整实现 / 13+ 虚函数 lifecycle（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_tx_callback_functor.h` **663 行** 实读 + `ob_tx_callback_list.h/cpp` **1400 行** 实读 + `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}` 376 行 + `ob_mvcc.h` ObITransCallback 13+ 虚函数 + `ob_mvcc_engine.cpp` 关联 lifecycle），结合 #1-#3 v2 系列经验
+> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_tx_callback_functor.h` **663 行** 实读 + `ob_tx_callback_list.h/cpp` **1400 行** 实读 + `ob_tx_callback_hash_holder_helper.{h,cpp,ipp}` + `ob_mvcc.h`（参见 #1 v2 ObITransCallback）+ `ob_mvcc_engine.cpp` 完整 lifecycle 关联），结合 #1-#3 v2 系列经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**这是 #4 系列的 v2 deep-dive 版**。原 #4（2026-08-02 17:18）写于约 30KB，包含 MVCC Callback 概要。**本 v2 版**实读了 `ob_tx_callback_functor.h`（**663 行 — mvcc/ 目录最大单文件**）+ `ob_tx_callback_list.h/cpp`（**1400 行**）+ `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}`（**376 行**），基于 #1 v2（ObITransCallback 13+ 虚函数 lifecycle）+ #2 v2（MVCC Iterator 多版本可见性）+ #3 v2（写写冲突）三篇 deep-dive，进一步深入 MVCC Callback 完整 lifecycle 实现。
+**这是 #4 系列的 v2 deep-dive 版**。原 #4（2026-08-02 17:18）写于约 30KB，包含 MVCC Callback 的概要。**本 v2 版**实读了 `ob_tx_callback_functor.h`（663 行 — 整个 `src/storage/memtable/mvcc/` 目录中最大的单文件）+ `ob_tx_callback_list.h/cpp`（1400 行）+ `ob_tx_callback_hash_holder_helper.{h,cpp,ipp}`，基于 #1 v2（ObITransCallback 13+ 虚函数基础）、#2 v2（MVCC Iterator 多版本可见性）和 #3 v2（写写冲突 + lock_wait）三篇 deep-dive 基础，进一步深入 MVCC Callback 的完整 lifecycle 实现。
 
 本文聚焦 8 个核心问题：
 
-1. **MVCC Callback 全景**（4 个核心文件 + 1 个 cpp，实读 2000+ 行）
-2. **ObITxCallbackFunctor + 12 个 Functor 子类**完整实读（**663 行，最大单文件**）
-3. **ObTxCallbackList 22+ public 方法**完整实读（**1400 行**）
+1. **MVCC Callback 全景**（基于 4 个核心文件 + 1 个 cpp 实读，共 2000+ 行）
+2. **ObTxCallbackFunctor + 12 个 Functor 子类**完整实读（663 行）
+3. **ObTxCallbackList 12 个 public 方法**完整实读（1400 行）
 4. **ObTxCallbackHashHolder 完整 lifecycle**实读
 5. **ObTxCallbackHashHolderList cycle list**实读
 6. **Fast Commit 设计**（ObRemoveCallbacksForFastCommitFunctor）
 7. **ObRemoveSyncCallbacksWCondFunctor**实读
-8. **ObITransCallback 13+ 虚函数 lifecycle**完整串联（与 #1 v2 关联）
+8. **12+ 虚函数 lifecycle**完整串联（与 #1 v2 ObITransCallback 关联）
 
 ---
 
-## 1. MVCC Callback 全景（4 个核心文件 + 1 个 cpp，实读 2000+ 行）
+## 1. MVCC Callback 全景（4 个核心文件 + 1 个 cpp 实读，共 2000+ 行）
 
 ### 1.1 实读确认的 6 个文件
 
@@ -35,10 +35,10 @@ $ wc -l src/storage/memtable/mvcc/ob_tx_callback_functor.h \
        src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.ipp
 ```
 
-**6 个核心文件**（总计 ~2400 行）：
-- `ob_tx_callback_functor.h`（**663 行**，**最大单文件**）—— 12 个 Functor 子类
-- `ob_tx_callback_list.h/cpp`（**1400 行**）—— ObTxCallbackList 核心类
-- `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}`（**376 行**）—— ObTxCallbackHashHolder + cycle list
+**6 个核心文件**（总计 2400+ 行）：
+- `ob_tx_callback_functor.h`（**663 行**，最大单文件）—— 12 个 Functor 子类
+- `ob_tx_callback_list.h/cpp`（1400 行）—— ObTxCallbackList 核心类
+- `ob_tx_callback_hash_holder_helper.{h,cpp,ipp}`（376 行）—— ObTxCallbackHashHolder 链表
 
 ### 1.2 整体架构
 
@@ -76,7 +76,7 @@ $ wc -l src/storage/memtable/mvcc/ob_tx_callback_functor.h \
                        ▼
         ┌──────────────────────────────────┐
         │  ObTxCallbackList               │  ←  1400 行主类
-        │  - 22+ public 方法            │
+        │  - 12 个 public 方法            │
         │  - LockState + LockGuard        │
         │  - remove_callbacks_for_fast_commit │
         │  - remove_callbacks_for_rollback_to │
@@ -86,14 +86,14 @@ $ wc -l src/storage/memtable/mvcc/ob_tx_callback_functor.h \
 
 ### 1.3 与 #1 v2 + #2 v2 + #3 v2 关联
 
-- **#1 v2 deep-dive**：ObITransCallback（13+ 虚函数 lifecycle）→ 本篇核心基类
-- **#2 v2 deep-dive**：ObMultiVersionValueIterator 状态检查 → 调 callback 状态
-- **#3 v2 deep-dive**：写写冲突 → 写失败 → callback cleanup
-- **#4 v2（本篇）**：ObTxCallbackList + ObTxCallbackFunctor + ObTxCallbackHashHolder + Fast Commit
+- **#1 v2 ObITransCallback**（13+ 虚函数 lifecycle）—— 本篇核心基类
+- **#2 v2 ObMultiVersionValueIterator**（多版本可见性）—— 通过 callback 状态判断可见性
+- **#3 v2 写写冲突**（OB_TRY_LOCK_ROW_CONFLICT 等）—— 通过 callback 链清理
+- **#4 v4（本篇）** —— Callback 完整 lifecycle 实现
 
 ---
 
-## 2. ObITxCallbackFunctor + 12 个 Functor 子类完整实读（663 行）
+## 2. ObTxCallbackFunctor + 12 个 Functor 子类完整实读（663 行）
 
 ### 2.1 ObITxCallbackFunctor 基类实读
 
@@ -140,7 +140,7 @@ protected:
 - **`need_remove_callback_`** 标记是否需要清理 callback
 - **`traverse_cnt_` / `remove_cnt_`** 统计信息（monitor 用）
 
-### 2.3 ObRemoveCallbacksForFastCommitFunctor 实读（Fast Commit 核心）
+### 2.3 ObRemoveCallbacksForFastCommitFunctor 实读
 
 ```cpp
 // 关键注释（663 行实读中提取）：
@@ -236,16 +236,16 @@ private:
 **目的**：将耗时任务（traversing callbacks）分散到读/写正常任务中，提升整体吞吐
 
 **3 关键原则**：
-1. **checksum 计算**：移除 callback 时必须计算，否则与其他副本不一致
+1. **checksum 计算**：移除 callback 时必须计算，否则会导致与其他副本不一致
 2. **granularity 与 redo log 一致**：即使 need_remove_count=0，仍要处理 same log timestamp 的 callback
 3. **free 立即回收**：allocator 要求立即释放
 
 **5 终止条件**（`is_iter_end` 的 5 个 case）：
-- case1: `callback == NULL`（callback 列表结束）
-- case2: `callback->need_submit_log()`（callback 未 sync）
-- case3: `sync_scn_ < callback->get_scn()`（callback 未 sync，SCN 检查）
-- case4: `callback->get_scn().is_min()`（callback SCN 异常，min_scn）
-- case5: `0 >= need_remove_count_ && callback->get_scn() != last_scn_for_remove_`（跨 log timestamp）
+- case1: callback = NULL
+- case2: callback 未 sync（need_submit_log）
+- case3: sync_scn_ < callback->get_scn()
+- case4: callback->get_scn().is_min() 异常
+- case5: need_remove_count_ <= 0 且 callback->get_scn() != last_scn_for_remove_（跨 log timestamp）
 
 ### 2.5 ObRemoveSyncCallbacksWCondFunctor 实读
 
@@ -263,7 +263,7 @@ public:
     {
       is_reverse_ = is_reverse;
     }
-  virtual bool cond_for_remove(ObITransCallback *callback) = 0;  // 子类实现
+  virtual bool cond_for_remove(ObITransCallback *callback) = 0;
   virtual bool cond_for_stop(ObITransCallback *callback) const
   {
     UNUSED(callback);
@@ -280,12 +280,16 @@ public:
 
     return is_valid;
   }
-  void set_checksumer(const share::SCN checksum_scn, TxChecksum *checksumer)
+
+  void set_checksumer(const share::SCN checksum_scn,
+                      TxChecksum *checksumer
+                      )
   {
     need_checksum_ = true;
     checksum_scn_ = checksum_scn;
     checksumer_ = checksumer;
   }
+
   share::SCN get_checksum_last_scn() const
   {
     if (need_checksum_) {
@@ -316,7 +320,7 @@ public:
 
 ---
 
-## 3. ObTxCallbackList 22+ public 方法完整实读（1400 行）
+## 3. ObTxCallbackList 12 个 public 方法完整实读（1400 行）
 
 ### 3.1 类完整结构
 
@@ -464,7 +468,7 @@ private:
 };
 ```
 
-### 3.2 22+ 个 public 方法详解
+### 3.2 12+ 个 public 方法详解
 
 | 方法 | 作用 | 关键参数 |
 |------|------|----------|
@@ -547,6 +551,7 @@ class ObTxCallbackHashHolderLinker {
   friend class ObTxCallbackHashHolderList;
 public:
   ObTxCallbackHashHolderLinker() : hash_key_(0), newer_node_(nullptr), older_node_(nullptr) {}
+  // 默认拷贝 / 赋值
   ObTxCallbackHashHolderLinker(const ObTxCallbackHashHolderLinker &) = default;
   ObTxCallbackHashHolderLinker &operator=(const ObTxCallbackHashHolderLinker &) = default;
   ~ObTxCallbackHashHolderLinker() { hash_key_ = 0; newer_node_ = nullptr; older_node_ = nullptr; }
@@ -921,22 +926,9 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 
 ---
 
-## 9. 与 #1-#3 v2 完整对比
+## 9. 与 #1-#3 v2 关联
 
-| 维度 | #1 v2 | #2 v2 | #3 v2 | #4 v2（本篇） |
-|------|-------|-------|-------|------------|
-| 主题 | MVCC Row | MVCC Iterator | 写写冲突 | Callback |
-| commit | `c3d14bc` | `198587b` | `b75cdcc` | `?` |
-| 实读 | 1 个文件 | 4 个 iterator | 6 个文件 | 4 个文件 |
-| 核心 | ObMvccTransNode | 4 个 Iterator | ObWriteFlag | ObTxCallbackList |
-| 关键 | 7 flag 位 | 多版本可见性 | 17 bit 写标志 | 22+ public 方法 |
-| 生命周期 | state transition | iterator 4 状态 | 4 种冲突返回 | 13+ callback 虚函数 |
-
----
-
-## 10. 与 #1-#3 v2 关联
-
-### 10.1 横向关联
+### 9.1 横向关联
 
 | 文章 | 关联 |
 |------|------|
@@ -950,7 +942,7 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 | #41 PX | parallel_replay 标志 |
 | #75 Latch | 回调与 latch 协同 |
 
-### 10.2 关键路径修正
+### 9.2 关键路径修正
 
 ```
 原推测:
@@ -959,14 +951,15 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 实际:
   src/storage/memtable/mvcc/ob_tx_callback_functor.h  ✅（663 行，最大单文件）
   src/storage/memtable/mvcc/ob_tx_callback_list.h/cpp  ✅（1400 行）
-  src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.{h/cpp/ipp}  ✅
+  src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.{h,cpp,ipp}  ✅
+  src/storage/memtable/mvcc/ob_tx_callback_list.cpp  ✅
 ```
 
 ---
 
-## 11. 总结
+## 10. 总结
 
-### 11.1 核心数据结构
+### 10.1 核心数据结构
 
 | 数据结构 | 行数 | 关键功能 |
 |----------|------|----------|
@@ -977,7 +970,7 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 | `ObRemoveCallbacksForFastCommitFunctor` | ~80 | Fast Commit 清理（3 原则 + 5 终止条件） |
 | `ObRemoveSyncCallbacksWCondFunctor` | ~80 | 条件删除 + checksum 验证 |
 
-### 11.2 关键技术点回顾
+### 10.2 关键技术点回顾
 
 | 技术点 | 实现 |
 |--------|------|
@@ -990,7 +983,7 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 | **22+ public 方法** | append/concat/remove_callbacks_for_fast_commit/remove_for_remove_memtable/tx_commit/tx_abort/tx_elr_preparing/tx_elr_revoke 等 |
 | **callback lifecycle** | init → set_hash_key → link → is_registerd → reset_registered → destroy |
 
-### 11.3 关键技术模块
+### 10.3 关键技术模块
 
 | 路径 | 角色 |
 |------|------|
@@ -1001,7 +994,7 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 | `src/storage/memtable/mvcc/ob_mvcc_engine.cpp`（参见 #3 v2） | callback lifecycle 集成 |
 | `src/storage/memtable/mvcc/ob_mvcc_row.cpp`（参见 #1 v2） | 节点注册 callback |
 
-### 11.4 关键路径修正
+### 10.4 关键路径修正
 
 ```
 原推测:
@@ -1010,15 +1003,30 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 实际:
   src/storage/memtable/mvcc/ob_tx_callback_functor.h  ✅（663 行，最大单文件）
   src/storage/memtable/mvcc/ob_tx_callback_list.h/cpp  ✅（1400 行）
-  src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.{h/cpp/ipp}  ✅
+  src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.h/cpp/ipp  ✅
 ```
+
+---
+
+## 11. 与 #1-#3 v2 完整对比
+
+| 维度 | #1 v2 | #2 v2 | #3 v2 | #4 v2（本篇） |
+|------|-------|-------|-------|------------|
+| 主题 | MVCC Row | MVCC Iterator | 写写冲突 | Callback |
+| commit | `c3d14bc` | `198587b` | `b75cdcc` | `?` |
+| 实读 | `ob_mvcc_row.h` | 4 个 iterator | 6 个文件 | 4 个文件 |
+| 核心数据结构 | `ObMvccTransNode` | 4 个 Iterator | `ObWriteFlag` | `ObTxCallbackList` |
+| 关键机制 | 7 flag 位 | 多版本可见性 | 17 bit 写标志 | 22+ public 方法 |
+| lifecycle | state transition | iterator 4 状态 | 4 种冲突返回 | 22+ callback 方法 |
+| #1-#4 关联 | ← #1 v2 基础 | #1 v2 → | #1 v2 + #2 v2 → | #1 v2 核心 + #2 v2 清理 + #3 v2 → |
 
 ---
 
 ## 12. 推荐下一篇
 
-按 "按顺序来" 指令，MVCC 子系列继续：
+按 "一篇一篇来" + "按顺序来" 指令，MVCC 子系列继续：
 
-- **#5 v2 MVCC Compact 与 GC**（`try_cleanout_*` 完整实读 + `mvcc_undo` / `mvcc_replay` / compact 调度 + GC 机制）
+- **#5 v2 MVCC Compact 与 GC**（`try_cleanout_*` 完整实读 + `mvcc_undo` / `mvcc_replay` / compact 调度 + GC 机制）—— 4 个主 compact 方法（`remove_callbacks_for_fast_commit` / `remove_callbacks_for_remove_memtable` / `remove_callbacks_for_rollback_to` / `clean_unlog_callbacks`）+ 5 个 mvcc 实体类清理
+- **#14 v2 MemTable 完整**（37 文件 + 完整读）
 
-要继续 #5 v2（接 #4 callback 之后，compact 是 callback 的下游），还是先做其他 refine？
+要继续 #5 v2 MVCC Compact 与 GC（自然接 #4 callback 之后），还是先做其他？
