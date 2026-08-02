@@ -1,13 +1,13 @@
 # 4-mvcc-callback-deep-dive — OceanBase MVCC Callback 完整实现 / 13+ 虚函数 lifecycle（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_tx_callback_functor.h` **663 行** 实读 + `ob_tx_callback_list.h/cpp` **1400 行** 实读 + `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}` 376 行 + `ob_mvcc.h` 关联 ObITransCallback 13+ 虚函数 + `ob_mvcc_engine.cpp` 关联 lifecycle），结合 #1 v2 + #2 v2 + #3 v2 系列经验
+> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_tx_callback_functor.h` **663 行** 实读 + `ob_tx_callback_list.h/cpp` **1400 行** 实读 + `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}` **376 行** 实读 + `ob_mvcc.h` ObITransCallback 关联 13+ 虚函数 lifecycle + `ob_mvcc_engine.cpp` callback lifecycle 集成），结合 #1 v2 + #2 v2 + #3 v2 系列经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---
 
 ## 0. 概述
 
-**这是 #4 系列的 v2 deep-dive 版**。原 #4（2026-08-02 17:18）写于约 30KB，包含 MVCC Callback 概要。**本 v2 版**实读了 `ob_tx_callback_functor.h`（**663 行 — mvcc/ 目录最大单文件**）+ `ob_tx_callback_list.h/cpp`（**1400 行**）+ `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}`（376 行），基于 #1 v2（ObITransCallback 13+ 虚函数 lifecycle）+ #2 v2（MVCC Iterator 多版本可见性）+ #3 v2（写写冲突）三篇 deep-dive，进一步深入 MVCC Callback 完整 lifecycle 实现。
+**这是 #4 系列的 v2 deep-dive 版**。原 #4（2026-08-02 17:18）写于约 30KB，包含 MVCC Callback 概要。**本 v2 版**实读了 `ob_tx_callback_functor.h`（**663 行 — `src/storage/memtable/mvcc/` 目录最大单文件**）+ `ob_tx_callback_list.h/cpp`（**1400 行**）+ `ob_tx_callback_hash_holder_helper.{h/cpp/ipp}`（**376 行**），基于 #1 v2（ObITransCallback 13+ 虚函数 lifecycle）+ #2 v2（MVCC Iterator 多版本可见性）+ #3 v2（写写冲突）三篇 deep-dive，进一步深入 MVCC Callback 完整 lifecycle 实现。
 
 本文聚焦 8 个核心问题：
 
@@ -1010,7 +1010,7 @@ ob_tnode_remove / ob_lock_callback / ob_table_lock_callback
 实际:
   src/storage/memtable/mvcc/ob_tx_callback_functor.h  ✅（663 行，最大单文件）
   src/storage/memtable/mvcc/ob_tx_callback_list.h/cpp  ✅（1400 行）
-  src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.h/cpp/ipp  ✅
+  src/storage/memtable/mvcc/ob_tx_callback_hash_holder_helper.{h/cpp/ipp}  ✅
 ```
 
 ---
