@@ -1,6 +1,6 @@
 # 18 — 索引设计：局部/全局索引、IndexBack、Covering Index
 
-> 基于 OceanBase 主线源码
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---

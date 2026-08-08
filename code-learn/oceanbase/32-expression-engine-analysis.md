@@ -1,6 +1,6 @@
 # 32-expression-engine — 表达式引擎：ObExpr、表达式计算与求值框架
 
-> 基于 OceanBase 主线源码
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

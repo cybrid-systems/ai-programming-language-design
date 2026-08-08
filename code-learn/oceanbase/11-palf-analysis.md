@@ -1,6 +1,6 @@
 # 11 — PALF — OceanBase 的 Paxos-Structured Log Framework
 
-> 基于 OceanBase 主线源码
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
