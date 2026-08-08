@@ -9,7 +9,7 @@
 
 ## 0. 写在前面
 
-这是一场历时 50 篇的源码漫游。我们从磁盘最底层的 macro block 起步，穿过 MVCC 版本链、Memtable 哈希表、SSTable 编码格式、Paxos 日志复制、SQL 解析优化、PX 并行执行，一路走到网络层的 MySQL 协议处理。50 篇文章覆盖了 OceanBase 从硬件抽象到 SQL 运行时的完整软件栈。
+这是一场历时 50 篇的源码漫游。我们从磁盘最底层的 macro block 起步，穿过 MVCC 版本链、Memtable BTree 索引、SSTable 编码格式、Paxos 日志复制、SQL 解析优化、PX 并行执行，一路走到网络层的 MySQL 协议处理。50 篇文章覆盖了 OceanBase 从硬件抽象到 SQL 运行时的完整软件栈。
 
 本文不是新的源码分析。它是一张地图，一张整理了我们走过的所有路径、标注了每个模块的位置和关系的全景图。如果你只读一篇来理解 OceanBase 的整体架构，读这篇就够了。
 
