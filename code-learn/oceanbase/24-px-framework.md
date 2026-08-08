@@ -1,5 +1,7 @@
 # #24 v2 — PX Framework / 并行调度 (Parallel Execution 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #41 v2 Join Operators + #51 v2 Block Cache + #17 v2 Query Optimizer:前
 > 面讲了 "join 怎么算" 和 "cache 怎么管理"。本文聚焦 **"大查询怎么并行"**
 > ——OB 的 PX Framework (Parallel eXecution)。这是 OB 在 AP/OLAP 场景下甩开

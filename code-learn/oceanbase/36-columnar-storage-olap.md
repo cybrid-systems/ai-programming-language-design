@@ -1,5 +1,7 @@
 # #36 v2 — Columnar Storage / OLAP (列存 + 向量化执行 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #34 v2 Storage Engine Internals + #20 v2 Compaction + #17 v2 CBO:前面
 > 讲了 "SSTable 怎么排、compaction 怎么合并、CBO 怎么估算"。本文聚焦
 > **"OLAP 场景的数据怎么存、查询怎么算"** ——OB 的列存 + 向量化执行。这是

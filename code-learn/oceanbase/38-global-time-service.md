@@ -1,5 +1,7 @@
 # #38 v2 — Global Time Service (GTS 高精度分布式时间服务 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #22 v2 Clog / Redo Log + #26 v2 Primary / Standby / Failover + #11 v2 
 > Trans Service / Lock:前面讲了"日志怎么同步、HA 怎么切、事务版本号怎么分配"。
 > 本文聚焦 **"全局唯一单调递增的时间戳是怎么产生的"** ——OB 的 Global Time

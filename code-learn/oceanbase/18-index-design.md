@@ -1,5 +1,7 @@
 # #18 v2 — Index Design (Clustered + Secondary + Functional)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #14 v2 / #15 v2 / #16 v2：MemTable + ObKeyBTree + ObMvccHashIndex 三件套已经
 > 把"在内存里怎么排"讲清楚。#18 v2 把视角抬到"在 OB 整个表/查询系统里,索引
 > 是什么 / 怎么用 / 怎么维护 / 怎么被优化器选 / 怎么扛住 MVCC / 怎么支持表达式"。

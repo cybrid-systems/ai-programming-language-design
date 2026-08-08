@@ -1,5 +1,7 @@
 # #19 v2 — SQL Parser (Parser + Resolver + Type Check 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #17 v2 Query Optimizer + #21 v2 Schema / DDL:前面讲了 "CBO 怎么估算"
 > 和 "schema 怎么描述"。本文聚焦 **"SQL 文本怎么变成内部结构"** ——OB 的
 > SQL Parser。这是 query pipeline 的第一步,也是 DDL 的解析层。

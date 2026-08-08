@@ -1,5 +1,7 @@
 # #22 v2 — Clog / Redo Log (日志子系统 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #51 v2 Block Cache + #1-#5 v2 MVCC:前面讲了 "数据怎么放内存 / 怎么
 > 走 cache / 怎么排序"。本文聚焦 **"数据怎么保证不丢"** ——OB 的日志子系统
 > (Clog)。它是 OB 持久化的核心:**MemTable 里的所有修改,必须先落 Clog,

@@ -1,5 +1,7 @@
 # #51 v2 — Block Cache (micro_block + bloom_filter + Row Cache 完整架构)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #14 v2 / #15 v2 / #16 v2 / #18 v2 / #41 v2：前面把"MemTable 怎么排"、
 > "BTree 怎么查"、"索引怎么用"、"join 怎么算"都讲了。本文聚焦 **block cache
 > 层** ——它是 MemTable flush 到 SSTable 之后的 **hot path 缓存**,决定了"冷数

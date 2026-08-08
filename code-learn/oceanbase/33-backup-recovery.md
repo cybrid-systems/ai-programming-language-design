@@ -1,5 +1,7 @@
 # #33 v2 — Backup / Recovery (备份 + 恢复 + PIT 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #22 v2 Clog + #26 v2 Failover:前面讲了 "日志怎么落盘、主备怎么切"。
 > 本文聚焦 **"数据丢了怎么救、历史 snapshot 怎么存、PIT 怎么恢复"** ——OB
 > 的备份与恢复子系统。这是 OB 容灾链的最后一环。

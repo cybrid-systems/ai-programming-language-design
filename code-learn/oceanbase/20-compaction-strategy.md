@@ -1,5 +1,7 @@
 # #20 v2 — Compaction Strategy (Minor Freeze / Major Freeze / SSTable Merge 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #14 v2 MemTable Internals + #22 v2 Clog / Redo Log + #51 v2 Block Cache:
 > 前面讲了 "MemTable 怎么排、Clog 怎么写、cache 怎么管"。本文聚焦 **"MemTable
 > 怎么落盘、旧 SSTable 怎么合并、major freeze 怎么触发"** ——OB 的 compaction

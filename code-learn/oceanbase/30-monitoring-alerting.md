@@ -1,5 +1,7 @@
 # #30 v2 — Monitoring / Alerting (Metrics + ASH + Alert 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #29 v2 Slow Query + #11 v2 Trans Service / Lock + #22 v2 Clog:前面讲
 > 了"慢查询怎么捕获、事务怎么运行、日志怎么落盘"。本文聚焦 **"这些怎么可
 > 观测、出了问题怎么报警"** ——OB 的监控告警体系。这是 OB 运维的眼睛。

@@ -1,5 +1,7 @@
 # #26 v2 — Primary / Standby / Failover (主备 + 自动切换 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #22 v2 Clog / Redo Log:前面讲了 "Clog 怎么写、备机怎么 sync、heartbeat
 > 怎么发"。本文聚焦 **"主挂了怎么切、备怎么提主、数据怎么不丢"** ——OB 的主
 > 备切换（HA / Failover）。这是 OB 高可用的核心。

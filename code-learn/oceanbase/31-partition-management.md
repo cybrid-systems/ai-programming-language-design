@@ -1,5 +1,7 @@
 # #31 v2 — Partition Management / Rebalance / Migration (分区管理 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #26 v2 Primary / Standby / Failover + #28 v2 Resource / Unit / Tenant +
 > #24 v2 PX Framework:前面讲了"主备怎么切、租户怎么隔离、并行怎么调度"。本文
 > 聚焦 **"数据怎么从一个 OBServer 搬到另一个、负载怎么均衡"** ——OB 的分区管

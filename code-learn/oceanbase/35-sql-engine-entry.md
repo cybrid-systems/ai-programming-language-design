@@ -1,5 +1,7 @@
 # #35 v2 — SQL Engine Entry (SQL 引擎入口 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #19 v2 SQL Parser + #24 v2 PX Framework + #28 v2 Resource / Unit / 
 > Tenant + #27 v2 RPC / obrpc:前面讲了"SQL 怎么解析、query 怎么并行、租户
 > 怎么隔离、RPC 怎么发"。本文聚焦 **"SQL 文本进入 OB 后,从连接接收到执行器派

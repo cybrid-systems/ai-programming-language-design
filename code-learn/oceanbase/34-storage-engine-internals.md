@@ -1,5 +1,7 @@
 # #34 v2 — Storage Engine Internals (SSTable / macro_block / micro_block 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #51 v2 Block Cache + #20 v2 Compaction Strategy + #22 v2 Clog / Redo Log:
 > 前面讲了 "cache 怎么命中、compact 怎么合并、日志怎么落盘"。本文聚焦 **"数
 > 据在磁盘上到底长什么样"** ——OB 的存储引擎内部细节:SSTable 的三层结构、

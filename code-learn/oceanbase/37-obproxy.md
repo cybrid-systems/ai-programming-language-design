@@ -1,5 +1,7 @@
 # #37 v2 — OBProxy (Proxy 层深度实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 接续 #35 v2 SQL Engine Entry + #27 v2 RPC / obrpc + #28 v2 Resource / Unit /
 > Tenant:前面讲了"SQL 引擎入口怎么接收、跨 OBServer RPC 怎么发、租户怎么隔
 > 离"。本文聚焦 **"Client 到 OBServer 中间的代理层"** ——OBProxy。OBProxy 是
