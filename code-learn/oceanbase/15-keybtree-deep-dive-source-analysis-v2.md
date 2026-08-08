@@ -42,9 +42,9 @@ src/storage/memtable/ob_memtable.h:
 
 | 索引 | 适用场景 | 性能 | 范围查询 |
 |------|----------|------|----------|
-| **ObMvccHashIndex** | 点查（精确匹配） | 快（O(1)） | 弱（不友好） |
-| **ObKeyBtree** | 范围查询（< / > / >= / <=） | 较慢 | **强（友好）** |
-| **ObClusterIndex** | 主键聚簇（数据按主键排） | 中（顺序扫描快） | **最强（连续）** |
+| ~~**ObMvccHashIndex**~~ | ~~点查（精确匹配）~~ | ~~快（O(1)）~~ | **5.0.2.0 REMOVE** (`FALSE_IT` in `ob_memtable.cpp:164`) |
+| **ObKeyBtree** | 范围查询（< / > / >= / <=） | 较慢 | **强（友好）** — 5.0.2.0 唯一 MemTable 索引 |
+| ~~**ObClusterIndex**~~ | ~~主键聚簇~~ | ~~中~~ | **待 verify** (在 `mvcc/` dir 也无,可能同 hash 一起 REMOVE) |
 
 ---
 
@@ -244,9 +244,9 @@ private:
 
 | 索引 | 文件 | 适用场景 | 性能 | 范围查询 | 聚簇 |
 |------|------|----------|------|----------|------|
-| **ObMvccHashIndex** | `ob_mvcc_hash_index.{h,cpp}` | 点查（精确匹配） | 快（O(1)） | 弱 | 否 |
-| **ObKeyBtree** | `ob_keybtree.{h,cpp}` | 范围查询（< / > / >= / <=） | 较慢（O(log n)） | **强** | 否 |
-| **ObClusterIndex** | `ob_mvcc_cluster_index.{h,cpp}` | 主键聚簇 | 中（顺序扫描快） | **最强** | **是** |
+| ~~**ObMvccHashIndex**~~ | ~~`ob_mvcc_hash_index.{h,cpp}`~~ | ~~点查~~ | ~~快 (O(1))~~ | **5.0.2.0 REMOVE** |
+| **ObKeyBtree** | `ob_keybtree.{h,cpp}` | 范围查询（< / > / >= / <=） | 较慢（O(log n)） | **强** | 否 | 5.0.2.0 唯一索引 |
+| ~~**ObClusterIndex**~~ | ~~`ob_mvcc_cluster_index.{h,cpp}`~~ | ~~主键聚簇~~ | ~~中~~ | ~~**最强**~~ | **待 verify** |
 
 ### 4.3 索引选择
 

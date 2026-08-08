@@ -233,7 +233,7 @@ private:
 | `is_frozen_` | 是否已冻结 |
 | `mvcc_engine_` | MVCC 引擎（参见 #2 v2 / #4 v2 / #5 v2） |
 | `query_engine_` | 查询引擎 |
-| `hash_index_` / `key_btree_` / `cluster_index_` | 三种索引实现 |
+| `key_btree_` (唯一 MemTable 索引) + `query_engine_` | **5.0.2.0 仅 BTree 单索引** (hash_index 已 REMOVE) |
 | `trans_node_allocator_` | TxNode 分配器 |
 | `iterator_factory_` | 多版本迭代器工厂 |
 | `version_` | MemTable 版本 |
@@ -254,9 +254,12 @@ bool is_ready_for_flush() const;
 
 ```cpp
 // 三种索引实现
-memtable::ObMvccHashIndex *hash_index_;     // Hash 索引
-memtable::ObKeyBtree *key_btree_;          // BTree 索引
-memtable::ObClusterIndex *cluster_index_;  // Cluster 索引
+// 5.0.2.0 实际架构 (per `ob_memtable.h` 实读):
+//   memtable::ObKeyBtree *key_btree_;       // BTree 索引 (唯一)
+//   ObQueryEngine *query_engine_;           // 查询引擎 (含 use_hash_index_ flag but FALSE_IT)
+// 旧 claim (5.0.2.0 之前):
+//   memtable::ObMvccHashIndex *hash_index_;     // REMOVED in 5.0.2.0
+//   memtable::ObClusterIndex *cluster_index_;  // 待 verify (可能 REMOVED too)
 ```
 
 ---
@@ -432,9 +435,9 @@ public:
 
 | 索引 | 文件 | 适用场景 |
 |------|------|----------|
-| **Hash Index** | `ob_mvcc_hash_index.{h,cpp}` | 高频点查（精确匹配） |
-| **BTree Index** | `ob_mvcc_keybtree.{h,cpp}` | 范围扫描（< / > / >= / <=） |
-| **Cluster Index** | `ob_mvcc_cluster_index.{h,cpp}` | 主键聚簇（数据按主键排序） |
+| ~~**Hash Index**~~ | ~~`ob_mvcc_hash_index.{h,cpp}`~~ | **5.0.2.0 REMOVE** (`FALSE_IT` dead code in `ob_memtable.cpp:164`) |
+| **BTree Index** | `ob_keybtree.{h,cpp}` | 范围扫描（< / > / >= / <=） + MemTable 唯一索引 |
+| ~~**Cluster Index**~~ | ~~`ob_mvcc_cluster_index.{h,cpp}`~~ | **待 verify** (在 5.0.2.0 `mvcc/` dir 也没看到,可能同 hash 一起 REMOVE 或重命名) |
 
 ### 7.2 性能优化要点
 

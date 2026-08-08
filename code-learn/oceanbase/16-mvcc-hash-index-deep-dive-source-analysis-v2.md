@@ -1,5 +1,7 @@
 # 16-mvcc-hash-index-deep-dive — OceanBase MemTable Hash Index 完整实读（基于实读源码 v2）
 
+> ⚠️ **架构演进 NOTE (2026-08-08, OB 5.0.2.0 实读)**：`ObMvccHashIndex` 类在 OB 5.0.2.0 已 **REMOVE** — `ob_memtable.cpp` line 164-165 用 `FALSE_IT(use_hash_index)` 设为 dead code,只 construct `ObMvccEngineWithoutHashIndex`。MemTable 级 hash index **已 architectural 移除**,Hash index 功能仅保留在 SSTable 级 (`src/storage/blocksstable/ob_micro_block_hash_index.{h,cpp}`)。本文档基于早期 OB 版本 (含 `ObMvccHashIndex` 三种索引实现),在 5.0.2.0 仅作 historical context — 实际架构用 `ObKeyBTree` 单索引 (`ObMvccEngineWithoutHashIndex`)。
+
 > 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/ob_mvcc_hash_index.{h,cpp}` + `src/storage/memtable/mvcc/ob_multi_version_iterator.{h,cpp}` + `src/storage/memtable/mvcc/ob_mvcc_hash_node.h` + `src/storage/memtable/mvcc/ob_mvcc_keybtree.h` 实读 + 与 #1-#15 v2 deep-dive 完整对比）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
