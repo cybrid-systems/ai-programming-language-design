@@ -1,5 +1,7 @@
 # #11 v2 — Trans Service / Lock Manager (事务子系统 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+
 > 接续 #1-#5 v2 MVCC + #22 v2 Clog:前面讲了 "每个 row 怎么管理版本"、"日志
 > 怎么落盘"。本文聚焦 **"事务怎么跨 row / 跨 partition / 跨 OBServer 协调"**
 > ——Trans Service 和 Lock Manager。这是 OB 分布式一致性的核心。

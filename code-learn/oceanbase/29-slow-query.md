@@ -1,5 +1,7 @@
 # #29 v2 — Slow Query (捕获 + 分析 + 索引推荐 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+
 > 接续 #17 v2 Query Optimizer + #51 v2 Block Cache:前面讲了 CBO 怎么估算、cache
 > 怎么管理。本文聚焦 **生产环境的"为什么慢"+ 怎么定位 + 怎么修** —— slow
 > query 的捕获机制、分析工具、推荐系统。这是 OB 把"理论 CBO" 变成"运维可

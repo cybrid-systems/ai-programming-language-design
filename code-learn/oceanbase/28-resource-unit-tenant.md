@@ -1,5 +1,7 @@
 # #28 v2 — Resource / Unit / Tenant (多租户隔离架构 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+
 > 接续 #11 v2 Trans Service / Lock + #21 v2 Schema / DDL + #24 v2 PX Framework:前
 > 面讲了"事务怎么跨 partition / schema 怎么描述 / query 怎么并行"。本文聚
 > 焦 **"多租户怎么隔离、Unit 怎么分配、资源怎么调度"** ——OB 的多租户架构。

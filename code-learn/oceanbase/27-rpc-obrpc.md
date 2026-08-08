@@ -1,5 +1,7 @@
 # #27 v2 — RPC / obrpc (跨 OBServer 通信 完整实读)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+
 > 接续 #11 v2 Trans Service / Lock + #22 v2 Clog + #26 v2 Primary / Standby:
 > 前面讲了"事务怎么跨 partition、日志怎么同步、主备怎么切"。本文聚焦 **"跨
 > OBServer 调用是怎么实现的"** ——OB 的 RPC 框架 obrpc。这是分布式协调的底

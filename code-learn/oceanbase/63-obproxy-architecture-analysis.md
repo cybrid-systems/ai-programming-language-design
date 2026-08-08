@@ -1,5 +1,7 @@
 # 63-obproxy — OBProxy 架构深度源码分析：MySQL 协议网关、连接池、LDC 路由、二阶段提交优化
 
+> 基于 OceanBase 5.0.2.0 主线源码
+
 > 基于 OceanBase 公开架构文档（`docs/docs/zh/architecture.md`）+ OB 已有 60 篇源码分析的交叉引用 + OBProxy 4.x 公开架构资料
 > **本文为架构综述** —— OBProxy 源码为独立仓库（`oceanbase-proxy`），未在当前 workspace 中，因此**未提供 file:line 级 doom-lsp 确认引用**；但关键设计点、模块定位、与主仓模块的接口边界均明确标注
 > 与 #62 cdcservice 形成 "集群入口 → 出口" 的完整 OB 链路图

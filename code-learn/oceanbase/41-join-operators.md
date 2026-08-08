@@ -1,5 +1,7 @@
 # #41 v2 — Join Operators (NL / Hash / Merge Join 完整实现)
 
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+
 > 接续 #17 v2 Query Optimizer：上一文讲了 CBO 怎么**估算**三种 join 的 cost 、
 > 怎么在三者之间**选择**。本文下沉一层,讲三种 join 的**实现细节**:
 > 内存布局、probe/build 时机、spill to disk 路径、runtime filter 接入、
