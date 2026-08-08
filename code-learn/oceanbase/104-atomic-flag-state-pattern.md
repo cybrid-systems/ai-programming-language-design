@@ -113,7 +113,7 @@ bool has_set_stop() const {
 | `deps/oblib/src/lib/thread/thread_mgr_interface.h` | `stop_` |
 | `src/rootserver/ddl_task/ob_ddl_scheduler.h` | `stop_` |
 | `src/rootserver/ob_rs_reentrant_thread.h` | `stop_` |
-| `src/storage/tx/ob_lock_wait_mgr.cpp` | `stop_repost_node_` / `stop_request_retry_` |
+| `src/storage/lock_wait_mgr/ob_lock_wait_mgr.cpp` | `stop_repost_node_` / `stop_request_retry_` |
 
 **pattern**:
 1. 外部线程调 `stop()` → `ATOMIC_STORE(&stop_, true)`
