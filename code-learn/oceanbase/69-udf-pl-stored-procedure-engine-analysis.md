@@ -271,7 +271,7 @@ UDF 在 observer 进程内执行（共享库方式），存在 **安全风险**�
 ### 3.5 UDF 源码位置
 
 **注**：我之前在 #60 提到的 `src/share/udf/` 路径 **不存在**。实际 UDF 基础设施在：
-- 共享库加载：`src/sql/engine/expr/ob_expr_udf.cpp/h`（推测）
+- 共享库加载：`src/sql/engine/expr/ob_expr_udf/ob_expr_udf.cpp/h`（推测）
 - 注册表：可能嵌在 schema service 或 SQL service 中
 
 需要在 OB 主仓进一步 grep 才能找到精确路径。**本文先标记 caveat**。
