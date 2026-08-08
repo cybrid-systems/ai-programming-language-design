@@ -1,5 +1,7 @@
 # ObLogger 日志系统 — 日志框架、异步落盘、诊断
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 ## 一、概述
 
 OceanBase 的日志系统（`ObLogger`）是一套完整的、高性能的日志基础设施，位于 `deps/oblib/src/lib/oblog/` 目录下，共 26 个源文件。它不仅承担着传统日志的角色，还深度参与了在线诊断（Trace、Probe）、审计（DBA Event、Security Audit）、限流熔断等场景。

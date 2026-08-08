@@ -1,5 +1,7 @@
 # 04 — 事务提交回调链与 Paxos 日志同步的协同
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 ## 概述
 
 OceanBase 的分布式事务提交机制中，一个关键设计问题是：**memtable 中的多版本数据（`ObMvccTransNode`）何时、如何感知到事务的最终决策（commit/abort），以及如何与底层的 Paxos 日志复制协同**。

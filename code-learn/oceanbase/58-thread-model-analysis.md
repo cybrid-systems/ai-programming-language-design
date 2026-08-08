@@ -1,5 +1,7 @@
 # 线程模型与线程池 — ThreadPool、工作队列、线程管理
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 ## 目录
 
 1. [概述](#1-概述)

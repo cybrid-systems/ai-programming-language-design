@@ -1,5 +1,7 @@
 # 42 — 排序与窗口函数：Sort Op、Window Function Op
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 ## 概述
 
 排序（Sort）和窗口函数（Window Function）是 SQL 执行引擎中紧密关联的两大算子。排序为窗口函数提供有序的数据基础，而窗口函数在此基础上完成分区内排名、聚合、偏移访问等分析型计算。
