@@ -1,5 +1,7 @@
 # §57 配置管理 ObConfig — 配置中心、动态变更、热加载
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 分析日期：2026-05-03  
 > 源码路径：`src/share/config/`（18 个文件）  
 > 核心文件：`ob_config.h`、`ob_config_manager.h`、`ob_reload_config.h`、`ob_server_config.h`、`ob_common_config.h`、`ob_system_config.h`

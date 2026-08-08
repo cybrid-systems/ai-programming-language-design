@@ -1,5 +1,7 @@
 # 35. Macro Block 生命周期 — 分配、GC、回收
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 深入 OceanBase Macro Block 的完整生命周期：从磁盘分配、引用计数管理，到 Mark-and-Sweep 垃圾回收、坏块检测，以及文件的自动扩展。
 
 ---

@@ -1,5 +1,7 @@
 # 查询优化器 — 执行计划生成与代价估算
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 分析日期：2026-05-03
 > 分析目标：OceanBase 查询优化器（Query Optimizer）
 > 源码位置：`src/sql/optimizer/`

@@ -1,5 +1,7 @@
 # Schema 与数据字典 — 元数据管理、Schema 版本
 
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 深度分析 OceanBase Schema 子系统：元数据管理体系、多版本 Schema 架构、线程安全访问模式与 SQL 执行集成
 
 ## 目录

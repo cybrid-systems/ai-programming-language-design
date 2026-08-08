@@ -1,5 +1,7 @@
 # GTS & 时间模型 — 全局时间戳与分布式授时
 
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > 分析版本：OceanBase CE 4.x  
 > 分析工具：doom-lsp + 源码阅读
 

@@ -1,5 +1,7 @@
 # 52 — ObBloomFilter 实现：构建、合并、SIMD 加速、自适应
 
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > OceanBase CE 源码深度分析系列
 > 主题：Bloom Filter 在两个场景中的实现 — 存储层的宏块过滤与 PX 层的 Join Filter
 

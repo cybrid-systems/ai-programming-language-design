@@ -1,5 +1,7 @@
 # 51 — Block Cache 体系：Row Cache、Bloom Filter Cache、Cache Suite
 
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
+
 > OceanBase CE 源码深度分析系列
 > 主题：多级存储缓存体系 — 从 Row Cache 到 Bloom Filter Cache，再到 Cache Suite 的全局协调
 
