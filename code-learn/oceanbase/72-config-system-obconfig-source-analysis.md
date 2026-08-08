@@ -736,7 +736,7 @@ OB 的配置中心是 **运行时可调优**的核心：
 
 按之前梳理的顺序，下一篇应该是 **#73 Logger / 日志框架**：
 
-OB 的统一日志系统 —— ObLogger / 异步落盘 / 日志格式 / 诊断。源码入口：`src/share/logger/` + `src/share/log/` + `src/common/log/`。
+OB 的统一日志系统 —— ObLogger / 异步落盘 / 日志格式 / 诊断。源码入口：`src/share/logger/` + `src/share/log/` + `deps/oblib/src/common/log/`。
 
 适用场景：日常运维 / 故障诊断 / 性能分析。
 

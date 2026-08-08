@@ -540,7 +540,7 @@ public:
 ### 8.2 Async IO(异步 IO)
 
 ```cpp
-// src/lib/io/ob_io_uring.cpp:50
+// deps/oblib/src/lib/io/ob_io_uring.cpp:50
 // io_uring:异步 IO(接 #27 RPC 的网络层)
 // 但磁盘 IO 也用 io_uring
 
@@ -798,7 +798,7 @@ v2 → #20 v2 → #27 v2 → #30 v2 → #31 v2 → **#34 v2 (本文)** 是 OB **
 - `src/storage/blocksstable/ob_prefetcher.cpp` — 预读
 - `src/storage/blocksstable/ob_sstable_handle.h` — SSTable Handle
 - `src/storage/ob_tablet.cpp` — Tablet 注册 SSTable
-- `src/lib/io/ob_io_uring.cpp` — 异步 IO
+- `deps/oblib/src/lib/io/ob_io_uring.cpp` — 异步 IO
 
 ---
 

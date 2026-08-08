@@ -75,7 +75,7 @@ src/sql/session/ob_sql_session_info.h            # SQL session thread state
 
 ### 1.2 路径修正（来自 #60）
 
-我之前在 #60 提到的 `src/share/thread_pool/` + `src/lib/thread/` + `src/lib/ob_thread/` **都不存在**。真实位置：
+我之前在 #60 提到的 `src/share/thread_pool/` + `deps/oblib/src/lib/thread/` + `deps/oblib/src/lib/ob_thread/` **都不存在**。真实位置：
 - OB 的 `lib/` 在 deps submodule (`deps/oblib/src/lib/thread/`) — 不是 OB 主仓
 - `src/share/ob_thread_pool.h` 仅 typedef（指向 `lib::Threads`）
 - reentrant thread / thread helper 在 `src/rootserver/`
@@ -642,7 +642,7 @@ OB 的线程模型是 **per-tenant TG + RPC pool + Reentrant + idle/checker** �
 
 ### 13.5 路径修正（来自 #60）
 
-我之前在 #60 提到的 `src/share/thread_pool/` + `src/lib/thread/` + `src/lib/ob_thread/` **都不存在**。真实位置：
+我之前在 #60 提到的 `src/share/thread_pool/` + `deps/oblib/src/lib/thread/` + `deps/oblib/src/lib/ob_thread/` **都不存在**。真实位置：
 - OB 的 `lib/` 在 deps submodule (`deps/oblib/src/lib/thread/`)
 - `src/share/ob_thread_pool.h` 是 typedef
 - Reentrant Thread / Thread helper 在 `src/rootserver/`
@@ -652,7 +652,7 @@ OB 的线程模型是 **per-tenant TG + RPC pool + Reentrant + idle/checker** �
 
 按之前梳理的顺序，下一篇应该是 **#75 Latch 系统 / 锁机制**：
 
-OB 的锁体系 —— RWLock / Futex / 自旋锁 / 多类互斥原语。源码入口：`src/share/latch/` + `src/lib/latch/`（推测）+ `src/share/utility/`。
+OB 的锁体系 —— RWLock / Futex / 自旋锁 / 多类互斥原语。源码入口：`src/share/latch/` + `deps/oblib/src/lib/latch/`（推测）+ `src/share/utility/`。
 
 适用场景：性能调优 / 死锁排查 / 高并发优化。
 

@@ -479,7 +479,7 @@ DTL（Data Transfer Layer）—— PX 节点间数据交换：
 | Schema Cache | `src/share/schema/ob_schema_cache.h` | `src/storage/schema/` ❌ |
 | 阻塞 | `src/observer/ob_rpc_processor_simple.{h,cpp}` | `src/sql/rpc/` ❌ |
 | 监控器 | `src/observer/ob_rpc_reverse_keepalive.{h,cpp}` | `src/sql/net/` ❌ |
-| 串行化 | `src/share/ob_rpc_struct.{h,cpp}` | `src/lib/serialization/` ❌ |
+| 串行化 | `src/share/ob_rpc_struct.{h,cpp}` | `deps/oblib/src/lib/serialization/` ❌ |
 | Compaction | `src/storage/compaction/` (108) | `src/share/compaction/` ❌ |
 | DDL 物理 | `src/storage/ddl/` (151) | `src/sql/ddl/` ❌ |
 | Index | `src/storage/blocksstable/index_block/` (38) | `src/share/index_builder/` ❌ |
@@ -488,18 +488,18 @@ DTL（Data Transfer Layer）—— PX 节点间数据交换：
 | Config | `src/share/config/ob_*.{h,cpp}` | `src/config/` ❌ |
 | Executor | `src/sql/executor/` (79) | `src/sql/runtime/` ❌ |
 | MemTable | `src/storage/memtable/` (37) | `src/memtable/` ❌ |
-| 日志 | `deps/3rdparty/easy/` | `src/lib/log/` ❌ |
+| 日志 | `deps/3rdparty/easy/` | `deps/oblib/src/lib/log/` ❌ |
 | 调度 | `src/share/scheduler/` (7) | `src/share/dag/` ❌ |
 | 单元 | `src/share/unit/ob_unit_resource.h` | `src/storage/unit/` ❌ |
-| 序列化 | `src/share/ob_rpc_struct.{h,cpp}` | `src/lib/serialization/` ❌ |
+| 序列化 | `src/share/ob_rpc_struct.{h,cpp}` | `deps/oblib/src/lib/serialization/` ❌ |
 | 路由 | `src/observer/ob_mysql_request_manager.{h,cpp}` | `src/sql/net/` ❌ |
 | DTL | `src/sql/executor/ob_dtl_*.h` | `src/share/dtl/` ❌ |
-| KV | `src/share/cache/ob_kv_*.h` | `src/lib/kv/` ❌ |
+| KV | `src/share/cache/ob_kv_*.h` | `deps/oblib/src/lib/kv/` ❌ |
 | 触发器 | `src/pl/ob_pl_*.h` | `src/share/trigger/` ❌ |
 | 物化视图 | `src/sql/optimizer/ob_log_plan.h` | `src/share/materialized/` ❌ |
 | 路由 | `src/share/location_cache/ob_*.h` | `src/sql/route/` ❌ |
 | 锁 | `src/storage/memtable/ob_concurrent_control.{h,cpp}` | `src/share/latch/` ❌ |
-| 锁 | `deps/3rdparty/easy/src/util/` | `src/lib/lock/` ❌ |
+| 锁 | `deps/3rdparty/easy/src/util/` | `deps/oblib/src/lib/lock/` ❌ |
 | 线程 | `src/share/scheduler/` + `src/storage/omt/` | `src/share/thread/` ❌ |
 | RPC | `src/observer/ob_rpc_*.h` + `src/share/ob_rpc_*.h` | `src/rpc/` ❌ |
 | 元数据 | `src/share/schema/ob_schema_struct.h` | `src/share/metadata/` ❌ |
@@ -517,7 +517,7 @@ DTL（Data Transfer Layer）—— PX 节点间数据交换：
 | 反向 | `src/observer/ob_sync_plan_driver.h` | `src/sql/plan_sync/` ❌ |
 | 列存 | `src/storage/blocksstable/encoding/` (30+) | `src/columnar/` ❌ |
 | MemTable | `src/storage/memtable/` (37) | `src/sql/memtable/` ❌ |
-| Cache | `src/share/cache/ob_cache_name_define.h` | `src/lib/cache/` ❌ |
+| Cache | `src/share/cache/ob_cache_name_define.h` | `deps/oblib/src/lib/cache/` ❌ |
 | 物化 | `src/share/cache/ob_vtable_event_recycle_buffer.h` | `src/share/buffer/` ❌ |
 | 资源 | `src/observer/omt/ob_multi_tenant.h` | `src/sql/tenant/` ❌ |
 | Session | `src/share/system_variable/ob_system_variable_factory.h` | `src/sql/session/` ❌ |
@@ -688,7 +688,7 @@ DTL（Data Transfer Layer）—— PX 节点间数据交换：
 | Config | `src/share/config/ob_*.{h,cpp}` | `src/config/` ❌ |
 | Executor | `src/sql/executor/` (79) | `src/sql/runtime/` ❌ |
 | MemTable | `src/storage/memtable/` (37) | `src/memtable/` ❌ |
-| 日志 | `deps/3rdparty/easy/` | `src/lib/log/` ❌ |
+| 日志 | `deps/3rdparty/easy/` | `deps/oblib/src/lib/log/` ❌ |
 | 调度 | `src/share/scheduler/` (7) | `src/share/dag/` ❌ |
 | Backup | `src/storage/backup/` (74) | `src/share/backup/` ❌ |
 | Freeze | `src/rootserver/freeze/` (34) | `src/sql/freeze/` ❌ |

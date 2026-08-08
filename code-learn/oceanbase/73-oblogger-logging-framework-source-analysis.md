@@ -1,6 +1,6 @@
 # 73-oblogger — OceanBase 日志框架 ObLogger / 诊断系统深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（LOG_ 宏定义在 `src/share/ob_define.h`，logger 类散落 storage/slog/ + logservice/logminer/ + diagnose/ + src/common/log/ + 其他位置）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（LOG_ 宏定义在 `src/share/ob_define.h`，logger 类散落 storage/slog/ + logservice/logminer/ + diagnose/ + deps/oblib/src/common/log/ + 其他位置）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---
@@ -80,7 +80,7 @@ src/sql/engine/cmd/ob_load_data_direct_impl.h        # Direct Load 日志
 
 ### 1.2 路径修正（来自 #60）
 
-我之前在 #60 提到的 `src/share/logger/` + `src/common/log/` + `src/share/log/` + `src/lib/log/` **都不存在**。OB 日志系统是 **嵌入式**实现：
+我之前在 #60 提到的 `src/share/logger/` + `deps/oblib/src/common/log/` + `src/share/log/` + `deps/oblib/src/lib/log/` **都不存在**。OB 日志系统是 **嵌入式**实现：
 - LOG_ 宏 → `src/share/ob_define.h`
 - Logger 类 → 散落在 storage/ / logservice/ / sql/ / observer/ 各模块
 
@@ -627,7 +627,7 @@ OB 日志框架是 **诊断 + 监控 + 审计**的统一基础：
 
 ### 13.5 路径修正（来自 #60）
 
-我之前在 #60 提到的 `src/share/logger/` + `src/common/log/` + `src/share/log/` + `src/lib/log/` **都不存在**。OB 日志系统是嵌入式实现：
+我之前在 #60 提到的 `src/share/logger/` + `deps/oblib/src/common/log/` + `src/share/log/` + `deps/oblib/src/lib/log/` **都不存在**。OB 日志系统是嵌入式实现：
 - LOG_ 宏 → `src/share/ob_define.h`
 - Logger 类 → 散落各模块
 

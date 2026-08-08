@@ -71,7 +71,7 @@ ob_index_block_row_scanner.{h,cpp}            # row scanner
 不存在路径 (按 #82-#93 路径修正继续):
   src/share/index_builder/  ← 不存在
   src/index_builder/         ← 不存在
-  src/lib/index_builder/     ← 不存在
+  deps/oblib/src/lib/index_builder/     ← 不存在
 ```
 
 ### 1.3 5 层架构

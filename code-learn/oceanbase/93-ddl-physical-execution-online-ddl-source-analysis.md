@@ -100,7 +100,7 @@ src/rootserver/
 不存在路径 (按 #82-#92 路径修正继续):
   src/sql/ddl/  ← 不存在（我之前 #60 提的路径错）
   src/ddl/      ← 不存在
-  src/lib/ddl/  ← 不存在
+  deps/oblib/src/lib/ddl/  ← 不存在
 ```
 
 ### 1.3 5 层架构

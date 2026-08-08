@@ -70,9 +70,9 @@ src/storage/lock_wait_mgr/ob_lock_wait_mgr_rpc.h      # RPC proxy
 
 ### 1.2 路径修正（来自 #60）
 
-我之前在 #60 提到的 `src/share/latch/` + `src/lib/latch/`（推测）+ `src/share/utility/` **都不完全正确**：
+我之前在 #60 提到的 `src/share/latch/` + `deps/oblib/src/lib/latch/`（推测）+ `src/share/utility/` **都不完全正确**：
 - `src/share/latch/` → 不存在
-- `src/lib/latch/` → 不在 src/ 下，在 deps submodule (`deps/oblib/src/lib/lock/`)
+- `deps/oblib/src/lib/latch/` → 不在 src/ 下，在 deps submodule (`deps/oblib/src/lib/lock/`)
 - `src/share/utility/` → 存在但不是 latch 主入口
 
 真实路径：`deps/oblib/src/lib/lock/ob_latch.{h,cpp}` + `deps/oblib/src/lib/alloc/ob_latch_v2.{h,cpp}`
@@ -635,9 +635,9 @@ Latch 是 **observer 进程内所有并发数据结构的基础同步原语**：
 
 ### 11.4 路径修正（来自 #60）
 
-我之前在 #60 提到的 `src/share/latch/` + `src/lib/latch/`（推测）+ `src/share/utility/` **都不完全正确**：
+我之前在 #60 提到的 `src/share/latch/` + `deps/oblib/src/lib/latch/`（推测）+ `src/share/utility/` **都不完全正确**：
 - `src/share/latch/` → 不存在
-- `src/lib/latch/` → 不在 src/，在 deps submodule
+- `deps/oblib/src/lib/latch/` → 不在 src/，在 deps submodule
 - 真实：OB 的 `lib/` 在 `deps/oblib/src/lib/lock/`
 
 ### 11.5 推荐下一步

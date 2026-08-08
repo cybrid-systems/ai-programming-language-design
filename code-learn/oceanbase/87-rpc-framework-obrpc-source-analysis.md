@@ -74,7 +74,7 @@ deps/3rdparty/easy/                              # easy RPC 库（OB 自研 RPC 
 
 不存在路径 (按 #82-#86 路径修正继续):
   src/rpc/                ← 不存在
-  src/lib/rpc/            ← 不存在
+  deps/oblib/src/lib/rpc/            ← 不存在
   src/share/rpc/          ← 不存在（实际是 ob_rpc_* 前缀）
 ```
 
@@ -536,7 +536,7 @@ RPC 框架是 **OB 跨进程通信的基础**：
 
 不存在路径:
   src/rpc/  ← 不存在（散落多处）
-  src/lib/rpc/  ← 不存在
+  deps/oblib/src/lib/rpc/  ← 不存在
   src/share/rpc/  ← 不存在
 ```
 

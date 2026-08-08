@@ -148,7 +148,7 @@ enum ObRpcCode {
 ### 2.4 序列化(FlatBuffers-like)
 
 ```cpp
-// src/lib/utility/ob_serialization.h:50
+// deps/oblib/src/lib/utility/ob_serialization.h:50
 // obrpc 用自研序列化框架(避免 protobuf 的反射开销)
 // 类 FlatBuffers:零拷贝
 
@@ -331,7 +331,7 @@ public:
 ### 5.1 Linux epoll
 
 ```cpp
-// src/lib/io/ob_epoll.cpp:80
+// deps/oblib/src/lib/io/ob_epoll.cpp:80
 class ObEpoll {
 public:
   // 1. epoll_create + 注册 socket
@@ -353,7 +353,7 @@ public:
 ### 5.2 io_uring(Linux 5.1+,OB 5.x)
 
 ```cpp
-// src/lib/io/ob_io_uring.cpp:50
+// deps/oblib/src/lib/io/ob_io_uring.cpp:50
 // io_uring 比 epoll 更高效(系统调用更少,内核旁路)
 class ObIoUring {
 public:
@@ -663,9 +663,9 @@ cache / 调优 / 日志 / 事务 / schema / 并行 / HA / 容灾 / 多租户 / p
 - `src/rpc/obrpc/ob_rpc_throttle.cpp` — 限流
 - `src/rpc/obrpc/ob_rpc_compress.cpp` — 压缩
 - `src/rpc/obrpc/ob_rpc_batch.cpp` — 批量
-- `src/lib/utility/ob_serialization.h` — 序列化
-- `src/lib/io/ob_epoll.cpp` — epoll 实现
-- `src/lib/io/ob_io_uring.cpp` — io_uring 实现
+- `deps/oblib/src/lib/utility/ob_serialization.h` — 序列化
+- `deps/oblib/src/lib/io/ob_epoll.cpp` — epoll 实现
+- `deps/oblib/src/lib/io/ob_io_uring.cpp` — io_uring 实现
 - `src/share/backup/ob_rpc_stat.h` — 监控指标
 
 ---

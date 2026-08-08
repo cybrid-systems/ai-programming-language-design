@@ -87,7 +87,7 @@ src/storage/direct_load/ob_direct_load_row_iterator.{h,cpp}
 不存在路径 (按 #82-#90 路径修正继续):
   src/storage/cache/  ← 不存在
   src/cache/          ← 不存在
-  src/lib/cache/      ← 不存在
+  deps/oblib/src/lib/cache/      ← 不存在
 ```
 
 ### 1.3 5 级 Cache 架构
@@ -460,7 +460,7 @@ Cache 是 **OB 性能加速的核心**：
 不存在路径 (按 #82-#90 路径修正继续):
   src/storage/cache/  ← 不存在
   src/cache/          ← 不存在
-  src/lib/cache/      ← 不存在
+  deps/oblib/src/lib/cache/      ← 不存在
   src/share/plan_cache/  ← 推测（待 grep 确认）
   src/storage/tablet/ob_tablet_cache.{h,cpp}  ← 未找到（散落 tablet 模块）
 ```

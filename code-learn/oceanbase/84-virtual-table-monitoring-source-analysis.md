@@ -62,7 +62,7 @@ $ ls src/observer/virtual_table/ | grep -c '^ob_all_virtual_'
 
 不存在路径 (按 #82 路径修正继续):
   src/share/virtual_table/  ← 不存在
-  src/lib/virtual_table/    ← 不存在
+  deps/oblib/src/lib/virtual_table/    ← 不存在
 ```
 
 ---
