@@ -1,6 +1,6 @@
 # #17 v2 — Query Optimizer (CBO + Cost Model + Join Ordering)
 
-> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 
 > 接续 #18 v2 Index Design：上一文把"索引是什么 + 怎么用 + 怎么维护"讲清楚。本
 > 文抬到更上层——**优化器怎么决定用什么索引、怎么排 join、怎么下推谓词、怎么

@@ -1,6 +1,6 @@
 # 49 — Log Service — 日志生成、Append Callback 全链路
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 核心文件：`src/logservice/ob_log_service.h`、`src/logservice/ob_append_callback.h`、`src/storage/memtable/ob_redo_log_generator.h`
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 

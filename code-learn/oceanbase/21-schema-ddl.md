@@ -1,6 +1,6 @@
 # #21 v2 — Schema / DDL (Schema Version + Online DDL 完整实读)
 
-> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 
 > 接续 #14 v2 MemTable / #15 v2 BTree / #16 v2 HashIndex / #18 v2 Index Design:
 > 前面讲了"row 怎么放、index 怎么组织"。本文聚焦 **"schema 怎么描述、DDL 怎么

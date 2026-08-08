@@ -1,6 +1,6 @@
 # 47 — Locality 与副本分布 — 副本策略、Locality 变更、分布管理
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 分析入口：`src/share/ob_locality_info.h` · `src/rootserver/ob_locality_util.h`
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 

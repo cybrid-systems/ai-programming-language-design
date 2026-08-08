@@ -1,6 +1,6 @@
 # 39 — Tenant 架构与资源隔离 — 租户创建、资源管理与线程池
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---

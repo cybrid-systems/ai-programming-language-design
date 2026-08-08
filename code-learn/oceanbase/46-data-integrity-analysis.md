@@ -1,6 +1,6 @@
 # 46 — 数据完整性 — Checksum 体系与数据验证
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 分析范围：
 > - `src/storage/memtable/mvcc/ob_mvcc_row.h/cpp`——行级累积校验和
 > - `src/storage/blocksstable/ob_micro_block_checksum_helper.h`——微块级行/列校验和

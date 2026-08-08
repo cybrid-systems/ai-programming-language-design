@@ -1,6 +1,6 @@
 # 30 — OBServer 启动与生命周期 — 模块初始化与服务注册
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 分析范围：`src/observer/main.cpp` + `src/observer/ob_server.h/cpp` + `src/observer/ob_heartbeat.h` + `src/observer/ob_check_params.h` + `src/observer/ob_startup_accel_task_handler.h`
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 

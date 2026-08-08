@@ -1,6 +1,6 @@
 # 27 — RootServer 架构 — 元数据管理与集群协调
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 分析入口：`src/rootserver/` — 200+ 文件，数十万行代码
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 

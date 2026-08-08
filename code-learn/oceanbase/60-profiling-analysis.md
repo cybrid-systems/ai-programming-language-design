@@ -1,6 +1,6 @@
 # 60 — SQL 性能分析深潜 — Profile、Trace、Slow Query 全路径
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 分析范围：`src/share/diagnosis/` + `src/sql/monitor/flt/` + `src/sql/monitor/` + `src/observer/mysql/`
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析
 

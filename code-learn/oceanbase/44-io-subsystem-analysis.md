@@ -1,6 +1,6 @@
 # 44 — IO 子系统 — IO 调度、预读、mClock 算法
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 分析范围：`src/share/io/`（IO 管理器 + 调度 + 校准）+ `deps/oblib/src/common/storage/ob_io_device.h`（设备抽象层）
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与代码结构分析
 

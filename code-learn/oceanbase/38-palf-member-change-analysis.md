@@ -1,6 +1,6 @@
 # 38 — PALF 成员变更 — 日志流配置变更与 Learner 同步
 
-> 基于 OceanBase CE 主线源码
+> 基于 OceanBase CE 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 使用 doom-lsp（clangd LSP）进行逐行符号解析与数据流追踪
 
 ---
