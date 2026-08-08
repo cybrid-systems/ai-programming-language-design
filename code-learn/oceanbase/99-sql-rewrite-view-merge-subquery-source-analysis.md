@@ -1,6 +1,6 @@
 # 99-sql-rewrite — OceanBase SQL 改写 / 视图改写 / 子查询优化深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/sql/rewrite/` **107 文件** + `src/sql/optimizer/ob_log_plan.h` + `src/sql/optimizer/optimizer_plan_rewriter/ob_plan_visitor.h` + `src/sql/resolver/dml/ob_hint.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/sql/rewrite/` **107 文件** + `src/sql/optimizer/ob_log_plan.h` + `src/sql/optimizer/optimizer_plan_rewriter/ob_plan_visitor.h` + `src/sql/resolver/dml/ob_hint.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

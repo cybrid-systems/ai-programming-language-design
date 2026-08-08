@@ -1,6 +1,6 @@
 # 5-mvcc-compact-deep-dive — OceanBase MVCC Compact 与 GC / `try_cleanout_*` 完整实读（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_mvcc_row.{h,cpp}` 完整实读 + `ob_mvcc_engine.h` compact 接口 + `ob_tx_callback_list.{h,cpp}` `remove_callbacks_*` 系列方法实读 + `ob_tx_callback_functor.h` `ObRemoveSyncCallbacksWCondFunctor` 与 `ObRemoveCallbacksForFastCommitFunctor` 实读 + `ob_mvcc_ctx.h` cleanout 接口），结合 #1-#4 v2 系列经验
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/ob_mvcc_row.{h,cpp}` 完整实读 + `ob_mvcc_engine.h` compact 接口 + `ob_tx_callback_list.{h,cpp}` `remove_callbacks_*` 系列方法实读 + `ob_tx_callback_functor.h` `ObRemoveSyncCallbacksWCondFunctor` 与 `ObRemoveCallbacksForFastCommitFunctor` 实读 + `ob_mvcc_ctx.h` cleanout 接口），结合 #1-#4 v2 系列经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

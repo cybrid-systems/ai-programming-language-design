@@ -1,6 +1,6 @@
 # 83-schema-cache-obkvcache — OceanBase Schema Cache / ObSchemaMgr / ObKVStoreCache 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/schema/ob_schema_cache.{h,cpp}` + `ob_schema_mgr.{h,cpp}` + `ob_schema_mgr_cache.{h,cpp}` + `src/share/cache/ob_kv_storecache.{h,cpp}` + `ob_kvcache_hazard_*`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/schema/ob_schema_cache.{h,cpp}` + `ob_schema_mgr.{h,cpp}` + `ob_schema_mgr_cache.{h,cpp}` + `src/share/cache/ob_kv_storecache.{h,cpp}` + `ob_kvcache_hazard_*`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

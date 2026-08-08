@@ -1,6 +1,6 @@
 # 95-query-optimizer — OceanBase 查询优化器 / 优化器 / CBO / 代价估算深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/sql/optimizer/` **184 文件** + `src/sql/rewrite/` **107 文件** + `src/share/stat/` 多个 opt_stat 类 + `src/sql/monitor/` 多个监控类 + `src/sql/optimizer/ob_optimizer.h` + `src/sql/ob_sql.h` + `src/sql/optimizer/ob_sharding_info.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/sql/optimizer/` **184 文件** + `src/sql/rewrite/` **107 文件** + `src/share/stat/` 多个 opt_stat 类 + `src/sql/monitor/` 多个监控类 + `src/sql/optimizer/ob_optimizer.h` + `src/sql/ob_sql.h` + `src/sql/optimizer/ob_sharding_info.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

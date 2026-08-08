@@ -1,6 +1,6 @@
 # 71-resource-isolation-cgroup — OceanBase 多租户资源隔离 / Unit / cgroup 集成深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/share/resource_manager/ + src/share/unit/ + src/share/resource_limit*/ + src/observer/virtual_table/ob_all_virtual_cgroup_config.{h,cpp}）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/share/resource_manager/ + src/share/unit/ + src/share/resource_limit*/ + src/observer/virtual_table/ob_all_virtual_cgroup_config.{h,cpp}）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

@@ -1,6 +1,6 @@
 # 90-sstable-macroblock-encoding — OceanBase SSTable / Macro Block / 列存 / 压缩编码深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/blocksstable/` **145 文件** + `cs_encoding/` + `encoding/` + `index_block/` 子目录 + `ob_sstable.h` + `ob_micro_block_*` + `ob_macro_block_*` + `ob_bloom_filter_*` + `encoding/ob_*_encoder/decoder.{h,cpp}`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/blocksstable/` **145 文件** + `cs_encoding/` + `encoding/` + `index_block/` 子目录 + `ob_sstable.h` + `ob_micro_block_*` + `ob_macro_block_*` + `ob_bloom_filter_*` + `encoding/ob_*_encoder/decoder.{h,cpp}`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

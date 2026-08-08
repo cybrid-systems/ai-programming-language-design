@@ -1,6 +1,6 @@
 # 84-virtual-table-monitoring — OceanBase 虚拟表 / 监控接口 / OCP 对接深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/observer/virtual_table/` **518 文件** + **363 虚拟表** + `src/observer/ob_server_event_history_table_operator.{h,cpp}` + `src/share/ob_virtual_table_scanner_iterator.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/observer/virtual_table/` **518 文件** + **363 虚拟表** + `src/observer/ob_server_event_history_table_operator.{h,cpp}` + `src/share/ob_virtual_table_scanner_iterator.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

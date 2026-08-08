@@ -1,6 +1,6 @@
 # 91-cache-obtabletcache — OceanBase Cache 体系 / ObTabletCache / ObKVStoreCache 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/cache/` 多文件 + `src/share/schema/ob_schema_cache.h`（参见 #83）+ `src/storage/blocksstable/ob_micro_block_cache.{h,cpp}` + `src/storage/blocksstable/ob_bloom_filter_cache.{h,cpp}` + `src/storage/ddl/ob_ddl_redo_log_writer.{h,cpp}` 等散落位置）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/cache/` 多文件 + `src/share/schema/ob_schema_cache.h`（参见 #83）+ `src/storage/blocksstable/ob_micro_block_cache.{h,cpp}` + `src/storage/blocksstable/ob_bloom_filter_cache.{h,cpp}` + `src/storage/ddl/ob_ddl_redo_log_writer.{h,cpp}` 等散落位置）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

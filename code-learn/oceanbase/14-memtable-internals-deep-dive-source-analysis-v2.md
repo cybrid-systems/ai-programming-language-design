@@ -1,6 +1,6 @@
 # 14-memtable-internals-deep-dive — OceanBase MemTable Internals / Lifecycle 完整覆盖（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/[ob_memtable.h | ob_memtable.cpp | ob_mvcc_row.h | ob_mvcc_engine.h | ob_query_engine.h | ob_mvcc_ctx.h]` 核心文件 + `mvcc/` 子目录 31 文件 + 参考 #1-#5 v2 deep-dive 经验），结合 #14 v2 MemTable Internals 与 MVCC Callback 深入集成
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/[ob_memtable.h | ob_memtable.cpp | ob_mvcc_row.h | ob_mvcc_engine.h | ob_query_engine.h | ob_mvcc_ctx.h]` 核心文件 + `mvcc/` 子目录 31 文件 + 参考 #1-#5 v2 deep-dive 经验），结合 #14 v2 MemTable Internals 与 MVCC Callback 深入集成
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

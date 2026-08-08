@@ -1,6 +1,6 @@
 # 65-standby-cluster — OceanBase Active-Standby 集群架构深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/share/ob_cluster_role.h + src/share/ob_tenant_switchover_status.h + src/logservice/restoreservice/ + src/observer/ + src/rootserver/）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/share/ob_cluster_role.h + src/share/ob_tenant_switchover_status.h + src/logservice/restoreservice/ + src/observer/ + src/rootserver/）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

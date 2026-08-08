@@ -1,6 +1,6 @@
 # 3-mvcc-write-conflict-deep-dive — OceanBase MVCC 写冲突检测 + lock_wait + deadlock 深度源码分析（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_mvcc_engine.h` **193 行** 实读 + `ob_mvcc_engine.cpp` 642 行 + `ob_concurrent_control.h` 173 行 + `ob_lock_wait_mgr.h` 515 行 + `ob_row_conflict_handler.h` 93 行 + `ob_row_conflict_info.h`），结合 #1 v2 + #2 v2 + #1-#100 系列经验
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/ob_mvcc_engine.h` **193 行** 实读 + `ob_mvcc_engine.cpp` 642 行 + `ob_concurrent_control.h` 173 行 + `ob_lock_wait_mgr.h` 515 行 + `ob_row_conflict_handler.h` 93 行 + `ob_row_conflict_info.h`），结合 #1 v2 + #2 v2 + #1-#100 系列经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

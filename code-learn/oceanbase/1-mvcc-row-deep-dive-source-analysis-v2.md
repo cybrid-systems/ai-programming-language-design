@@ -1,6 +1,6 @@
 # 1-mvcc-row-deep-dive — OceanBase MVCC Row / ObMvccTransNode 深度源码分析（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/` **31 个文件**，实读 `ob_mvcc.h` + `ob_mvcc_row.h` + `ob_mvcc_define.h` + 头部 30+ 行），结合 #1-#100 全系列经验
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/` **31 个文件**，实读 `ob_mvcc.h` + `ob_mvcc_row.h` + `ob_mvcc_define.h` + 头部 30+ 行），结合 #1-#100 全系列经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

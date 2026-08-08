@@ -1,6 +1,6 @@
 # 94-index-system — OceanBase 索引系统 / 二级索引 / 索引类型深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/blocksstable/index_block/` **38 文件** + `src/storage/access/` 多个 index 类 + `src/rootserver/ob_index_builder.h` + `src/storage/blocksstable/ob_sstable.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/blocksstable/index_block/` **38 文件** + `src/storage/access/` 多个 index 类 + `src/rootserver/ob_index_builder.h` + `src/storage/blocksstable/ob_sstable.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

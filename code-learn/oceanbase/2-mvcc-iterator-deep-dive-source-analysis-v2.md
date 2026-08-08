@@ -1,6 +1,6 @@
 # 2-mvcc-iterator-deep-dive — OceanBase MVCC Iterator / 多版本可见性深度源码分析（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_multi_version_iterator.h` **137 行** 实读 + `src/storage/memtable/mvcc/ob_mvcc_iterator.h` **192 行** 实读 + `src/storage/memtable/mvcc/ob_mvcc_acc_ctx.h` **362 行** 实读 + 头文件 30+ 行），结合 #1-#100 系列 + #1 v2 deep-dive 经验
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/ob_multi_version_iterator.h` **137 行** 实读 + `src/storage/memtable/mvcc/ob_mvcc_iterator.h` **192 行** 实读 + `src/storage/memtable/mvcc/ob_mvcc_acc_ctx.h` **362 行** 实读 + 头文件 30+ 行），结合 #1-#100 系列 + #1 v2 deep-dive 经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

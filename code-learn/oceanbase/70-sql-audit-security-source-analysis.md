@@ -1,6 +1,6 @@
 # 70-sql-audit-security — OceanBase SQL 审计 / 安全 / 权限 / Label Security 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/sql/privilege_check/ 6 文件 + src/share/schema/ob_security_audit_mgr.h + ob_security_audit_sql_service.h + ob_label_security.h + ob_priv_mgr.cpp + ob_priv_sql_service.cpp 等）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/sql/privilege_check/ 6 文件 + src/share/schema/ob_security_audit_mgr.h + ob_security_audit_sql_service.h + ob_label_security.h + ob_priv_mgr.cpp + ob_priv_sql_service.cpp 等）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

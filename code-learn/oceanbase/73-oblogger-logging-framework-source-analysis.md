@@ -1,6 +1,6 @@
 # 73-oblogger — OceanBase 日志框架 ObLogger / 诊断系统深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（LOG_ 宏定义在 `src/share/ob_define.h`，logger 类散落 storage/slog/ + logservice/logminer/ + diagnose/ + src/common/log/ + 其他位置）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（LOG_ 宏定义在 `src/share/ob_define.h`，logger 类散落 storage/slog/ + logservice/logminer/ + diagnose/ + src/common/log/ + 其他位置）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

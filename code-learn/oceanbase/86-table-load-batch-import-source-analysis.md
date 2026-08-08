@@ -1,6 +1,6 @@
 # 86-table-load-batch-import — OceanBase Table Load / 批量导入 / LOAD DATA 框架深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/observer/table_load/` 128 文件 + `src/sql/engine/cmd/ob_load_data_*` 10 文件 + `src/share/table/ob_table_load_define.h` + `src/observer/table_load/backup/` 42 文件 + `src/storage/direct_load/` 参见 #66）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/observer/table_load/` 128 文件 + `src/sql/engine/cmd/ob_load_data_*` 10 文件 + `src/share/table/ob_table_load_define.h` + `src/observer/table_load/backup/` 42 文件 + `src/storage/direct_load/` 参见 #66）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

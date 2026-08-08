@@ -1,6 +1,6 @@
 # 85-partition-table-tablet — OceanBase Partition Table / Tablet 物理分布深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/partition_table/ob_partition_location.{h,cpp}` 2 文件 + `src/rootserver/ob_partition_balance.h` + `ob_tenant_balance_service.h` + `src/observer/table_load/backup/` 42 文件 + `src/libtable/src/ob_tablet_location_proxy.h` + `src/share/location_cache/`（参见 #77））
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/partition_table/ob_partition_location.{h,cpp}` 2 文件 + `src/rootserver/ob_partition_balance.h` + `ob_tenant_balance_service.h` + `src/observer/table_load/backup/` 42 文件 + `src/libtable/src/ob_tablet_location_proxy.h` + `src/share/location_cache/`（参见 #77））
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

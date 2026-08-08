@@ -1,6 +1,6 @@
 # 87-rpc-obrpc — OceanBase RPC 框架 / obrpc 跨 observer 通信深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/observer/ob_rpc_processor_simple.{h,cpp}` + `src/observer/net/ob_rpc_reverse_keepalive.{h,cpp}` + `src/observer/ob_rpc_intrusion_detect.{h,cpp}` + `src/observer/ob_rpc_extra_payload.{h,cpp}` + `src/share/ob_rpc_struct.{h,cpp}` + `src/share/ob_rpc_share.{h,cpp}` + `src/share/ls/ob_rpc_ls_table.{h,cpp}` + `deps/3rdparty/easy/`（推测））
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/observer/ob_rpc_processor_simple.{h,cpp}` + `src/observer/net/ob_rpc_reverse_keepalive.{h,cpp}` + `src/observer/ob_rpc_intrusion_detect.{h,cpp}` + `src/observer/ob_rpc_extra_payload.{h,cpp}` + `src/share/ob_rpc_struct.{h,cpp}` + `src/share/ob_rpc_share.{h,cpp}` + `src/share/ls/ob_rpc_ls_table.{h,cpp}` + `deps/3rdparty/easy/`（推测））
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

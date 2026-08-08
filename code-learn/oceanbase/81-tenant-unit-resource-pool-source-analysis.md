@@ -1,6 +1,6 @@
 # 81-tenant-unit-resource-pool — OceanBase Tenant / Unit / Resource Pool 资源管理深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/resource_manager/` + `src/share/unit/ob_unit_resource.h` + `src/observer/omt/ob_tenant_*.{h,cpp}` + `src/share/ob_resource_limit_*.{h,cpp}`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/resource_manager/` + `src/share/unit/ob_unit_resource.h` + `src/observer/omt/ob_tenant_*.{h,cpp}` + `src/share/ob_resource_limit_*.{h,cpp}`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

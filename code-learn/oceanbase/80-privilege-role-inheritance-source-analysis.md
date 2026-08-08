@@ -1,6 +1,6 @@
 # 80-privilege-role-inheritance — OceanBase Privilege / 角色继承 / RBAC 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/ob_priv_common.h` + `src/share/schema/ob_priv_type.{h,cpp}` + `ob_priv_mgr.{h,cpp}` + `ob_priv_sql_service.{h,cpp}` + `src/sql/privilege_check/ob_privilege_check.{h,cpp}` (241KB) + `ob_ora_priv_check.{h,cpp}` (109KB) + `ob_ai_model_priv_util.{h,cpp}` + `src/rootserver/ob_objpriv_mysql_ddl_*.{h,cpp}` 等）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/ob_priv_common.h` + `src/share/schema/ob_priv_type.{h,cpp}` + `ob_priv_mgr.{h,cpp}` + `ob_priv_sql_service.{h,cpp}` + `src/sql/privilege_check/ob_privilege_check.{h,cpp}` (241KB) + `ob_ora_priv_check.{h,cpp}` (109KB) + `ob_ai_model_priv_util.{h,cpp}` + `src/rootserver/ob_objpriv_mysql_ddl_*.{h,cpp}` 等）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

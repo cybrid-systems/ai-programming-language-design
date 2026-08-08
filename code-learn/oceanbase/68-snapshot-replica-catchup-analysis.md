@@ -1,6 +1,6 @@
 # 68-snapshot-replica-catchup — OceanBase Snapshot 机制 / 副本追赶深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/storage/slog/ 26 文件 + src/logservice/archiveservice/ 45 文件 + src/storage/backup/ 74 文件）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/storage/slog/ 26 文件 + src/logservice/archiveservice/ 45 文件 + src/storage/backup/ 74 文件）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

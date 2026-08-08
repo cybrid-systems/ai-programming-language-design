@@ -1,6 +1,6 @@
 # 82-meta-table-internal-schema — OceanBase Meta Table / 内部表 Schema 详解深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/inner_table/` **108 文件** + `ob_inner_table_schema.h` + `ob_dump_inner_table_schema.{h,cpp}` + `ob_inner_table_init_data.py` + `generate_inner_table_schema.py` + `src/rootserver/ob_load_inner_table_schema_executor.{h,cpp}` 等）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/inner_table/` **108 文件** + `ob_inner_table_schema.h` + `ob_dump_inner_table_schema.{h,cpp}` + `ob_inner_table_init_data.py` + `generate_inner_table_schema.py` + `src/rootserver/ob_load_inner_table_schema_executor.{h,cpp}` 等）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

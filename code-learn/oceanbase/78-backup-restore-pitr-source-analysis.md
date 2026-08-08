@@ -1,6 +1,6 @@
 # 78-backup-restore-pitr — OceanBase Backup / Restore / PITR 时点恢复深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/backup/` 74 文件 + `src/rootserver/backup/` + `src/rootserver/restore/` + `src/observer/ob_restore_ctx.h` + `src/observer/ob_restore_sql_modifier.h` + `src/observer/table_load/backup/` + `src/observer/virtual_table/ob_tenant_show_restore_preview.{h,cpp}`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/backup/` 74 文件 + `src/rootserver/backup/` + `src/rootserver/restore/` + `src/observer/ob_restore_ctx.h` + `src/observer/ob_restore_sql_modifier.h` + `src/observer/table_load/backup/` + `src/observer/virtual_table/ob_tenant_show_restore_preview.{h,cpp}`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

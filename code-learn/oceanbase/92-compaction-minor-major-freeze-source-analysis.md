@@ -1,6 +1,6 @@
 # 92-compaction-freeze — OceanBase Compaction / Minor & Major Freeze / 合并策略深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/compaction/` **108 文件** + `src/rootserver/freeze/` 34 文件 + `src/share/ob_freeze_info_*.{h,cpp}` + `src/observer/virtual_table/ob_all_virtual_dag.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/compaction/` **108 文件** + `src/rootserver/freeze/` 34 文件 + `src/share/ob_freeze_info_*.{h,cpp}` + `src/observer/virtual_table/ob_all_virtual_dag.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

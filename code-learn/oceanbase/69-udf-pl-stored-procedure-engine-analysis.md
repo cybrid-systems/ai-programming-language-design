@@ -1,6 +1,6 @@
 # 69-udf-pl-stored-procedure — OceanBase UDF / PL / 存储过程 / 触发器深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/pl/ 44 文件 + src/sql/engine/expr/ 1161 文件 + src/pl/sys_package/ + src/pl/external_routine/）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/pl/ 44 文件 + src/sql/engine/expr/ 1161 文件 + src/pl/sys_package/ + src/pl/external_routine/）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

@@ -1,6 +1,6 @@
 # 77-location-cache — OceanBase Location Cache / 位置缓存深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/location_cache/` 20 文件 + `src/share/partition_table/ob_partition_location.h` + `src/libtable/src/ob_tablet_location_proxy.h` + `src/observer/mysql/obmp_query.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/location_cache/` 20 文件 + `src/share/partition_table/ob_partition_location.h` + `src/libtable/src/ob_tablet_location_proxy.h` + `src/observer/mysql/obmp_query.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

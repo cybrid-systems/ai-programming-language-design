@@ -1,6 +1,6 @@
 # 100-sql-engine-overview — OceanBase SQL 引擎总览 / 25+ Operator / Task 框架 / PX 并行 / #1-#100 全系列总结
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/sql/executor/` **79 文件** + `src/sql/engine/cmd/` 131 文件 + `src/share/scheduler/` 7 文件 + `src/sql/optimizer/` 184 文件 + `src/sql/rewrite/` 107 文件 + `src/sql/plan_cache/` 57 文件 + `src/sql/monitor/` 27 文件 + `src/sql/optimizer/ob_log_plan.h` + `src/sql/engine/cmd/ob_ddl_executor_util.h`（实读）+ 跨 #1-#99 全部 99 篇文章）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/sql/executor/` **79 文件** + `src/sql/engine/cmd/` 131 文件 + `src/share/scheduler/` 7 文件 + `src/sql/optimizer/` 184 文件 + `src/sql/rewrite/` 107 文件 + `src/sql/plan_cache/` 57 文件 + `src/sql/monitor/` 27 文件 + `src/sql/optimizer/ob_log_plan.h` + `src/sql/engine/cmd/ob_ddl_executor_util.h`（实读）+ 跨 #1-#99 全部 99 篇文章）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

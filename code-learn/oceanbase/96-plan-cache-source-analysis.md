@@ -1,6 +1,6 @@
 # 96-plan-cache — OceanBase Plan Cache / 计划缓存详解深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/sql/plan_cache/` **57 文件** + `src/sql/monitor/` 多个监控类 + `src/pl/pl_cache/ob_pl_cache_mgr.h` + `src/observer/virtual_table/ob_all_plan_cache_stat.h` + `src/observer/virtual_table/ob_virtual_open_cursor_table.h` + `src/observer/virtual_table/ob_plan_cache_plan_explain.h` + `src/observer/mysql/ob_sync_plan_driver.h` + `src/sql/spm/ob_spm_controller.h` + `src/share/ob_i_sql_expression.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/sql/plan_cache/` **57 文件** + `src/sql/monitor/` 多个监控类 + `src/pl/pl_cache/ob_pl_cache_mgr.h` + `src/observer/virtual_table/ob_all_plan_cache_stat.h` + `src/observer/virtual_table/ob_virtual_open_cursor_table.h` + `src/observer/virtual_table/ob_plan_cache_plan_explain.h` + `src/observer/mysql/ob_sync_plan_driver.h` + `src/sql/spm/ob_spm_controller.h` + `src/share/ob_i_sql_expression.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

@@ -1,6 +1,6 @@
 # 97-spm — OceanBase SPM / SQL Plan Management / Baseline 详解深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/sql/spm/` **7 文件** + `src/sql/plan_cache/ob_plan_set.h` + `src/sql/plan_cache/ob_plan_cache.h` + `src/observer/mysql/ob_sync_plan_driver.h` + `src/logservice/libobcdc/src/ob_log_meta_data_baseline_loader.h` + `src/share/schema/ob_schema_service.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/sql/spm/` **7 文件** + `src/sql/plan_cache/ob_plan_set.h` + `src/sql/plan_cache/ob_plan_cache.h` + `src/observer/mysql/ob_sync_plan_driver.h` + `src/logservice/libobcdc/src/ob_log_meta_data_baseline_loader.h` + `src/share/schema/ob_schema_service.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

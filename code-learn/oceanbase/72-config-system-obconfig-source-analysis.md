@@ -1,6 +1,6 @@
 # 72-config-system-obconfig — OceanBase 配置中心 / ObConfig 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/share/config/ 18 文件 + src/share/parameter/ + src/observer/omt/ob_tenant_config.{h,cpp} + 多个虚拟表）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/share/config/ 18 文件 + src/share/parameter/ + src/observer/omt/ob_tenant_config.{h,cpp} + 多个虚拟表）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

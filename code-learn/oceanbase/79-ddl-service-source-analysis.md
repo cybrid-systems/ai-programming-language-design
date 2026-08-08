@@ -1,6 +1,6 @@
 # 79-ddl-service — OceanBase DDL Service / CREATE / ALTER / DROP 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/sql/engine/cmd/` 131 文件 + `src/sql/resolver/ddl/ob_ddl_stmt.{h,cpp}` + `src/rootserver/ob_ddl_service.{h,cpp}` + `src/rootserver/ddl_task/ob_ddl_*.{h,cpp}` + `src/storage/ddl/ob_ddl_*.{h,cpp}` 等）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/sql/engine/cmd/` 131 文件 + `src/sql/resolver/ddl/ob_ddl_stmt.{h,cpp}` + `src/rootserver/ob_ddl_service.{h,cpp}` + `src/rootserver/ddl_task/ob_ddl_*.{h,cpp}` + `src/storage/ddl/ob_ddl_*.{h,cpp}` 等）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

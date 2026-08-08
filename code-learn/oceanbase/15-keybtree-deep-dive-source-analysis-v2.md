@@ -1,6 +1,6 @@
 # 15-keybtree-deep-dive — OceanBase ObKeyBTree / MemTable BTree 索引实现（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_keybtree.{h,cpp}` 实读 + 与 #1-#14 v2 deep-dive 完整对比），结合 #1-#5 v2 MVCC 经验
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/ob_keybtree.{h,cpp}` 实读 + 与 #1-#14 v2 deep-dive 完整对比），结合 #1-#5 v2 MVCC 经验
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

@@ -1,6 +1,6 @@
 # 93-ddl-physical-execution — OceanBase DDL 物理执行 / Online DDL 实现深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/ddl/` **151 文件** + `src/rootserver/ob_ddl_service.{h,cpp,launcher.h,launcher.cpp,service.cpp}` + `src/rootserver/ob_alter_table_constraint_checker.h` + `ob_index_builder.h` + `ob_mlog_builder.h` + `parallel_ddl/ob_ddl_helper.h` + `ob_create_index_on_empty_table_helper.h` + `ddl_task/ob_index_build_task.h` + `ob_lob_piece_builder.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/ddl/` **151 文件** + `src/rootserver/ob_ddl_service.{h,cpp,launcher.h,launcher.cpp,service.cpp}` + `src/rootserver/ob_alter_table_constraint_checker.h` + `ob_index_builder.h` + `ob_mlog_builder.h` + `parallel_ddl/ob_ddl_helper.h` + `ob_create_index_on_empty_table_helper.h` + `ddl_task/ob_index_build_task.h` + `ob_lob_piece_builder.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

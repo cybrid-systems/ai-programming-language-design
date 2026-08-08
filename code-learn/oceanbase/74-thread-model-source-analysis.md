@@ -1,6 +1,6 @@
 # 74-thread-model — OceanBase 线程模型 / TG / RPC thread / worker pool 深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/ob_thread_pool.h` typedef + `deps/oblib/src/lib/thread/threads.h` 实际实现 + `src/rootserver/ob_*_thread*.{h,cpp}` reentrant/idling/checker 系列 + `src/observer/virtual_table/ob_all_virtual_thread.h` 监控虚拟表）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/ob_thread_pool.h` typedef + `deps/oblib/src/lib/thread/threads.h` 实际实现 + `src/rootserver/ob_*_thread*.{h,cpp}` reentrant/idling/checker 系列 + `src/observer/virtual_table/ob_all_virtual_thread.h` 监控虚拟表）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

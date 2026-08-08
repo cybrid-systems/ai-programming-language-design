@@ -1,6 +1,6 @@
 # 89-memtable-memstore — OceanBase MemTable / 内存表 / MVCC 链深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/` 37 文件 + `src/storage/memtable/mvcc/` + `src/storage/ob_i_memtable_mgr.{h,cpp}` + `src/storage/ob_i_tablet_memtable.h` + `src/storage/tablet/ob_tablet_memtable_mgr.h` + `src/storage/ob_storage_table_guard.h` + `src/observer/virtual_table/ob_all_virtual_memstore_info.h` + `ob_all_virtual_tx_stat.h`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/` 37 文件 + `src/storage/memtable/mvcc/` + `src/storage/ob_i_memtable_mgr.{h,cpp}` + `src/storage/ob_i_tablet_memtable.h` + `src/storage/tablet/ob_tablet_memtable_mgr.h` + `src/storage/ob_storage_table_guard.h` + `src/observer/virtual_table/ob_all_virtual_memstore_info.h` + `ob_all_virtual_tx_stat.h`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

@@ -1,6 +1,6 @@
 # 16-mvcc-hash-index-deep-dive — OceanBase MemTable Hash Index 完整实读（基于实读源码 v2）
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/storage/memtable/mvcc/ob_mvcc_hash_index.{h,cpp}` + `src/storage/memtable/mvcc/ob_multi_version_iterator.{h,cpp}` + `src/storage/memtable/mvcc/ob_mvcc_hash_node.h` + `src/storage/memtable/mvcc/ob_mvcc_keybtree.h` 实读 + 与 #1-#15 v2 deep-dive 完整对比）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/storage/memtable/mvcc/ob_mvcc_hash_index.{h,cpp}` + `src/storage/memtable/mvcc/ob_multi_version_iterator.{h,cpp}` + `src/storage/memtable/mvcc/ob_mvcc_hash_node.h` + `src/storage/memtable/mvcc/ob_mvcc_keybtree.h` 实读 + 与 #1-#15 v2 deep-dive 完整对比）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

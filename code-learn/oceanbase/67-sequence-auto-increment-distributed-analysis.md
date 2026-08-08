@@ -1,6 +1,6 @@
 # 67-sequence-auto-increment — OceanBase Sequence / Auto-increment 分布式序列深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（src/share/sequence/ 10 文件 + src/share/schema/ob_sequence_mgr.cpp + ob_sequence_sql_service.cpp + src/storage/blocksstable/ob_macro_seq_generator.cpp）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（src/share/sequence/ 10 文件 + src/share/schema/ob_sequence_mgr.cpp + ob_sequence_sql_service.cpp + src/storage/blocksstable/ob_macro_seq_generator.cpp）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

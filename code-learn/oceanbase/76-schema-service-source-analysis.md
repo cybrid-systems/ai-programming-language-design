@@ -1,6 +1,6 @@
 # 76-schema-service — OceanBase Schema 持久化 / Service / 多版本管理深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`src/share/schema/` 244 文件，含 `ob_schema_service.{h,cpp}` + `ob_multi_version_schema_service.{h,cpp}` + `ob_schema_cache.h` + `ob_schema_getter_guard.h` + `ob_ddl_trans_controller.{h,cpp}` 等）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`src/share/schema/` 244 文件，含 `ob_schema_service.{h,cpp}` + `ob_multi_version_schema_service.{h,cpp}` + `ob_schema_cache.h` + `ob_schema_getter_guard.h` + `ob_ddl_trans_controller.{h,cpp}` 等）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

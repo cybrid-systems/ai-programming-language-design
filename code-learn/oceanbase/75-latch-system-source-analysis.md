@@ -1,6 +1,6 @@
 # 75-latch-system — OceanBase Latch 系统 / 锁机制深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（`deps/oblib/src/lib/lock/ob_latch.{h,cpp}` + `deps/oblib/src/lib/alloc/ob_latch_v2.{h,cpp}` + `deps/oblib/src/lib/stat/ob_latch_define.{h,cpp}` + `src/storage/lock_wait_mgr/` + `src/storage/tablelock/`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（`deps/oblib/src/lib/lock/ob_latch.{h,cpp}` + `deps/oblib/src/lib/alloc/ob_latch_v2.{h,cpp}` + `deps/oblib/src/lib/stat/ob_latch_define.{h,cpp}` + `src/storage/lock_wait_mgr/` + `src/storage/tablelock/`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

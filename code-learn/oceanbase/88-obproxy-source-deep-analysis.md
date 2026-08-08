@@ -1,6 +1,6 @@
 # 88-obproxy — OceanProxy 源码深度分析 / 跨 observer 通信深化 #63
 
-> 基于 OceanBase 5.0.2.0 主线源码（OBProxy 主仓独立于 OB 主仓，**当前 workspace 不存在**）+ 现有 OB 仓库中与 OBProxy 相关的 proxy 类（`src/share/ob_common_rpc_proxy.{h,cpp,ipp}` + `ob_core_table_proxy.{h,cpp}` + `ob_freeze_info_proxy.{h,cpp}` + `ob_global_stat_proxy.{h,cpp}` + `ob_log_restore_proxy.{h,cpp}` + `ob_schema_status_proxy.{h,cpp}` + `ob_service_epoch_proxy.{h,cpp}` + `ob_service_name_proxy.{h,cpp}` + `ob_snapshot_table_proxy.{h,cpp}` + `ob_srv_rpc_proxy.{h,cpp,ipp}` + `ob_tenant_info_proxy.{h,cpp}` + `src/observer/ob_inner_sql_rpc_proxy.{h,cpp}` + `src/observer/mysql/obmp_query.h` + 多个 `src/observer/virtual_table/ob_all_virtual_proxy_*.{h,cpp}`）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（OBProxy 主仓独立于 OB 主仓，**当前 workspace 不存在**）+ 现有 OB 仓库中与 OBProxy 相关的 proxy 类（`src/share/ob_common_rpc_proxy.{h,cpp,ipp}` + `ob_core_table_proxy.{h,cpp}` + `ob_freeze_info_proxy.{h,cpp}` + `ob_global_stat_proxy.{h,cpp}` + `ob_log_restore_proxy.{h,cpp}` + `ob_schema_status_proxy.{h,cpp}` + `ob_service_epoch_proxy.{h,cpp}` + `ob_service_name_proxy.{h,cpp}` + `ob_snapshot_table_proxy.{h,cpp}` + `ob_srv_rpc_proxy.{h,cpp,ipp}` + `ob_tenant_info_proxy.{h,cpp}` + `src/observer/ob_inner_sql_rpc_proxy.{h,cpp}` + `src/observer/mysql/obmp_query.h` + 多个 `src/observer/virtual_table/ob_all_virtual_proxy_*.{h,cpp}`）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---

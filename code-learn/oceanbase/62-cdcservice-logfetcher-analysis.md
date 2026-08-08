@@ -1,6 +1,6 @@
 # 62-cdcservice-logfetcher — OceanBase 5.x CDC 服务端 / PALF Subscriber / 归档冷启动 三模块深度源码分析
 
-> 基于 OceanBase 5.0.2.0 主线源码（与 01-60 篇文章使用的 OB 4.x 不同：5.x 把 liboblog 拆成了 `cdcservice` / `logfetcher` / `restoreservice` 三个独立模块）
+> 基于 OceanBase 5.0.2.0 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")（与 01-60 篇文章使用的 OB 4.x 不同：5.x 把 liboblog 拆成了 `cdcservice` / `logfetcher` / `restoreservice` 三个独立模块）
 > 使用 doom-lsp（clangd LSP）进行符号解析与数据流追踪
 
 ---
