@@ -226,7 +226,7 @@ MySQL Client (JDBC/ODBC/mysql CLI)
 | 12 | **Election** — 选主与故障切换 | `src/logservice/election/` |
 | 13 | **Clog** — 日志回放 | `src/logservice/clog/` |
 | 14 | **Memtable 内部结构** — Hash 表与行存 | `src/storage/memtable/ob_memtable.h` |
-| 15 | **KeyBtree** — 自研 B-Tree | `src/storage/memtable/ob_key_btree.h` |
+| 15 | **KeyBtree** — 自研 B-Tree | `src/storage/memtable/mvcc/ob_keybtree.h` |
 | 16 | **行级冲突处理** — 完整冲突路径 | `src/storage/memtable/mvcc/ob_row_conflict_handler.h` |
 | 17 | **查询优化器** — 计划生成与代价估算 | `src/sql/optimizer/` |
 | 18 | **索引设计** — 局部/全局索引 | `src/sql/optimizer/` |
@@ -399,7 +399,7 @@ OceanBase 没有魔改 MySQL 服务器代码。它从零实现了 MySQL 协议�
 | Row Conflict Handler | `src/storage/memtable/mvcc/ob_row_conflict_handler.h` | 写写冲突检测 | 03, 16 |
 | MVCC Engine | `src/storage/memtable/mvcc/ob_mvcc_engine.h` | MVCC 引擎入口 | 09 |
 | Memtable | `src/storage/memtable/ob_memtable.h` | 内存写入缓冲区 | 06, 14 |
-| KeyBtree | `src/storage/memtable/ob_key_btree.h` | 自研 B-Tree | 15 |
+| KeyBtree | `src/storage/memtable/mvcc/ob_keybtree.h` | 自研 B-Tree | 15 |
 | Freezer | `src/storage/memtable/ob_memtable.h` (freeze) | 冻结调度 | 06 |
 | SSTable | `src/storage/sstable/ob_sstable.h` | 持久化数据格式 | 08 |
 | SSTable Merge | `src/storage/blocksstable/ob_sstable_merge.h` | 合并策略 | 34 |

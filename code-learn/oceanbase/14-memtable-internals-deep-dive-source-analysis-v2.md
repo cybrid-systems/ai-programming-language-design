@@ -326,7 +326,7 @@ ObMemtable (主类)
 ### 5.1 ObQueryEngine 完整实读
 
 ```cpp
-// src/storage/memtable/ob_query_engine.h
+// src/storage/memtable/mvcc/ob_query_engine.h
 class ObQueryEngine {
 public:
   // 扫描（point / range）

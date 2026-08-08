@@ -29,7 +29,7 @@
 ```bash
 # 文件位置
 src/storage/memtable/mvcc/ob_keybtree.{h,cpp}
-src/storage/memtable/ob_keybtree_deps.h
+src/storage/memtable/mvcc/ob_keybtree_deps.h
 
 # ObKeyBTree 在 MemTable 中的角色
 src/storage/memtable/ob_memtable.h:
