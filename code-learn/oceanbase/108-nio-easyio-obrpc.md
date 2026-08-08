@@ -1,6 +1,6 @@
 # 108-nio-easyio-obrpc — OceanBase NIO (2/2): easy_io 连接生命周期 + obrpc 协议栈
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `deps/easy/src/io/easy_connection.{h,c}` + `deps/easy/src/io/easy_request.{h,c}` + `deps/easy/src/io/easy_message.{h,c}` + `deps/easy/src/io/easy_client.{h,c}` + `src/share/rpc/ob_rpc_packet.{h,cpp}` + `src/share/rpc/ob_rpc_proxy_*.{h,cpp}` + `src/share/rpc/ob_net_client.{h,cpp}` + `src/share/rpc/ob_net_server.{h,cpp}` + `src/share/rpc/ob_batch_rpc.{h,cpp}` + `src/share/rpc/ob_async_rpc_proxy.h`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #107 libeasy Reactor — 本篇深入 easy_io 连接生命周期 + obrpc 序列化 / 路由 / 重试, 后续接 #109 Worker 系列

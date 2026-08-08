@@ -1,6 +1,6 @@
 # 109-worker-obworker — OceanBase Worker (1/2): ObWorker 体系 + 各专用 Worker
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `src/observer/omt/ob_worker_processor.{h,cpp}` + `src/observer/omt/ob_th_worker.{h,cpp}` + `src/observer/omt/ob_multi_level_queue.{h,cpp}` + `src/sql/engine/px/ob_px_worker.{h,cpp}` + `src/rootserver/ob_disaster_recovery_worker.{h,cpp}` + `src/storage/tx/ob_tx_loop_worker.{h,cpp}` + `src/storage/tx/ob_ts_worker.{h,cpp}` + `src/storage/tx/ob_xa_trans_heartbeat_worker.{h,cpp}` + `src/storage/direct_load/ob_direct_load_mem_worker.{h,cpp}` + `src/logservice/archiveservice/ob_archive_worker.{h,cpp}` + `src/logservice/logfetcher/ob_ls_worker.{h,cpp}` + `src/logservice/palf/log_io_worker.{h,cpp,wrapper.{h,cpp}}` + `src/logservice/restoreservice/ob_remote_fetch_log_worker.{h,cpp}` + `src/logservice/logfetcher/ob_log_fetcher_bg_worker.{h,cpp}` + `src/pl/sys_package/ob_dbms_scheduler.{h,cpp}` + `src/rootserver/freeze/ob_major_merge_scheduler.{h,cpp}` + `src/rootserver/backup/ob_backup_*_scheduler.{h,cpp}` + `src/rootserver/restore/ob_*_scheduler.{h,cpp}` + `src/rootserver/ddl_task/ob_*_scheduler.{h,cpp}` + `src/rootserver/tenant_snapshot/ob_tenant_snapshot_scheduler.{h,cpp}` + `src/rootserver/compaction_ttl/ob_tenant_compaction_ttl_scheduler.{h,cpp}` + `src/logservice/replayservice/ob_replay_handler.{h,cpp}`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #107 libeasy + #108 easy_io/obrpc — 本篇拆 OB Worker 体系, 后续接 #110 ThreadPool 模型

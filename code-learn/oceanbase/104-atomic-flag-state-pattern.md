@@ -1,6 +1,6 @@
 # 104-atomic-flag-state — OceanBase 原子变量应用 (2/4): Flag / State Machine 模式
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点:`deps/oblib/src/lib/atomic/ob_atomic.h` + `deps/oblib/src/lib/thread/thread.h` + `src/storage/multi_data_source/mds_table_base.cpp` + `src/storage/tx_table/ob_tx_table.h` + `src/storage/memtable/ob_memtable_context.h` + `deps/oblib/src/common/ob_role_mgr.h` + `deps/oblib/src/lib/lock/ob_qsync_lock.cpp`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #103 Counter / Metric — 本系列 4 篇拆 OB 所有原子变量应用

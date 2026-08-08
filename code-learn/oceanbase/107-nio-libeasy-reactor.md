@@ -1,6 +1,6 @@
 # 107-nio-libeasy-reactor — OceanBase NIO (1/2): libeasy 整体架构与 Reactor 线程模型
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `deps/easy/src/io/easy_io.h` + `deps/easy/src/io/easy_io_struct.h` + `deps/easy/src/io/easy_connection.{h,c}` + `deps/easy/src/io/easy_baseth_pool.{h,c}` + `deps/easy/src/io/ev.{h,c}` + `deps/easy/src/io/easy_request.h` + `deps/easy/src/io/easy_message.h`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #103-#106 atomic 系列 — 本系列 2 篇拆 OB NIO, 再接 #109-#110 Worker 系列

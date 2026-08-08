@@ -1,6 +1,6 @@
 # 106-atomic-lockfree-data-structure — OceanBase 原子变量应用 (4/4): Lock-free Data Structure 模式
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点:`deps/oblib/src/lib/atomic/ob_atomic.h` + `deps/oblib/src/lib/atomic/atomic128.h` + `deps/oblib/src/lib/lock/ob_latch.cpp` + `deps/oblib/src/lib/lock/ob_qsync_lock.{h,cpp}` + `deps/oblib/src/lib/lock/ob_bucket_qsync_lock.{h,cpp}` + `deps/oblib/src/lib/hash/ob_darray.h` + `deps/oblib/src/lib/tc/deps/drwlock.h` + `deps/oblib/src/lib/tc/deps/batch_pop_queue.h` + `deps/oblib/src/lib/hash/ob_link_hashmap.{h}` + `deps/oblib/src/lib/allocator/ob_slice_alloc.h` + `deps/oblib/src/common/ob_clock_generator.h` + `deps/oblib/src/lib/stat/ob_stat_template.cpp` + `deps/oblib/src/lib/hash/ob_multi_mod_ref_mgr.h` + `src/share/queue/ob_sp_link_queue.h`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #103 Counter / #104 Flag / #105 Refcount — 本系列 4 篇收尾

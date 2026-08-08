@@ -1,6 +1,6 @@
 # 105-atomic-refcount-hazard — OceanBase 原子变量应用 (3/4): Refcount / Hazard Pointer 模式
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点:`deps/oblib/src/lib/atomic/ob_atomic.h` + `deps/oblib/src/lib/hash/ob_link_hashmap.{h}` + `deps/oblib/src/lib/hash/ob_multi_mod_ref_mgr.h` + `deps/oblib/src/lib/tc/deps/drwlock.h` + `deps/oblib/src/lib/hash/ob_hazard_pointer.h` + `src/share/cache/ob_kvcache_hazard_pointer.{h,cpp}` + `src/share/cache/ob_kvcache_hazard_domain.{h,cpp}` + `deps/oblib/src/lib/allocator/ob_hazard_ref.{h,cpp}`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #103 Counter / #104 Flag — 本系列 4 篇拆 OB 所有原子变量应用

@@ -1,6 +1,6 @@
 # 111-coroutine-migration — OceanBase NIO+Worker follow-up 1/3: 协程化进度 (libeasy uthread → C++20 coroutine)
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `deps/easy/src/thread/easy_uthread.{h,c}` + `deps/oblib/src/lib/coro/co_var.h` + `src/sql/engine/px/ob_px_worker.{h,cpp}` + `src/share/ob_occam_thread_pool.h` (ObPromise/ObFuture) + `src/lib/future/ob_future.h`
 > 接续 #107 libeasy + #109 ObWorker + #110 ObOccamThreadPool — 本篇拆 OB 协程化路径 (ucontext uthread ↔ C++20 coroutine)
 > 状态: **进行中** (OB 5.x 部分路径切到 C++20 coroutine, libeasy uthread 仍是大头)

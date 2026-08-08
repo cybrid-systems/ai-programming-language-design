@@ -1,6 +1,6 @@
 # 112-io-uring-benchmark — OceanBase NIO+Worker follow-up 2/3: io_uring 端到端 benchmark (libeasy 实验性后端 vs epoll)
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `deps/easy/src/io/easy_io.{h,c}` (实验性 `HAVE_IO_URING` 分支) + `src/share/io/ob_io_struct.h:495` (TODO 注释: io_uring 替代 ObIODevice) + `deps/oblib/src/lib/coro/co_var.h`
 > 接续 #107 libeasy + #111 协程化进度 — 本篇拆 OB io_uring 现状 (未启用) + 真实 OB RPC 流量下的 benchmark 方法 + 迁移路径
 > 状态: **未启用** (libeasy 当前仅 epoll 后端, io_uring 是已规划未实现的优化路径)

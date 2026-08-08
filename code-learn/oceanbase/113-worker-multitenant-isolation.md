@@ -1,6 +1,6 @@
 # 113-worker-multitenant-isolation — OceanBase NIO+Worker follow-up 3/3: Worker Pool 多租户隔离完整模型 (ObUnitResource + per-tenant queue + 背压)
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `src/share/unit/ob_unit_resource.{h,cpp}` + `src/observer/omt/ob_multi_tenant.{h,cpp}` + `src/observer/omt/ob_th_worker.{h,cpp}` + `src/observer/omt/ob_tenant.h` + `src/observer/omt/ob_tenant_config.{h,cpp}` + `src/observer/omt/ob_tenant_meta.{h,cpp}` + `src/share/rc/ob_tenant_base.h` (MTL_CTX) + `src/share/resource_manager/ob_resource_limiter.{h,cpp}` + `src/observer/omt/ob_multi_level_queue.{h,cpp}` (#109 §2.3)
 > 接续 #109 ObWorker + #110 ObThreadPool + #111 协程化 — 本篇拆 OB Worker Pool 在多租户场景下的完整隔离模型
 > 状态: **完整实现** (OB 5.x 多租户隔离覆盖 CPU/内存/IOPS/网络/任务并发度)

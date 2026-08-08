@@ -1,6 +1,6 @@
 # 103-atomic-counter-metric — OceanBase 原子变量应用 (1/4): 计数器 / 指标 模式
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点:`deps/oblib/src/lib/atomic/ob_atomic.h` + `deps/oblib/src/common/ob_clock_generator.h` + `src/share/ob_autoincrement_service.cpp` + `src/share/schema/ob_schema_store.h` + `deps/oblib/src/lib/resource/ob_resource_limiter.cpp` + `deps/oblib/src/lib/tc/deps/fifo_alloc.h` + `deps/oblib/src/lib/allocator/ob_block_alloc_mgr.h` + `src/storage/memtable/ob_memtable_context.{h,cpp}`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #101 NUMA-Aware 线程分配 + #102 NUMA-Aware 内存分配 — 本系列 4 篇拆 OB 所有原子变量应用

@@ -1,6 +1,6 @@
 # 110-worker-threadpool-models — OceanBase Worker (2/2): ObThreadPool / ObOccamThreadPool 线程池模型
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点: `src/share/ob_thread_pool.h` + `src/share/ob_occam_thread_pool.h` + `src/share/ob_occam_time_guard.h` + `src/share/ob_occam_timer.h` + `src/lib/thread/ob_async_task.h` + `src/lib/queue/ob_priority_queue.h` + `src/observer/ob_uniq_task_queue.{h,cpp}` + `deps/oblib/src/lib/queue/ob_simple_queue.h` + `deps/oblib/src/lib/thread/thread.h` + `src/storage/tx/ob_trans_define.h` + `src/share/rc/ob_tenant_base.h`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #107 libeasy + #108 easy_io/obrpc + #109 ObWorker — 本篇拆 OB 线程池底层模型, 后续可追 follow-up
