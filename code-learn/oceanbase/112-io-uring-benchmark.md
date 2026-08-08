@@ -26,7 +26,7 @@ OB 当前网络栈基于 **epoll** (libeasy 的默认后端),`io_uring` 是已�
 |------|--------|
 | #107 libeasy | libeasy 当前的 epoll 后端是本篇起点 |
 | #108 easy_io/obrpc | OB RPC 流量是本篇 benchmark 对象 |
-| #111 协程化 | io_uring + C++20 coroutine 是 OB 4.x 异步 IO 的两条路径 |
+| #111 协程化 | io_uring + C++20 coroutine 是 OB 5.x 异步 IO 的两条路径 |
 
 ---
 
@@ -61,7 +61,7 @@ OB 当前网络栈基于 **epoll** (libeasy 的默认后端),`io_uring` 是已�
 | **稳定性** | io_uring 在 OB 主流版本 (3.x / 早期 4.x) 还在演进,曾有严重 bug (CVE-2023-2598 io_uring 提权漏洞) |
 | **kernel 版本** | OB 支持的 kernel 范围广 (3.10+),io_uring 需 ≥ 5.6 |
 | **reactor 模型契合度** | OB 用 epoll 已有 15+ 年生产经验,io_uring 需要重新设计 IO loop |
-| **优先级** | OB 4.x 主推协程化 (#111),io_uring 是次要优化路径 |
+| **优先级** | OB 5.x 主推协程化 (#111),io_uring 是次要优化路径 |
 | **向后兼容** | libeasy 是公共代码,改 epoll → io_uring 影响所有 OB 业务 |
 
 ---
@@ -211,7 +211,7 @@ io_uring_prep_send_zc(sqe, fd, buf, size, flags, 0);
 ### 4.2 真实 OB RPC 流量 benchmark 方法
 
 ```cpp
-// 自建 benchmark (假想, OB 4.x 实验中)
+// 自建 benchmark (假想, OB 5.x 实验中)
 // 1. 启动 OB server (监听端口 X)
 // 2. 启动 N 个 obclient (模拟 M 个 tenant × K 个并发)
 // 3. 跑 RPC traffic: mix of read (70%) / write (20%) / DDL (10%)
@@ -317,7 +317,7 @@ $ perf stat -e syscalls:sys_enter_* -p <pid> sleep 10
 |------|--------|
 | #107 libeasy | libeasy 当前 epoll 后端是本篇起点 |
 | #108 easy_io/obrpc | OB RPC 流量是 benchmark 对象 |
-| #111 协程化 | io_uring + C++20 coroutine 是 OB 4.x 异步 IO 两条路径 |
+| #111 协程化 | io_uring + C++20 coroutine 是 OB 5.x 异步 IO 两条路径 |
 | #25 内存管理 | registered_buffers 跟 #25 内存池结合 |
 
 ---
@@ -477,7 +477,7 @@ grep -n "uname\|sysctl\|kernel_version" deps/easy/src/util/easy_util.c
 | 主题 | 关联点 |
 |------|--------|
 | NIO | 本篇核心 — io_uring vs epoll |
-| 协程 | C++20 协程 + io_uring 是 OB 4.x 异步 IO 两条路径 |
+| 协程 | C++20 协程 + io_uring 是 OB 5.x 异步 IO 两条路径 |
 | 内核 | io_uring 是 Linux 5.1+ 新特性, kernel 版本依赖 |
 | 兼容 | OB 支持老 kernel (3.10+), io_uring 需 fallback |
 | 性能 | sys_call 减少 80%+ 是 io_uring 核心收益 |
@@ -496,7 +496,7 @@ OB 当前 **未启用 io_uring**,仅 1 处 TODO 注释提及 (`ob_io_struct.h:49
 1. **稳定性** — io_uring 还在演进,OB 不愿承担风险
 2. **kernel 兼容** — OB 支持 3.10+ kernel,io_uring 需 ≥ 5.6
 3. **reactor 模型契合** — OB 用 epoll 15+ 年,io_uring 需重新设计 IO loop
-4. **优先级** — OB 4.x 主推协程化 (#111),io_uring 是次要路径
+4. **优先级** — OB 5.x 主推协程化 (#111),io_uring 是次要路径
 
 **预期收益** (假设启用):
 
@@ -517,7 +517,7 @@ OB 当前 **未启用 io_uring**,仅 1 处 TODO 注释提及 (`ob_io_struct.h:49
 
 **关键观察**:
 
-- io_uring 不是 OB 4.x 短期优化路径 (优先级低于协程化)
+- io_uring 不是 OB 5.x 短期优化路径 (优先级低于协程化)
 - 真实收益需 OB RPC 流量 benchmark 验证 (echo benchmark 不够)
 - kernel 版本兼容性是主要障碍 (OB 不愿放弃 3.10+ 支持)
 
@@ -534,4 +534,4 @@ OB 当前 **未启用 io_uring**,仅 1 处 TODO 注释提及 (`ob_io_struct.h:49
 7. **OB 单连接 RTT 优化** — recv multishot + send zc 把单连接 RTT 从 ~50 μs 压到 ~10 μs
 8. **io_uring registered_buffers 与 OB 内存池整合** — 用 #25 的 `ObMemBuf` 做 registered buffer,避免额外拷贝
 9. **ob_io_struct.h:495 TODO 实现** — 把 ObIODevice 改造为 io_uring 异步文件 IO (备份场景)
-10. **OB 4.x 异步 IO 框架统一** — libeasy (网络) + ObIODevice (文件) + ObLogIoWorker (clog) 都用 io_uring
+10. **OB 5.x 异步 IO 框架统一** — libeasy (网络) + ObIODevice (文件) + ObLogIoWorker (clog) 都用 io_uring

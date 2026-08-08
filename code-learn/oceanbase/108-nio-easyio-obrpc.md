@@ -1220,7 +1220,7 @@ OB 在 libeasy 之上有两层封装:
 - 重试 + 退避 + circuit breaker — 应对瞬时故障
 - 跨 region 限流 — 多 region 部署时控制带宽
 
-**OB 4.x 演进**:
+**OB 5.x 演进**:
 
 - obrpc header 压缩 (小包场景)
 - io_uring send / recv (实验性)
@@ -1234,6 +1234,6 @@ OB 在 libeasy 之上有两层封装:
 2. **obrpc streaming RPC 实现** — 长连接 / 大包场景 (心跳 / 推送 / 增量备份)
 3. **obrpc batch RPC + `ObBatchProcessor`** — 高 QPS 小包场景 (e.g. 心跳)
 4. **`ObLocationCache` 缓存策略 deep-dive** — LRU vs LFU, TTL, cache invalidation, refresh-ahead
-5. **Circuit breaker 实现** — OB 4.x 是否引入了 circuit breaker? (目前只有重试,没有熔断)
+5. **Circuit breaker 实现** — OB 5.x 是否引入了 circuit breaker? (目前只有重试,没有熔断)
 6. **obrpc 跨语言互操作** — C++ / Java / Python client 跟 OB server 通信的协议兼容
 7. **SSL 性能优化** — session cache (SSL session resumption), 减少 handshake 开销

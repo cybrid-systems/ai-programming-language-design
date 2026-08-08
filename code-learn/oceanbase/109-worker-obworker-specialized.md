@@ -1081,7 +1081,7 @@ OB 内部有 **~40 个 Worker 类**, 按业务分:
 - **Scheduler 是 1-thread pool**, 不重, 周期性调度
 - **状态机用 BCAS** (`ObReplayStatus` 跟 #104 连接)
 
-**OB 4.x 演进**:
+**OB 5.x 演进**:
 
 - `ObPxCoroWorker` (C++20 coroutine) 替代 `ObPxThreadWorker`
 - Worker 池化 (从独立 pthread 改 `ObOccamThreadPool`)

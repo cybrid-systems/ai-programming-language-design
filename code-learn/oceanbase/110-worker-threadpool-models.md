@@ -12,7 +12,7 @@
 OB 业务层 Worker (~40 种, 见 #109) 底层共用两套线程池:
 
 - **`ObThreadPool`** — 传统 pthread + MPSC task queue 模型 (OB 早期 / 现在大多数后台 Worker 用)
-- **`ObOccamThreadPool`** — "Occam's razor" 模型: 闭包驱动 + 5 级优先级 + C++20 future 风格 `ObPromise`/`ObFuture` (OB 4.x 主推)
+- **`ObOccamThreadPool`** — "Occam's razor" 模型: 闭包驱动 + 5 级优先级 + C++20 future 风格 `ObPromise`/`ObFuture` (OB 5.x 主推)
 
 本篇拆这两套底层模型:
 
@@ -42,7 +42,7 @@ OB 业务层 Worker (~40 种, 见 #109) 底层共用两套线程池:
 
 | 维度 | `ObThreadPool` | `ObOccamThreadPool` |
 |------|----------------|----------------------|
-| 引入版本 | OB 1.x | OB 4.x |
+| 引入版本 | OB 1.x | OB 5.x |
 | 任务模型 | `ObLink*` (链表节点) | 任意可调用闭包 (`std::function`-like) |
 | 优先级 | 无 (FIFO) | 5 级 (`EXTREMELY_HIGH` / `HIGH` / `NORMAL` / `LOW` / `EXTREMELY_LOW`) |
 | 返回值 | 通过 callback (`ObLink::~ObLink`) | `ObFuture<T>` (C++20 风格) |
@@ -1119,7 +1119,7 @@ grep -n "ObOccamTimeGuard\|ObOccamTimer\|schedule_repeat" \
 OB 业务层 Worker (~40 种, #109) 底层共用两套线程池:
 
 - **`ObThreadPool`** — 传统 pthread + `ObLink` 任务 + round-robin MPSC 队列 — 用于后台 Worker
-- **`ObOccamThreadPool`** — "Occam's razor" 闭包 + 5 级优先级 + `ObPromise`/`ObFuture` — 用于业务 RPC / SQL (OB 4.x 主推)
+- **`ObOccamThreadPool`** — "Occam's razor" 闭包 + 5 级优先级 + `ObPromise`/`ObFuture` — 用于业务 RPC / SQL (OB 5.x 主推)
 
 **关键设计**:
 
@@ -1129,7 +1129,7 @@ OB 业务层 Worker (~40 种, #109) 底层共用两套线程池:
 - **元编程 unpack** (`CallWithTupleUnpack`) — 编译期展开 tuple, 零开销
 - **租户隔离** (`MTL_CTX`) — 每线程一个 tenant context, 自动切换
 
-**OB 4.x 演进**:
+**OB 5.x 演进**:
 
 - `ObOccamThreadPool` 替代 `ObThreadPool` 在业务路径
 - C++20 coroutine 越来越多业务路径使用
@@ -1141,7 +1141,7 @@ OB 业务层 Worker (~40 种, #109) 底层共用两套线程池:
 ## 14. 后续可扩展方向
 
 1. **`ObAsyncTask` / `ObFuture` / `ObPromise` 完整剖析** — C++20 future 在 OB 的封装层
-2. **`map_queue` 升级为 `ObLockFreeQueue`** — OB 4.x 引入了更高效的 `ObLockFreeQueue` (基于 Lamport queue)
+2. **`map_queue` 升级为 `ObLockFreeQueue`** — OB 5.x 引入了更高效的 `ObLockFreeQueue` (基于 Lamport queue)
 3. **`ObCoroutine` (libeasy uthread) vs C++20 coroutine 对比** — 协程化进度
 4. **租户资源隔离完整模型** — `tenant_max_running_tasks` / `tenant_max_queue_size` 的实现细节
 5. **`ObSchedule` 通用调度框架** — 提取 20+ 种 Scheduler 的共同模式

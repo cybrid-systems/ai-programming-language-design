@@ -3,7 +3,7 @@
 > 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
 > 源码锚点: `deps/easy/src/thread/easy_uthread.{h,c}` + `deps/oblib/src/lib/coro/co_var.h` + `src/sql/engine/px/ob_px_worker.{h,cpp}` + `src/share/ob_occam_thread_pool.h` (ObPromise/ObFuture) + `src/lib/future/ob_future.h`
 > 接续 #107 libeasy + #109 ObWorker + #110 ObOccamThreadPool — 本篇拆 OB 协程化路径 (ucontext uthread ↔ C++20 coroutine)
-> 状态: **进行中** (OB 4.x 部分路径切到 C++20 coroutine, libeasy uthread 仍是大头)
+> 状态: **进行中** (OB 5.x 部分路径切到 C++20 coroutine, libeasy uthread 仍是大头)
 
 ---
 
@@ -12,7 +12,7 @@
 OB 内部两套协程模型并存:
 
 - **`easy_uthread_t`** — ucontext-based 用户态线程 (2007 年起,libeasy 内置),64 KB 栈,栈式切换,所有 IO 线程 / RPC client 用
-- **C++20 coroutine** (`std::coroutine_handle` + `co_await`/`co_return`) — OB 4.x 主推,`ObPxCoroWorker` / `ObFuture`/`ObPromise` / `co_var.h::RLOCAL` 体系
+- **C++20 coroutine** (`std::coroutine_handle` + `co_await`/`co_return`) — OB 5.x 主推,`ObPxCoroWorker` / `ObFuture`/`ObPromise` / `co_var.h::RLOCAL` 体系
 
 | 主题 | 本篇内容 |
 |------|---------|
@@ -20,7 +20,7 @@ OB 内部两套协程模型并存:
 | **C++20 coroutine 封装** | `ObFuture` / `ObPromise` / `RLOCAL` / `co_await` |
 | **ObPxCoroWorker** | PX Worker 的协程化实现 |
 | **切换成本** | ctx switch (~1 μs vs ~100 ns) + 内存 (64 KB vs ~4 KB) + API |
-| **迁移路径** | OB 4.x 已切 / 未切 / 实验路径 |
+| **迁移路径** | OB 5.x 已切 / 未切 / 实验路径 |
 
 ### 跟前面文章的关联
 
@@ -435,13 +435,13 @@ ObFuture<int> obrpc_async_call_coro(const ObAddr &server, ObRpcRequest &req) {
 
 ---
 
-## 4. 实现细节 — OB 4.x 协程化进度
+## 4. 实现细节 — OB 5.x 协程化进度
 
 ### 4.1 已切到 C++20 coroutine 的路径
 
 | 路径 | 状态 | 备注 |
 |------|------|------|
-| **`ObPxCoroWorker`** | ✅ 已切 | PX Worker 默认容器 (OB 4.x) |
+| **`ObPxCoroWorker`** | ✅ 已切 | PX Worker 默认容器 (OB 5.x) |
 | **`ObOccamThreadPool`** | ✅ 已切 | 闭包 + ObFuture (见 #110 §3) |
 | **`ObPromise`/`ObFuture`** | ✅ 已切 | 所有 occam 异步 RPC |
 | **obrpc `async_call_coro`** | ✅ 已切 (部分) | RPC client 协程化封装 |
@@ -520,7 +520,7 @@ ObFuture<int> obrpc_async_call_coro(const ObAddr &server, ObRpcRequest &req) {
 ### 7.1 选择协程模型
 
 ```bash
-# 默认 — 用 ObPxCoroWorker (OB 4.x 推荐)
+# 默认 — 用 ObPxCoroWorker (OB 5.x 推荐)
 # 修改方法: 在 PX 调度时选 ObPxCoroWorkerFactory
 PX_WORKER_TYPE = "coro"
 
@@ -684,9 +684,9 @@ grep -rn "ObPxCoroWorker\|co_await" src/sql/ src/share/ src/observer/ \
 OB 内部两套协程模型并存:
 
 - **`easy_uthread`** — ucontext-based,OB 1.x 起,仍是大头 (libeasy + obrpc sync_call)
-- **C++20 coroutine** — OB 4.x 主推,`ObPxCoroWorker` + `ObFuture`/`ObPromise` + `RLOCAL` 体系
+- **C++20 coroutine** — OB 5.x 主推,`ObPxCoroWorker` + `ObFuture`/`ObPromise` + `RLOCAL` 体系
 
-**OB 4.x 切换进度**:
+**OB 5.x 切换进度**:
 
 | 路径 | 状态 |
 |------|------|
@@ -716,6 +716,6 @@ OB 内部两套协程模型并存:
 2. **栈式协程 vs 非栈式协程** — OB 目前都是非栈式 (C++20),栈式协程 (e.g. goroutine) 是否值得引入?
 3. **协程调度器自实现** — 当前 C++20 协程用 libstdc++ 自带调度,是否值得自实现 (更可控)
 4. **协程与 RAII 的交互** — C++20 协程的 RAII (e.g. lock_guard) 在 co_await 后是否还安全?
-5. **百万级协程 benchmark** — OB 4.x 在 PX Worker 上验证过,其他路径呢?
+5. **百万级协程 benchmark** — OB 5.x 在 PX Worker 上验证过,其他路径呢?
 6. **协程死锁检测** — 多个 co_await 互等 (cyclic await) 是常见 bug,需要专门的检测工具
 7. **协程化收益量化** — 不同路径的协程化收益有多大? 哪些值得切?

@@ -483,7 +483,7 @@ void obrpc_invoke_async(...) {
 }
 ```
 
-**OB 4.x 演进**: 部分路径从 `easy_uthread` 切到 **C++20 coroutine** (`ob_occam_*`),但 `easy_uthread` 仍是大多数 RPC client 的实现。
+**OB 5.x 演进**: 部分路径从 `easy_uthread` 切到 **C++20 coroutine** (`ob_occam_*`),但 `easy_uthread` 仍是大多数 RPC client 的实现。
 
 ---
 
@@ -825,7 +825,7 @@ OB 用 libeasy (而非 muduo / asio) 是因为:
 2. SO_REUSEPORT 多队列优化
 3. 跟 OB 内存模型集成 (`easy_pool_t`)
 
-**libeasy 在 OB 4.x 的演进**:
+**libeasy 在 OB 5.x 的演进**:
 
 - 加入 io_uring 后端 (实验性,在后台分支)
 - 协程 (`libeasy uthread` → C++20 coroutine 部分路径)
@@ -836,7 +836,7 @@ OB 用 libeasy (而非 muduo / asio) 是因为:
 
 ## 10. 后续可扩展方向
 
-1. **libeasy uthread vs C++20 coroutine 对比** — OB 4.x 在部分路径已切到 C++20 coroutine (`ob_occam_*`),但 libeasy uthread 仍是大头。两者 yield / resume 语义差异、性能对比、内存占用
+1. **libeasy uthread vs C++20 coroutine 对比** — OB 5.x 在部分路径已切到 C++20 coroutine (`ob_occam_*`),但 libeasy uthread 仍是大头。两者 yield / resume 语义差异、性能对比、内存占用
 2. **SO_REUSEPORT + io_uring 端到端 benchmark** — 现有 benchmark 多是 echo,没有真实 OB RPC 流量。io_uring 真实收益 (vs epoll) 需在 OB 协议栈下验证
 3. **easy_io graceful shutdown 异步化** — 当前同步流程是痛点 (slow connection 卡 shutdown)。改为:close listen → 等所有 connection 关闭 (异步,带超时) → join thread
 4. **eventfd vs io_uring event 唤醒对比** — eventfd 是为了跨线程通信,io_uring 有原生 event 机制 (CQE),可以省掉 eventfd 这一层

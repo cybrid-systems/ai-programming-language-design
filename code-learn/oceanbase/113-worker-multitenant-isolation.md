@@ -3,7 +3,7 @@
 > 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
 > 源码锚点: `src/share/unit/ob_unit_resource.{h,cpp}` + `src/observer/omt/ob_multi_tenant.{h,cpp}` + `src/observer/omt/ob_th_worker.{h,cpp}` + `src/observer/omt/ob_tenant.h` + `src/observer/omt/ob_tenant_config.{h,cpp}` + `src/observer/omt/ob_tenant_meta.{h,cpp}` + `src/share/rc/ob_tenant_base.h` (MTL_CTX) + `src/share/resource_manager/ob_resource_limiter.{h,cpp}` + `src/observer/omt/ob_multi_level_queue.{h,cpp}` (#109 §2.3)
 > 接续 #109 ObWorker + #110 ObThreadPool + #111 协程化 — 本篇拆 OB Worker Pool 在多租户场景下的完整隔离模型
-> 状态: **完整实现** (OB 4.x 多租户隔离覆盖 CPU/内存/IOPS/网络/任务并发度)
+> 状态: **完整实现** (OB 5.x 多租户隔离覆盖 CPU/内存/IOPS/网络/任务并发度)
 
 ---
 
@@ -475,7 +475,7 @@ CGROUP_USER_CPU_SHARE = 800    # 所有 user 租户共享
 cat /sys/fs/cgroup/cpu/ob/cpu.share
 ```
 
-OB 4.x 引入了**租户级 cgroup** (e.g. meta 租户一个 cgroup, user 租户分组),通过 Linux kernel CFS scheduler 实现 CPU 隔离。
+OB 5.x 引入了**租户级 cgroup** (e.g. meta 租户一个 cgroup, user 租户分组),通过 Linux kernel CFS scheduler 实现 CPU 隔离。
 
 ---
 
@@ -843,7 +843,7 @@ ORDER BY iops_total DESC LIMIT 10;
 
 - 调小问题租户 `max_iops`
 - 启用 cgroup blkio (Linux 内核级 IO 隔离)
-- 拆分 disk (OB 4.x shared storage 模式)
+- 拆分 disk (OB 5.x shared storage 模式)
 
 ### 10.5 跨 region 限流触发
 
@@ -940,7 +940,7 @@ OB 多租户隔离覆盖 **5 个维度**: CPU / 内存 / IO / 网络 / 任务并
 - **Per-tenant 队列** — 每租户独立 MPSC 队列
 - **背压** — 直接拒绝 (`OB_EXCEED_LIMIT` / `OB_QUEUE_FULL`)
 
-**OB 4.x 演进**:
+**OB 5.x 演进**:
 
 - ✅ 5 维度隔离完整 (CPU / 内存 / IO / 网络 / 任务)
 - ✅ 多租户公平调度 (round-robin)
@@ -952,7 +952,7 @@ OB 多租户隔离覆盖 **5 个维度**: CPU / 内存 / IO / 网络 / 任务并
 
 | DB | 多租户隔离 | 粒度 |
 |----|-----------|------|
-| **OB 4.x** | ✅ 5 维度 | 租户级 |
+| **OB 5.x** | ✅ 5 维度 | 租户级 |
 | MySQL | ❌ 实例级 (多实例隔离) | 实例 |
 | PostgreSQL | 🟡 schema + role 级别 | db / role |
 | Oracle | ✅ 多 PDB + resource plan | PDB |
