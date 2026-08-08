@@ -666,7 +666,7 @@ filter:
 // 减少 outer 实际进 hash probe 的行数
 ```
 
-OB 4.x 起引入 runtime filter,主要优化"join 内表小,外表大"的场景。
+OB 5.x 起引入 runtime filter,主要优化"join 内表小,外表大"的场景。
 
 ### 10.3 Plan Monitor
 

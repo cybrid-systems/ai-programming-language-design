@@ -1,6 +1,6 @@
 # 102-numa-aware-memory — OceanBase NUMA-Aware 内存分配深度源码分析
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点:`deps/oblib/src/lib/resource/achunk_mgr.{h,cpp}` + `deps/oblib/src/lib/alloc/ob_malloc_allocator.cpp` + `src/observer/omt/ob_multi_tenant.cpp` + `src/observer/omt/ob_tenant.cpp` + `share/allocator/ob_{memstore,vector,mds,tx_data}_allocator.{h,cpp}`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 > 接续 #101 NUMA-Aware 线程分配 — 本篇是它的镜像:thread 绑 NUMA, memory 绑 NUMA

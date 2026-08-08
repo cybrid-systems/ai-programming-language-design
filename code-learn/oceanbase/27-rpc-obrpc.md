@@ -348,7 +348,7 @@ public:
 };
 ```
 
-### 5.2 io_uring(Linux 5.1+,OB 4.x)
+### 5.2 io_uring(Linux 5.1+,OB 5.x)
 
 ```cpp
 // src/lib/io/ob_io_uring.cpp:50

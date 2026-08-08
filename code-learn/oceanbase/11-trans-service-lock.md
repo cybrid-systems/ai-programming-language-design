@@ -339,7 +339,7 @@ public:
 };
 ```
 
-OB 4.x 引入 Wait-for Graph 检测(可选),更快发现死锁。
+OB 5.x 引入 Wait-for Graph 检测(可选),更快发现死锁。
 
 ---
 

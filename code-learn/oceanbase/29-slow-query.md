@@ -696,7 +696,7 @@ TABLE GET t via idx_ab  rows=5 cost=10
 
 > **v2 洞察**(接 #17 v2 + #51 v2):CBO 错选 80% 是 stats 过时。生产环境
 > 的 stats 维护:**大表每周 ANALYZE,小表每天 ANALYZE,ETL 后立即 ANALYZE**。
-> OB 4.x 的 `auto_collect_stats` 可以在 DML 量超过阈值时自动 ANALYZE。
+> OB 5.x 的 `auto_collect_stats` 可以在 DML 量超过阈值时自动 ANALYZE。
 
 ---
 

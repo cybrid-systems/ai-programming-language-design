@@ -266,7 +266,7 @@ public:
 };
 ```
 
-OB 4.x 引入 **tenant 级 cgroup** —— 强隔离:
+OB 5.x 引入 **tenant 级 cgroup** —— 强隔离:
 
 ```cpp
 // src/share/resource/ob_tenant_cgroup.cpp:80
@@ -500,7 +500,7 @@ Tenant 内并行度 = tenant cpu 数限制
 PX 不能跨 tenant
   ↓
 PX worker pool 是 tenant 共享还是独立?
-  - 4.x 默认:OBServer 级共享,按 quota 调度
+  - 5.x 默认:OBServer 级共享,按 quota 调度
 ```
 
 ---

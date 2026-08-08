@@ -1,6 +1,6 @@
 # 101-numa-aware-thread — OceanBase NUMA-Aware 线程分配深度源码分析
 
-> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后)
+> 基于 OceanBase 主线源码 (commit `f2e437ea62` 之后, OB_BUILD_VERSION "5.0.2.0")
 > 源码锚点:`deps/oblib/src/lib/resource/ob_affinity_ctrl.{h,cpp}` + `deps/oblib/src/lib/thread/{thread,threads}.{h,cpp}` + `src/observer/omt/ob_th_worker.cpp` + `src/observer/omt/ob_tenant.cpp` + `src/observer/ob_srv_network_frame.cpp` + `src/observer/ob_server.cpp`
 > 使用 doom-lsp (clangd LSP) 做符号解析与数据流追踪
 

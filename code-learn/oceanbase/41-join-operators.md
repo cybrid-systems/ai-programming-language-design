@@ -708,7 +708,7 @@ CBO 决策:
 ### 7.2 Join Reordering(运行时)
 
 某些场景下,CBO 的 join 顺序在执行时是错的——可以**运行时重排**(adapt
-join order)。OB 4.x 引入了 **adaptive join**:
+join order)。OB 5.x 引入了 **adaptive join**:
 
 ```cpp
 // src/sql/engine/join/ob_adaptive_join_op.cpp:50
@@ -720,7 +720,7 @@ public:
 };
 ```
 
-Adaptive join 是 4.x 的较新特性,生产环境用得不多——大部分场景 CBO 已经够
+Adaptive join 是 5.x 的较新特性,生产环境用得不多——大部分场景 CBO 已经够
 准。
 
 ---

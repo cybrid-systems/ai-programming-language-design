@@ -443,7 +443,7 @@ ALTER TABLE t ADD COLUMN c_new INT DEFAULT 0;
 | 锁等待 | < 1s |
 | 内存 | 几个 KB(schema 元数据) |
 
-这是 OB 4.x 的 killer feature —— 几乎 0 开销的 ADD COLUMN。
+这是 OB 5.x 的 killer feature —— 几乎 0 开销的 ADD COLUMN。
 
 ---
 
@@ -632,7 +632,7 @@ WHERE task_status_ = 'RUNNING'
 ```
 
 常见修法:
-- 取消重试:`ALTER TABLE t CANCEL DDL;` (OB 4.x 支持)
+- 取消重试:`ALTER TABLE t CANCEL DDL;` (OB 5.x 支持)
 - 检查 OBServer 负载(扫表任务会跑满磁盘 IO)
 
 ### 10.3 Schema 不一致
