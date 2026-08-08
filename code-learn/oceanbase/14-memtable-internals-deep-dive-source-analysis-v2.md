@@ -259,7 +259,7 @@ bool is_ready_for_flush() const;
 //   ObQueryEngine *query_engine_;           // 查询引擎 (含 use_hash_index_ flag but FALSE_IT)
 // 旧 claim (5.0.2.0 之前):
 //   memtable::ObMvccHashIndex *hash_index_;     // REMOVED in 5.0.2.0
-//   memtable::ObClusterIndex *cluster_index_;  // 待 verify (可能 REMOVED too)
+//   memtable::ObClusterIndex *cluster_index_;  // REMOVED in 5.0.2.0 (跟 ObMvccHashIndex 一起)
 ```
 
 ---
@@ -379,7 +379,7 @@ public:
    - ObMemtable::init() 初始化
    - 关联 schema_guard / tablet_id / ls_handle
    - 创建 mvcc_engine / query_engine
-   - 创建 hash_index / key_btree / cluster_index
+   - 创建 key_btree (5.0.2.0 OB ONLY MemTable 索引;hash_index / cluster_index 已 REMOVE)
    - 建 tx_node_allocator / row_tnode_allocator
    - iterator_factory
    - version = 0 / max_schema_version = 0
@@ -437,7 +437,7 @@ public:
 |------|------|----------|
 | ~~**Hash Index**~~ | ~~`ob_mvcc_hash_index.{h,cpp}`~~ | **5.0.2.0 REMOVE** (`FALSE_IT` dead code in `ob_memtable.cpp:164`) |
 | **BTree Index** | `ob_keybtree.{h,cpp}` | 范围扫描（< / > / >= / <=） + MemTable 唯一索引 |
-| ~~**Cluster Index**~~ | ~~`ob_mvcc_cluster_index.{h,cpp}`~~ | **待 verify** (在 5.0.2.0 `mvcc/` dir 也没看到,可能同 hash 一起 REMOVE 或重命名) |
+| ~~**Cluster Index**~~ | ~~`ob_mvcc_cluster_index.{h,cpp}`~~ | **5.0.2.0 REMOVE** (per `grep -r ObClusterIndex f2e437ea62` 全 repo 无 `ObClusterIndex` 类;MemTable 只剩 `ObKeyBtree` 单索引,跟 `ObMvccHashIndex` 一起 architectural REMOVE) |
 
 ### 7.2 性能优化要点
 
