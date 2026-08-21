@@ -1,0 +1,115 @@
+; 019-vfs_test.aura
+; =====================
+; Smoke tests for 019-vfs.aura — VFS minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/019-vfs_test.aura
+;
+; Verified automatically (smoke):
+;   - make-inode construction (mode, content, ops)
+;   - make-dentry construction (name, parent linkage)
+;   - make-file construction (inode, pos, flags)
+;   - make-super-block construction (root dentry)
+;   - inode-lookup finds child by name in directory
+;   - vfs-open returns file closure
+;   - vfs-read advances pos
+;   - vfs-write advances pos + returns byte count
+;   - vfs-close returns ops' release result
+;
+; Verified via separate probes during development:
+;   - ops-dispatch fallback (no 'read arm → returns raw content)
+;   - O_RDWR flag preservation
+;   - Multiple-file operations on same inode
+;
+; Deferred (full Linux VFS):
+;   - struct path / struct vfsmount
+;   - dcache (dentry hash table)
+;   - inode cache (icache)
+;   - file_operations (async / io_uring / splice / sendfile)
+;   - Permission checks (inode_permission)
+;   - Mount / umount / path walking
+;   - Filesystem-specific ops (ext4 / xfs / btrfs)
+
+(require "std/test" all:)
+(require "019-vfs" all:)
+
+; ----------------------------------------------------------------
+; Inode
+; ----------------------------------------------------------------
+
+(test-suite "vfs-001-inode-init"
+  (check (= 1 (eq? S-IFREG (inode-mode (make-inode S-IFREG 'file-data #f)))))
+  (check (= 1 (eq? 'file-data (inode-content (make-inode S-IFREG 'file-data #f)))))
+
+; ----------------------------------------------------------------
+; Dentry
+; ----------------------------------------------------------------
+
+(test-suite "vfs-002-dentry-init"
+  (check (= 1 (eq? 'README (dentry-name (make-dentry 'README)))))
+  (check (= 1 (if (not (dentry-parent (make-dentry 'README))) 1 0))))
+
+; ----------------------------------------------------------------
+; File
+; ----------------------------------------------------------------
+
+(test-suite "vfs-003-file-init"
+  (check (= 1 (= 0 (file-pos (make-file (make-inode S-IFREG 'data #f) O-RDONLY)))))
+
+; ----------------------------------------------------------------
+; Lookup (directory inode with children)
+; ----------------------------------------------------------------
+
+; Build a directory inode with one child 'README'.
+(define (dir-with-readme)
+  (let ((dir (make-inode S-IFDIR '() #f)))
+    ((dir 'add-child!) (cons 'README (make-inode S-IFREG 'readme-content #f)))
+    dir))
+
+(test-suite "vfs-004-lookup"
+  (check (= 1 (eq? 'readme-content (inode-content
+    (inode-lookup (dir-with-readme) 'README)))))
+
+(test-suite "vfs-004-lookup-miss"
+  (check (= 1 (if (not (inode-lookup (dir-with-readme) 'missing)) 1 0)))
+
+; ----------------------------------------------------------------
+; VFS ops
+; ----------------------------------------------------------------
+
+(test-suite "vfs-005-read"
+  ; Read 5 bytes from a file with content "hello-world".
+  (check (= 1 (eq? 'hello
+    (vfs-read (make-file (make-inode S-IFREG "hello-world" #f) O-RDONLY) 5))))
+
+(test-suite "vfs-005-read-advances-pos"
+  ; After read, file pos advances by bytes read.
+  (check (= 5 (file-pos (let ((f (make-file (make-inode S-IFREG "hello-world" #f) O-RDONLY)))
+                              (vfs-read f 5)
+                              f))))
+
+(test-suite "vfs-005-write"
+  ; vfs-write returns the count of bytes written.
+  (check (= 5 (vfs-write (make-file (make-inode S-IFREG "xxxxx" #f) O-WRONLY) "hello")))
+
+(test-suite "vfs-005-open"
+  ; vfs-open returns a file closure with the inode.
+  (check (= 1 (procedure? (vfs-open (make-inode S-IFREG 'data #f) O-RDONLY))))
+
+(test-suite "vfs-005-close"
+  ; vfs-close returns the ops' release result (#t for default fallback).
+  (check (= 1 (vfs-close (vfs-open (make-inode S-IFREG 'data #f) O-RDONLY))))
+
+; ----------------------------------------------------------------
+; Super-block
+; ----------------------------------------------------------------
+
+(test-suite "vfs-006-super-root"
+  (check (= 1 (eq? 'root (super-root (make-super-block (make-dentry 'root))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

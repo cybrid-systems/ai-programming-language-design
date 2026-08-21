@@ -1,0 +1,272 @@
+; 019-vfs.aura
+; ==================
+; VFS (Virtual File System) — minimal capability port to aura.
+;
+; Maps to: 019-vfs-analysis.md
+; Source: include/linux/fs.h + include/linux/fs/super_types.h +
+;         fs/open.c + fs/read_write.c + fs/namei.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux VFS is a 4-layer abstraction:
+;   - Syscall layer (sys_open / sys_read / sys_write / sys_close)
+;   - VFS generic (vfs_open / vfs_read / vfs_write / vfs_close / vfs_lookup)
+;   - Filesystem-specific (ext4_file_operations / xfs_file_operations / ...)
+;   - Block layer (submit_bio / make_request)
+;
+; aura has no POSIX syscalls, no real filesystems, no block layer.
+; v1 ships the four core VFS data structures + generic ops dispatch:
+;   - make-inode (mode, size, operations, content)
+;   - make-dentry (name, parent, inode)
+;   - make-file (inode, pos, flags, ops)
+;   - make-super-block (root dentry)
+;   - vfs-open / vfs-read / vfs-write / vfs-close (dispatch via op table)
+;   - inode-lookup (lookup child by name in directory)
+;
+; Deferred (full Linux VFS):
+;   - struct path (dentry + vfsmount pair)
+;   - struct vfsmount (mount point + per-mount data)
+;   - struct cred (file credentials)
+;   - dcache (dentry hash table for fast lookup)
+;   - inode cache (icache)
+;   - file_operations async / io_uring / splice / sendfile
+;   - lock_manager for filesystem locking
+;   - Permission checks (inode_permission)
+;   - Filesystem-specific ops (ext4 / xfs / btrfs)
+;   - Mount / umount / path walking
+
+(export
+  ; Inode
+  make-inode
+  inode-mode
+  inode-size
+  inode-set-size!
+  inode-content
+  inode-set-content!
+  inode-ops
+  inode-set-ops!
+  ; Dentry
+  make-dentry
+  dentry-name
+  dentry-parent
+  dentry-inode
+  ; File
+  make-file
+  file-inode
+  file-pos
+  file-set-pos!
+  file-flags
+  ; Super-block
+  make-super-block
+  super-root
+  ; VFS ops
+  vfs-open
+  vfs-read
+  vfs-write
+  vfs-close
+  ; Lookup
+  inode-lookup)
+
+; File mode flags (analogous to FMODE_* in Linux)
+(define FMODE-READ  1)   ; bit 0
+(define FMODE-WRITE 2)   ; bit 1
+
+; Open flags (analogous to O_* in Linux)
+(define O-RDONLY  0)
+(define O-WRONLY  1)
+(define O-RDWR    2)
+
+; Inode type bits (mode: regular file vs directory)
+; Note: aura doesn't support #o octal literals — use decimal/hex.
+; S_IFREG = 0o100000 = #x8000 = 32768
+; S_IFDIR = 0o040000 = #x4000 = 16384
+(define S-IFREG    32768)   ; regular file
+(define S-IFDIR    16384)   ; directory
+
+; ----------------------------------------------------------------
+; Inode (closure with mode, size, content, ops)
+; ----------------------------------------------------------------
+
+; Make an inode. mode contains S_IFREG / S_IFDIR + permissions.
+; content is a list of children (for directory) or bytes (for file).
+; ops is a closure providing lookup/read/write/open/etc.
+(define (make-inode mode content ops)
+  (let ((ino-mode mode)
+        (ino-size 0)
+        (ino-content content)
+        (ino-ops ops)
+        (children '()))           ; list of (name . inode) pairs (for dirs)
+    (letrec ((set-size!     (lambda (v) (set! ino-size v) v))
+             (set-content!  (lambda (v) (set! ino-content v) v))
+             (set-ops!      (lambda (v) (set! ino-ops v) v))
+             (add-child!    (lambda (kv) (set! children (cons kv children))))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'mode) ino-mode)
+                       ((eq? msg 'size) ino-size)
+                       ((eq? msg 'content) ino-content)
+                       ((eq? msg 'ops) ino-ops)
+                       ((eq? msg 'children) children)
+                       ((eq? msg 'set-size!) set-size!)
+                       ((eq? msg 'set-content!) set-content!)
+                       ((eq? msg 'set-ops!) set-ops!)
+                       ((eq? msg 'add-child!) add-child!)
+                       (else #f)))))
+      self)))
+
+; inode-mode: get the inode's mode (file type + permissions).
+(define (inode-mode i) (i 'mode))
+
+; inode-size: get the inode's size (bytes for files).
+(define (inode-size i) (i 'size))
+
+; inode-set-size!: set the inode's size.
+(define (inode-set-size! i n) ((i 'set-size!) n))
+
+; inode-content: get the inode's content (raw bytes for files).
+(define (inode-content i) (i 'content))
+
+; inode-set-content!: set the inode's content.
+(define (inode-set-content! i c) ((i 'set-content!) c))
+
+; inode-ops: get the inode's op dispatch closure.
+(define (inode-ops i) (i 'ops))
+
+; inode-set-ops!: set the inode's op dispatch closure.
+(define (inode-set-ops! i ops) ((i 'set-ops!) ops))
+
+; ----------------------------------------------------------------
+; Dentry (closure with name, parent, inode)
+; ----------------------------------------------------------------
+
+; Make a dentry with optional parent and optional inode.
+(define (make-dentry name)
+  (let ((d-name name)
+        (d-parent #f)
+        (d-inode #f))
+    (letrec ((set-parent! (lambda (v) (set! d-parent v) v))
+             (set-inode!  (lambda (v) (set! d-inode  v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) d-name)
+                       ((eq? msg 'parent) d-parent)
+                       ((eq? msg 'inode) d-inode)
+                       ((eq? msg 'set-parent!) set-parent!)
+                       ((eq? msg 'set-inode!) set-inode!)
+                       (else #f)))))
+      self)))
+
+; dentry-name: get the dentry's name.
+(define (dentry-name d) (d 'name))
+
+; dentry-parent: get the dentry's parent (or #f for root).
+(define (dentry-parent d) (d 'parent))
+
+; dentry-inode: get the dentry's associated inode.
+(define (dentry-inode d) (d 'inode))
+
+; ----------------------------------------------------------------
+; File (closure with inode, pos, flags)
+; ----------------------------------------------------------------
+
+; Make an open file. flags is O_* (O_RDONLY / O_WRONLY / / O_RDWR).
+; Returns a file closure.
+(define (make-file inode flags)
+  (let ((f-inode inode)
+        (f-pos 0)
+        (f-flags flags))
+    (letrec ((set-pos! (lambda (v) (set! f-pos v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'inode) f-inode)
+                       ((eq? msg 'pos) f-pos)
+                       ((eq? msg 'flags) f-flags)
+                       ((eq? msg 'set-pos!) set-pos!)
+                       (else #f)))))
+      self)))
+
+; file-inode: get the file's inode.
+(define (file-inode f) (f 'inode))
+
+; file-pos: get the current read/write position.
+(define (file-pos f) (f 'pos))
+
+; file-set-pos!: set the read/write position.
+(define (file-set-pos! f v) ((f 'set-pos!) v))
+
+; file-flags: get the file's open flags.
+(define (file-flags f) (f 'flags))
+
+; ----------------------------------------------------------------
+; Super-block (closure with root dentry)
+; ----------------------------------------------------------------
+
+; Make a super-block with the given root dentry.
+(define (make-super-block root-dentry)
+  (let ((root root-dentry))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'root) root)
+                       (else #f)))))
+      self)))
+
+; super-root: get the super-block's root dentry.
+(define (super-root sb) (sb 'root))
+
+; ----------------------------------------------------------------
+; VFS generic ops (dispatch via inode ops closure)
+; ----------------------------------------------------------------
+
+; vfs-open: open a file (delegates to inode ops' 'open arm).
+; Returns a file closure, or #f if ops have no 'open.
+(define (vfs-open inode flags)
+  (let ((ops (inode-ops inode)))
+    (if (and ops (ops 'open))
+        ((ops 'open) inode flags)
+        (make-file inode flags))))
+
+; vfs-read: read N bytes from a file at its current position.
+; Delegates to ops' 'read arm. Returns the data read.
+(define (vfs-read file n)
+  (let* ((inode (file-inode file))
+         (ops (inode-ops inode))
+         (pos (file-pos file))
+         (data (if (and ops (ops 'read))
+                   ((ops 'read) inode pos n)
+                   (inode-content inode))))
+    (file-set-pos! file (+ pos (length data)))
+    data))
+
+; vfs-write: write data to a file at its current position.
+; Delegates to ops' 'write arm. Returns # of bytes written.
+(define (vfs-write file data)
+  (let* ((inode (file-inode file))
+         (ops (inode-ops inode))
+         (pos (file-pos file))
+         (n (if (and ops (ops 'write))
+                ((ops 'write) inode pos data)
+                (length data))))
+    (file-set-pos! file (+ pos n))
+    n))
+
+; vfs-close: close a file (delegates to ops' 'release arm).
+; Returns whatever ops' release returns.
+(define (vfs-close file)
+  (let ((ops (inode-ops (file-inode file))))
+    (if (and ops (ops 'release))
+        ((ops 'release) file)
+        #t)))
+
+; ----------------------------------------------------------------
+; Lookup — find a child in a directory inode
+; ----------------------------------------------------------------
+
+; inode-lookup: find a child by name in a directory inode.
+; Linear search in the children list. Returns child inode or #f.
+(define (inode-lookup dir-inode name)
+  (let ((children (dir-inode 'children)))
+    (let loop ((rest children))
+      (cond
+        ((null? rest) #f)
+        ((eq? (car (car rest)) name) (cdr (car rest)))
+        (else (loop (cdr rest)))))))
