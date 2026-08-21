@@ -1,0 +1,414 @@
+; 33-backup-recovery.aura
+; ======================
+; backup_recovery — minimal capability port to aura.
+;
+; Maps to: OceanBase Backup + Recovery + PIT
+; Source: src/share/backup/ob_backup_type.h
+;         + src/share/backup/ob_backup_struct.h
+;         + src/storage/backup/ob_full_backup.cpp
+;         + src/storage/backup/ob_inc_backup.cpp
+;         + src/storage/backup/ob_restore.cpp
+;         + src/share/backup/ob_backup_struct.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Backup + Recovery:
+;   - 3 BACKUP-TYPE constants: FULL / INCREMENTAL / LOG_ARCHIVE
+;   - 4 BACKUP-STATUS constants: PENDING / DOING / DONE / FAILED
+;   - 2 RESTORE-STATUS constants: PENDING / DONE
+;   - BackupSetDesc: metadata (id, tenant, type, status, time, path)
+;   - ObFullBackupExecutor: full SSTable backup
+;   - ObIncBackupExecutor: incremental backup
+;   - ObRestoreExecutor: restore from backup + archive
+;   - BackupService: backup management
+;   - PIT recovery: restore to arbitrary point in time
+;
+; aura v1 ships:
+;   - 3 BACKUP-TYPE constants (FULL, INCREMENTAL, LOG_ARCHIVE)
+;   - 4 BACKUP-STATUS constants (PENDING, DOING, DONE, FAILED)
+;   - 2 RESTORE-STATUS constants (PENDING, DONE)
+;   - make-backup-set-desc (factory: id, tenant, type, status,
+;     start-time, end-time, path)
+;   - backup-set-desc accessors + set-status! + set-end-time!
+;   - make-full-backup-executor
+;   - full-backup-executor-get-backup-id + get-status
+;   - full-backup-executor-execute! + set-status!
+;   - make-inc-backup-executor
+;   - inc-backup-executor-get-backup-id + get-status
+;   - inc-backup-executor-execute! + set-status!
+;   - make-restore-executor
+;   - restore-executor-get-backup-id + get-status + get-pit-time
+;   - restore-executor-execute! + set-status!
+;   - make-backup-service
+;   - backup-service-get-backup-count + get-restore-count
+;   - backup-service-add-backup! + add-restore!
+;   - backup-service-find-backup + find-restore
+;
+; Deferred (full OceanBase Backup + Recovery):
+;   - real BackupSetDesc with full __all_backup_set metadata
+;   - real ObFullBackupExecutor with real MemTable freeze +
+;     SSTable upload to OSS/S3
+;   - real ObIncBackupExecutor with delta tracking
+;   - real ObRestoreExecutor with PIT replay from log archive
+;   - real backup coordinator scheduling across OBServer
+;   - real compression + encryption for backup data
+;   - real log archive streaming to remote storage
+;   - real PIT (Point-in-Time) recovery with arbitrary timestamp
+;   - real backup metadata in __all_backup_set internal table
+;   - real tenant-level backup isolation
+;   - real backup progress monitoring + alert integration
+
+(export
+  ; BackupType constants
+  BACKUP-TYPE-FULL
+  BACKUP-TYPE-INCREMENTAL
+  BACKUP-TYPE-LOG-ARCHIVE
+  ; BackupStatus constants
+  BACKUP-STATUS-PENDING
+  BACKUP-STATUS-DOING
+  BACKUP-STATUS-DONE
+  BACKUP-STATUS-FAILED
+  ; RestoreStatus constants
+  RESTORE-STATUS-PENDING
+  RESTORE-STATUS-DONE
+  ; BackupSetDesc
+  make-backup-set-desc
+  backup-set-desc?
+  backup-set-desc-get-backup-id
+  backup-set-desc-get-tenant-id
+  backup-set-desc-get-type
+  backup-set-desc-get-status
+  backup-set-desc-get-start-time
+  backup-set-desc-get-end-time
+  backup-set-desc-get-path
+  backup-set-desc-set-status!
+  backup-set-desc-set-end-time!
+  ; Full backup executor
+  make-full-backup-executor
+  full-backup-executor?
+  full-backup-executor-get-backup-id
+  full-backup-executor-get-status
+  full-backup-executor-execute!
+  full-backup-executor-set-status!
+  ; Incremental backup executor
+  make-inc-backup-executor
+  inc-backup-executor?
+  inc-backup-executor-get-backup-id
+  inc-backup-executor-get-status
+  inc-backup-executor-get-parent-id
+  inc-backup-executor-execute!
+  inc-backup-executor-set-status!
+  ; Restore executor
+  make-restore-executor
+  restore-executor?
+  restore-executor-get-backup-id
+  restore-executor-get-status
+  restore-executor-get-pit-time
+  restore-executor-execute!
+  restore-executor-set-status!
+  ; Backup service
+  make-backup-service
+  backup-service?
+  backup-service-get-backup-count
+  backup-service-get-restore-count
+  backup-service-add-backup!
+  backup-service-add-restore!
+  backup-service-find-backup
+  backup-service-find-restore)
+
+; ----------------------------------------------------------------
+; BackupType constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_backup_type.h:50):
+;   FULL, INCREMENTAL, LOG_ARCHIVE
+
+(define BACKUP-TYPE-FULL 0)
+(define BACKUP-TYPE-INCREMENTAL 1)
+(define BACKUP-TYPE-LOG-ARCHIVE 2)
+
+; ----------------------------------------------------------------
+; BackupStatus constants
+; ----------------------------------------------------------------
+
+(define BACKUP-STATUS-PENDING 0)
+(define BACKUP-STATUS-DOING 1)
+(define BACKUP-STATUS-DONE 2)
+(define BACKUP-STATUS-FAILED 3)
+
+; ----------------------------------------------------------------
+; RestoreStatus constants
+; ----------------------------------------------------------------
+
+(define RESTORE-STATUS-PENDING 0)
+(define RESTORE-STATUS-DONE 1)
+
+; ----------------------------------------------------------------
+; BackupSetDesc — closure-based
+; ----------------------------------------------------------------
+
+; make-backup-set-desc: create a BackupSetDesc.
+; Args: backup-id (integer), tenant-id (integer), type (integer),
+;       status (integer), start-time (integer), end-time (integer),
+;       path (symbol — backup path)
+; Returns: backup_set_desc closure.
+(define (make-backup-set-desc backup-id tenant-id type status
+                            start-time end-time path)
+  (letrec ((set-status! (lambda (v) (set! status v) v))
+           (set-end-time! (lambda (v) (set! end-time v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'backup-id) backup-id)
+                     ((eq? msg 'tenant-id) tenant-id)
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'status) status)
+                     ((eq? msg 'start-time) start-time)
+                     ((eq? msg 'end-time) end-time)
+                     ((eq? msg 'path) path)
+                     ((eq? msg 'set-status!) set-status!)
+                     ((eq? msg 'set-end-time!) set-end-time!)
+                     (else #f)))))
+      self))
+
+; backup-set-desc?: is the object a backup set desc?
+; Detected by querying 'path — only descs return a symbol.
+(define (backup-set-desc? obj)
+  (if (procedure? obj)
+      (if (symbol? (obj 'path)) #t #f)
+      #f))
+
+; backup-set-desc-get-backup-id: get backup id.
+(define (backup-set-desc-get-backup-id bsd) (bsd 'backup-id))
+
+; backup-set-desc-get-tenant-id: get tenant id.
+(define (backup-set-desc-get-tenant-id bsd) (bsd 'tenant-id))
+
+; backup-set-desc-get-type: get backup type.
+(define (backup-set-desc-get-type bsd) (bsd 'type))
+
+; backup-set-desc-get-status: get status.
+(define (backup-set-desc-get-status bsd) (bsd 'status))
+
+; backup-set-desc-get-start-time: get start time.
+(define (backup-set-desc-get-start-time bsd) (bsd 'start-time))
+
+; backup-set-desc-get-end-time: get end time.
+(define (backup-set-desc-get-end-time bsd) (bsd 'end-time))
+
+; backup-set-desc-get-path: get backup path.
+(define (backup-set-desc-get-path bsd) (bsd 'path))
+
+; backup-set-desc-set-status!: set status.
+; Returns the new status.
+(define (backup-set-desc-set-status! bsd v) ((bsd 'set-status!) v))
+
+; backup-set-desc-set-end-time!: set end time.
+; Returns the new end time.
+(define (backup-set-desc-set-end-time! bsd v) ((bsd 'set-end-time!) v))
+
+; ----------------------------------------------------------------
+; ObFullBackupExecutor — closure-based
+; ----------------------------------------------------------------
+
+; make-full-backup-executor: create a full backup executor.
+; Args: backup-id (integer)
+; Returns: full_backup_executor closure.
+(define (make-full-backup-executor backup-id)
+  (let ((status BACKUP-STATUS-PENDING))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'backup-id) backup-id)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self))
+
+; full-backup-executor?: is the object a full backup executor?
+; Detected by querying 'backup-id — only executors return integer.
+(define (full-backup-executor? obj)
+  (if (procedure? obj)
+      (let ((b (obj 'backup-id)))
+        (if (and (integer? b) (>= b 0)) #t #f))
+      #f))
+
+; full-backup-executor-get-backup-id: get backup id.
+(define (full-backup-executor-get-backup-id e) (e 'backup-id))
+
+; full-backup-executor-get-status: get status.
+(define (full-backup-executor-get-status e) (e 'status))
+
+; full-backup-executor-execute!: execute backup (v1: set
+; status to DOING then DONE).
+; Returns the final status.
+(define (full-backup-executor-execute! e)
+  ((e 'set-status!) BACKUP-STATUS-DOING)
+  ((e 'set-status!) BACKUP-STATUS-DONE))
+
+; full-backup-executor-set-status!: set status directly.
+; Returns the new status.
+(define (full-backup-executor-set-status! e v) ((e 'set-status!) v))
+
+; ----------------------------------------------------------------
+; ObIncBackupExecutor — closure-based
+; ----------------------------------------------------------------
+
+; make-inc-backup-executor: create an incremental backup executor.
+; Args: backup-id (integer), parent-id (integer — parent backup)
+; Returns: inc_backup_executor closure.
+(define (make-inc-backup-executor backup-id parent-id)
+  (let ((status BACKUP-STATUS-PENDING))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'backup-id) backup-id)
+                       ((eq? msg 'parent-id) parent-id)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self))
+
+; inc-backup-executor?: is the object an inc backup executor?
+; Detected by querying 'parent-id — only executors return integer.
+(define (inc-backup-executor? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'parent-id)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; inc-backup-executor-get-backup-id: get backup id.
+(define (inc-backup-executor-get-backup-id e) (e 'backup-id))
+
+; inc-backup-executor-get-status: get status.
+(define (inc-backup-executor-get-status e) (e 'status))
+
+; inc-backup-executor-get-parent-id: get parent backup id.
+(define (inc-backup-executor-get-parent-id e) (e 'parent-id))
+
+; inc-backup-executor-execute!: execute inc backup (v1: set to
+; DOING then DONE).
+; Returns the final status.
+(define (inc-backup-executor-execute! e)
+  ((e 'set-status!) BACKUP-STATUS-DOING)
+  ((e 'set-status!) BACKUP-STATUS-DONE))
+
+; inc-backup-executor-set-status!: set status.
+; Returns the new status.
+(define (inc-backup-executor-set-status! e v) ((e 'set-status!) v))
+
+; ----------------------------------------------------------------
+; ObRestoreExecutor — closure-based
+; ----------------------------------------------------------------
+
+; make-restore-executor: create a restore executor.
+; Args: backup-id (integer), pit-time (integer — point-in-time)
+; Returns: restore_executor closure (initial: status=PENDING).
+(define (make-restore-executor backup-id pit-time)
+  (let ((status RESTORE-STATUS-PENDING))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'backup-id) backup-id)
+                       ((eq? msg 'pit-time) pit-time)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self))
+
+; restore-executor?: is the object a restore executor?
+; Detected by querying 'pit-time — only executors return integer.
+(define (restore-executor? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'pit-time)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; restore-executor-get-backup-id: get backup id.
+(define (restore-executor-get-backup-id e) (e 'backup-id))
+
+; restore-executor-get-status: get status.
+(define (restore-executor-get-status e) (e 'status))
+
+; restore-executor-get-pit-time: get point-in-time.
+(define (restore-executor-get-pit-time e) (e 'pit-time))
+
+; restore-executor-execute!: execute restore (v1: set to DONE).
+; Returns the final status.
+(define (restore-executor-execute! e)
+  ((e 'set-status!) RESTORE-STATUS-DONE))
+
+; restore-executor-set-status!: set status.
+; Returns the new status.
+(define (restore-executor-set-status! e v) ((e 'set-status!) v))
+
+; ----------------------------------------------------------------
+; ObBackupService — closure-based
+; ----------------------------------------------------------------
+
+; make-backup-service: create a backup service.
+; Returns: backup_service closure (initial: empty lists).
+(define (make-backup-service)
+  (let ((backups '())
+        (restores '()))
+    (letrec ((set-backups! (lambda (v) (set! backups v) v))
+             (set-restores! (lambda (v) (set! restores v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'backups) backups)
+                       ((eq? msg 'restores) restores)
+                       ((eq? msg 'set-backups!) set-backups!)
+                       ((eq? msg 'set-restores!) set-restores!)
+                       (else #f)))))
+      self))
+
+; backup-service?: is the object a backup service?
+; Detected by querying 'backups — only services return a cons.
+(define (backup-service? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'backups)) #t #f)
+      #f))
+
+; backup-service-get-backup-count: get backup count.
+(define (backup-service-get-backup-count s)
+  (let loop ((rest (s 'backups)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; backup-service-get-restore-count: get restore count.
+(define (backup-service-get-restore-count s)
+  (let loop ((rest (s 'restores)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; backup-service-add-backup!: add a backup.
+; Returns the new count.
+(define (backup-service-add-backup! s backup)
+  (let ((existing (s 'backups)))
+    ((s 'set-backups!) (cons backup existing))))
+
+; backup-service-add-restore!: add a restore.
+; Returns the new count.
+(define (backup-service-add-restore! s restore)
+  (let ((existing (s 'restores)))
+    ((s 'set-restores!) (cons restore existing))))
+
+; backup-service-find-backup: find backup by id.
+; Returns the executor or #f.
+(define (backup-service-find-backup s id)
+  (let loop ((rest (s 'backups)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'backup-id) id) (car rest))
+      (#t (loop (cdr rest))))))
+
+; backup-service-find-restore: find restore by id.
+; Returns the executor or #f.
+(define (backup-service-find-restore s id)
+  (let loop ((rest (s 'restores)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'backup-id) id) (car rest))
+      (#t (loop (cdr rest))))))

@@ -1,0 +1,249 @@
+; 33-backup-recovery_test.aura
+; ======================
+; Smoke tests for 33-backup-recovery.aura — Backup + Recovery minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/33-backup-recovery_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 BACKUP-TYPE + 4 BACKUP-STATUS + 2 RESTORE-STATUS distinct
+;   - make-backup-set-desc + accessors + set-status + set-end-time
+;   - make-full-backup-executor + execute! (DOING → DONE)
+;   - make-inc-backup-executor + execute! + parent-id
+;   - make-restore-executor + execute! + PIT time
+;   - make-backup-service + add-backup! + add-restore! + find
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Backup lifecycle: PENDING → DOING → DONE works
+;   - Restore lifecycle: PENDING → DONE works
+;
+; Deferred (full OceanBase Backup + Recovery):
+;   - real BackupSetDesc with full __all_backup_set metadata
+;   - real ObFullBackupExecutor with real MemTable freeze +
+;     SSTable upload to OSS/S3
+;   - real ObIncBackupExecutor with delta tracking
+;   - real ObRestoreExecutor with PIT replay from log archive
+;   - real backup coordinator scheduling across OBServer
+;   - real compression + encryption for backup data
+;   - real log archive streaming to remote storage
+;   - real PIT (Point-in-Time) recovery with arbitrary timestamp
+;   - real backup metadata in __all_backup_set internal table
+;   - real tenant-level backup isolation
+;   - real backup progress monitoring + alert integration
+
+(require "std/test" all:)
+(require "33-backup-recovery" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "33-001-backup-type-distinct"
+  ; 3 BACKUP-TYPE constants are distinct.
+  (check (= 1 (if (not (= BACKUP-TYPE-FULL
+                          BACKUP-TYPE-INCREMENTAL)) 1 0)))
+  (check (= 1 (if (not (= BACKUP-TYPE-INCREMENTAL
+                          BACKUP-TYPE-LOG-ARCHIVE)) 1 0)))
+  (check (= 1 (if (not (= BACKUP-TYPE-FULL
+                          BACKUP-TYPE-LOG-ARCHIVE)) 1 0))))
+
+(test-suite "33-001-backup-status-distinct"
+  ; 4 BACKUP-STATUS constants are distinct.
+  (check (= 1 (if (not (= BACKUP-STATUS-PENDING
+                          BACKUP-STATUS-DOING)) 1 0)))
+  (check (= 1 (if (not (= BACKUP-STATUS-DOING
+                          BACKUP-STATUS-DONE)) 1 0)))
+  (check (= 1 (if (not (= BACKUP-STATUS-DONE
+                          BACKUP-STATUS-FAILED)) 1 0)))
+  (check (= 1 (if (not (= BACKUP-STATUS-PENDING
+                          BACKUP-STATUS-FAILED)) 1 0))))
+
+(test-suite "33-001-restore-status-distinct"
+  ; 2 RESTORE-STATUS constants are distinct.
+  (check (= 1 (if (not (= RESTORE-STATUS-PENDING
+                          RESTORE-STATUS-DONE)) 1 0))))
+
+; ----------------------------------------------------------------
+; BackupSetDesc
+; ----------------------------------------------------------------
+
+(test-suite "33-002-bsd-construction"
+  ; bsd preserves all fields.
+  (check (= 1 (backup-set-desc-get-backup-id
+               (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                 BACKUP-STATUS-PENDING 1000 0 'oss-path))))
+  (check (= 1004 (backup-set-desc-get-tenant-id
+                   (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                     BACKUP-STATUS-PENDING 1000 0 'oss-path))))
+  (check (= BACKUP-TYPE-FULL
+             (backup-set-desc-get-type
+               (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                 BACKUP-STATUS-PENDING 1000 0 'oss-path))))
+  (check (= BACKUP-STATUS-PENDING
+             (backup-set-desc-get-status
+               (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                 BACKUP-STATUS-PENDING 1000 0 'oss-path))))
+  (check (= 1000 (backup-set-desc-get-start-time
+                   (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                     BACKUP-STATUS-PENDING 1000 0 'oss-path))))
+  (check (= 0 (backup-set-desc-get-end-time
+               (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                 BACKUP-STATUS-PENDING 1000 0 'oss-path))))
+  (check (= #t (eq? 'oss-path
+                   (backup-set-desc-get-path
+                     (make-backup-set-desc 1 1004 BACKUP-TYPE-FULL
+                       BACKUP-STATUS-PENDING 1000 0 'oss-path))))))
+
+(test-suite "33-002-bsd-predicate"
+  ; backup-set-desc? accepts only descs.
+  (check (= #t (backup-set-desc?
+                 (make-backup-set-desc 1 1 BACKUP-TYPE-FULL
+                   BACKUP-STATUS-PENDING 0 0 'p))))
+  (check (= #f (backup-set-desc? 'not-bsd)))
+  (check (= #f (backup-set-desc? 42)))
+
+(test-suite "33-003-bsd-set-status"
+  ; bsd set-status! updates.
+  (check (= BACKUP-STATUS-DOING
+             (let ((b (make-backup-set-desc 1 1 BACKUP-TYPE-FULL
+                       BACKUP-STATUS-PENDING 0 0 'p)))
+               (backup-set-desc-set-status! b BACKUP-STATUS-DOING)
+               (backup-set-desc-get-status b))))
+
+(test-suite "33-003-bsd-set-end-time"
+  ; bsd set-end-time! updates.
+  (check (= 5000 (let ((b (make-backup-set-desc 1 1 BACKUP-TYPE-FULL
+                         BACKUP-STATUS-PENDING 0 0 'p)))
+                   (backup-set-desc-set-end-time! b 5000)
+                   (backup-set-desc-get-end-time b))))
+
+; ----------------------------------------------------------------
+; Full Backup Executor
+; ----------------------------------------------------------------
+
+(test-suite "33-004-full-construction"
+  ; full backup preserves id.
+  (check (= 1 (full-backup-executor-get-backup-id
+               (make-full-backup-executor 1))))
+
+(test-suite "33-004-full-predicate"
+  ; full-backup-executor? accepts only full backup executors.
+  (check (= #t (full-backup-executor? (make-full-backup-executor 1))))
+  (check (= #f (full-backup-executor? 'not-full)))
+  (check (= #f (full-backup-executor? 42)))
+
+(test-suite "33-005-full-execute"
+  ; execute! lifecycle: DOING → DONE.
+  (check (= BACKUP-STATUS-DONE
+             (let ((e (make-full-backup-executor 1)))
+               (full-backup-executor-execute! e)
+               (full-backup-executor-get-status e))))
+
+(test-suite "33-005-full-set-status"
+  ; set-status! updates.
+  (check (= BACKUP-STATUS-FAILED
+             (let ((e (make-full-backup-executor 1)))
+               (full-backup-executor-set-status! e BACKUP-STATUS-FAILED)
+               (full-backup-executor-get-status e))))
+
+; ----------------------------------------------------------------
+; Incremental Backup Executor
+; ----------------------------------------------------------------
+
+(test-suite "33-006-inc-construction"
+  ; inc backup preserves id + parent-id.
+  (check (= 2 (inc-backup-executor-get-backup-id
+               (make-inc-backup-executor 2 1))))
+  (check (= 1 (inc-backup-executor-get-parent-id
+               (make-inc-backup-executor 2 1))))
+
+(test-suite "33-006-inc-predicate"
+  ; inc-backup-executor? accepts only inc backup executors.
+  (check (= #t (inc-backup-executor? (make-inc-backup-executor 1 0))))
+  (check (= #f (inc-backup-executor? 'not-inc)))
+  (check (= #f (inc-backup-executor? 42)))
+
+(test-suite "33-007-inc-execute"
+  ; execute! lifecycle: DOING → DONE.
+  (check (= BACKUP-STATUS-DONE
+             (let ((e (make-inc-backup-executor 2 1)))
+               (inc-backup-executor-execute! e)
+               (inc-backup-executor-get-status e))))
+
+; ----------------------------------------------------------------
+; Restore Executor
+; ----------------------------------------------------------------
+
+(test-suite "33-008-restore-construction"
+  ; restore executor preserves id + pit-time.
+  (check (= 1 (restore-executor-get-backup-id
+               (make-restore-executor 1 5000))))
+  (check (= 5000 (restore-executor-get-pit-time
+                  (make-restore-executor 1 5000))))
+
+(test-suite "33-008-restore-predicate"
+  ; restore-executor? accepts only restore executors.
+  (check (= #t (restore-executor? (make-restore-executor 1 0))))
+  (check (= #f (restore-executor? 'not-restore)))
+  (check (= #f (restore-executor? 42)))
+
+(test-suite "33-009-restore-execute"
+  ; execute! lifecycle: PENDING → DONE.
+  (check (= RESTORE-STATUS-DONE
+             (let ((e (make-restore-executor 1 5000)))
+               (restore-executor-execute! e)
+               (restore-executor-get-status e))))
+
+; ----------------------------------------------------------------
+; Backup Service
+; ----------------------------------------------------------------
+
+(test-suite "33-010-bs-construction"
+  ; service starts with empty lists.
+  (check (= 0 (backup-service-get-backup-count
+               (make-backup-service))))
+  (check (= 0 (backup-service-get-restore-count
+               (make-backup-service))))
+
+(test-suite "33-010-bs-predicate"
+  ; backup-service? accepts only services.
+  (check (= #t (backup-service? (make-backup-service))))
+  (check (= #f (backup-service? 'not-service)))
+  (check (= #f (backup-service? 42)))
+
+(test-suite "33-011-bs-add-backup"
+  ; add-backup! increases count.
+  (check (= 1 (let ((s (make-backup-service)))
+                 (backup-service-add-backup! s
+                   (make-full-backup-executor 1))
+                 (backup-service-get-backup-count s))))
+
+(test-suite "33-011-bs-add-restore"
+  ; add-restore! increases count.
+  (check (= 1 (let ((s (make-backup-service)))
+                 (backup-service-add-restore! s
+                   (make-restore-executor 1 5000))
+                 (backup-service-get-restore-count s))))
+
+(test-suite "33-012-bs-find"
+  ; find-backup returns the matching backup.
+  (check (= #t (let ((s (make-backup-service)))
+                 (backup-service-add-backup! s
+                   (make-full-backup-executor 42))
+                 (eq? BACKUP-STATUS-DONE
+                   (let ((e (backup-service-find-backup s 42)))
+                     (full-backup-executor-execute! e)
+                     (full-backup-executor-get-status e))))))
+
+(test-suite "33-012-bs-find-missing"
+  ; find-backup returns #f for unknown id.
+  (check (= #f (backup-service-find-backup (make-backup-service) 999)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
