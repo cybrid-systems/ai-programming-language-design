@@ -1,0 +1,148 @@
+; 016-vm-area-struct.aura
+; ============================
+; VMA (Virtual Memory Area) — minimal capability port to aura.
+;
+; Maps to: 016-vm-area-struct-analysis.md
+; Source: include/linux/mm_types.h + mm/vma.c + mm/mmap.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux VMA is a complex per-process memory region descriptor:
+;   - struct vm_area_struct: vm_start, vm_end, vm_mm, vm_page_prot, vm_flags,
+;     vm_lock_seq (per-VMA lock), vm_file, vm_pgoff, anon_vma, vma_policy,
+;     vm_ops, + many more
+;   - Maple Tree (O(log n) lookup) — replaced RB tree in 6.1
+;   - Per-VMA reader lock (replaced global mmap_lock read path)
+;   - VMA merging (mergeable flags), splitting, unmap
+;   - mmap.c operations: find_vma, find_vma_prev, mmap_region, etc.
+;
+; aura has no MMU, no Maple tree, no per-VMA lock infrastructure.
+; v1 ships the VMA data structure + contains check + flag tracking + linear search:
+;   - make-vma (closure with vm_start, vm_end, vm_flags, vm_file-name)
+;   - vma-start / vma-end / vma-size / vma-flags
+;   - vma-set-flag! / vma-has-flag? / vma-clear-flag!
+;   - vma-contains? (addr in [start, end))
+;   - vma-find (linear search in a list of VMAs)
+;   - VM_* flag constants
+;
+; Deferred (full Linux VMA, separate issues):
+;   - Maple Tree (mtree) integration for O(log n) lookup
+;   - Per-VMA reader lock (vm_lock_seq)
+;   - VMA merging (VMA_MERGEABLE flag + RB tree predecessor/successor walks)
+;   - vm_file backing (file-backed mappings)
+;   - anon_vma + rmap (reverse mapping)
+;   - vm_ops table (open/close/page-fault handlers)
+;   - policy / NUMA hints (vma_policy)
+;   - pgoff / shared memory semantics
+;   - mmap_region / do_brk_flags creation paths
+
+(export
+  make-vma
+  vma-start
+  vma-end
+  vma-size
+  vma-flags
+  vma-set-flag!
+  vma-clear-flag!
+  vma-has-flag?
+  vma-contains?
+  vma-file-name
+  vma-set-file-name!
+  vma-find
+  VM-READ
+  VM-WRITE
+  VM-EXEC
+  VM-SHARED
+  VM-PRIVATE)
+
+; VM_* flag bit positions (analogous to Linux include/linux/mm.h)
+(define VM-READ     1)   ; bit 0
+(define VM-WRITE    2)   ; bit 1
+(define VM-EXEC     4)   ; bit 2
+(define VM-SHARED   8)   ; bit 3
+(define VM-PRIVATE  16)  ; bit 4 (deprecated alias for VM_SHARED not set)
+(define VM-MAYREAD  32)  ; bit 5 (informational — VM_READ is allowed)
+(define VM-MAYWRITE 64)  ; bit 6
+(define VM-MAYEXEC  128) ; bit 7
+
+; ----------------------------------------------------------------
+; VMA (closure with start/end/flags + file-name)
+; ----------------------------------------------------------------
+
+; Make a VMA covering [vm_start, vm_end) with the given flags.
+; vm-file-name defaults to #f (anonymous mapping).
+(define (make-vma start end flags)
+  (let ((vm-start start)
+        (vm-end end)
+        (vm-flags flags)
+        (vm-file-name #f))
+    (letrec ((set-flags!       (lambda (v) (set! vm-flags v) v))
+             (set-file-name!   (lambda (v) (set! vm-file-name v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'start) vm-start)
+                       ((eq? msg 'end) vm-end)
+                       ((eq? msg 'flags) vm-flags)
+                       ((eq? msg 'file-name) vm-file-name)
+                       ((eq? msg 'set-flags!) set-flags!)
+                       ((eq? msg 'set-file-name!) set-file-name!)
+                       ((eq? msg 'has-flag?) (lambda (bit) (not (zero? (modulo vm-flags bit)))))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+; vma-start: get the VMA's start address (inclusive).
+(define (vma-start v) (v 'start))
+
+; vma-end: get the VMA's end address (exclusive).
+(define (vma-end v) (v 'end))
+
+; vma-size: get the VMA's size (end - start).
+(define (vma-size v) (- (v 'end) (v 'start)))
+
+; vma-flags: get the VMA's flag bitfield.
+(define (vma-flags v) (v 'flags))
+
+; vma-set-flag!: set a flag bit. Returns the new flags.
+(define (vma-set-flag! v bit)
+  ((v 'set-flags!) (+ (v 'flags) bit)))
+
+; vma-clear-flag!: clear a flag bit. Returns the new flags.
+(define (vma-clear-flag! v bit)
+  ((v 'set-flags!) (modulo (v 'flags) (* bit 2))))
+
+; vma-has-flag?: is the VMA's flag bit set?
+(define (vma-has-flag? v bit)
+  ((v 'has-flag?) bit))
+
+; vma-file-name: get the VMA's backing file name (or #f if anonymous).
+(define (vma-file-name v) (v 'file-name))
+
+; vma-set-file-name!: set the VMA's backing file name.
+(define (vma-set-file-name! v name)
+  ((v 'set-file-name!) name))
+
+; ----------------------------------------------------------------
+; Query
+; ----------------------------------------------------------------
+
+; vma-contains?: is the address in [start, end)?
+(define (vma-contains? v addr)
+  (and (>= addr (v 'start)) (< addr (v 'end))))
+
+; ----------------------------------------------------------------
+; Lookup — linear search (analogous to find_vma in a small list)
+; ----------------------------------------------------------------
+
+; vma-find: find the first VMA containing addr in a list of VMAs.
+; Returns the VMA or #f if none contains addr.
+; (Linux's find_vma uses Maple Tree for O(log n); v1 is O(n) over a list.)
+(define (vma-find vma-list addr)
+  (let loop ((rest vma-list))
+    (cond
+      ((null? rest) #f)
+      ((vma-contains? (car rest) addr) (car rest))
+      (else (loop (cdr rest))))))

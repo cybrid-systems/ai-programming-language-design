@@ -1,0 +1,94 @@
+; 016-vm-area-struct_test.aura
+; ===============================
+; Smoke tests for 016-vm-area-struct.aura — VMA minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/016-vm-area-struct_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-vma construction (start, end, flags, no file)
+;   - vma-size = end - start
+;   - vma-contains? (addr in range)
+;   - vma-set-flag! / vma-has-flag?
+;   - vma-clear-flag! removes bit
+;   - vma-find linear search (returns first containing addr)
+;
+; Verified via separate probes during development:
+;   - vma-find returns #f when no VMA contains addr
+;   - vma-end is exclusive (addr == end → not contained)
+;
+; Deferred (full Linux VMA):
+;   - Maple Tree (mtree) integration for O(log n) lookup
+;   - Per-VMA reader lock
+;   - VMA merging / splitting
+;   - vm_file backing (file-backed mappings)
+;   - anon_vma + rmap
+;   - vm_ops table
+
+(require "std/test" all:)
+(require "016-vm-area-struct" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "vma-001-init"
+  (check (= 4096 (vma-start (make-vma 4096 8192 VM-READ))))
+  (check (= 8192 (vma-end (make-vma 4096 8192 VM-READ))))
+  (check (= 4096 (vma-size (make-vma 4096 8192 VM-READ))))
+  (check (= 1 (eq? VM-READ (vma-flags (make-vma 0 1 VM-READ))))
+
+; ----------------------------------------------------------------
+; contains?
+; ----------------------------------------------------------------
+
+(test-suite "vma-002-contains"
+  (check (= 1 (vma-contains? (make-vma 1000 2000 0) 1500)))
+  (check (= 1 (if (not (vma-contains? (make-vma 1000 2000 0) 500)) 1 0)))
+  ; end is exclusive
+  (check (= 1 (if (not (vma-contains? (make-vma 1000 2000 0) 2000)) 1 0)))
+
+; ----------------------------------------------------------------
+; Flag set/has/clear
+; ----------------------------------------------------------------
+
+(test-suite "vma-003-flags"
+  (check (= 1 (vma-has-flag? (make-vma 0 1 (+ VM-READ VM-WRITE VM-EXEC)) VM-WRITE)))
+  (check (= 1 (if (not (vma-has-flag? (make-vma 0 1 VM-READ) VM-WRITE)) 1 0)))
+
+(test-suite "vma-003-clear-flag"
+  ; After clearing VM-WRITE, only VM-READ remains.
+  (check (= 1 (= VM-READ (vma-flags
+    (let ((v (make-vma 0 1 (+ VM-READ VM-WRITE))))
+      (vma-clear-flag! v VM-WRITE)
+      v)))))
+
+; ----------------------------------------------------------------
+; find
+; ----------------------------------------------------------------
+
+(test-suite "vma-004-find"
+  ; Three VMAs at disjoint ranges; find the one containing 6000.
+  (check (= 1 (eq? 'second (vma-file-name
+    (let ((v1 (make-vma 1000 2000 0))
+          (v2 (make-vma 5000 6000 0))
+          (v3 (make-vma 9000 10000 0)))
+      (vma-set-file-name! v1 'first)
+      (vma-set-file-name! v2 'second)
+      (vma-set-file-name! v3 'third)
+      (vma-find (list v1 v2 v3) 5500)))))
+
+(test-suite "vma-004-find-miss"
+  ; vma-find returns #f when no VMA contains the address.
+  (check (= 1 (if (not (vma-find (list (make-vma 1000 2000 0)) 9999)) 1 0)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
