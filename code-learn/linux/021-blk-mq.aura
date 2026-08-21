@@ -1,0 +1,189 @@
+; 021-blk-mq.aura
+; ========================
+; blk-mq (Block Multi-Queue) — minimal capability port to aura.
+;
+; Maps to: 021-blk-mq-analysis.md
+; Source: include/linux/blk-mq.h + block/blk-mq.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux blk-mq is the multiqueue block I/O framework:
+;   - struct request_queue (per-device queue with hardware + software queues)
+;   - struct request (single I/O request: op, data, state, bio)
+;   - struct blk_mq_ctx (per-CPU software queue, almost lockless)
+;   - struct blk_mq_hw_ctx (hardware dispatch queue)
+;   - struct blk_mq_tag_set (tag allocation for outstanding requests)
+;   - submit_bio / blk_mq_submit_bio / blk_mq_complete_request
+;   - I/O schedulers (elevator — mq-deadline, bfq, kyber)
+;   - 323 symbols in blk-mq.h, 5330 lines in blk-mq.c
+;
+; aura has no block devices, no hardware queues, no I/O schedulers.
+; v1 ships the request_queue + request pool + submission/completion simulation:
+;   - make-request (closure with op, data, state, queue back-ref)
+;   - make-request-queue (with hardware queues, ops, free-list, active-list)
+;   - request-queue-alloc-request (get a free request)
+;   - request-queue-free-request! (return to free-list)
+;   - request-queue-submit (simulate hardware dispatch)
+;   - request-queue-complete (mark complete + return to free-list)
+;   - request-queue-active-count / -free-count
+;   - request-op / request-state / request-data
+;   - request-set-state!
+;   - REQ-OP-READ / REQ-OP-WRITE / REQ-OP-DISCARD
+;   - REQ-STATE-IDLE / REQ-STATE-IN-FLIGHT / REQ-STATE-COMPLETED
+;
+; Deferred (full Linux blk-mq):
+;   - per-CPU software queues (blk_mq_ctx)
+;   - hardware dispatch queues (blk_mq_hw_ctx)
+;   - tag allocation (blk_mq_tags)
+;   - I/O scheduler framework (elevator)
+;   - bio / bvec_iter integration
+;   - blk_plug (process-level batching)
+;   - multi-queue hw-queue mapping (CPU → hw queue)
+;   - request merging
+;   - timeout / requeue
+
+(export
+  ; Request
+  make-request
+  request-op
+  request-state
+  request-set-state!
+  request-data
+  ; Request queue
+  make-request-queue
+  request-queue-alloc-request
+  request-queue-free-request!
+  request-queue-submit
+  request-queue-complete
+  request-queue-active-count
+  request-queue-free-count
+  ; Request ops
+  REQ-OP-READ
+  REQ-OP-WRITE
+  REQ-OP-DISCARD
+  ; Request states
+  REQ-STATE-IDLE
+  REQ-STATE-IN-FLIGHT
+  REQ-STATE-COMPLETED)
+
+; REQ_OP_* constants (analogous to req_op in Linux)
+(define REQ-OP-READ    1)
+(define REQ-OP-WRITE   2)
+(define REQ-OP-DISCARD 3)
+
+; Request state constants
+(define REQ-STATE-IDLE       0)
+(define REQ-STATE-IN-FLIGHT  1)
+(define REQ-STATE-COMPLETED  2)
+
+; Maximum requests in queue (v1 cap)
+(define MAX-REQUESTS 64)
+
+; ----------------------------------------------------------------
+; Request (closure with op, data, state, queue ref)
+; ----------------------------------------------------------------
+
+; Make a request. op is REQ_OP_*; data is opaque; state defaults to IDLE.
+(define (make-request op data)
+  (let ((req-op op)
+        (req-data data)
+        (req-state REQ-STATE-IDLE)
+        (req-queue #f))           ; back-reference to queue (set when allocated)
+    (letrec ((set-state! (lambda (v) (set! req-state v) v))
+             (set-queue!  (lambda (v) (set! req-queue  v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'op) req-op)
+                       ((eq? msg 'data) req-data)
+                       ((eq? msg 'state) req-state)
+                       ((eq? msg 'queue) req-queue)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'set-queue!) set-queue!)
+                       (else #f)))))
+      self)))
+
+; request-op: get the request's op code.
+(define (request-op r) (r 'op))
+
+; request-state: get the request's current state.
+(define (request-state r) (r 'state))
+
+; request-set-state!: set the request's state.
+(define (request-set-state! r v) ((r 'set-state!) v))
+
+; request-data: get the request's data.
+(define (request-data r) (r 'data))
+
+; ----------------------------------------------------------------
+; Request queue (closure with free-list + active list + ops)
+; ----------------------------------------------------------------
+
+; list-of-idle-requests: pre-build N idle requests for the free-list.
+(define (list-of-idle-requests n)
+  (let loop ((i 0) (acc '()))
+    (if (>= i n)
+        acc
+        (let ((r (make-request 0 'placeholder)))
+          (request-set-state! r REQ-STATE-IDLE)
+          (loop (+ i 1) (cons r acc)))))
+
+; Make a request queue. ops is the blk_mq_ops closure (e.g., queue-rq).
+; Initially the free-list is filled with MAX-REQUESTS idle requests.
+(define (make-request-queue ops)
+  (let ((free-list (list-of-idle-requests MAX-REQUESTS))
+        (active-list '())
+        (mq-ops ops))
+    (letrec ((set-free!    (lambda (l) (set! free-list l) l))
+             (set-active!  (lambda (l) (set! active-list l) l))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'free) free-list)
+                       ((eq? msg 'active) active-list)
+                       ((eq? msg 'ops) mq-ops)
+                       ((eq? msg 'set-free!) set-free!)
+                       ((eq? msg 'set-active!) set-active!)
+                       (else #f)))))
+      self)))
+
+; request-queue-alloc-request: get a free request from the free-list.
+; Returns the request, or #f if the free-list is empty.
+(define (request-queue-alloc-request q)
+  (let ((free (q 'free)))
+    (if (null? free)
+        #f
+        (let ((r (car free)))
+          ((q 'set-free!) (cdr free))
+          ((r 'set-queue!) q)
+          ((q 'set-active!) (cons r (q 'active)))
+          r))))
+
+; request-queue-free-request!: return a request to the free-list.
+; Resets request state to IDLE.
+(define (request-queue-free-request! q r)
+  ((q 'set-active!) (filter (lambda (x) (not (eq? x r))) (q 'active)))
+  ((q 'set-free!) (cons r (q 'free)))
+  (request-set-state! r REQ-STATE-IDLE))
+
+; request-queue-submit: submit a request. Sets state IN-FLIGHT, calls
+; ops' 'queue-rq arm (if present) to simulate hardware dispatch.
+; Returns #t if dispatch succeeded, #f otherwise.
+(define (request-queue-submit q r)
+  (request-set-state! r REQ-STATE-IN-FLIGHT)
+  (let ((ops (q 'ops)))
+    (if (and ops (ops 'queue-rq))
+        ((ops 'queue-rq) q r)
+        #t)))
+
+; request-queue-complete: mark a request as completed.
+; Sets state COMPLETED, then returns request to free-list.
+(define (request-queue-complete q r)
+  (request-set-state! r REQ-STATE-COMPLETED)
+  (request-queue-free-request! q r))
+
+; request-queue-active-count: number of in-flight requests.
+(define (request-queue-active-count q)
+  (length (q 'active)))
+
+; request-queue-free-count: number of free requests available.
+(define (request-queue-free-count q)
+  (length (q 'free)))
