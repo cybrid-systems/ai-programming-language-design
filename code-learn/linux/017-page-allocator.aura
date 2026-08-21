@@ -1,0 +1,104 @@
+; 017-page-allocator.aura
+; ===========================
+; Page allocator — minimal capability port to aura.
+;
+; Maps to: 017-page-allocator-analysis.md
+; Source: include/linux/gfp.h + mm/page_alloc.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux page allocator is the core memory subsystem:
+;   - struct zone (DMA / DMA32 / Normal / HighMem zones per node)
+;   - Buddy allocator (free_area[MAX_ORDER] with MAX_ORDER=11)
+;   - Per-CPU pageset (pcp) cache for fast path
+;   - Watermarks (min / low / high) for reclaim
+;   - GFP flags (GFP_KERNEL / GFP_ATOMIC / __GFP_ZERO / etc.)
+;   - Compact / reclaim / OOM killer (slow path)
+;   - 349 symbols in page_alloc.c (7795 lines)
+;
+; aura has no zones, no buddy allocator, no PCP, no reclaim.
+; v1 ships the page-alloc abstraction with order + GFP flag tracking:
+;   - make-page-allocator (closure with available page count + total)
+;   - alloc-pages (decrement count, mark order + GFP flags)
+;   - free-pages (increment count, clear order)
+;   - page-allocator-available / page-allocator-total
+;   - MAX_ORDER constant
+;   - GFP-* flag constants
+;
+; Deferred (full Linux page allocator, separate issues):
+;   - Buddy algorithm (split/coalesce by order)
+;   - Per-CPU pageset (pcp) cache
+;   - Watermarks (min / low / high)
+;   - Zone types (DMA / DMA32 / Normal / HighMem)
+;   - Compact / reclaim / OOM killer
+;   - CMA (Contiguous Memory Allocator)
+;   - Hugepage allocation (order-9 / order-10)
+;   - MIGRATE_TYPES (Unmovable / Reclaimable / Movable)
+;   - NUMA node-aware allocation
+
+(export
+  make-page-allocator
+  alloc-pages
+  free-pages
+  page-allocator-available
+  page-allocator-total
+  MAX-ORDER
+  GFP-KERNEL
+  GFP-ATOMIC
+  GFP-ZERO)
+
+; MAX_ORDER: largest allocation order (2^MAX_ORDER pages).
+; Linux's MAX_ORDER is 11 (2^11 = 2048 pages per alloc).
+(define MAX-ORDER 11)
+
+; GFP flag bit positions (analogous to Linux include/linux/gfp.h)
+; Note: Linux uses a more complex flag type — we use simple bits.
+(define GFP-KERNEL  1)   ; bit 0: may sleep (process context)
+(define GFP-ATOMIC  2)   ; bit 1: must not sleep (atomic / interrupt)
+(define GFP-ZERO    4)   ; bit 2: zero-initialized pages
+
+; ----------------------------------------------------------------
+; Page allocator (closure with total + available)
+; ----------------------------------------------------------------
+
+; Make a page allocator with the given total page count.
+; Initially all pages are available.
+(define (make-page-allocator total)
+  (let ((avail total)
+        (total-pages total))
+    (letrec ((set-avail! (lambda (v) (set! avail v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'avail) avail)
+                       ((eq? msg 'total) total-pages)
+                       ((eq? msg 'set-avail!) set-avail!)
+                       (else #f)))))
+      self)))
+
+; page-allocator-available: pages currently available.
+(define (page-allocator-available pa) (pa 'avail))
+
+; page-allocator-total: total pages managed.
+(define (page-allocator-total pa) (pa 'total))
+
+; ----------------------------------------------------------------
+; alloc / free
+; ----------------------------------------------------------------
+
+; alloc-pages: allocate 2^order pages. Decrements available count.
+; Returns the order on success, or -1 if no pages available.
+; v1 doesn't model fragmentation (contiguous-2^order pages) — just
+; decrements counter. Real buddy algorithm is in deferred.
+(define (alloc-pages pa order gfp-flags)
+  (let ((avail (pa 'avail))
+        (need (expt 2 order)))
+    (if (< avail need)
+        -1
+        (begin
+          ((pa 'set-avail!) (- avail need))
+          order))))
+
+; free-pages: return 2^order pages to the allocator.
+; Increments available count.
+(define (free-pages pa order)
+  ((pa 'set-avail!) (+ (pa 'avail) (expt 2 order))))

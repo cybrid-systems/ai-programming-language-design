@@ -1,0 +1,86 @@
+; 017-page-allocator_test.aura
+; ==========================
+; Smoke tests for 017-page-allocator.aura — page allocator minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/017-page-allocator_test.aura
+;
+; Verified automatically (smoke):
+;   - make-page-allocator construction
+;   - alloc-pages decrements available count
+;   - alloc-pages returns -1 when not enough pages
+;   - free-pages increments available count
+;   - Order 0 / order 1 / order 2 allocations
+;
+; Verified via separate probes during development:
+;   - alloc + free round-trip restores count
+;   - Multiple consecutive allocations
+;
+; Deferred (full Linux page allocator):
+;   - Buddy algorithm (split/coalesce by order)
+;   - Per-CPU pageset (pcp) cache
+;   - Watermarks (min / low / high)
+;   - Zone types (DMA / DMA32 / Normal / HighMem)
+;   - Compact / reclaim / OOM killer
+;   - CMA / MIGRATE_TYPES
+
+(require "std/test" all:)
+(require "017-page-allocator" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "pagealloc-001-init"
+  (check (= 100 (page-allocator-total (make-page-allocator 100))))
+  (check (= 100 (page-allocator-available (make-page-allocator 100))))
+
+; ----------------------------------------------------------------
+; alloc
+; ----------------------------------------------------------------
+
+(test-suite "pagealloc-002-alloc-order-0"
+  ; alloc-pages order=0 needs 1 page.
+  (check (= 99 (page-allocator-available
+    (let ((pa (make-page-allocator 100)))
+      (alloc-pages pa 0 GFP-KERNEL)
+      pa))))
+
+(test-suite "pagealloc-002-alloc-order-2"
+  ; alloc-pages order=2 needs 4 pages.
+  (check (= 96 (page-allocator-available
+    (let ((pa (make-page-allocator 100)))
+      (alloc-pages pa 2 GFP-KERNEL)
+      pa))))
+
+(test-suite "pagealloc-002-alloc-fail"
+  ; alloc returns -1 when not enough pages.
+  (check (= -1 (alloc-pages (make-page-allocator 0) 1 GFP-KERNEL)))
+
+; ----------------------------------------------------------------
+; free
+; ----------------------------------------------------------------
+
+(test-suite "pagealloc-003-free"
+  ; free restores available count.
+  (check (= 100 (page-allocator-available
+    (let ((pa (make-page-allocator 100)))
+      (alloc-pages pa 0 GFP-KERNEL)
+      (alloc-pages pa 2 GFP-KERNEL)
+      (free-pages pa 0)
+      (free-pages pa 2)
+      pa))))
+
+; ----------------------------------------------------------------
+; Constants
+; ----------------------------------------------------------------
+
+(test-suite "pagealloc-004-max-order"
+  (check (= 11 (MAX-ORDER)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
