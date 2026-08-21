@@ -1,0 +1,140 @@
+; 018-copy-page-range.aura
+; ===========================
+; Copy Page Range — minimal capability port to aura.
+;
+; Maps to: 018-copy-page-range-analysis.md
+; Source: mm/memory.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux copy_page_range is the page-table copy workhorse of fork():
+;   - Recursive walk: copy_page_range → copy_p4d_range → copy_pud_range →
+;     copy_pmd_range → copy_pte_range
+;   - COW strategy: parent + child share pages; PTEs marked read-only;
+;     write triggers do_wp_page → allocates new page, copies content
+;   - Handles swap entries, migration entries, huge pages, etc.
+;
+; aura has no page tables, no fork(), no do_wp_page.
+; v1 ships the COW model abstraction (logical page copy + shared flag tracking):
+;   - make-page (closure with content + COW flag + source ref)
+;   - page-content / page-set-content! / page-is-cow? / page-source
+;   - copy-page-range (logical copy; both src/dst share src content; COW flag set)
+;   - cow-break (allocate new page, copy content from source)
+;   - page-count-cow-pages
+;
+; Deferred (full Linux copy_page_range):
+;   - Recursive 5-level page-table walk (PGD/P4D/PUD/PMD/PTE)
+;   - Real COW: mark PTE read-only, fault on write
+;   - do_wp_page (allocate + memcpy on write fault)
+;   - Swap / migration entries
+;   - Hugepage / transparent hugepage handling
+;   - MMU notifier integration
+
+(export
+  make-page
+  page-content
+  page-set-content!
+  page-is-cow?
+  page-source
+  copy-page-range
+  cow-break
+  page-cow-source?
+  page-count-cow-pages)
+
+; ----------------------------------------------------------------
+; Page (closure with content + cow flag + source ref)
+;
+; Notes:
+;   - content: opaque value (any aura value: number, symbol, cons, etc.)
+;   - cow-flag: boolean — is this page COW-shared with a source?
+;   - source: #f if not COW; otherwise a page closure pointing to the
+;     original (pre-fork) page whose content is being shared.
+; ----------------------------------------------------------------
+
+(define (make-page content)
+  (let ((cnt content)
+        (cow? #f)
+        (src #f))
+    (letrec ((set-content!  (lambda (v) (set! cnt v) v))
+             (set-cow!      (lambda (v) (set! cow? v) v))
+             (set-source!   (lambda (v) (set! src  v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'content) cnt)
+                       ((eq? msg 'cow?) cow?)
+                       ((eq? msg 'source) src)
+                       ((eq? msg 'set-content!) set-content!)
+                       ((eq? msg 'set-cow!) set-cow!)
+                       ((eq? msg 'set-source!) set-source!)
+                       (else #f)))))
+      self)))
+
+; page-content: get the page's current content.
+(define (page-content p) (p 'content))
+
+; page-set-content!: set the page's content (post-COW).
+(define (page-set-content! p v) ((p 'set-content!) v))
+
+; page-is-cow?: is the page currently in COW (shared) state?
+(define (page-is-cow? p) (p 'cow?))
+
+; page-source: get the COW source page (the original pre-fork page).
+; Returns #f if page is not in COW state.
+(define (page-source p) (p 'source))
+
+; page-cow-source?: is this page's content directly tied to a source?
+; (Helper: returns source or #f.)
+(define (page-cow-source? p)
+  (if ((p 'cow?)) (p 'source) #f))
+
+; ----------------------------------------------------------------
+; Copy page range — COW semantics
+; ----------------------------------------------------------------
+
+; copy-page-range: copy a range of pages from src-list to dst-list.
+; Both source and destination share content + dst pages are marked COW
+; pointing to the corresponding source page. The actual physical copy
+; happens later via cow-break when a writer touches the dst page.
+;
+; Returns the number of pages copied.
+;
+; src-list and dst-list must be the same length (representing the same
+; virt-address range). v1 doesn't model page-table-walk error cases.
+(define (copy-page-range src-list dst-list)
+  (let loop ((src-rest src-list)
+             (dst-rest dst-list)
+             (count 0))
+    (if (or (null? src-rest) (null? dst-rest))
+        count
+        (let* ((src-page (car src-rest))
+               (dst-page (car dst-rest)))
+          ((dst-page 'set-content!) (src-page 'content))
+          ((dst-page 'set-cow!) #t)
+          ((dst-page 'set-source!) src-page)
+          (loop (cdr src-rest) (cdr dst-rest) (+ count 1))))))
+
+; ----------------------------------------------------------------
+; cow-break — handle a write to a COW page (do_wp_page analog)
+; ----------------------------------------------------------------
+
+; cow-break: allocate a new physical page, copy content from source.
+; After cow-break, the page is no longer in COW state; it owns its content.
+; Returns the page (same closure, but with new content + cow cleared).
+(define (cow-break p)
+  (let ((src (p 'source)))
+    (when src
+      ((p 'set-content!) (src 'content))
+      ((p 'set-cow!) #f)
+      ((p 'set-source!) #f)))
+  p)
+
+; page-count-cow-pages: count pages in a list that are in COW state.
+(define (page-count-cow-pages pages)
+  (let loop ((rest pages) (count 0))
+    (cond
+      ((null? rest) count)
+      (else
+        (let ((first (car rest)))
+          (if (page-is-cow? first)
+              (loop (cdr rest) (+ count 1))
+              (loop (cdr rest) count)))))))

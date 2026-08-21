@@ -1,0 +1,106 @@
+; 018-copy-page-range_test.aura
+; ===========================
+; Smoke tests for 018-copy-page-range.aura — page copy + COW.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/018-copy-page-range_test.aura
+;
+; Verified automatically (smoke):
+;   - make-page construction (content set, no COW)
+;   - copy-page-range shares content + sets COW flag
+;   - dst page source = src page
+;   - page-is-cow? returns #t after copy
+;   - cow-break copies content from source + clears COW
+;   - After cow-break, src unchanged, dst owns its content
+;   - page-count-cow-pages counts COW pages
+;
+; Verified via separate probes during development:
+;   - Multi-page fork: copy range of 3 pages
+;   - Independent write to dst doesn't affect src (after cow-break)
+;   - Page without COW source is a no-op for cow-break
+;
+; Deferred (full Linux copy_page_range):
+;   - Recursive 5-level page-table walk
+;   - Real COW (PTE read-only + fault on write)
+;   - do_wp_page (allocate + memcpy)
+;   - Swap / migration entries
+;   - Hugepage handling
+
+(require "std/test" all:)
+(require "018-copy-page-range" all:)
+
+; ----------------------------------------------------------------
+; Page construction
+; ----------------------------------------------------------------
+
+(test-suite "cp-001-page-init"
+  (check (= 1 (eq? 'data (page-content (make-page 'data)))))
+  (check (= 1 (if (not (page-is-cow? (make-page 'data))) 1 0)))
+  (check (= 1 (if (not (page-source (make-page 'data))) 1 0))))
+
+; ----------------------------------------------------------------
+; copy-page-range
+; ----------------------------------------------------------------
+
+(test-suite "cp-002-copy-shares-content"
+  ; After copy, dst page has same content as src.
+  (check (= 1 (eq? 'parent-data
+    (let ((src (make-page 'parent-data))
+          (dst (make-page 'placeholder)))
+      (copy-page-range (list src) (list dst))
+      (page-content dst)))))
+
+(test-suite "cp-002-copy-marks-cow"
+  ; After copy, dst page is in COW state with src as source.
+  (check (= 1 (let ((src (make-page 'x))
+                       (dst (make-page 'y)))
+                   (copy-page-range (list src) (list dst))
+                   (and (page-is-cow? dst)
+                        (eq? src (page-source dst))))))
+
+; ----------------------------------------------------------------
+; cow-break
+; ----------------------------------------------------------------
+
+(test-suite "cp-003-cow-break-copies"
+  ; After cow-break, dst owns its content (no longer COW).
+  (check (= 1 (let ((src (make-page 'original))
+                       (dst (make-page 'ignored)))
+                   (copy-page-range (list src) (list dst))
+                   (cow-break dst)
+                   (and (eq? 'original (page-content dst))
+                        (not (page-is-cow? dst))))))
+
+(test-suite "cp-003-cow-break-independent"
+  ; After cow-break, modifying dst doesn't affect src.
+  (check (= 1 (let ((src (make-page 'src-content))
+                       (dst (make-page 'ignored)))
+                   (copy-page-range (list src) (list dst))
+                   (cow-break dst)
+                   (page-set-content! dst 'dst-modified)
+                   (eq? 'src-content (page-content src)))))
+
+; ----------------------------------------------------------------
+; copy range of multiple pages
+; ----------------------------------------------------------------
+
+(test-suite "cp-004-multi-page-copy"
+  ; Copy 3 pages.
+  (check (= 1 (= 3 (let ((srcs (list (make-page 1) (make-page 2) (make-page 3)))
+                          (dsts (list (make-page 0) (make-page 0) (make-page 0))))
+                      (copy-page-range srcs dsts)))))
+
+(test-suite "cp-004-count-cow"
+  ; All 3 dst pages are in COW after copy.
+  (check (= 3 (page-count-cow-pages
+    (let ((srcs (list (make-page 1) (make-page 2) (make-page 3)))
+          (dsts (list (make-page 0) (make-page 0) (make-page 0))))
+      (copy-page-range srcs dsts)
+      dsts))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
