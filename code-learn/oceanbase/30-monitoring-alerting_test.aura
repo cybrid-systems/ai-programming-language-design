@@ -1,0 +1,330 @@
+; 30-monitoring-alerting_test.aura
+; ======================
+; Smoke tests for 30-monitoring-alerting.aura — Monitoring + Alerting minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/30-monitoring-alerting_test.aura
+;
+; Verified automatically (smoke):
+;   - 4 INDICATOR-TYPE + 4 ALERT-LEVEL + 3 ALERT-STATUS distinct
+;   - make-counter + inc + inc-by + get
+;   - make-gauge + set + get
+;   - make-histogram + observe + get-count
+;   - make-summary + observe + get-avg
+;   - make-ash-sampler + record-sample + get-count
+;   - make-alert-rule + evaluate + set-status
+;   - make-alert-engine + add-rule + evaluate + get-firing
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Counter increments correctly
+;   - Gauge can go up and down (set directly)
+;   - Histogram distributes values into buckets
+;   - Summary tracks avg
+;   - Alert rule fires when condition >= threshold
+;
+; Deferred (full OceanBase Monitoring + Alerting):
+;   - real ObCounter / ObGauge with thread-safe atomics
+;   - real ObHistogram with t-digest percentile estimation
+;   - real ObSummary with t-digest quantile queries
+;   - real ObAshSampler with 1Hz periodic sampling
+;   - real ObAlertEngine with full rule DSL
+;   - real notify channels (email / webhook / OCP)
+;   - real __all_virtual_metric internal tables
+;   - real dashboard integration (Grafana / OCP)
+;   - real ASH session sampling (100% sessions per second)
+;   - real performance overhead monitoring
+;   - real multi-tenant metric aggregation
+
+(require "std/test" all:)
+(require "30-monitoring-alerting" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "30-001-indicator-type-distinct"
+  ; 4 INDICATOR-TYPE constants are distinct.
+  (check (= 1 (if (not (= INDICATOR-TYPE-COUNTER
+                          INDICATOR-TYPE-GAUGE)) 1 0)))
+  (check (= 1 (if (not (= INDICATOR-TYPE-GAUGE
+                          INDICATOR-TYPE-HISTOGRAM)) 1 0)))
+  (check (= 1 (if (not (= INDICATOR-TYPE-HISTOGRAM
+                          INDICATOR-TYPE-SUMMARY)) 1 0)))
+  (check (= 1 (if (not (= INDICATOR-TYPE-COUNTER
+                          INDICATOR-TYPE-SUMMARY)) 1 0))))
+
+(test-suite "30-001-alert-level-distinct"
+  ; 4 ALERT-LEVEL constants are distinct.
+  (check (= 1 (if (not (= ALERT-LEVEL-INFO
+                          ALERT-LEVEL-WARNING)) 1 0)))
+  (check (= 1 (if (not (= ALERT-LEVEL-WARNING
+                          ALERT-LEVEL-ERROR)) 1 0)))
+  (check (= 1 (if (not (= ALERT-LEVEL-ERROR
+                          ALERT-LEVEL-CRITICAL)) 1 0)))
+  (check (= 1 (if (not (= ALERT-LEVEL-INFO
+                          ALERT-LEVEL-CRITICAL)) 1 0))))
+
+(test-suite "30-001-alert-status-distinct"
+  ; 3 ALERT-STATUS constants are distinct.
+  (check (= 1 (if (not (= ALERT-STATUS-PENDING
+                          ALERT-STATUS-FIRING)) 1 0)))
+  (check (= 1 (if (not (= ALERT-STATUS-FIRING
+                          ALERT-STATUS-RESOLVED)) 1 0)))
+  (check (= 1 (if (not (= ALERT-STATUS-PENDING
+                          ALERT-STATUS-RESOLVED)) 1 0))))
+
+; ----------------------------------------------------------------
+; Counter
+; ----------------------------------------------------------------
+
+(test-suite "30-002-counter-construction"
+  ; counter preserves name + value.
+  (check (= #t (eq? 'query_count
+                   (counter-get-name (make-counter 'query_count 0)))))
+  (check (= 0 (counter-get
+               (make-counter 'query_count 0))))
+  (check (= 100 (counter-get
+                 (make-counter 'query_count 100)))))
+
+(test-suite "30-002-counter-predicate"
+  ; counter? accepts only counters.
+  (check (= #t (counter? (make-counter 'c 0))))
+  (check (= #f (counter? 'not-counter)))
+  (check (= #f (counter? 42)))
+
+(test-suite "30-003-counter-inc"
+  ; counter-inc! increments by 1.
+  (check (= 1 (let ((c (make-counter 'c 0)))
+                 (counter-inc! c)
+                 (counter-get c))))
+  (check (= 5 (let ((c (make-counter 'c 0)))
+                 (counter-inc! c)
+                 (counter-inc! c)
+                 (counter-inc! c)
+                 (counter-inc! c)
+                 (counter-inc! c)
+                 (counter-get c))))
+
+(test-suite "30-003-counter-inc-by"
+  ; counter-inc-by! increments by delta.
+  (check (= 100 (let ((c (make-counter 'c 0)))
+                 (counter-inc-by! c 100)
+                 (counter-get c))))
+  (check (= 150 (let ((c (make-counter 'c 100)))
+                 (counter-inc-by! c 50)
+                 (counter-get c))))
+
+; ----------------------------------------------------------------
+; Gauge
+; ----------------------------------------------------------------
+
+(test-suite "30-004-gauge-construction"
+  ; gauge preserves name + value.
+  (check (= 0 (gauge-get
+               (make-gauge 'memory_used 0))))
+  (check (= 1000 (gauge-get
+                   (make-gauge 'memory_used 1000))))
+
+(test-suite "30-004-gauge-predicate"
+  ; gauge? accepts only gauges.
+  (check (= #t (gauge? (make-gauge 'g 0))))
+  (check (= #f (gauge? 'not-gauge)))
+  (check (= #f (gauge? 42)))
+
+(test-suite "30-005-gauge-set"
+  ; gauge-set! sets value (can go up or down).
+  (check (= 500 (let ((g (make-gauge 'g 1000)))
+                 (gauge-set! g 500)
+                 (gauge-get g))))
+  (check (= 1500 (let ((g (make-gauge 'g 500)))
+                  (gauge-set! g 1500)
+                  (gauge-get g))))
+
+; ----------------------------------------------------------------
+; Histogram
+; ----------------------------------------------------------------
+
+(test-suite "30-006-histogram-construction"
+  ; histogram preserves buckets.
+  (check (= 5 (histogram-bucket-count
+                 (make-histogram 'h '(10 50 100 500 1000)))))
+
+(test-suite "30-006-histogram-predicate"
+  ; histogram? accepts only histograms.
+  (check (= #t (histogram? (make-histogram 'h '(10 50 100))))
+  (check (= #f (histogram? 'not-hist)))
+  (check (= #f (histogram? 42)))
+
+(test-suite "30-007-histogram-observe"
+  ; observe! distributes values into appropriate buckets.
+  (check (= 1 (let ((h (make-histogram 'h '(10 50 100 500))))
+                 (histogram-observe! h 5)
+                 (histogram-get-count h 0))))
+
+(test-suite "30-007-histogram-observe-multiple"
+  ; Multiple observations accumulate counts.
+  (check (= 3 (let ((h (make-histogram 'h '(10 50 100))))
+                 (histogram-observe! h 5)
+                 (histogram-observe! h 25)
+                 (histogram-observe! h 75)
+                 (histogram-get-count h 1))))
+
+; ----------------------------------------------------------------
+; Summary
+; ----------------------------------------------------------------
+
+(test-suite "30-008-summary-construction"
+  ; summary preserves sum + count.
+  (check (= 0 (summary-get-count
+               (make-summary 's 0 0))))
+  (check (= 0 (summary-get-sum
+               (make-summary 's 0 0))))
+  (check (= 0 (summary-get-avg
+               (make-summary 's 0 0))))
+
+(test-suite "30-008-summary-predicate"
+  ; summary? accepts only summaries.
+  (check (= #t (summary? (make-summary 's 0 0))))
+  (check (= #f (summary? 'not-s)))
+  (check (= #f (summary? 42)))
+
+(test-suite "30-009-summary-observe"
+  ; observe! updates sum + count.
+  (check (= 1 (let ((s (make-summary 's 0 0)))
+                 (summary-observe! s 100)
+                 (summary-get-count s))))
+  (check (= 100 (let ((s (make-summary 's 0 0)))
+                  (summary-observe! s 100)
+                  (summary-get-sum s))))
+  (check (= 50 (let ((s (make-summary 's 0 0)))
+                 (summary-observe! s 100)
+                 (summary-get-avg s))))
+
+(test-suite "30-009-summary-observe-multiple"
+  ; Multiple observations accumulate.
+  (check (= 3 (let ((s (make-summary 's 0 0)))
+                 (summary-observe! s 10)
+                 (summary-observe! s 20)
+                 (summary-observe! s 30)
+                 (summary-get-count s))))
+  (check (= 20 (let ((s (make-summary 's 0 0)))
+                 (summary-observe! s 10)
+                 (summary-observe! s 20)
+                 (summary-observe! s 30)
+                 (summary-get-avg s))))
+
+; ----------------------------------------------------------------
+; ASH Sampler
+; ----------------------------------------------------------------
+
+(test-suite "30-010-ash-sampler-construction"
+  ; ash-sampler preserves interval + sample-count.
+  (check (= 1 (ash-sampler-get-interval
+                (make-ash-sampler 1 100))))
+  (check (= 100 (ash-sampler-get-sample-count
+                  (make-ash-sampler 1 100))))
+
+(test-suite "30-010-ash-sampler-predicate"
+  ; ash-sampler? accepts only samplers.
+  (check (= #t (ash-sampler? (make-ash-sampler 1 0))))
+  (check (= #f (ash-sampler? 'not-sampler)))
+  (check (= #f (ash-sampler? 42)))
+
+(test-suite "30-011-ash-sampler-record"
+  ; record-sample! increments sample-count.
+  (check (= 5 (let ((s (make-ash-sampler 1 0)))
+                 (ash-sampler-record-sample! s)
+                 (ash-sampler-record-sample! s)
+                 (ash-sampler-record-sample! s)
+                 (ash-sampler-record-sample! s)
+                 (ash-sampler-record-sample! s)
+                 (ash-sampler-get-sample-count s))))
+
+; ----------------------------------------------------------------
+; Alert Rule
+; ----------------------------------------------------------------
+
+(test-suite "30-012-alert-rule-construction"
+  ; alert-rule preserves name + condition + threshold + level.
+  (check (= #t (eq? 'cpu_high
+                   (alert-rule-get-name
+                     (make-alert-rule 'cpu_high 80 90 ALERT-LEVEL-WARNING)))))
+  (check (= 80 (alert-rule-get-condition
+                 (make-alert-rule 'cpu_high 80 90 ALERT-LEVEL-WARNING))))
+  (check (= 90 (alert-rule-get-threshold
+                 (make-alert-rule 'cpu_high 80 90 ALERT-LEVEL-WARNING))))
+  (check (= ALERT-LEVEL-WARNING
+             (alert-rule-get-level
+               (make-alert-rule 'cpu_high 80 90 ALERT-LEVEL-WARNING))))
+  (check (= ALERT-STATUS-PENDING
+             (alert-rule-get-status
+               (make-alert-rule 'cpu_high 80 90 ALERT-LEVEL-WARNING))))
+
+(test-suite "30-012-alert-rule-predicate"
+  ; alert-rule? accepts only rules.
+  (check (= #t (alert-rule?
+                 (make-alert-rule 'r 0 0 ALERT-LEVEL-INFO))))
+  (check (= #f (alert-rule? 'not-rule)))
+  (check (= #f (alert-rule? 42)))
+
+(test-suite "30-013-alert-rule-evaluate-fire"
+  ; evaluate fires when condition >= threshold.
+  (check (= ALERT-STATUS-FIRING
+             (alert-rule-evaluate
+               (make-alert-rule 'r 100 90 ALERT-LEVEL-WARNING))))
+
+(test-suite "30-013-alert-rule-evaluate-no-fire"
+  ; evaluate does not fire when condition < threshold.
+  (check (= ALERT-STATUS-PENDING
+             (let ((r (make-alert-rule 'r 50 90 ALERT-LEVEL-WARNING)))
+               (alert-rule-evaluate r)
+               (alert-rule-get-status r))))
+
+; ----------------------------------------------------------------
+; Alert Engine
+; ----------------------------------------------------------------
+
+(test-suite "30-014-alert-engine-construction"
+  ; engine preserves fields.
+  (check (= 0 (alert-engine-get-rule-count
+               (make-alert-engine '() 0 '()))))
+
+(test-suite "30-014-alert-engine-predicate"
+  ; alert-engine? accepts only engines.
+  (check (= #t (alert-engine? (make-alert-engine '() 0 '()))))
+  (check (= #f (alert-engine? 'not-engine)))
+  (check (= #f (alert-engine? 42)))
+
+(test-suite "30-015-alert-engine-add-rule"
+  ; add-rule! increases count.
+  (check (= 1 (let ((e (make-alert-engine '() 0 '())))
+                 (alert-engine-add-rule! e
+                   (make-alert-rule 'r 0 0 ALERT-LEVEL-INFO))
+                 (alert-engine-get-rule-count e))))
+
+(test-suite "30-015-alert-engine-evaluate"
+  ; evaluate-rules! returns count of firing alerts.
+  (check (= 1 (let ((e (make-alert-engine '() 0 '())))
+                 (alert-engine-add-rule! e
+                   (make-alert-rule 'r 100 90 ALERT-LEVEL-WARNING))
+                 (alert-engine-evaluate-rules! e))))
+
+(test-suite "30-015-alert-engine-evaluate-mixed"
+  ; Mixed firing + non-firing rules.
+  (check (= 2 (let ((e (make-alert-engine '() 0 '())))
+                 (alert-engine-add-rule! e
+                   (make-alert-rule 'r1 100 90 ALERT-LEVEL-WARNING))
+                 (alert-engine-add-rule! e
+                   (make-alert-rule 'r2 50 90 ALERT-LEVEL-INFO))
+                 (alert-engine-add-rule! e
+                   (make-alert-rule 'r3 200 100 ALERT-LEVEL-ERROR))
+                 (alert-engine-evaluate-rules! e))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

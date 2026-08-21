@@ -1,0 +1,527 @@
+; 30-monitoring-alerting.aura
+; ======================
+; monitoring_alerting — minimal capability port to aura.
+;
+; Maps to: OceanBase Monitoring + Alerting (Metrics + ASH + Alert)
+; Source: src/share/ob_log_stat.{h,cpp}
+;         + src/share/monitor/ash/ob_ash.h
+;         + src/share/alert/ob_alert_engine.{h,cpp}
+;         + src/share/metric/ob_metric.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Monitoring + Alerting:
+;   - 3 layers: Metrics (counter/gauge/histogram/summary) +
+;     ASH (Active Session History) + Alert (threshold rules)
+;   - 4 indicator types: COUNTER / GAUGE / HISTOGRAM / SUMMARY
+;   - 4 alert levels: INFO / WARNING / ERROR / CRITICAL
+;   - 3 alert statuses: PENDING / FIRING / RESOLVED
+;   - ObCounter: monotonic counter (inc / inc_by / get)
+;   - ObGauge: up/down gauge (set / get)
+;   - ObHistogram: distribution (observe / get-count)
+;   - ObSummary: quantile-based (observe / get-avg)
+;   - ObAshSampler: 1Hz active session sampling
+;   - ObAlertEngine: periodic rule evaluation + notification
+;
+; aura v1 ships:
+;   - 4 INDICATOR-TYPE constants (COUNTER, GAUGE, HISTOGRAM,
+;     SUMMARY)
+;   - 4 ALERT-LEVEL constants (INFO, WARNING, ERROR, CRITICAL)
+;   - 3 ALERT-STATUS constants (PENDING, FIRING, RESOLVED)
+;   - make-counter (factory: name + value)
+;   - counter-inc! / counter-inc-by! / counter-get
+;   - make-gauge (factory: name + value)
+;   - gauge-set! / gauge-get
+;   - make-histogram (factory: name + buckets)
+;   - histogram-observe! (add to bucket)
+;   - histogram-get-count (get count for bucket)
+;   - histogram-bucket-count
+;   - make-summary (factory: name + sum + count)
+;   - summary-observe! / summary-get-avg / summary-get-sum /
+;     summary-get-count
+;   - make-ash-sampler (factory: interval-sec + samples)
+;   - ash-sampler-record-sample! / get-sample-count
+;   - make-alert-rule (factory: name + condition + threshold +
+;     level)
+;   - alert-rule-evaluate (check if threshold exceeded)
+;   - alert-rule-get-name / get-level / get-status
+;   - alert-rule-set-status!
+;   - make-alert-engine (factory: rules + last-eval)
+;   - alert-engine-add-rule! / alert-engine-evaluate-rules!
+;   - alert-engine-get-firing-alerts / get-rule-count
+;
+; Deferred (full OceanBase Monitoring + Alerting):
+;   - real ObCounter / ObGauge with thread-safe atomics
+;   - real ObHistogram with t-digest percentile estimation
+;   - real ObSummary with t-digest quantile queries
+;   - real ObAshSampler with 1Hz periodic sampling
+;   - real ObAlertEngine with full rule DSL
+;   - real notify channels (email / webhook / OCP)
+;   - real __all_virtual_metric internal tables
+;   - real dashboard integration (Grafana / OCP)
+;   - real ASH session sampling (100% sessions per second)
+;   - real performance overhead monitoring
+;   - real multi-tenant metric aggregation
+
+(export
+  ; Indicator type constants
+  INDICATOR-TYPE-COUNTER
+  INDICATOR-TYPE-GAUGE
+  INDICATOR-TYPE-HISTOGRAM
+  INDICATOR-TYPE-SUMMARY
+  ; Alert level constants
+  ALERT-LEVEL-INFO
+  ALERT-LEVEL-WARNING
+  ALERT-LEVEL-ERROR
+  ALERT-LEVEL-CRITICAL
+  ; Alert status constants
+  ALERT-STATUS-PENDING
+  ALERT-STATUS-FIRING
+  ALERT-STATUS-RESOLVED
+  ; Counter
+  make-counter counter?
+  counter-get counter-inc!
+  counter-inc-by! counter-set!
+  ; Gauge
+  make-gauge gauge?
+  gauge-get gauge-set!
+  ; Histogram
+  make-histogram histogram?
+  histogram-bucket-count
+  histogram-observe!
+  histogram-get-count
+  ; Summary
+  make-summary summary?
+  summary-get-count
+  summary-get-sum
+  summary-get-avg
+  summary-observe!
+  ; ASH Sampler
+  make-ash-sampler ash-sampler?
+  ash-sampler-get-interval
+  ash-sampler-get-sample-count
+  ash-sampler-record-sample!
+  ; Alert Rule
+  make-alert-rule alert-rule?
+  alert-rule-get-name
+  alert-rule-get-condition
+  alert-rule-get-threshold
+  alert-rule-get-level
+  alert-rule-get-status
+  alert-rule-set-status!
+  alert-rule-evaluate
+  ; Alert Engine
+  make-alert-engine alert-engine?
+  alert-engine-get-last-eval
+  alert-engine-get-rule-count
+  alert-engine-get-firing-alerts
+  alert-engine-add-rule!
+  alert-engine-evaluate-rules!
+  alert-engine-set-last-eval!
+  alert-engine-clear-firing!)
+
+; ----------------------------------------------------------------
+; Indicator type constants
+; ----------------------------------------------------------------
+
+(define INDICATOR-TYPE-COUNTER 0)
+(define INDICATOR-TYPE-GAUGE 1)
+(define INDICATOR-TYPE-HISTOGRAM 2)
+(define INDICATOR-TYPE-SUMMARY 3)
+
+; ----------------------------------------------------------------
+; Alert level constants
+; ----------------------------------------------------------------
+
+(define ALERT-LEVEL-INFO 0)
+(define ALERT-LEVEL-WARNING 1)
+(define ALERT-LEVEL-ERROR 2)
+(define ALERT-LEVEL-CRITICAL 3)
+
+; ----------------------------------------------------------------
+; Alert status constants
+; ----------------------------------------------------------------
+
+(define ALERT-STATUS-PENDING 0)
+(define ALERT-STATUS-FIRING 1)
+(define ALERT-STATUS-RESOLVED 2)
+
+; ----------------------------------------------------------------
+; Counter — closure-based (monotonic)
+; ----------------------------------------------------------------
+
+; make-counter: create a Counter.
+; Args: name (symbol), value (integer)
+; Returns: counter closure.
+(define (make-counter name value)
+  (letrec ((set-value! (lambda (v) (set! value v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'value) value)
+                     ((eq? msg 'set-value!) set-value!)
+                     (else #f)))))
+      self))
+
+; counter?: is the object a counter?
+; Detected by querying 'value — only counters return integer.
+(define (counter? obj)
+  (if (procedure? obj)
+      (let ((v (obj 'value)))
+        (if (and (integer? v) (>= v 0)) #t #f))
+      #f))
+
+; counter-get: get current value.
+(define (counter-get c) (c 'value))
+
+; counter-inc!: increment by 1.
+; Returns the new value.
+(define (counter-inc! c)
+  (let ((cur (c 'value)))
+    ((c 'set-value!) (+ cur 1))))
+
+; counter-inc-by!: increment by delta.
+; Returns the new value.
+(define (counter-inc-by! c delta)
+  (let ((cur (c 'value)))
+    ((c 'set-value!) (+ cur delta))))
+
+; counter-set!: set value directly.
+; Returns the new value.
+(define (counter-set! c v) ((c 'set-value!) v))
+
+; ----------------------------------------------------------------
+; Gauge — closure-based (up/down)
+; ----------------------------------------------------------------
+
+; make-gauge: create a Gauge.
+; Args: name (symbol), value (integer)
+; Returns: gauge closure.
+(define (make-gauge name value)
+  (letrec ((set-value! (lambda (v) (set! value v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'value) value)
+                     ((eq? msg 'set-value!) set-value!)
+                     (else #f)))))
+      self))
+
+; gauge?: is the object a gauge?
+; Detected by querying 'value — only gauges return integer.
+(define (gauge? obj)
+  (if (procedure? obj)
+      (let ((v (obj 'value)))
+        (if (integer? v) #t #f))
+      #f))
+
+; gauge-get: get current value.
+(define (gauge-get g) (g 'value))
+
+; gauge-set!: set value directly.
+; Returns the new value.
+(define (gauge-set! g v) ((g 'set-value!) v))
+
+; ----------------------------------------------------------------
+; Histogram — closure-based (distribution with buckets)
+; ----------------------------------------------------------------
+
+; make-histogram: create a Histogram.
+; Args: name (symbol), buckets (cons list of upper bounds)
+; Returns: histogram closure.
+(define (make-histogram name buckets)
+  (let ((counts (let loop ((rest buckets) (acc '()))
+                  (cond
+                    ((null? rest) (reverse acc))
+                    (#t (loop (cdr rest)
+                               (cons 0 acc)))))))
+    (letrec ((set-count! (lambda (i v)
+                        (let ((new-counts
+                                (let loop ((rest counts) (j 0) (acc '()))
+                                  (cond
+                                    ((null? rest) (reverse acc))
+                                    ((= j i) (cons v (cdr rest)))
+                                    (#t (loop (cdr rest)
+                                              (+ j 1)
+                                              (cons (car rest) acc)))))))
+                          (set! counts new-counts)
+                          v)))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'buckets) buckets)
+                       ((eq? msg 'counts) counts)
+                       ((eq? msg 'set-count!) set-count!)
+                       (else #f)))))
+      self))
+
+; histogram?: is the object a histogram?
+; Detected by querying 'buckets — only histograms return a cons.
+(define (histogram? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'buckets)) #t #f)
+      #f))
+
+; histogram-bucket-count: get number of buckets.
+(define (histogram-bucket-count h)
+  (let loop ((rest (h 'buckets)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; histogram-observe!: add `value` to appropriate bucket.
+; v1: finds the first bucket with upper bound >= value.
+; Returns the bucket index.
+(define (histogram-observe! h value)
+  (let ((counts (h 'counts)))
+    (let ((bucket-idx
+            (let loop ((rest (h 'buckets)) (j 0))
+              (cond
+                ((null? rest) (- (histogram-bucket-count h) 1))
+                ((>= value (car rest)) j)
+                (#t (loop (cdr rest) (+ j 1)))))))
+      (let ((cur (let loop ((rest counts) (i 0))
+                    (cond
+                      ((null? rest) 0)
+                      ((= i bucket-idx) (car rest))
+                      (#t (loop (cdr rest) (+ i 1)))))))
+        ((h 'set-count!) bucket-idx (+ cur 1))))))
+
+; histogram-get-count: get count for bucket N.
+; Returns the count or #f.
+(define (histogram-get-count h n)
+  (let loop ((rest (h 'counts)) (i 0))
+    (cond
+      ((null? rest) #f)
+      ((= i n) (car rest))
+      (#t (loop (cdr rest) (+ i 1))))))
+
+; ----------------------------------------------------------------
+; Summary — closure-based (quantile-based)
+; ----------------------------------------------------------------
+
+; make-summary: create a Summary.
+; Args: name (symbol), sum (integer), count (integer)
+; Returns: summary closure.
+(define (make-summary name sum count)
+  (letrec ((set-sum! (lambda (v) (set! sum v) v))
+           (set-count! (lambda (v) (set! count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'sum) sum)
+                     ((eq? msg 'count) count)
+                     ((eq? msg 'set-sum!) set-sum!)
+                     ((eq? msg 'set-count!) set-count!)
+                     (else #f)))))
+      self))
+
+; summary?: is the object a summary?
+; Detected by querying 'sum — only summaries return integer.
+(define (summary? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'sum)))
+        (if (integer? s) #t #f))
+      #f))
+
+; summary-get-count: get observation count.
+(define (summary-get-count s) (s 'count))
+
+; summary-get-sum: get sum of observations.
+(define (summary-get-sum s) (s 'sum))
+
+; summary-get-avg: get average (sum / count).
+; Returns 0 if count is 0.
+(define (summary-get-avg s)
+  (let ((count (s 'count)))
+    (if (= count 0)
+        0
+        (quotient (s 'sum) count))))
+
+; summary-observe!: add `value` to sum and increment count.
+; Returns the new average.
+(define (summary-observe! s value)
+  (let ((cur-sum (s 'sum))
+        (cur-count (s 'count)))
+    ((s 'set-sum!) (+ cur-sum value))
+    ((s 'set-count!) (+ cur-count 1))
+    (summary-get-avg s)))
+
+; ----------------------------------------------------------------
+; ASH Sampler — closure-based
+; ----------------------------------------------------------------
+
+; make-ash-sampler: create an ASH sampler.
+; Args: interval-sec (integer — sample interval in seconds),
+;       sample-count (integer — initial sample count)
+; Returns: ash_sampler closure.
+(define (make-ash-sampler interval-sec sample-count)
+  (letrec ((set-sample-count! (lambda (v) (set! sample-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'interval-sec) interval-sec)
+                     ((eq? msg 'sample-count) sample-count)
+                     ((eq? msg 'set-sample-count!) set-sample-count!)
+                     (else #f)))))
+      self))
+
+; ash-sampler?: is the object an ASH sampler?
+; Detected by querying 'interval-sec — only samplers return integer.
+(define (ash-sampler? obj)
+  (if (procedure? obj)
+      (let ((i (obj 'interval-sec)))
+        (if (and (integer? i) (>= i 1)) #t #f))
+      #f))
+
+; ash-sampler-get-interval: get sample interval.
+(define (ash-sampler-get-interval s) (s 'interval-sec))
+
+; ash-sampler-get-sample-count: get total sample count.
+(define (ash-sampler-get-sample-count s) (s 'sample-count))
+
+; ash-sampler-record-sample!: record a new sample.
+; Returns the new sample count.
+(define (ash-sampler-record-sample! s)
+  (let ((cur (s 'sample-count)))
+    ((s 'set-sample-count!) (+ cur 1))))
+
+; ----------------------------------------------------------------
+; Alert Rule — closure-based
+; ----------------------------------------------------------------
+
+; make-alert-rule: create an Alert Rule.
+; Args: name (symbol), condition (integer — current value),
+;       threshold (integer — alert if value >= threshold),
+;       level (integer — ALERT-LEVEL-*)
+; Returns: alert_rule closure (initial: status=PENDING).
+(define (make-alert-rule name condition threshold level)
+  (let ((status ALERT-STATUS-PENDING))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'condition) condition)
+                       ((eq? msg 'threshold) threshold)
+                       ((eq? msg 'level) level)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self))
+
+; alert-rule?: is the object an alert rule?
+; Detected by querying 'threshold — only rules return integer.
+(define (alert-rule? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'threshold)))
+        (if (integer? t) #t #f))
+      #f))
+
+; alert-rule-get-name: get rule name.
+(define (alert-rule-get-name r) (r 'name))
+
+; alert-rule-get-condition: get current condition value.
+(define (alert-rule-get-condition r) (r 'condition))
+
+; alert-rule-get-threshold: get threshold.
+(define (alert-rule-get-threshold r) (r 'threshold))
+
+; alert-rule-get-level: get alert level.
+(define (alert-rule-get-level r) (r 'level))
+
+; alert-rule-get-status: get current status.
+(define (alert-rule-get-status r) (r 'status))
+
+; alert-rule-set-status!: set status.
+; Returns the new status.
+(define (alert-rule-set-status! r v) ((r 'set-status!) v))
+
+; alert-rule-evaluate: evaluate the rule.
+; If condition >= threshold → set status to FIRING.
+; Returns the new status.
+(define (alert-rule-evaluate r)
+  (if (>= (r 'condition) (r 'threshold))
+      (begin
+        ((r 'set-status!) ALERT-STATUS-FIRING)
+        ALERT-STATUS-FIRING)
+      (r 'status)))
+
+; ----------------------------------------------------------------
+; Alert Engine — closure-based
+; ----------------------------------------------------------------
+
+; make-alert-engine: create an Alert Engine.
+; Args: rules (cons list of alert rules — initially empty),
+;       last-eval (integer — last evaluation timestamp),
+;       firing-alerts (cons list — initially empty)
+; Returns: alert_engine closure.
+(define (make-alert-engine rules last-eval firing-alerts)
+  (let ((rs rules)
+        (last last-eval)
+        (firing firing-alerts))
+    (letrec ((set-rules! (lambda (v) (set! rs v) v))
+             (set-last-eval! (lambda (v) (set! last v) v))
+             (set-firing! (lambda (v) (set! firing v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'rules) rs)
+                       ((eq? msg 'last-eval) last)
+                       ((eq? msg 'firing-alerts) firing)
+                       ((eq? msg 'set-rules!) set-rules!)
+                       ((eq? msg 'set-last-eval!) set-last-eval!)
+                       ((eq? msg 'set-firing!) set-firing!)
+                       (else #f)))))
+      self))
+
+; alert-engine?: is the object an alert engine?
+; Detected by querying 'rules — only engines return a cons.
+(define (alert-engine? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'rules)) #t #f)
+      #f))
+
+; alert-engine-get-last-eval: get last evaluation timestamp.
+(define (alert-engine-get-last-eval e) (e 'last-eval))
+
+; alert-engine-get-rule-count: get rule count.
+(define (alert-engine-get-rule-count e)
+  (let loop ((rest (e 'rules)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; alert-engine-get-firing-alerts: get list of firing alerts.
+(define (alert-engine-get-firing-alerts e) (e 'firing-alerts))
+
+; alert-engine-add-rule!: add a rule.
+; Returns the new count.
+(define (alert-engine-add-rule! e rule)
+  (let ((existing (e 'rules)))
+    ((e 'set-rules!) (cons rule existing))))
+
+; alert-engine-evaluate-rules!: evaluate all rules.
+; Updates firing-alerts list with rules that fired.
+; v1: simply set status to FIRING for rules that fire.
+; Returns the count of rules that fired.
+(define (alert-engine-evaluate-rules! e)
+  (let loop ((rest (e 'rules)) (firing '()) (count 0))
+    (cond
+      ((null? rest)
+       ((e 'set-firing!) firing)
+       count)
+      (else
+       (let ((rule (car rest)))
+         (let ((new-status (alert-rule-evaluate rule)))
+           (if (= new-status ALERT-STATUS-FIRING)
+               (loop (cdr rest) (cons rule firing) (+ count 1))
+               (loop (cdr rest) firing count)))))))
+
+; alert-engine-set-last-eval!: set last evaluation timestamp.
+; Returns the new value.
+(define (alert-engine-set-last-eval! e v)
+  ((e 'set-last-eval!) v))
+
+; alert-engine-clear-firing!: clear firing alerts list.
+; Returns #f (no firing alerts now).
+(define (alert-engine-clear-firing! e)
+  ((e 'set-firing!) '()))
