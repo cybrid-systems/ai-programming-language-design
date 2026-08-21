@@ -1,0 +1,209 @@
+; 029-netfilter.aura
+; =====================
+; netfilter — minimal capability port to aura.
+;
+; Maps to: Linux kernel netfilter subsystem
+; Source: include/linux/netfilter.h + net/netfilter/ (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux netfilter is the packet processing framework providing:
+;   - 5 hook points: NF_INET_PRE_ROUTING, LOCAL_IN, FORWARD,
+;     LOCAL_OUT, POST_ROUTING
+;   - struct nf_hook_ops (hook function + priority)
+;   - nf_register_net_hook / nf_unregister_net_hook
+;   - struct nf_hookfn (hook callback returning verdict)
+;   - Verdict: NF_ACCEPT, NF_DROP, NF_STOLEN, NF_QUEUE, NF_REPEAT
+;   - Tables: filter, nat, mangle, raw
+;   - Chains: INPUT, OUTPUT, FORWARD, PREROUTING, POSTROUTING
+;   - nf_conntrack (connection tracking — separate module)
+;   - nf_nat (NAT — separate module)
+;
+; aura has no network stack, no packets, no conntrack. v1 ships:
+;   - make-hook (hook ops factory: name, priority, fn)
+;   - nf-hook? predicate
+;   - nf-hook-name / nf-hook-priority / nf-hook-fn
+;   - make-hook-registry (closure-based)
+;   - nf-register-hook / nf-unregister-hook
+;   - nf-find-hook / nf-hook-count
+;   - Verdict symbols: 'accept / 'drop / 'stolen / 'queue / 'repeat
+;   - Hook point symbols: 'pre-routing / 'local-in / 'forward /
+;     'local-out / 'post-routing
+;
+; Deferred (full Linux netfilter):
+;   - real packet traversal through hook chains
+;   - 5 hook points separately registered
+;   - nf_conntrack (connection tracking table)
+;   - nf_nat (SNAT / DNAT / MASQUERADE)
+;   - iptables / nftables userspace
+;   - nf_queue (nfnetlink_queue for userspace verdict)
+;   - nf_log packet logging
+;   - socket option registration
+
+(export
+  make-hook
+  nf-hook?
+  nf-hook-name
+  nf-hook-priority
+  nf-hook-fn
+  nf-register-hook
+  nf-unregister-hook
+  nf-find-hook
+  nf-hook-count
+  ; Verdict symbols
+  'accept
+  'drop
+  'stolen
+  'queue
+  'repeat
+  ; Hook point symbols
+  'pre-routing
+  'local-in
+  'forward
+  'local-out
+  'post-routing)
+
+; ----------------------------------------------------------------
+; Constants — verdicts + hook points
+; ----------------------------------------------------------------
+;
+; Linux definitions (kept here for reference):
+;   enum nf_inet_hooks {
+;     NF_INET_PRE_ROUTING,
+;     NF_INET_LOCAL_IN,
+;     NF_INET_FORWARD,
+;     NF_INET_LOCAL_OUT,
+;     NF_INET_POST_ROUTING,
+;     NF_INET_NUMHOOKS,
+;   };
+;   enum nf_ip_hook_priorities {
+;     NF_IP_PRI_FIRST = INT_MIN,
+;     NF_IP_PRI_CONNTRACK_DEFRAG = -400,
+;     NF_IP_PRI_RAW = -300,
+;     NF_IP_PRI_SELINUX_FIRST = -225,
+;     NF_IP_PRI_CONNTRACK = -200,
+;     NF_IP_PRI_MANGLE = -150,
+;     NF_IP_PRI_NAT_DST = -100,
+;     NF_IP_PRI_FILTER = 0,
+;     NF_IP_PRI_SECURITY = 50,
+;     NF_IP_PRI_NAT_SRC = 100,
+;     NF_IP_PRI_LAST = INT_MAX,
+;   };
+;   #define NF_ACCEPT 1
+;   #define NF_DROP   0
+;   #define NF_STOLEN 2
+;   #define NF_QUEUE  3
+;   #define NF_REPEAT 4
+;
+; v1 uses symbols (no real packet processing).
+
+; ----------------------------------------------------------------
+; nf_hook_ops (closure-based)
+; ----------------------------------------------------------------
+
+; make-hook: create a hook ops record.
+; Args: name (symbol), priority (integer), fn (procedure)
+; Returns: hook closure.
+(define (make-hook name priority fn)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'priority) priority)
+                       ((eq? msg 'fn) fn)
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; nf-hook?: is the object a nf_hook?
+; Detected by querying 'priority — only nf_hook closures return an
+; integer for priority.
+(define (nf-hook? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'priority)))
+        (if (integer? p) #t #f))
+      #f))
+
+; nf-hook-name: get hook name
+(define (nf-hook-name h) (h 'name))
+
+; nf-hook-priority: get hook priority (lower = earlier)
+(define (nf-hook-priority h) (h 'priority))
+
+; nf-hook-fn: get hook function (callback)
+(define (nf-hook-fn h) (h 'fn))
+
+; ----------------------------------------------------------------
+; Hook registry (closure-based, mutable via letrec setters)
+; ----------------------------------------------------------------
+
+; make-hook-registry: empty registry.
+(define (make-hook-registry)
+  (let ((hooks '())
+        (next-id 0))
+    (letrec ((set-hooks!   (lambda (v) (set! hooks v) v))
+             (set-next-id! (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) hooks)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-hooks!)   set-hooks!)
+                       ((eq? msg 'set-next-id!) set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global hook registry
+(define g-hook-registry (make-hook-registry))
+
+; nf-register-hook: register a hook, assign a unique id.
+; Returns the assigned id.
+(define (nf-register-hook hook)
+  (let ((new-id (+ (g-hook-registry 'next-id) 1)))
+    ((g-hook-registry 'set-next-id!) new-id)
+    ((hook 'set-id!) new-id)
+    ((g-hook-registry 'set-hooks!)
+     (cons hook (g-hook-registry 'list)))
+    new-id))
+
+; nf-unregister-hook: remove a hook from the registry.
+; Returns #t if removed, #f if not found.
+(define (nf-unregister-hook hook)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-hook-registry 'set-hooks!)
+                             (cons-rev acc '()))
+                            ((g-hook-registry 'set-hooks!) acc))
+                        found?)
+                       ((eq? (car rest) hook)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-hook-registry 'list) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; nf-find-hook: find a hook by name.
+; Returns the hook or #f if not found.
+(define (nf-find-hook name)
+  (let loop ((rest (g-hook-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (nf-hook-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; nf-hook-count: count of registered hooks
+(define (nf-hook-count)
+  (let loop ((rest (g-hook-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))

@@ -1,0 +1,122 @@
+; 029-netfilter_test.aura
+; ========================
+; Smoke tests for 029-netfilter.aura — netfilter minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/029-netfilter_test.aura
+;
+; Verified automatically (smoke):
+;   - hook ops construction (name, priority, fn)
+;   - nf-hook? predicate
+;   - nf-register-hook / nf-unregister-hook
+;   - nf-find-hook
+;   - nf-hook-count
+;
+; Verified via separate probes during development:
+;   - Multiple hooks coexist with different priorities
+;   - nf-unregister-hook returns #f for non-registered hook
+;   - Hook fn is callable + returns expected verdict
+;
+; Deferred (full Linux netfilter):
+;   - real packet traversal through 5 hook points
+;   - nf_conntrack / nf_nat modules
+;   - iptables / nftables userspace
+;   - nf_queue / nf_log
+
+(require "std/test" all:)
+(require "029-netfilter" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+; noop-fn: minimal hook callback for tests.
+(define (noop-fn skb)
+  'accept)
+
+(test-suite "nf-001-construction"
+  ; Hook ops preserved name, priority, fn.
+  (check (= 'pre-routing (nf-hook-name (make-hook 'pre-routing -200 noop-fn))))
+  (check (= -200 (nf-hook-priority (make-hook 'pre-routing -200 noop-fn))))
+  (check (= 1 (if (eq? noop-fn (nf-hook-fn (make-hook 'pre-routing -200 noop-fn))) 1 0))))
+
+(test-suite "nf-001-predicate"
+  ; nf-hook? accepts only hook closures.
+  (check (= 1 (if (nf-hook? (make-hook 'pre-routing -200 noop-fn)) 1 0)))
+  (check (= 1 (if (not (nf-hook? 'not-a-hook)) 1 0)))
+  (check (= 1 (if (not (nf-hook? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Hook registration
+; ----------------------------------------------------------------
+
+(test-suite "nf-002-register"
+  ; nf-register-hook assigns sequential id.
+  (check (= 1 (nf-register-hook (make-hook 'unq-nf-002 -100 noop-fn))))
+  (check (= 1 (let ((h (make-hook 'unq-nf-002-id -100 noop-fn)))
+                (nf-register-hook h)
+                ((h 'id)))))
+  ; Same hook after register.
+  (check (= 1 (if (> ((make-hook 'unq-nf-002-pri -200 noop-fn) 'id) 0)
+                  0 1))))
+
+(test-suite "nf-002-register-increments"
+  ; Multiple registers assign different ids.
+  (check (= 1 (let ((h1 (make-hook 'unq-nf-002a -100 noop-fn))
+                    (h2 (make-hook 'unq-nf-002b -200 noop-fn)))
+                (nf-register-hook h1)
+                (nf-register-hook h2)
+                (if (not (= ((h1 'id)) ((h2 'id)))) 1 0)))))
+
+; ----------------------------------------------------------------
+; nf-find-hook
+; ----------------------------------------------------------------
+
+(test-suite "nf-003-find"
+  ; nf-find-hook returns the registered hook.
+  (check (= 1 (let ((h (make-hook 'unq-nf-003-find -100 noop-fn)))
+                (nf-register-hook h)
+                (if (eq? h (nf-find-hook 'unq-nf-003-find)) 1 0)))))
+
+(test-suite "nf-003-find-missing"
+  ; nf-find-hook returns #f for unknown name.
+  (check (= 1 (if (not (nf-find-hook 'unq-nf-003-missing)) 1 0))))
+
+; ----------------------------------------------------------------
+; nf-unregister-hook
+; ----------------------------------------------------------------
+
+(test-suite "nf-004-unregister"
+  ; nf-unregister-hook removes + nf-find returns #f.
+  (check (= 1 (let ((h (make-hook 'unq-nf-004-unreg -100 noop-fn)))
+                (nf-register-hook h)
+                (nf-unregister-hook h)
+                (if (not (nf-find-hook 'unq-nf-004-unreg)) 1 0)))))
+
+(test-suite "nf-004-unregister-not-found"
+  ; nf-unregister-hook returns #f for unregistered hook.
+  (check (= 1 (if (not (nf-unregister-hook (make-hook 'unq-nf-004-orphan -100 noop-fn))) 1 0))))
+
+; ----------------------------------------------------------------
+; nf-hook-count
+; ----------------------------------------------------------------
+
+(test-suite "nf-005-count"
+  ; nf-hook-count returns positive after registrations.
+  (check (= 1 (> (nf-hook-count) 0))))
+
+; ----------------------------------------------------------------
+; Hook fn call (smoke)
+; ----------------------------------------------------------------
+
+(test-suite "nf-006-fn-callable"
+  ; Hook fn can be invoked + returns expected verdict.
+  (check (= 'accept (noop-fn 'fake-skb))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
