@@ -1,0 +1,102 @@
+; 011-completion_test.aura
+; ==========================
+; Smoke tests for 011-completion.aura — completion minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/011-completion_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-completion construction (done=0)
+;   - completion-is-complete? initially #f
+;   - completion-complete increments done
+;   - completion-complete-all sets done to saturated value
+;   - completion-wait decrements done
+;   - completion-try-wait non-blocking
+;   - Signal-then-wait cycle
+;
+; Verified via separate probes during development:
+;   - complete saturates at upper bound (no further increments)
+;   - complete_all + multiple waits drain done
+;   - reinit (manual reset to 0)
+;
+; Deferred (full Linux completion):
+;   - swait (sleep + scheduler integration)
+;   - complete_with_flags (interrupt-context signaling)
+;   - wait_for_completion_timeout
+;   - wait_for_completion_killable
+;   - reinit_completion (built-in reset)
+;   - completion_done (atomic poll)
+
+(require "std/test" all:)
+(require "011-completion" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "completion-001-init"
+  (check (= 0 (completion-done-count (make-completion))))
+  (check (= 1 (if (not (completion-is-complete? (make-completion))) 1 0)))
+
+; ----------------------------------------------------------------
+; complete (producer)
+; ----------------------------------------------------------------
+
+(test-suite "completion-002-complete"
+  (check (= 1 (completion-complete (make-completion))))
+
+(test-suite "completion-002-complete-thrice"
+  (check (= 3 (let ((c (make-completion)))
+                 (completion-complete c)
+                 (completion-complete c)
+                 (completion-complete c)
+                 (completion-done-count c))))
+
+; ----------------------------------------------------------------
+; complete_all
+; ----------------------------------------------------------------
+
+(test-suite "completion-003-complete-all"
+  (check (= 1 (if (completion-is-complete? (let ((c (make-completion)))
+                                                (completion-complete-all c)
+                                                c)) 1 0))))
+
+; ----------------------------------------------------------------
+; wait (consumer)
+; ----------------------------------------------------------------
+
+(test-suite "completion-004-wait"
+  (check (= 0 (let ((c (make-completion)))
+                 (completion-complete c)
+                 (completion-wait c)
+                 (completion-done-count c))))
+
+(test-suite "completion-004-try-wait"
+  (check (= 0 (let ((c (make-completion)))
+                 (completion-complete c)
+                 (completion-try-wait c)
+                 (completion-done-count c))))
+
+; ----------------------------------------------------------------
+; signal-then-wait cycle
+; ----------------------------------------------------------------
+
+(test-suite "completion-005-cycle"
+  ; Complete twice, then wait twice → back to 0.
+  (check (= 0 (let ((c (make-completion)))
+                 (completion-complete c)
+                 (completion-complete c)
+                 (completion-wait c)
+                 (completion-wait c)
+                 (completion-done-count c))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

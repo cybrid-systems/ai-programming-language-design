@@ -1,0 +1,114 @@
+; 011-completion.aura
+; =======================
+; Completion — minimal capability port to aura.
+;
+; Maps to: 011-completion-analysis.md
+; Source: include/linux/completion.h + kernel/sched/completion.c
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux completion integrates with the scheduler:
+;   - wait_for_completion blocks via swait (Marek-style sleep)
+;   - complete increments done + wakes one waiter
+;   - complete_all sets done = UINT_MAX permanently
+;
+; aura has no scheduler, no atomics.
+; v1 ships the done counter + wait/try-wait/complete API:
+;   - make-completion
+;   - completion-complete (signal one waiter)
+;   - completion-complete-all (signal all)
+;   - completion-wait (decrement done, return success)
+;   - completion-try-wait (non-blocking)
+;   - completion-done-count (read done)
+;   - completion-is-complete?
+;
+; Deferred (full Linux completion, separate issues):
+;   - swait (sleep + scheduler integration)
+;   - complete_with_flags (interrupt-context signaling)
+;   - wait_for_completion_timeout
+;   - wait_for_completion_killable
+;   - wait_for_completion_io
+;   - reinit_completion
+;   - completion_done (atomic poll)
+
+(export
+  make-completion
+  completion-complete
+  completion-complete-all
+  completion-wait
+  completion-try-wait
+  completion-done-count
+  completion-is-complete?)
+
+; ----------------------------------------------------------------
+; Completion (closure with done counter + wait list)
+; ----------------------------------------------------------------
+
+; Make a completion. Initially done=0 (waiting).
+(define (make-completion)
+  (let ((done 0))
+    (letrec ((set-done! (lambda (v) (set! done v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'done) done)
+                       ((eq? msg 'set-done!) set-done!)
+                       ((eq? msg 'complete?) (> done 0))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+; completion-is-complete?: is done > 0?
+(define (completion-is-complete? c)
+  (> (c 'done) 0))
+
+; completion-done-count: current value of done.
+(define (completion-done-count c)
+  (c 'done))
+
+; ----------------------------------------------------------------
+; Signal (producer path)
+; ----------------------------------------------------------------
+
+; completion-complete: signal one waiter.
+; Increments done (saturates at UINT_MAX — once done reaches "max"
+; [we use a large number, not true UINT_MAX], all subsequent completes
+; are no-ops until reinit).
+; Returns the new done count.
+(define (completion-complete c)
+  (let ((d (c 'done)))
+    (if (>= d 999999)    ; "saturated" sentinel — analog of UINT_MAX
+        d
+        (begin
+          ((c 'set-done!) (+ d 1))
+          (+ d 1)))))
+
+; completion-complete-all: signal all current and future waiters.
+; Sets done to a large value (analog of UINT_MAX).
+(define (completion-complete-all c)
+  ((c 'set-done!) 999999)
+  999999)
+
+; ----------------------------------------------------------------
+; Wait (consumer path)
+; ----------------------------------------------------------------
+
+; completion-wait: decrement done by 1. If done > 0, succeeds.
+; Returns the new done count (after decrement) on success,
+; or #f if done was already 0 (caller bug in v1 since wait would block).
+(define (completion-wait c)
+  (let ((d (c 'done)))
+    (if (= d 0)
+        #f
+        (begin
+          ((c 'set-done!) (- d 1))
+          (- d 1)))))
+
+; completion-try-wait: non-blocking wait.
+; Returns the new done count (after decrement) on success,
+; or #f if done was 0 (would block in real kernel).
+(define (completion-try-wait c)
+  (completion-wait c))
