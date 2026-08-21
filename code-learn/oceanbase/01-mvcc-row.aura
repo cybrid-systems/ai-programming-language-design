@@ -1,0 +1,498 @@
+; 01-mvcc-row.aura
+; ====================
+; MVCC row minimal capability port to aura.
+;
+; Maps to: OceanBase storage layer MVCC row implementation
+; Source: src/storage/memtable/mvcc/ob_mvcc_row.h + ob_mvcc_row.cpp
+;         + ob_tx_seq.h + ob_mvcc.h (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase MVCC row provides multi-version concurrency control:
+;   - struct ObMvccTransNode: tx_id, trans_version, scn, seq_no,
+;     prev/next pointers, modify_count, acc_checksum, version,
+;     snapshot_version_barrier, tx_end_scn, type (NDT_NORMAL /
+;     NDT_COMPACT), flag (TransNodeFlag state machine), buf_[0]
+;     payload (flexible array for row data)
+;   - struct TransNodeFlag: 8 flags (F_INIT, F_WEAK_CONSISTENT_READ_BARRIER,
+;     F_STRONG_CONSISTENT_READ_BARRIER, F_COMMITTED, F_ELR, F_ABORTED,
+;     F_DELAYED_CLEANOUT, F_INCOMPLETE_STATE)
+;   - struct ObMvccRow: list_head_, first_dml_flag_, last_dml_flag_,
+;     update_since_compact_, total_trans_node_cnt_,
+;     max_trans_version_, max_elr_trans_version_, max_modify_scn_,
+;     min_modify_scn_, max_trans_id_, max_elr_trans_id_,
+;     latest_compact_node_, row_flag_
+;   - struct ObTxSEQ: 64-bit tx seq with branch support (15-bit
+;     branch + 47-bit seq + 1-bit n_format + 1-bit sign)
+;   - mvcc_write: insert new version at head of chain
+;   - mvcc_undo: rollback latest version (F_ABORTED + unlink)
+;   - visibility: find latest committed version <= snapshot_version
+;
+; aura has no concurrency, no transactions, no real pointer
+; arithmetic. v1 ships:
+;   - make-mvcc-trans-node (factory: tx-id, trans-version, scn, seq,
+;     type, flag, payload) + setters + commit/abort transitions
+;   - make-mvcc-row (factory: first-dml-flag, last-dml-flag) +
+;     list-head + aggregates
+;   - mvcc-row-add-version! (link new version at head + update
+;     aggregates)
+;   - mvcc-row-find-visible (walk chain from head via prev pointers,
+;     return first committed version <= snapshot)
+;   - mvcc-row-version-count (chain length)
+;   - mvcc-row-undo-latest! (set F_ABORTED + unlink from head)
+;   - make-tx-seq (branch + seq + n-format) + accessors
+;
+; Deferred (full OceanBase MVCC):
+;   - real CAS loop on TransNodeFlag (multi-flag OR via atomic ops)
+;   - row latch (ObRowLatch) for atomic head mutation
+;   - delayed cleanout + tx_table_guard_ queries
+;   - 6-case state machine in mvcc_write_ (trans_set_violation,
+;     try_lock_row_conflict, primary_key_duplicate, etc.)
+;   - mvcc_sanity_check_ (double-insert detection + PDML branch)
+;   - sequence_set_violation check
+;   - ObITransCallback / ObTxCallbackList lifecycle
+;   - ObMvccAccessCtx (snapshot, acc_ctx)
+;   - ObStoreRowLockState (lock state in conflict)
+;   - memory layout: ObMvccRow <= 120 bytes cache-line fit
+;   - actual buf_[0] flexible array layout (ObDatumRow payload)
+
+(export
+  ; Flag constants
+  F-INIT F-WEAK-CONSISTENT-READ-BARRIER F-STRONG-CONSISTENT-READ-BARRIER
+  F-COMMITTED F-ELR F-ABORTED F-DELAYED-CLEANOUT F-INCOMPLETE-STATE
+  ; NDT types
+  NDT-NORMAL NDT-COMPACT
+  ; DML flags
+  DML-NONE DML-INSERT DML-UPDATE DML-DELETE DML-REPLACE
+  ; ObTxSEQ
+  make-tx-seq tx-seq? tx-seq-branch tx-seq-seq tx-seq-n-format?
+  tx-seq-set-branch! tx-seq-set-seq!
+  ; ObMvccTransNode
+  make-mvcc-trans-node mvcc-trans-node?
+  mvcc-trans-node-tx-id mvcc-trans-node-trans-version mvcc-trans-node-scn
+  mvcc-trans-node-seq mvcc-trans-node-type mvcc-trans-node-flag
+  mvcc-trans-node-payload mvcc-trans-node-prev mvcc-trans-node-next
+  mvcc-trans-node-modify-count mvcc-trans-node-tx-end-scn
+  mvcc-trans-node-set-prev! mvcc-trans-node-set-next!
+  mvcc-trans-node-set-flag! mvcc-trans-node-set-tx-end-scn!
+  mvcc-trans-node-trans-commit! mvcc-trans-node-trans-abort!
+  ; ObMvccRow
+  make-mvcc-row mvcc-row?
+  mvcc-row-list-head mvcc-row-first-dml-flag mvcc-row-last-dml-flag
+  mvcc-row-max-trans-version mvcc-row-max-elr-trans-version
+  mvcc-row-max-modify-scn mvcc-row-min-modify-scn
+  mvcc-row-max-trans-id mvcc-row-max-elr-trans-id
+  mvcc-row-total-trans-node-cnt
+  mvcc-row-add-version! mvcc-row-find-visible mvcc-row-version-count
+  mvcc-row-undo-latest!)
+
+; ----------------------------------------------------------------
+; TransNodeFlag — 8 atomic state flags
+; ----------------------------------------------------------------
+;
+; Linux definitions (kept here for reference):
+;   F_INIT                          = 0x00
+;   F_WEAK_CONSISTENT_READ_BARRIER  = (1 << 0)  = 1
+;   F_STRONG_CONSISTENT_READ_BARRIER = (1 << 1) = 2
+;   F_COMMITTED                     = (1 << 2)  = 4
+;   F_ELR                           = (1 << 3)  = 8
+;   F_ABORTED                       = (1 << 4)  = 16
+;   F_DELAYED_CLEANOUT              = (1 << 6)  = 64
+;   F_INCOMPLETE_STATE              = (1 << 7)  = 128
+;
+; v1 uses single-bit integer values. Multi-flag OR not supported.
+
+(define F-INIT 0)
+(define F-WEAK-CONSISTENT-READ-BARRIER 1)
+(define F-STRONG-CONSISTENT-READ-BARRIER 2)
+(define F-COMMITTED 4)
+(define F-ELR 8)
+(define F-ABORTED 16)
+(define F-DELAYED-CLEANOUT 64)
+(define F-INCOMPLETE-STATE 128)
+
+; ----------------------------------------------------------------
+; NDT (Node Data Type)
+; ----------------------------------------------------------------
+
+(define NDT-NORMAL 0)
+(define NDT-COMPACT 1)
+
+; ----------------------------------------------------------------
+; DML flags
+; ----------------------------------------------------------------
+
+(define DML-NONE 0)
+(define DML-INSERT 1)
+(define DML-UPDATE 2)
+(define DML-DELETE 3)
+(define DML-REPLACE 4)
+
+; ----------------------------------------------------------------
+; ObTxSEQ — 64-bit transaction sequence with branch support
+; ----------------------------------------------------------------
+
+; make-tx-seq: create a transaction sequence.
+; Args: branch (integer 0..2^15-1), seq (integer 0..2^47-1),
+;       n-format (0 or 1 — old or new format)
+; Returns: tx_seq closure.
+(define (make-tx-seq branch seq n-format)
+  (let ((b branch)
+        (s seq)
+        (f n-format))
+    (letrec ((set-branch! (lambda (v) (set! b v) v))
+             (set-seq! (lambda (v) (set! s v) v))
+             (set-format! (lambda (v) (set! f v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'branch) b)
+                       ((eq? msg 'seq) s)
+                       ((eq? msg 'n-format) f)
+                       ((eq? msg 'set-branch!) set-branch!)
+                       ((eq? msg 'set-seq!) set-seq!)
+                       ((eq? msg 'set-format!) set-format!)
+                       (else #f)))))
+      self)))
+
+; tx-seq?: is the object a tx_seq?
+; Detected by querying 'n-format — only tx_seq closures return 0 or 1.
+(define (tx-seq? obj)
+  (if (procedure? obj)
+      (let ((f (obj 'n-format)))
+        (if (or (= f 0) (= f 1)) #t #f))
+      #f))
+
+; tx-seq-branch: get branch id (15-bit)
+(define (tx-seq-branch ts) (ts 'branch))
+
+; tx-seq-seq: get sequence number (47-bit)
+(define (tx-seq-seq ts) (ts 'seq))
+
+; tx-seq-n-format?: is this a new-format tx_seq?
+(define (tx-seq-n-format? ts)
+  (if (= (ts 'n-format) 1) #t #f))
+
+; tx-seq-set-branch!: set branch id.
+; Returns the new branch.
+(define (tx-seq-set-branch! ts new-branch)
+  ((ts 'set-branch!) new-branch))
+
+; tx-seq-set-seq!: set sequence number.
+; Returns the new seq.
+(define (tx-seq-set-seq! ts new-seq)
+  ((ts 'set-seq!) new-seq))
+
+; ----------------------------------------------------------------
+; ObMvccTransNode — version node
+; ----------------------------------------------------------------
+
+; make-mvcc-trans-node: create a version node.
+; Args: tx-id, trans-version, scn, seq, type, flag, payload
+; Returns: mvcc_trans_node closure.
+(define (make-mvcc-trans-node tx-id trans-version scn seq type flag payload)
+  (let ((prev #f)
+        (next #f)
+        (modify-count 0)
+        (acc-checksum 0)
+        (version 0)
+        (barrier 0)
+        (tx-end-scn 0)
+        (write-epoch 0))
+    (letrec ((set-prev! (lambda (v) (set! prev v) v))
+             (set-next! (lambda (v) (set! next v) v))
+             (set-flag! (lambda (v) (set! flag v) v))
+             (set-modify-count! (lambda (v) (set! modify-count v) v))
+             (set-version! (lambda (v) (set! version v) v))
+             (set-barrier! (lambda (v) (set! barrier v) v))
+             (set-tx-end-scn! (lambda (v) (set! tx-end-scn v) v))
+             (set-write-epoch! (lambda (v) (set! write-epoch v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tx-id) tx-id)
+                       ((eq? msg 'trans-version) trans-version)
+                       ((eq? msg 'scn) scn)
+                       ((eq? msg 'seq) seq)
+                       ((eq? msg 'type) type)
+                       ((eq? msg 'flag) flag)
+                       ((eq? msg 'payload) payload)
+                       ((eq? msg 'prev) prev)
+                       ((eq? msg 'next) next)
+                       ((eq? msg 'modify-count) modify-count)
+                       ((eq? msg 'acc-checksum) acc-checksum)
+                       ((eq? msg 'version) version)
+                       ((eq? msg 'barrier) barrier)
+                       ((eq? msg 'tx-end-scn) tx-end-scn)
+                       ((eq? msg 'write-epoch) write-epoch)
+                       ((eq? msg 'set-prev!) set-prev!)
+                       ((eq? msg 'set-next!) set-next!)
+                       ((eq? msg 'set-flag!) set-flag!)
+                       ((eq? msg 'set-modify-count!) set-modify-count!)
+                       ((eq? msg 'set-version!) set-version!)
+                       ((eq? msg 'set-barrier!) set-barrier!)
+                       ((eq? msg 'set-tx-end-scn!) set-tx-end-scn!)
+                       ((eq? msg 'set-write-epoch!) set-write-epoch!)
+                       (else #f)))))
+      self)))
+
+; mvcc-trans-node?: is the object a mvcc_trans_node?
+; Detected by querying 'tx-end-scn — only version nodes return an integer.
+(define (mvcc-trans-node? obj)
+  (if (procedure? obj)
+      (let ((e (obj 'tx-end-scn)))
+        (if (integer? e) #t #f))
+      #f))
+
+; mvcc-trans-node-tx-id: get tx_id
+(define (mvcc-trans-node-tx-id n) (n 'tx-id))
+
+; mvcc-trans-node-trans-version: get trans_version
+(define (mvcc-trans-node-trans-version n) (n 'trans-version))
+
+; mvcc-trans-node-scn: get scn
+(define (mvcc-trans-node-scn n) (n 'scn))
+
+; mvcc-trans-node-seq: get seq_no
+(define (mvcc-trans-node-seq n) (n 'seq))
+
+; mvcc-trans-node-type: get type (NDT_NORMAL / NDT_COMPACT)
+(define (mvcc-trans-node-type n) (n 'type))
+
+; mvcc-trans-node-flag: get flag (TransNodeFlag state)
+(define (mvcc-trans-node-flag n) (n 'flag))
+
+; mvcc-trans-node-payload: get payload (row data via buf_[0])
+(define (mvcc-trans-node-payload n) (n 'payload))
+
+; mvcc-trans-node-prev: get prev pointer (older version)
+(define (mvcc-trans-node-prev n) (n 'prev))
+
+; mvcc-trans-node-next: get next pointer (newer version)
+(define (mvcc-trans-node-next n) (n 'next))
+
+; mvcc-trans-node-modify-count: get modify_count
+(define (mvcc-trans-node-modify-count n) (n 'modify-count))
+
+; mvcc-trans-node-tx-end-scn: get tx_end_scn
+(define (mvcc-trans-node-tx-end-scn n) (n 'tx-end-scn))
+
+; mvcc-trans-node-set-prev!: set prev pointer (internal)
+(define (mvcc-trans-node-set-prev! n v) ((n 'set-prev!) v))
+
+; mvcc-trans-node-set-next!: set next pointer (internal)
+(define (mvcc-trans-node-set-next! n v) ((n 'set-next!) v))
+
+; mvcc-trans-node-set-flag!: set flag (TransNodeFlag state)
+; Returns the new flag.
+(define (mvcc-trans-node-set-flag! n v) ((n 'set-flag!) v))
+
+; mvcc-trans-node-set-tx-end-scn!: set tx_end_scn
+; Returns the new tx-end-scn.
+(define (mvcc-trans-node-set-tx-end-scn! n v) ((n 'set-tx-end-scn!) v))
+
+; mvcc-trans-node-trans-commit!: set F_COMMITTED + tx_end_scn.
+; Args: n (version_node), commit-version (integer — for reference),
+;       tx-end-scn (integer)
+; Returns the new flag.
+(define (mvcc-trans-node-trans-commit! n commit-version tx-end-scn)
+  ((n 'set-flag!) F-COMMITTED)
+  ((n 'set-tx-end-scn!) tx-end-scn))
+
+; mvcc-trans-node-trans-abort!: set F_ABORTED + tx_end_scn.
+; Returns the new flag.
+(define (mvcc-trans-node-trans-abort! n tx-end-scn)
+  ((n 'set-flag!) F-ABORTED)
+  ((n 'set-tx-end-scn!) tx-end-scn))
+
+; ----------------------------------------------------------------
+; ObMvccRow — row container with version chain
+; ----------------------------------------------------------------
+
+; make-mvcc-row: create an empty mvcc_row.
+; Args: first-dml-flag, last-dml-flag
+; Returns: mvcc_row closure (initial: list-head = #f, all counters 0).
+(define (make-mvcc-row first-dml-flag last-dml-flag)
+  (let ((list-head #f)
+        (latest-compact-node #f)
+        (total-trans-node-cnt 0)
+        (max-trans-version 0)
+        (max-elr-trans-version 0)
+        (max-modify-scn 0)
+        (min-modify-scn 0)
+        (max-trans-id 0)
+        (max-elr-trans-id 0)
+        (row-flag 0)
+        (update-since-compact 0))
+    (letrec ((set-list-head! (lambda (v) (set! list-head v) v))
+             (set-latest-compact-node! (lambda (v) (set! latest-compact-node v) v))
+             (set-total-trans-node-cnt! (lambda (v) (set! total-trans-node-cnt v) v))
+             (set-max-trans-version! (lambda (v) (set! max-trans-version v) v))
+             (set-max-elr-trans-version! (lambda (v) (set! max-elr-trans-version v) v))
+             (set-max-modify-scn! (lambda (v) (set! max-modify-scn v) v))
+             (set-min-modify-scn! (lambda (v) (set! min-modify-scn v) v))
+             (set-max-trans-id! (lambda (v) (set! max-trans-id v) v))
+             (set-max-elr-trans-id! (lambda (v) (set! max-elr-trans-id v) v))
+             (set-row-flag! (lambda (v) (set! row-flag v) v))
+             (set-update-since-compact! (lambda (v) (set! update-since-compact v) v))
+             (inc-total-trans-node-cnt! (lambda () (set! total-trans-node-cnt (+ total-trans-node-cnt 1)) total-trans-node-cnt))
+             (dec-total-trans-node-cnt! (lambda () (set! total-trans-node-cnt (- total-trans-node-cnt 1)) total-trans-node-cnt))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'first-dml-flag) first-dml-flag)
+                       ((eq? msg 'last-dml-flag) last-dml-flag)
+                       ((eq? msg 'list-head) list-head)
+                       ((eq? msg 'latest-compact-node) latest-compact-node)
+                       ((eq? msg 'total-trans-node-cnt) total-trans-node-cnt)
+                       ((eq? msg 'max-trans-version) max-trans-version)
+                       ((eq? msg 'max-elr-trans-version) max-elr-trans-version)
+                       ((eq? msg 'max-modify-scn) max-modify-scn)
+                       ((eq? msg 'min-modify-scn) min-modify-scn)
+                       ((eq? msg 'max-trans-id) max-trans-id)
+                       ((eq? msg 'max-elr-trans-id) max-elr-trans-id)
+                       ((eq? msg 'row-flag) row-flag)
+                       ((eq? msg 'update-since-compact) update-since-compact)
+                       ((eq? msg 'set-list-head!) set-list-head!)
+                       ((eq? msg 'set-latest-compact-node!) set-latest-compact-node!)
+                       ((eq? msg 'set-total-trans-node-cnt!) set-total-trans-node-cnt!)
+                       ((eq? msg 'set-max-trans-version!) set-max-trans-version!)
+                       ((eq? msg 'set-max-elr-trans-version!) set-max-elr-trans-version!)
+                       ((eq? msg 'set-max-modify-scn!) set-max-modify-scn!)
+                       ((eq? msg 'set-min-modify-scn!) set-min-modify-scn!)
+                       ((eq? msg 'set-max-trans-id!) set-max-trans-id!)
+                       ((eq? msg 'set-max-elr-trans-id!) set-max-elr-trans-id!)
+                       ((eq? msg 'set-row-flag!) set-row-flag!)
+                       ((eq? msg 'set-update-since-compact!) set-update-since-compact!)
+                       ((eq? msg 'inc-total-trans-node-cnt!) inc-total-trans-node-cnt!)
+                       ((eq? msg 'dec-total-trans-node-cnt!) dec-total-trans-node-cnt!)
+                       (else #f)))))
+      self)))
+
+; mvcc-row?: is the object a mvcc_row?
+; Detected by querying 'total-trans-node-cnt — only mvcc_row closures
+; return a non-negative integer.
+(define (mvcc-row? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'total-trans-node-cnt)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; mvcc-row-list-head: get current head of version chain
+(define (mvcc-row-list-head row) (row 'list-head))
+
+; mvcc-row-first-dml-flag: get first_dml_flag
+(define (mvcc-row-first-dml-flag row) (row 'first-dml-flag))
+
+; mvcc-row-last-dml-flag: get last_dml_flag
+(define (mvcc-row-last-dml-flag row) (row 'last-dml-flag))
+
+; mvcc-row-max-trans-version: get max_trans_version
+(define (mvcc-row-max-trans-version row) (row 'max-trans-version))
+
+; mvcc-row-max-elr-trans-version: get max_elr_trans_version
+(define (mvcc-row-max-elr-trans-version row) (row 'max-elr-trans-version))
+
+; mvcc-row-max-modify-scn: get max_modify_scn
+(define (mvcc-row-max-modify-scn row) (row 'max-modify-scn))
+
+; mvcc-row-min-modify-scn: get min_modify_scn
+(define (mvcc-row-min-modify-scn row) (row 'min-modify-scn))
+
+; mvcc-row-max-trans-id: get max_trans_id
+(define (mvcc-row-max-trans-id row) (row 'max-trans-id))
+
+; mvcc-row-max-elr-trans-id: get max_elr_trans_id
+(define (mvcc-row-max-elr-trans-id row) (row 'max-elr-trans-id))
+
+; mvcc-row-total-trans-node-cnt: get count of version nodes
+(define (mvcc-row-total-trans-node-cnt row) (row 'total-trans-node-cnt))
+
+; ----------------------------------------------------------------
+; mvcc-row-add-version! — insert new version at head of chain
+; ----------------------------------------------------------------
+;
+; In real OB: ATOMIC_STORE new_node.prev_ = list_head_;
+;             ATOMIC_STORE new_node.next_ = NULL;
+;             if (NULL != list_head_) ATOMIC_STORE list_head_->next_ = &new_node;
+;             ATOMIC_STORE list_head_ = &new_node;
+;             writer_node.modify_count_ = (NULL != writer_node.prev_) ?
+;                                          writer_node.prev_->modify_count_ + 1 : 0;
+;             total_trans_node_cnt_++;
+;
+; Aura v1: same semantics, no atomic (single-threaded).
+
+(define (mvcc-row-add-version! row new-node)
+  (let ((old-head (mvcc-row-list-head row))
+        (tv (mvcc-trans-node-trans-version new-node)))
+    ; Link new_node.prev = old-head
+    (mvcc-trans-node-set-prev! new-node old-head)
+    ; If old-head exists, link old-head.next = new_node
+    (if (not (eq? old-head #f))
+        (mvcc-trans-node-set-next! old-head new-node))
+    ; Update row's list-head to new-node
+    ((row 'set-list-head!) new-node)
+    ; Update modify-count: prev.modify-count + 1 if prev exists, else 0
+    (if (eq? old-head #f)
+        ((new-node 'set-modify-count!) 0)
+        ((new-node 'set-modify-count!)
+         (+ (mvcc-trans-node-modify-count old-head) 1)))
+    ; Increment total-trans-node-cnt
+    ((row 'inc-total-trans-node-cnt!))
+    ; Update max-trans-version if new > current
+    (if (> tv (mvcc-row-max-trans-version row))
+        ((row 'set-max-trans-version!) tv))
+    new-node))
+
+; ----------------------------------------------------------------
+; mvcc-row-find-visible — find latest committed version <= snapshot
+; ----------------------------------------------------------------
+;
+; Visibility conditions (all must be true):
+;   - node.flag_.is_committed() == true
+;   - node.trans_version_ <= snapshot_version_
+;   - (we skip tx_id check — not in v1 minimal port)
+;
+; Walk from list_head via prev pointers (newest to oldest).
+
+(define (mvcc-row-find-visible row snapshot-version)
+  (let loop ((iter (mvcc-row-list-head row)))
+    (cond
+      ((eq? iter #f) #f)
+      (else
+       (let ((flag (mvcc-trans-node-flag iter))
+             (tv (mvcc-trans-node-trans-version iter)))
+         (if (and (= flag F-COMMITTED) (<= tv snapshot-version))
+             iter
+             (loop (mvcc-trans-node-prev iter))))))))
+
+; ----------------------------------------------------------------
+; mvcc-row-version-count — count nodes in chain
+; ----------------------------------------------------------------
+
+(define (mvcc-row-version-count row)
+  (let loop ((iter (mvcc-row-list-head row)) (n 0))
+    (cond
+      ((eq? iter #f) n)
+      (else (loop (mvcc-trans-node-prev iter) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; mvcc-row-undo-latest! — rollback latest node (set F_ABORTED + unlink)
+; ----------------------------------------------------------------
+;
+; In real OB:
+;   iter->trans_rollback();  // F_ABORTED
+;   ATOMIC_STORE(&list_head_, iter->prev_);
+;   if (NULL != iter->prev_) ATOMIC_STORE(&iter->prev_->next_, NULL);
+;   total_trans_node_cnt_--;
+;
+; Aura v1: same semantics.
+
+(define (mvcc-row-undo-latest! row)
+  (let ((iter (mvcc-row-list-head row)))
+    (if (eq? iter #f)
+        'no-op
+        (begin
+          ((iter 'set-flag!) F-ABORTED)
+          ((row 'set-list-head!) (mvcc-trans-node-prev iter))
+          (let ((prev (mvcc-trans-node-prev iter)))
+            (if (not (eq? prev #f))
+                (mvcc-trans-node-set-next! prev #f)))
+          ((row 'dec-total-trans-node-cnt!))))))

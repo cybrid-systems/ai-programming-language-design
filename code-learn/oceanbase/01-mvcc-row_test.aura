@@ -1,0 +1,350 @@
+; 01-mvcc-row_test.aura
+; ========================
+; Smoke tests for 01-mvcc-row.aura — MVCC row minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/01-mvcc-row_test.aura
+;
+; Verified automatically (smoke):
+;   - ObTxSEQ construction + branch/seq/format + set-branch/seq
+;   - TransNodeFlag constants are distinct
+;   - ObMvccTransNode construction + setters + commit/abort
+;   - ObMvccRow construction + aggregates
+;   - mvcc-row-add-version! (single + multiple + aggregates update)
+;   - mvcc-row-find-visible (empty + not-committed + committed +
+;     multiple versions)
+;   - mvcc-row-version-count
+;   - mvcc-row-undo-latest!
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Modify-count chain: first=0, second=1, third=2
+;
+; Deferred (full OceanBase MVCC):
+;   - real CAS loop on TransNodeFlag
+;   - row latch (ObRowLatch) for atomic head mutation
+;   - delayed cleanout + tx_table_guard_
+;   - 6-case state machine in mvcc_write_
+;   - mvcc_sanity_check_ (double-insert detection)
+;   - ObITransCallback / ObTxCallbackList lifecycle
+;   - ObMvccAccessCtx (snapshot, acc_ctx)
+;   - actual buf_[0] flexible array layout (ObDatumRow payload)
+
+(require "std/test" all:)
+(require "01-mvcc-row" all:)
+
+; ----------------------------------------------------------------
+; Flag constants
+; ----------------------------------------------------------------
+
+(test-suite "mv-001-flag-constants-distinct"
+  ; Flag constants are distinct integers.
+  (check (= 1 (if (not (= F-INIT F-COMMITTED)) 1 0)))
+  (check (= 1 (if (not (= F-COMMITTED F-ABORTED)) 1 0)))
+  (check (= 1 (if (not (= F-ELR F-INIT)) 1 0)))
+  (check (= 1 (if (not (= F-DELAYED-CLEANOUT F-INCOMPLETE-STATE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObTxSEQ
+; ----------------------------------------------------------------
+
+(test-suite "mv-001-tx-seq-construction"
+  ; tx_seq preserves branch, seq, n-format.
+  (check (= 1 (tx-seq-branch (make-tx-seq 1 100 1))))
+  (check (= 100 (tx-seq-seq (make-tx-seq 1 100 1))))
+  (check (= 1 (if (tx-seq-n-format? (make-tx-seq 1 100 1)) 1 0))))
+
+(test-suite "mv-001-tx-seq-old-format"
+  ; Old-format (n-format = 0) returns #f for n-format?.
+  (check (= 1 (if (not (tx-seq-n-format? (make-tx-seq 0 0 0))) 1 0))))
+
+(test-suite "mv-001-tx-seq-predicate"
+  ; tx-seq? accepts only tx_seq closures.
+  (check (= 1 (if (tx-seq? (make-tx-seq 0 0 0)) 1 0)))
+  (check (= 1 (if (not (tx-seq? 'not-a-tx-seq)) 1 0)))
+  (check (= 1 (if (not (tx-seq? 42)) 1 0))))
+
+(test-suite "mv-001-tx-seq-set-branch"
+  ; tx-seq-set-branch! updates branch.
+  (check (= 5 (let ((ts (make-tx-seq 0 0 0)))
+                (tx-seq-set-branch! ts 5)
+                (tx-seq-branch ts)))))
+
+(test-suite "mv-001-tx-seq-set-seq"
+  ; tx-seq-set-seq! updates seq.
+  (check (= 999 (let ((ts (make-tx-seq 0 0 0)))
+                  (tx-seq-set-seq! ts 999)
+                  (tx-seq-seq ts)))))
+
+; ----------------------------------------------------------------
+; ObMvccTransNode construction
+; ----------------------------------------------------------------
+
+(test-suite "mv-002-trans-node-construction"
+  ; trans node preserves tx-id, trans-version, scn, seq, type, flag, payload.
+  (check (= 100 (mvcc-trans-node-tx-id
+                  (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))))
+  (check (= 5 (mvcc-trans-node-trans-version
+                (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))))
+  (check (= 10 (mvcc-trans-node-scn
+                 (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))))
+  (check (= 1 (mvcc-trans-node-seq
+                (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))))
+  (check (= NDT-NORMAL (mvcc-trans-node-type
+                          (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))))
+  (check (= F-INIT (mvcc-trans-node-flag
+                     (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))))
+  (check (= 1 (if (eq? 'payload (mvcc-trans-node-payload
+                                  (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT 'payload))) 1 0))))
+
+(test-suite "mv-002-trans-node-predicate"
+  ; mvcc-trans-node? accepts only trans_node closures.
+  (check (= 1 (if (mvcc-trans-node? (make-mvcc-trans-node 100 5 10 1 NDT-NORMAL F-INIT #f)) 1 0)))
+  (check (= 1 (if (not (mvcc-trans-node? 'not-a-node)) 1 0)))
+  (check (= 1 (if (not (mvcc-trans-node? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObMvccTransNode setters
+; ----------------------------------------------------------------
+
+(test-suite "mv-002-trans-node-set-prev"
+  ; mvcc-trans-node-set-prev! updates prev.
+  (check (= 1 (let ((a (make-mvcc-trans-node 1 1 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 2 2 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-trans-node-set-prev! a b)
+                (if (eq? b (mvcc-trans-node-prev a)) 1 0)))))
+
+(test-suite "mv-002-trans-node-set-next"
+  ; mvcc-trans-node-set-next! updates next.
+  (check (= 1 (let ((a (make-mvcc-trans-node 1 1 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 2 2 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-trans-node-set-next! a b)
+                (if (eq? b (mvcc-trans-node-next a)) 1 0)))))
+
+(test-suite "mv-002-trans-node-trans-commit"
+  ; mvcc-trans-node-trans-commit! sets F-COMMITTED + tx-end-scn.
+  (check (= 1 (let ((n (make-mvcc-trans-node 1 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-trans-node-trans-commit! n 5 100)
+                (if (= (mvcc-trans-node-flag n) F-COMMITTED) 1 0))))
+  (check (= 100 (let ((n (make-mvcc-trans-node 1 5 0 0 NDT-NORMAL F-INIT #f)))
+                  (mvcc-trans-node-trans-commit! n 5 100)
+                  (mvcc-trans-node-tx-end-scn n)))))
+
+(test-suite "mv-002-trans-node-trans-abort"
+  ; mvcc-trans-node-trans-abort! sets F-ABORTED.
+  (check (= 1 (let ((n (make-mvcc-trans-node 1 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-trans-node-trans-abort! n 200)
+                (if (= (mvcc-trans-node-flag n) F-ABORTED) 1 0))))
+
+; ----------------------------------------------------------------
+; ObMvccRow construction
+; ----------------------------------------------------------------
+
+(test-suite "mv-003-row-construction"
+  ; mvcc_row preserves first-dml-flag, last-dml-flag, initial aggregates.
+  (check (= DML-INSERT (mvcc-row-first-dml-flag
+                         (make-mvcc-row DML-INSERT DML-UPDATE))))
+  (check (= DML-UPDATE (mvcc-row-last-dml-flag
+                         (make-mvcc-row DML-INSERT DML-UPDATE))))
+  (check (= 0 (mvcc-row-total-trans-node-cnt
+                 (make-mvcc-row DML-INSERT DML-UPDATE))))
+  (check (= 0 (mvcc-row-max-trans-version
+                 (make-mvcc-row DML-INSERT DML-UPDATE)))))
+
+(test-suite "mv-003-row-predicate"
+  ; mvcc-row? accepts only mvcc_row closures.
+  (check (= 1 (if (mvcc-row? (make-mvcc-row 0 0)) 1 0)))
+  (check (= 1 (if (not (mvcc-row? 'not-a-row)) 1 0)))
+  (check (= 1 (if (not (mvcc-row? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; mvcc-row-add-version!
+; ----------------------------------------------------------------
+
+(test-suite "mv-004-row-add-version-single"
+  ; mvcc-row-add-version! on empty row sets list-head.
+  (check (= 1 (let ((row (make-mvcc-row DML-INSERT DML-UPDATE))
+                    (n (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row n)
+                (if (eq? n (mvcc-row-list-head row)) 1 0)))))
+
+(test-suite "mv-004-row-add-version-count"
+  ; mvcc-row-add-version! increments total-trans-node-cnt.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (n (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row n)
+                (mvcc-row-total-trans-node-cnt row)))))
+
+(test-suite "mv-004-row-add-version-modify-count-first"
+  ; First version (no prev) has modify-count = 0.
+  (check (= 0 (let ((row (make-mvcc-row 0 0))
+                    (n (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row n)
+                (mvcc-trans-node-modify-count n)))))
+
+(test-suite "mv-004-row-add-version-multiple-head"
+  ; Multiple adds — list-head is the latest version.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (if (eq? b (mvcc-row-list-head row)) 1 0)))))
+
+(test-suite "mv-004-row-add-version-count-multiple"
+  ; Multiple adds accumulate count.
+  (check (= 3 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f))
+                    (c (make-mvcc-trans-node 300 15 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-add-version! row c)
+                (mvcc-row-total-trans-node-cnt row)))))
+
+(test-suite "mv-004-row-modify-count-increments"
+  ; Second version (with prev) has modify-count = 1.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-trans-node-modify-count b)))))
+
+(test-suite "mv-004-row-modify-count-chain"
+  ; Third version has modify-count = 2.
+  (check (= 2 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f))
+                    (c (make-mvcc-trans-node 300 15 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-add-version! row c)
+                (mvcc-trans-node-modify-count c)))))
+
+(test-suite "mv-004-row-max-trans-version"
+  ; max-trans-version tracks highest.
+  (check (= 10 (let ((row (make-mvcc-row 0 0))
+                     (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                     (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-max-trans-version row)))))
+
+(test-suite "mv-004-row-prev-link"
+  ; new_node.prev points to old-head.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (if (eq? a (mvcc-trans-node-prev b)) 1 0)))))
+
+; ----------------------------------------------------------------
+; mvcc-row-find-visible
+; ----------------------------------------------------------------
+
+(test-suite "mv-005-row-find-visible-empty"
+  ; find-visible on empty row returns #f.
+  (check (= 1 (if (not (mvcc-row-find-visible (make-mvcc-row 0 0) 1000)) 1 0))))
+
+(test-suite "mv-005-row-find-visible-not-committed"
+  ; find-visible returns #f if no version is committed yet.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (n (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row n)
+                (if (not (mvcc-row-find-visible row 1000)) 1 0)))))
+
+(test-suite "mv-005-row-find-visible-committed"
+  ; find-visible returns committed version <= snapshot.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (n (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row n)
+                (mvcc-trans-node-trans-commit! n 5 100)
+                (if (eq? n (mvcc-row-find-visible row 1000)) 1 0)))))
+
+(test-suite "mv-005-row-find-visible-multiple-versions"
+  ; find-visible picks latest committed version <= snapshot.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f))
+                    (c (make-mvcc-trans-node 300 15 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-add-version! row c)
+                (mvcc-trans-node-trans-commit! b 10 200)
+                (if (eq? b (mvcc-row-find-visible row 12)) 1 0)))))
+
+(test-suite "mv-005-row-find-visible-snapshot-too-old"
+  ; find-visible returns #f if snapshot is older than all committed versions.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (n (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row n)
+                (mvcc-trans-node-trans-commit! n 100 100)
+                (if (not (mvcc-row-find-visible row 50)) 1 0)))))
+
+; ----------------------------------------------------------------
+; mvcc-row-version-count
+; ----------------------------------------------------------------
+
+(test-suite "mv-006-row-version-count"
+  ; mvcc-row-version-count tracks chain length.
+  (check (= 3 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f))
+                    (c (make-mvcc-trans-node 300 15 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-add-version! row c)
+                (mvcc-row-version-count row)))))
+
+(test-suite "mv-006-row-version-count-empty"
+  ; Empty row has version-count 0.
+  (check (= 0 (mvcc-row-version-count (make-mvcc-row 0 0)))))
+
+; ----------------------------------------------------------------
+; mvcc-row-undo-latest!
+; ----------------------------------------------------------------
+
+(test-suite "mv-007-row-undo-latest-flag"
+  ; mvcc-row-undo-latest! sets F_ABORTED on latest.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-undo-latest! row)
+                (if (= (mvcc-trans-node-flag b) F-ABORTED) 1 0))))
+
+(test-suite "mv-007-row-undo-latest-head"
+  ; mvcc-row-undo-latest! unlinks — list-head becomes previous version.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-undo-latest! row)
+                (if (eq? a (mvcc-row-list-head row)) 1 0))))
+
+(test-suite "mv-007-row-undo-latest-count"
+  ; mvcc-row-undo-latest! decrements count.
+  (check (= 1 (let ((row (make-mvcc-row 0 0))
+                    (a (make-mvcc-trans-node 100 5 0 0 NDT-NORMAL F-INIT #f))
+                    (b (make-mvcc-trans-node 200 10 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-add-version! row a)
+                (mvcc-row-add-version! row b)
+                (mvcc-row-undo-latest! row)
+                (mvcc-row-total-trans-node-cnt row)))))
+
+(test-suite "mv-007-row-undo-latest-empty"
+  ; mvcc-row-undo-latest! on empty row is no-op.
+  (check (= 1 (let ((row (make-mvcc-row 0 0)))
+                (if (eq? 'no-v (mvcc-row-undo-latest! row)) 1 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
