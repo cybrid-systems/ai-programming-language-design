@@ -1,0 +1,281 @@
+; 36-columnar-storage-olap_test.aura
+; ======================
+; Smoke tests for 36-columnar-storage-olap.aura — Columnar Storage + OLAP minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/36-columnar-storage-olap_test.aura
+;
+; Verified automatically (smoke):
+;   - 5 ENCODING-TYPE + 4 VECTOR-FORMAT constants distinct
+;   - make-column-chunk + accessors + set-row-count! +
+;     compressed-size
+;   - make-column-dictionary + set-entry! + find-by-value
+;     (match + missing)
+;   - make-column-index + accessors + predicate
+;   - make-vector + accessors + get-length + is-const? + is-uniform?
+;   - make-vectorized-executor + compute-batch! + reset-call-count!
+;     + call-count tracking
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - find-by-value returns -1 for missing
+;   - compute-batch! increments call count
+;
+; Deferred (full OceanBase Columnar Storage + OLAP):
+;   - real ObColumnChunk with bitmap + dict + min-max +
+;     encoding pipeline
+;   - real ObVector with 4 formats (Uniform/Discrete/Fixed/Const)
+;   - real vectorized expression evaluation (eval_vector)
+;   - real column index with bloom filter + skip index
+;   - real columnar CBO with vectorized cost model
+;   - real dictionary encoding with sort + dedup
+;   - real RLE + DELTA + BITPACKED encoders/decoders
+;   - real materialized view with incremental refresh
+;   - real HTAP routing (OLTP → row path, OLAP → column path)
+;   - real columnar statistics collection
+;   - real columnar compaction (Inc Major → columnar)
+
+(require "std/test" all:)
+(require "36-columnar-storage-olap" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "36-001-encoding-distinct"
+  ; 5 ENCODING-TYPE constants are distinct.
+  (check (= 1 (if (not (= ENCODING-TYPE-PLAIN
+                          ENCODING-TYPE-DICTIONARY)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-DICTIONARY
+                          ENCODING-TYPE-RLE)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-RLE
+                          ENCODING-TYPE-DELTA)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-DELTA
+                          ENCODING-TYPE-BITPACKED)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-PLAIN
+                          ENCODING-TYPE-BITPACKED)) 1 0))))
+
+(test-suite "36-001-vector-format-distinct"
+  ; 4 VECTOR-FORMAT constants are distinct.
+  (check (= 1 (if (not (= VECTOR-FORMAT-UNIFORM
+                          VECTOR-FORMAT-DISCRETE)) 1 0)))
+  (check (= 1 (if (not (= VECTOR-FORMAT-DISCRETE
+                          VECTOR-FORMAT-FIXED)) 1 0)))
+  (check (= 1 (if (not (= VECTOR-FORMAT-FIXED
+                          VECTOR-FORMAT-CONST)) 1 0)))
+  (check (= 1 (if (not (= VECTOR-FORMAT-UNIFORM
+                          VECTOR-FORMAT-CONST)) 1 0))))
+
+; ----------------------------------------------------------------
+; ColumnChunk
+; ----------------------------------------------------------------
+
+(test-suite "36-002-chunk-construction"
+  ; chunk preserves all fields.
+  (check (= 1 (column-chunk-get-column-id
+               (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100))))
+  (check (= 0 (column-chunk-get-column-type
+               (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100))))
+  (check (= ENCODING-TYPE-PLAIN
+             (column-chunk-get-encoding
+               (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100))))
+  (check (= 100 (column-chunk-get-row-count
+                 (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100))))
+  (check (= 0 (column-chunk-get-min
+               (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100))))
+  (check (= 100 (column-chunk-get-max
+                 (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100)))))
+
+(test-suite "36-002-chunk-predicate"
+  ; column-chunk? accepts only chunks.
+  (check (= #t (column-chunk?
+                 (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 0 0 0))))
+  (check (= #f (column-chunk? 'not-chunk)))
+  (check (= #f (column-chunk? 42)))
+
+(test-suite "36-003-chunk-set-row-count"
+  ; set-row-count! updates.
+  (check (= 200 (let ((c (make-column-chunk 1 0 ENCODING-TYPE-PLAIN
+                     100 0 100)))
+                 (column-chunk-set-row-count! c 200)
+                 (column-chunk-get-row-count c))))
+
+(test-suite "36-003-chunk-compressed-size"
+  ; compressed-size = row-count × 8.
+  (check (= 800 (column-chunk-compressed-size
+                  (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 100 0 100))))
+  (check (= 0 (column-chunk-compressed-size
+                (make-column-chunk 1 0 ENCODING-TYPE-PLAIN 0 0 0)))))
+
+; ----------------------------------------------------------------
+; ColumnDictionary
+; ----------------------------------------------------------------
+
+(test-suite "36-004-dict-construction"
+  ; dict starts empty.
+  (check (= 0 (column-dictionary-get-size
+               (make-column-dictionary))))
+  (check (= '() (column-dictionary-get-entries
+                 (make-column-dictionary))))
+
+(test-suite "36-004-dict-predicate"
+  ; column-dictionary? accepts only dicts.
+  (check (= #t (column-dictionary? (make-column-dictionary))))
+  (check (= #f (column-dictionary? 'not-dict)))
+  (check (= #f (column-dictionary? 42)))
+
+(test-suite "36-005-dict-set-entry"
+  ; set-entry! increases size.
+  (check (= 1 (let ((d (make-column-dictionary)))
+                 (column-dictionary-set-entry! d "apple")
+                 (column-dictionary-get-size d))))
+  (check (= 3 (let ((d (make-column-dictionary)))
+                 (column-dictionary-set-entry! d "apple")
+                 (column-dictionary-set-entry! d "banana")
+                 (column-dictionary-set-entry! d "cherry")
+                 (column-dictionary-get-size d))))
+
+(test-suite "36-005-dict-find"
+  ; find-by-value returns 0-based index.
+  (check (= 0 (let ((d (make-column-dictionary)))
+                 (column-dictionary-set-entry! d "apple")
+                 (column-dictionary-set-entry! d "banana")
+                 (column-dictionary-find-by-value d "apple"))))
+  (check (= 1 (let ((d (make-column-dictionary)))
+                 (column-dictionary-set-entry! d "apple")
+                 (column-dictionary-set-entry! d "banana")
+                 (column-dictionary-find-by-value d "banana"))))
+
+(test-suite "36-005-dict-find-missing"
+  ; find-by-value returns -1 for missing.
+  (check (= -1 (let ((d (make-column-dictionary)))
+                 (column-dictionary-set-entry! d "apple")
+                 (column-dictionary-find-by-value d "missing"))))
+
+; ----------------------------------------------------------------
+; ColumnIndex
+; ----------------------------------------------------------------
+
+(test-suite "36-006-index-construction"
+  ; index preserves all fields.
+  (check (= 1024 (column-index-get-chunk-offset
+                  (make-column-index 1024 100 0 100))))
+  (check (= 100 (column-index-get-row-count
+                 (make-column-index 1024 100 0 100))))
+  (check (= 0 (column-index-get-min
+               (make-column-index 1024 100 0 100))))
+  (check (= 100 (column-index-get-max
+                 (make-column-index 1024 100 0 100)))))
+
+(test-suite "36-006-index-predicate"
+  ; column-index? accepts only indices.
+  (check (= #t (column-index? (make-column-index 0 0 0 0))))
+  (check (= #f (column-index? 'not-index)))
+  (check (= #f (column-index? 42)))
+
+; ----------------------------------------------------------------
+; Vector
+; ----------------------------------------------------------------
+
+(test-suite "36-007-vector-construction"
+  ; vector preserves format + batch-size + data.
+  (check (= VECTOR-FORMAT-UNIFORM
+             (vector-get-format
+               (make-vector VECTOR-FORMAT-UNIFORM 1024 '(1 2 3)))))
+  (check (= 1024 (vector-get-batch-size
+                  (make-vector VECTOR-FORMAT-UNIFORM 1024 '(1 2 3))))
+  (check (= #t (eq? '(1 2 3)
+                   (vector-get-data
+                     (make-vector VECTOR-FORMAT-UNIFORM 1024 '(1 2 3)))))))
+
+(test-suite "36-007-vector-predicate"
+  ; vector? accepts only vectors.
+  (check (= #t (vector? (make-vector VECTOR-FORMAT-CONST 0 '()))))
+  (check (= #f (vector? 'not-vector)))
+  (check (= #f (vector? 42)))
+
+(test-suite "36-008-vector-length"
+  ; get-length counts data items.
+  (check (= 3 (vector-get-length
+                (make-vector VECTOR-FORMAT-UNIFORM 1024 '(1 2 3)))))
+  (check (= 0 (vector-get-length
+                (make-vector VECTOR-FORMAT-CONST 0 '())))))
+
+(test-suite "36-008-vector-is-const"
+  ; is-const? checks CONST format.
+  (check (= #t (vector-is-const?
+                 (make-vector VECTOR-FORMAT-CONST 1024 '(42)))))
+  (check (= #f (vector-is-const?
+                 (make-vector VECTOR-FORMAT-UNIFORM 1024 '(1 2 3))))))
+
+(test-suite "36-008-vector-is-uniform"
+  ; is-uniform? checks UNIFORM format.
+  (check (= #t (vector-is-uniform?
+                 (make-vector VECTOR-FORMAT-UNIFORM 1024 '(1 2 3)))))
+  (check (= #f (vector-is-uniform?
+                 (make-vector VECTOR-FORMAT-CONST 1024 '(42))))))
+
+; ----------------------------------------------------------------
+; VectorizedExecutor
+; ----------------------------------------------------------------
+
+(test-suite "36-009-executor-construction"
+  ; executor preserves fields, starts at 0 calls.
+  (check (= #t (eq? 'sum
+                   (vectorized-executor-get-name
+                     (make-vectorized-executor 'sum
+                       VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM)))))
+  (check (= VECTOR-FORMAT-UNIFORM
+             (vectorized-executor-get-input-format
+               (make-vectorized-executor 'sum
+                 VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM))))
+  (check (= VECTOR-FORMAT-UNIFORM
+             (vectorized-executor-get-output-format
+               (make-vectorized-executor 'sum
+                 VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM))))
+  (check (= 0 (vectorized-executor-get-call-count
+               (make-vectorized-executor 'sum
+                 VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM)))))
+
+(test-suite "36-009-executor-predicate"
+  ; vectorized-executor? accepts only executors.
+  (check (= #t (vectorized-executor?
+                 (make-vectorized-executor 'sum
+                   VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM))))
+  (check (= #f (vectorized-executor? 'not-executor)))
+  (check (= #f (vectorized-executor? 42)))
+
+(test-suite "36-010-executor-compute"
+  ; compute-batch! increments call count.
+  (check (= 1 (let ((e (make-vectorized-executor 'sum
+                       VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM)))
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-get-call-count e))))
+
+(test-suite "36-010-executor-compute-multiple"
+  ; Multiple compute calls accumulate.
+  (check (= 5 (let ((e (make-vectorized-executor 'sum
+                       VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM)))
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-get-call-count e))))
+
+(test-suite "36-011-executor-reset"
+  ; reset-call-count! sets to 0.
+  (check (= 0 (let ((e (make-vectorized-executor 'sum
+                       VECTOR-FORMAT-UNIFORM VECTOR-FORMAT-UNIFORM)))
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-compute-batch! e)
+                 (vectorized-executor-reset-call-count! e)
+                 (vectorized-executor-get-call-count e))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

@@ -1,0 +1,377 @@
+; 36-columnar-storage-olap.aura
+; ======================
+; columnar_storage_olap — minimal capability port to aura.
+;
+; Maps to: OceanBase Columnar Storage + OLAP + Vectorized Execution
+; Source: src/storage/columnar/ob_column_chunk.h
+;         + src/storage/columnar/ob_column_index.h
+;         + src/storage/columnar/ob_column_dic.h
+;         + src/storage/columnar/ob_vector.h
+;         + src/sql/engine/expr/ob_expr_vector.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Columnar Storage + OLAP:
+;   - 5 ENCODING-TYPE constants: PLAIN / DICTIONARY / RLE / DELTA /
+;     BITPACKED
+;   - 4 VECTOR-FORMAT constants: UNIFORM / DISCRETE / FIXED / CONST
+;   - ObColumnChunk: column-organized chunk
+;   - ObColumnDictionary: dictionary encoding
+;   - ObColumnIndex: column index (min/max/offset)
+;   - ObVector: vectorized batch
+;   - VectorizedExecutor: apply function to column chunk
+;
+; aura v1 ships:
+;   - 5 ENCODING-TYPE constants
+;   - 4 VECTOR-FORMAT constants
+;   - make-column-chunk (factory: column-id, column-type,
+;     encoding, row-count, min, max)
+;   - column-chunk accessors + set-row-count!
+;   - column-chunk-compressed-size (computed: row-count × 8)
+;   - make-column-dictionary (factory: entries, size)
+;   - column-dictionary accessors + set-entry! + find-by-value
+;   - make-column-index (factory: chunk-offset, row-count,
+;     min, max)
+;   - column-index accessors
+;   - make-vector (factory: format, batch-size, data)
+;   - vector accessors + get-length + is-const? + is-uniform?
+;   - make-vectorized-executor (factory: name, input-format,
+;     output-format)
+;   - vectorized-executor-get-name + get-call-count
+;   - vectorized-executor-compute-batch! (call + bump counter)
+;
+; Deferred (full OceanBase Columnar Storage + OLAP):
+;   - real ObColumnChunk with bitmap + dict + min-max +
+;     encoding pipeline
+;   - real ObVector with 4 formats (Uniform/Discrete/Fixed/Const)
+;   - real vectorized expression evaluation (eval_vector)
+;   - real column index with bloom filter + skip index
+;   - real columnar CBO with vectorized cost model
+;   - real dictionary encoding with sort + dedup
+;   - real RLE + DELTA + BITPACKED encoders/decoders
+;   - real materialized view with incremental refresh
+;   - real HTAP routing (OLTP → row path, OLAP → column path)
+;   - real columnar statistics collection
+;   - real columnar compaction (Inc Major → columnar)
+
+(export
+  ; EncodingType constants
+  ENCODING-TYPE-PLAIN
+  ENCODING-TYPE-DICTIONARY
+  ENCODING-TYPE-RLE
+  ENCODING-TYPE-DELTA
+  ENCODING-TYPE-BITPACKED
+  ; VectorFormat constants
+  VECTOR-FORMAT-UNIFORM
+  VECTOR-FORMAT-DISCRETE
+  VECTOR-FORMAT-FIXED
+  VECTOR-FORMAT-CONST
+  ; ColumnChunk
+  make-column-chunk
+  column-chunk?
+  column-chunk-get-column-id
+  column-chunk-get-column-type
+  column-chunk-get-encoding
+  column-chunk-get-row-count
+  column-chunk-get-min
+  column-chunk-get-max
+  column-chunk-set-row-count!
+  column-chunk-compressed-size
+  ; ColumnDictionary
+  make-column-dictionary
+  column-dictionary?
+  column-dictionary-get-size
+  column-dictionary-get-entries
+  column-dictionary-set-entry!
+  column-dictionary-find-by-value
+  ; ColumnIndex
+  make-column-index
+  column-index?
+  column-index-get-chunk-offset
+  column-index-get-row-count
+  column-index-get-min
+  column-index-get-max
+  ; Vector
+  make-vector
+  vector?
+  vector-get-format
+  vector-get-batch-size
+  vector-get-data
+  vector-get-length
+  vector-is-const?
+  vector-is-uniform?
+  ; VectorizedExecutor
+  make-vectorized-executor
+  vectorized-executor?
+  vectorized-executor-get-name
+  vectorized-executor-get-input-format
+  vectorized-executor-get-output-format
+  vectorized-executor-get-call-count
+  vectorized-executor-compute-batch!
+  vectorized-executor-reset-call-count!)
+
+; ----------------------------------------------------------------
+; EncodingType constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_column_chunk.h):
+;   ENCODING_PLAIN, ENCODING_DICTIONARY, ENCODING_RLE,
+;   ENCODING_DELTA, ENCODING_BITPACKED
+
+(define ENCODING-TYPE-PLAIN 0)
+(define ENCODING-TYPE-DICTIONARY 1)
+(define ENCODING-TYPE-RLE 2)
+(define ENCODING-TYPE-DELTA 3)
+(define ENCODING-TYPE-BITPACKED 4)
+
+; ----------------------------------------------------------------
+; VectorFormat constants
+; ----------------------------------------------------------------
+
+(define VECTOR-FORMAT-UNIFORM 0)
+(define VECTOR-FORMAT-DISCRETE 1)
+(define VECTOR-FORMAT-FIXED 2)
+(define VECTOR-FORMAT-CONST 3)
+
+; ----------------------------------------------------------------
+; ObColumnChunk — closure-based
+; ----------------------------------------------------------------
+
+; make-column-chunk: create a column chunk.
+; Args: column-id (integer), column-type (integer), encoding (integer),
+;       row-count (integer), min (integer), max (integer)
+; Returns: column_chunk closure.
+(define (make-column-chunk column-id column-type encoding row-count
+                           min max)
+  (letrec ((set-row-count! (lambda (v) (set! row-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'column-id) column-id)
+                     ((eq? msg 'column-type) column-type)
+                     ((eq? msg 'encoding) encoding)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'min) min)
+                     ((eq? msg 'max) max)
+                     ((eq? msg 'set-row-count!) set-row-count!)
+                     (else #f)))))
+      self))
+
+; column-chunk?: is the object a column chunk?
+; Detected by querying 'max — only chunks return integer.
+(define (column-chunk? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'max)))
+        (if (integer? m) #t #f))
+      #f))
+
+; column-chunk-get-column-id: get column id.
+(define (column-chunk-get-column-id chunk) (chunk 'column-id))
+
+; column-chunk-get-column-type: get column type.
+(define (column-chunk-get-column-type chunk) (chunk 'column-type))
+
+; column-chunk-get-encoding: get encoding type.
+(define (column-chunk-get-encoding chunk) (chunk 'encoding))
+
+; column-chunk-get-row-count: get row count.
+(define (column-chunk-get-row-count chunk) (chunk 'row-count))
+
+; column-chunk-get-min: get min value.
+(define (column-chunk-get-min chunk) (chunk 'min))
+
+; column-chunk-get-max: get max value.
+(define (column-chunk-get-max chunk) (chunk 'max))
+
+; column-chunk-set-row-count!: set row count.
+; Returns the new row count.
+(define (column-chunk-set-row-count! chunk v) ((chunk 'set-row-count!) v))
+
+; column-chunk-compressed-size: get estimated compressed size.
+; v1: row-count × 8 (bytes per value).
+(define (column-chunk-compressed-size chunk)
+  (* (chunk 'row-count) 8))
+
+; ----------------------------------------------------------------
+; ObColumnDictionary — closure-based
+; ----------------------------------------------------------------
+
+; make-column-dictionary: create a column dictionary.
+; Returns: column_dictionary closure (initial: empty entries).
+(define (make-column-dictionary)
+  (let ((entries '()))
+    (letrec ((set-entries! (lambda (v) (set! entries v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'entries) entries)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       (else #f)))))
+      self)))
+
+; column-dictionary?: is the object a column dictionary?
+; Detected by querying 'entries — only dictionaries return a cons.
+(define (column-dictionary? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'entries)) #t #f)
+      #f))
+
+; column-dictionary-get-size: get number of entries.
+(define (column-dictionary-get-size dict)
+  (let loop ((rest (dict 'entries)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; column-dictionary-get-entries: get entries list.
+(define (column-dictionary-get-entries dict) (dict 'entries))
+
+; column-dictionary-set-entry!: add a new entry.
+; Returns the new entry.
+(define (column-dictionary-set-entry! dict entry)
+  (let ((existing (dict 'entries)))
+    ((dict 'set-entries!) (cons entry existing))))
+
+; column-dictionary-find-by-value: find entry by value.
+; Returns the entry index (0-based) or -1.
+(define (column-dictionary-find-by-value dict value)
+  (let loop ((rest (dict 'entries)) (idx 0))
+    (cond
+      ((null? rest) -1)
+      ((= (car rest) value) idx)
+      (#t (loop (cdr rest) (+ idx 1))))))
+
+; ----------------------------------------------------------------
+; ObColumnIndex — closure-based
+; ----------------------------------------------------------------
+
+; make-column-index: create a column index.
+; Args: chunk-offset (integer), row-count (integer),
+;       min (integer), max (integer)
+; Returns: column_index closure.
+(define (make-column-index chunk-offset row-count min max)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'chunk-offset) chunk-offset)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'min) min)
+                     ((eq? msg 'max) max)
+                     (else #f)))))
+      self))
+
+; column-index?: is the object a column index?
+; Detected by querying 'chunk-offset — only indices return integer.
+(define (column-index? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'chunk-offset)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; column-index-get-chunk-offset: get chunk offset.
+(define (column-index-get-chunk-offset idx) (idx 'chunk-offset))
+
+; column-index-get-row-count: get row count.
+(define (column-index-get-row-count idx) (idx 'row-count))
+
+; column-index-get-min: get min.
+(define (column-index-get-min idx) (idx 'min))
+
+; column-index-get-max: get max.
+(define (column-index-get-max idx) (idx 'max))
+
+; ----------------------------------------------------------------
+; ObVector — closure-based (vectorized batch)
+; ----------------------------------------------------------------
+
+; make-vector: create a vector.
+; Args: format (integer), batch-size (integer), data (cons list)
+; Returns: vector closure.
+(define (make-vector format batch-size data)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'format) format)
+                     ((eq? msg 'batch-size) batch-size)
+                     ((eq? msg 'data) data)
+                     (else #f)))))
+      self))
+
+; vector?: is the object a vector?
+; Detected by querying 'batch-size — only vectors return integer.
+(define (vector? obj)
+  (if (procedure? obj)
+      (let ((b (obj 'batch-size)))
+        (if (and (integer? b) (>= b 0)) #t #f))
+      #f))
+
+; vector-get-format: get format.
+(define (vector-get-format vec) (vec 'format))
+
+; vector-get-batch-size: get batch size.
+(define (vector-get-batch-size vec) (vec 'batch-size))
+
+; vector-get-data: get data.
+(define (vector-get-data vec) (vec 'data))
+
+; vector-get-length: get length (count of data items).
+(define (vector-get-length vec)
+  (let loop ((rest (vec 'data)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; vector-is-const?: is this a CONST vector?
+(define (vector-is-const? vec) (= (vec 'format) VECTOR-FORMAT-CONST))
+
+; vector-is-uniform?: is this a UNIFORM vector?
+(define (vector-is-uniform? vec) (= (vec 'format) VECTOR-FORMAT-UNIFORM))
+
+; ----------------------------------------------------------------
+; VectorizedExecutor — closure-based
+; ----------------------------------------------------------------
+
+; make-vectorized-executor: create a vectorized executor.
+; Args: name (symbol), input-format (integer), output-format (integer)
+; Returns: vectorized_executor closure (initial: call-count=0).
+(define (make-vectorized-executor name input-format output-format)
+  (let ((call-count 0))
+    (letrec ((set-call-count! (lambda (v) (set! call-count v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'input-format) input-format)
+                       ((eq? msg 'output-format) output-format)
+                       ((eq? msg 'call-count) call-count)
+                       ((eq? msg 'set-call-count!) set-call-count!)
+                       (else #f)))))
+      self)))
+
+; vectorized-executor?: is the object a vectorized executor?
+; Detected by querying 'output-format — only executors return integer.
+(define (vectorized-executor? obj)
+  (if (procedure? obj)
+      (let ((o (obj 'output-format)))
+        (if (and (integer? o) (>= o 0)) #t #f))
+      #f))
+
+; vectorized-executor-get-name: get executor name.
+(define (vectorized-executor-get-name e) (e 'name))
+
+; vectorized-executor-get-input-format: get input format.
+(define (vectorized-executor-get-input-format e) (e 'input-format))
+
+; vectorized-executor-get-output-format: get output format.
+(define (vectorized-executor-get-output-format e) (e 'output-format))
+
+; vectorized-executor-get-call-count: get call count.
+(define (vectorized-executor-get-call-count e) (e 'call-count))
+
+; vectorized-executor-compute-batch!: compute one batch.
+; v1: increments call-count, returns the call-count.
+; (real impl would call eval_func on vector data).
+(define (vectorized-executor-compute-batch! e)
+  (let ((new-cnt (+ (e 'call-count) 1)))
+    ((e 'set-call-count!) new-cnt)))
+
+; vectorized-executor-reset-call-count!: reset call count to 0.
+; Returns the new (0) call count.
+(define (vectorized-executor-reset-call-count! e)
+  ((e 'set-call-count!) 0))
