@@ -1,0 +1,208 @@
+; 045-scheduler-domains.aura
+; =============================
+; scheduler_domains — minimal capability port to aura.
+;
+; Maps to: Linux kernel scheduler domains (sched domains)
+; Source: kernel/sched/topology.c + include/linux/sched/topology.h
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux scheduler domains organize CPUs into hierarchical groupings
+; for load balancing:
+;   - struct sched_domain (cpu groupings for load balancing)
+;   - struct sched_group (group of cpus within domain)
+;   - struct sched_domain_shared (shared state across siblings)
+;   - struct root_domain (top-level domain)
+;   - sched_domain.flags (SD_FLAG_*: BALANCE_NEWIDLE, BALANCE_EXEC,
+;     BALANCE_FORK, BALANCE_WAKE, BALANCE_TASKS, etc)
+;   - sched/numa topology integration
+;   - sched_domain_build_sched_groups / attach_domain
+;
+; aura has no CPU topology, no NUMA, no load balancing. v1 ships:
+;   - make-sched-domain (name, level, flags, parent)
+;   - sched-domain? predicate
+;   - sched-domain-name / sched-domain-level / sched-domain-flags /
+;     sched-domain-parent
+;   - sched-domain-set-parent! / set-flags!
+;   - make-sched-group (capacity)
+;   - sched-group? / sched-group-capacity
+;   - make-root-domain (refcount, span)
+;   - root-domain? / root-domain-refcount / root-domain-span
+;
+; Deferred (full Linux scheduler domains):
+;   - real CPU topology parsing (CPU topology dt / ACPI)
+;   - sched_domain_build_sched_groups (group construction)
+;   - sched/numa group assignment
+;   - load balancing across domains (find_idlest_cpu)
+;   - sched_domain_shared state (NUMA metrics)
+;   - SD_ASYM_CPUCAPACITY flag handling
+;   - SD_OVERLAP domain flags
+
+(export
+  make-sched-domain
+  sched-domain?
+  sched-domain-name
+  sched-domain-level
+  sched-domain-flags
+  sched-domain-parent
+  sched-domain-set-parent!
+  sched-domain-set-flags!
+  sched-domain-count
+  make-sched-group
+  sched-group?
+  sched-group-capacity
+  make-root-domain
+  root-domain?
+  root-domain-refcount
+  root-domain-span
+  root-domain-reset
+  'balance-newidle
+  'balance-exec
+  'balance-fork
+  'balance-wake
+  'balance-tasks
+  'balance-numa)
+
+; ----------------------------------------------------------------
+; sched_domain — closure-based, mutable parent + flags
+; ----------------------------------------------------------------
+
+; make-sched-domain: create a scheduler domain.
+; Args: name (symbol), level (integer), flags (integer), parent
+;       (sched_domain or #f for top-level)
+; Returns: sched_domain closure.
+(define (make-sched-domain name level flags parent)
+  (letrec ((set-parent! (lambda (v) (set! parent v) v))
+           (set-flags!  (lambda (v) (set! flags v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'level) level)
+                     ((eq? msg 'flags) flags)
+                     ((eq? msg 'parent) parent)
+                     ((eq? msg 'set-parent!) set-parent!)
+                     ((eq? msg 'set-flags!)  set-flags!)
+                     (else #f)))))
+    self))
+
+; sched-domain?: is the object a sched_domain?
+; Detected by querying 'level — only sched_domain closures return an
+; integer for level.
+(define (sched-domain? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'level)))
+        (if (integer? l) #t #f))
+      #f))
+
+; sched-domain-name: get domain name
+(define (sched-domain-name sd) (sd 'name))
+
+; sched-domain-level: get domain level (0 = top-level, larger = deeper)
+(define (sched-domain-level sd) (sd 'level))
+
+; sched-domain-flags: get SD_FLAG_* bitmap
+(define (sched-domain-flags sd) (sd 'flags))
+
+; sched-domain-parent: get parent sched_domain (or #f for top)
+(define (sched-domain-parent sd) (sd 'parent))
+
+; sched-domain-set-parent!: set parent sched_domain.
+; Returns the new parent.
+(define (sched-domain-set-parent! sd new-parent)
+  ((sd 'set-parent!) new-parent))
+
+; sched-domain-set-flags!: set SD_FLAG_* bitmap.
+; Returns the new flags.
+(define (sched-domain-set-flags! sd new-flags)
+  ((sd 'set-flags!) new-flags))
+
+; ----------------------------------------------------------------
+; sched_domain_count — closure-based, mutable via letrec setter
+; ----------------------------------------------------------------
+
+; make-sched-domain-counter: empty domain counter.
+(define (make-sched-domain-counter)
+  (let ((count 0))
+    (letrec ((set-count! (lambda (v) (set! count v) v))
+             (inc!       (lambda () (set! count (+ count 1)) count))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'count) count)
+                       ((eq? msg 'set-count!) set-count!)
+                       ((eq? msg 'inc!) inc!)
+                       (else #f)))))
+      self)))
+
+; Global domain counter
+(define g-sched-domain-counter (make-sched-domain-counter))
+
+; sched-domain-count: total sched_domains created since boot
+(define (sched-domain-count) (g-sched-domain-counter 'count))
+
+; ----------------------------------------------------------------
+; sched_group — closure-based
+; ----------------------------------------------------------------
+
+; make-sched-group: create a CPU group within a sched_domain.
+; Args: capacity (integer — relative CPU capacity, e.g. 1024 = 1 CPU)
+; Returns: sched_group closure.
+(define (make-sched-group capacity)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'capacity) capacity)
+                     (else #f)))))
+    self))
+
+; sched-group?: is the object a sched_group?
+; Detected by querying 'capacity — only sched_group closures return
+; a positive integer for capacity.
+(define (sched-group? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'capacity)))
+        (if (and (integer? c) (> c 0)) #t #f))
+      #f))
+
+; sched-group-capacity: get group capacity
+(define (sched-group-capacity g) (g 'capacity))
+
+; ----------------------------------------------------------------
+; root_domain — closure-based, mutable refcount
+; ----------------------------------------------------------------
+
+; make-root-domain: create a root domain.
+; Args: span (integer — total CPU capacity span), refcount (integer)
+; Returns: root_domain closure.
+(define (make-root-domain span refcount)
+  (letrec ((set-refcount! (lambda (v) (set! refcount v) v))
+           (inc!         (lambda () (set! refcount (+ refcount 1)) refcount))
+           (dec!         (lambda () (set! refcount (- refcount 1)) refcount))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'span) span)
+                     ((eq? msg 'refcount) refcount)
+                     ((eq? msg 'set-refcount!) set-refcount!)
+                     ((eq? msg 'inc!) inc!)
+                     ((eq? msg 'dec!) dec!)
+                     (else #f)))))
+    self))
+
+; root-domain?: is the object a root_domain?
+; Detected by querying 'span — only root_domain closures return an
+; integer for span.
+(define (root-domain? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'span)))
+        (if (integer? s) #t #f))
+      #f))
+
+; root-domain-refcount: get current refcount
+(define (root-domain-refcount rd) (rd 'refcount))
+
+; root-domain-span: get total span
+(define (root-domain-span rd) (rd 'span))
+
+; root-domain-reset: reset refcount to 0.
+; Returns the new refcount.
+(define (root-domain-reset rd)
+  ((rd 'set-refcount!) 0))

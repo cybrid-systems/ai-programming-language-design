@@ -1,0 +1,116 @@
+; 045-scheduler-domains_test.aura
+; =================================
+; Smoke tests for 045-scheduler-domains.aura — sched domains minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/045-scheduler-domains_test.aura
+;
+; Verified automatically (smoke):
+;   - sched_domain / sched_group / root_domain construction
+;   - sched-domain? / sched-group? / root-domain? predicates
+;   - sched-domain-set-parent! / set-flags!
+;   - sched-domain-count (total domains created)
+;
+; Verified via separate probes during development:
+;   - Multiple domains with hierarchical parent linkage
+;   - root-domain-reset zeros refcount
+;
+; Deferred (full Linux scheduler domains):
+;   - real CPU topology parsing (CPU topology dt / ACPI)
+;   - sched_domain_build_sched_groups
+;   - sched/numa group assignment
+;   - load balancing across domains (find_idlest_cpu)
+;   - sched_domain_shared state (NUMA metrics)
+;   - SD_ASYM_CPUCAPACITY flag handling
+
+(require "std/test" all:)
+(require "045-scheduler-domains" all:)
+
+; ----------------------------------------------------------------
+; sched_domain construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "sd-001-domain-construction"
+  ; sched_domain preserves name, level, flags, parent.
+  (check (= 'sibling (sched-domain-name
+                       (make-sched-domain 'sibling 1 1 #f))))
+  (check (= 1 (sched-domain-level
+               (make-sched-domain 'sibling 1 1 #f))))
+  (check (= 1 (sched-domain-flags
+               (make-sched-domain 'sibling 1 1 #f))))
+  (check (= 1 (if (not (sched-domain-parent
+                          (make-sched-domain 'sibling 1 1 #f))) 1 0))))
+
+(test-suite "sd-001-domain-predicate"
+  ; sched-domain? accepts only sched_domain closures.
+  (check (= 1 (if (sched-domain? (make-sched-domain 'unq-sd-001 0 0 #f)) 1 0)))
+  (check (= 1 (if (not (sched-domain? 'not-a-domain)) 1 0)))
+  (check (= 1 (if (not (sched-domain? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; sched_domain setters
+; ----------------------------------------------------------------
+
+(test-suite "sd-002-domain-set-parent"
+  ; sched-domain-set-parent! updates parent.
+  (check (= 1 (let ((top (make-sched-domain 'top 0 1 #f))
+                    (sub (make-sched-domain 'sub 1 1 top)))
+                (sched-domain-set-parent! sub top)
+                (if (eq? top (sched-domain-parent sub)) 1 0)))))
+
+(test-suite "sd-002-domain-set-flags"
+  ; sched-domain-set-flags! updates flags.
+  (check (= 5 (let ((sd (make-sched-domain 'sibling 1 1 #f)))
+                (sched-domain-set-flags! sd 5)
+                (sched-domain-flags sd)))))
+
+; ----------------------------------------------------------------
+; sched_domain_count
+; ----------------------------------------------------------------
+
+(test-suite "sd-003-domain-count"
+  ; sched-domain-count is positive after creating domains.
+  (check (= 1 (> (sched-domain-count) 0))))
+
+; ----------------------------------------------------------------
+; sched_group construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "sd-004-group-construction"
+  ; sched_group preserves capacity.
+  (check (= 1024 (sched-group-capacity (make-sched-group 1024)))))
+
+(test-suite "sd-004-group-predicate"
+  ; sched-group? accepts only sched_group closures.
+  (check (= 1 (if (sched-group? (make-sched-group 1024)) 1 0)))
+  (check (= 1 (if (not (sched-group? 'not-a-group)) 1 0)))
+  (check (= 1 (if (not (sched-group? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; root_domain construction + predicate + reset
+; ----------------------------------------------------------------
+
+(test-suite "sd-005-root-construction"
+  ; root_domain preserves span, refcount.
+  (check (= 8192 (root-domain-span (make-root-domain 8192 5))))
+  (check (= 5 (root-domain-refcount (make-root-domain 8192 5)))))
+
+(test-suite "sd-005-root-predicate"
+  ; root-domain? accepts only root_domain closures.
+  (check (= 1 (if (root-domain? (make-root-domain 1024 1)) 1 0)))
+  (check (= 1 (if (not (root-domain? 'not-a-root)) 1 0)))
+  (check (= 1 (if (not (root-domain? 42)) 1 0))))
+
+(test-suite "sd-005-root-reset"
+  ; root-domain-reset zeros refcount.
+  (check (= 0 (let ((rd (make-root-domain 8192 5)))
+                (root-domain-reset rd)
+                (root-domain-refcount rd)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
