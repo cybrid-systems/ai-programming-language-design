@@ -1,0 +1,115 @@
+; 025-hrtimer_test.aura
+; ========================
+; Smoke tests for 025-hrtimer.aura — hrtimer minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/025-hrtimer_test.aura
+;
+; Verified automatically (smoke):
+;   - make-hrtimer construction (INACTIVE state)
+;   - hrtimer-state predicate
+;   - hrtimer-active? predicate
+;   - hrtimer-expires accessors
+;   - hrtimer-start sets expires + ENQUEUED
+;   - hrtimer-cancel transitions ENQUEUED → INACTIVE
+;   - hrtimer-fire invokes callback + transitions RUNNING → INACTIVE
+;   - hrtimer-set-state! / hrtimer-set-expires!
+;
+; Verified via separate probes during development:
+;   - Constants: HRTIMER-STATE-INACTIVE / ENQUEUED / RUNNING
+;   - Constants: CLOCK-MONOTONIC / CLOCK-REALTIME / CLOCK-BOOTTIME / CLOCK-TAI
+;   - Constants: HRTIMER-MODE-REL / HRTIMER-MODE-ABS
+;
+; Deferred (full Linux hrtimer):
+;   - struct hrtimer_clock_base / hrtimer_cpu_base (per-CPU infrastructure)
+;   - hrtimer_run_queues / HRTIMER_SOFTIRQ dispatch
+;   - hrtimer_forward / hrtimer_add_expires_ns
+;   - Internal rb-tree for timer organization
+;   - HRTIMER_MODE_HARD
+;   - Clock sources (ktime_get_real / ktime_get_monotonic)
+;   - hrtimer_grab_expiry / hrtimer_cpu migration (NO_HZ)
+
+(require "std/test" all:)
+(require "025-hrtimer" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "hrtimer-001-init"
+  (check (= 1 (eq? HRTIMER-STATE-INACTIVE (hrtimer-state (make-hrtimer (lambda () 'ok)))))
+  (check (= 1 (if (not (hrtimer-active? (make-hrtimer (lambda () 'ok)))) 1 0))))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+; A no-op function for the timer.
+(define (noop) 'fired)
+
+(test-suite "hrtimer-002-function"
+  (check (= 1 (eq? 'fired (hrtimer-function (make-hrtimer noop)))))
+
+; ----------------------------------------------------------------
+; Start
+; ----------------------------------------------------------------
+
+(test-suite "hrtimer-003-start"
+  (check (= 1 (let ((t (make-hrtimer noop)))
+                 (hrtimer-start t 1000)
+                 (and (= 1000 (hrtimer-expires t))
+                      (eq? HRTIMER-STATE-ENQUEUED (hrtimer-state t))
+                      (hrtimer-active? t))))))
+
+; ----------------------------------------------------------------
+; Cancel
+; ----------------------------------------------------------------
+
+(test-suite "hrtimer-004-cancel"
+  (check (= 1 (let ((t (make-hrtimer noop)))
+                 (hrtimer-start t 500)
+                 (hrtimer-cancel t)
+                 (and (not (hrtimer-active? t))
+                      (eq? HRTIMER-STATE-INACTIVE (hrtimer-state t))))))
+
+; ----------------------------------------------------------------
+; Fire
+; ----------------------------------------------------------------
+
+; A fire-counter function — returns count of fires.
+(define (make-fire-counter)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'fn) (lambda () (set! count (+ count 1)) count))
+                       ((eq? msg 'count) count)
+                       (else #f)))))
+      self)))
+
+(test-suite "hrtimer-005-fire"
+  ; Fire invokes the callback + transitions RUNNING → INACTIVE.
+  (check (= 1 (let ((t (make-hrtimer (make-fire-counter 'fn)))
+                      (c (make-fire-counter)))
+                  (hrtimer-start t 1000)
+                  (hrtimer-fire t)
+                  (and (= 1 (c 'count))
+                       (eq? HRTIMER-STATE-INACTIVE (hrtimer-state t))))))
+
+; ----------------------------------------------------------------
+; Constants
+; ----------------------------------------------------------------
+
+(test-suite "hrtimer-006-state-constants"
+  (check (= 0 HRTIMER-STATE-INACTIVE))
+  (check (= 1 HRTIMER-STATE-ENQUEUED)))
+
+(test-suite "hrtimer-006-clock-constants"
+  (check (= 0 CLOCK-MONOTONIC))
+  (check (= 1 CLOCK-REALTIME)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

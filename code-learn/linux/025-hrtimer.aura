@@ -1,0 +1,162 @@
+; 025-hrtimer.aura
+; =====================
+; hrtimer (High-Resolution Timer) — minimal capability port to aura.
+;
+; Maps to: 025-hrtimer-analysis.md
+; Source: include/linux/hrtimer.h + kernel/time/hrtimer.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux hrtimer is the ns-precision timer framework:
+;   - struct hrtimer (function, expires, state, base, node)
+;   - struct hrtimer_clock_base (per-CPU base: monotonic / realtime / boot / tai)
+;   - struct hrtimer_cpu_base (per-CPU aggregate)
+;   - hrtimer_start / hrtimer_cancel / hrtimer_forward
+;   - hrtimer_set_expires / hrtimer_add_expires_ns
+;   - Clock IDs: CLOCK_MONOTONIC / CLOCK_REALTIME / CLOCK_BOOTTIME / CLOCK_TAI /
+;     CLOCK_MONOTONIC_RAW
+;   - HRTIMER_STATE_INACTIVE / HRTIMER_STATE_ENQUEUED
+;   - HRTIMER_MODE_REL / HRTIMER_MODE_ABS / HRTIMER_MODE_HARD / SOFT
+;   - hrtimer_cancel / forward / expires paths
+;   - Internal red-black tree (since Linux 6.2: rb-tree per base)
+;
+; aura has no hardware clocks, no timer interrupt, no softirq dispatch.
+; v1 ships the hrtimer closure + start/cancel + state machine + clock IDs:
+;   - make-hrtimer (closure with function, expires, state, clock-id)
+;   - hrtimer-start (set expires, transition to ENQUEUED)
+;   - hrtimer-cancel (transition to INACTIVE if currently ENQUEUED)
+;   - hrtimer-state / hrtimer-set-state!
+;   - hrtimer-expires / hrtimer-set-expires!
+;   - hrtimer-function
+;   - hrtimer-active?
+;   - HRTIMER-STATE-INACTIVE / HRTIMER-STATE-ENQUEUED / HRTIMER-STATE-RUNNING
+;   - CLOCK-MONOTONIC / CLOCK-REALTIME / CLOCK-BOOTTIME / CLOCK-TAI
+;   - HRTIMER-MODE-REL / HRTIMER-MODE-ABS
+;
+; Deferred (full Linux hrtimer):
+;   - struct hrtimer_clock_base + hrtimer_cpu_base (per-CPU infrastructure)
+;   - hrtimer_run_queues / hrtimer_run_softirq (dispatch from HRTIMER_SOFTIRQ)
+;   - hrtimer_forward / hrtimer_add_expires_ns
+;   - Internal rb-tree for organizing timers by expiration
+;   - HRTIMER_MODE_HARD (in hardirq context)
+;   - Clock sources (ktime_get_real, ktime_get_monotonic)
+;   - hrtimer_grab_expiry / expiry tracking
+;   - hrtimer_cpu migration (NO_HZ)
+;   - restart_block callback integration
+
+(export
+  make-hrtimer
+  hrtimer-start
+  hrtimer-cancel
+  hrtimer-state
+  hrtimer-set-state!
+  hrtimer-expires
+  hrtimer-set-expires!
+  hrtimer-function
+  hrtimer-active?
+  hrtimer-fire
+  ; Constants
+  HRTIMER-STATE-INACTIVE
+  HRTIMER-STATE-ENQUEUED
+  HRTIMER-STATE-RUNNING
+  CLOCK-MONOTONIC
+  CLOCK-REALTIME
+  CLOCK-BOOTTIME
+  CLOCK-TAI
+  HRTIMER-MODE-REL
+  HRTIMER-MODE-ABS)
+
+; hrtimer state constants (analogous to enum hrtimer_state)
+(define HRTIMER-STATE-INACTIVE 0)
+(define HRTIMER-STATE-ENQUEUED 1)
+(define HRTIMER-STATE-RUNNING  2)
+
+; Clock IDs (analogous to include/linux/time.h CLOCK_*)
+(define CLOCK-MONOTONIC  0)
+(define CLOCK-REALTIME   1)
+(define CLOCK-BOOTTIME   2)
+(define CLOCK-TAI        3)
+
+; hrtimer mode constants (analogous to hrtimer_mode)
+(define HRTIMER-MODE-REL  0)   ; expires is relative to now
+(define HRTIMER-MODE-ABS  1)   ; expires is absolute time
+
+; ----------------------------------------------------------------
+; hrtimer (closure with function, expires, state, clock-id, mode)
+; ----------------------------------------------------------------
+
+; Make a hrtimer. function is the callback (called when timer fires).
+; Initially INACTIVE.
+(define (make-hrtimer function)
+  (let ((fn function)
+        (expires 0)
+        (state HRTIMER-STATE-INACTIVE)
+        (clock-id CLOCK-MONOTONIC)
+        (mode HRTIMER-MODE-REL))
+    (letrec ((set-expires!   (lambda (v) (set! expires v) v))
+             (set-state!     (lambda (v) (set! state   v) v))
+             (set-clock-id!  (lambda (v) (set! clock-id v) v))
+             (set-mode!      (lambda (v) (set! mode    v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'function) fn)
+                       ((eq? msg 'expires) expires)
+                       ((eq? msg 'state) state)
+                       ((eq? msg 'clock-id) clock-id)
+                       ((eq? msg 'mode) mode)
+                       ((eq? msg 'set-expires!) set-expires!)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'set-clock-id!) set-clock-id!)
+                       ((eq? msg 'set-mode!) set-mode!)
+                       ((eq? msg 'active?) (not (zero? state)))
+                       (else #f)))))
+      self)))
+
+; hrtimer-function: get the hrtimer's callback.
+(define (hrtimer-function t) (t 'function))
+
+; hrtimer-expires: get the hrtimer's expiration time.
+(define (hrtimer-expires t) (t 'expires))
+
+; hrtimer-set-expires!: set the hrtimer's expiration time.
+(define (hrtimer-set-expires! t v) ((t 'set-expires!) v))
+
+; hrtimer-state: get the hrtimer's current state.
+(define (hrtimer-state t) (t 'state))
+
+; hrtimer-set-state!: set the hrtimer's state.
+(define (hrtimer-set-state! t v) ((t 'set-state!) v))
+
+; hrtimer-active?: is the hrtimer in ENQUEUED or RUNNING state?
+(define (hrtimer-active? t) (t 'active?))
+
+; ----------------------------------------------------------------
+; Start / cancel
+; ----------------------------------------------------------------
+
+; hrtimer-start: set expires + transition to ENQUEUED.
+; Returns the new state.
+; v1 doesn't actually dispatch the timer — caller invokes hrtimer-fire
+; to simulate firing (Linux's HRTIMER_SOFTIRQ dispatch path).
+(define (hrtimer-start t expires)
+  ((t 'set-expires!) expires)
+  ((t 'set-state!) HRTIMER-STATE-ENQUEUED))
+
+; hrtimer-cancel: transition from ENQUEUED to INACTIVE.
+; No-op if timer is INACTIVE or RUNNING.
+; Returns #t if cancelled, #f otherwise.
+(define (hrtimer-cancel t)
+  (cond
+    ((= (t 'state) HRTIMER-STATE-ENQUEUED)
+     ((t 'set-state!) HRTIMER-STATE-INACTIVE)
+     #t)
+    (else #f)))
+
+; hrtimer-fire: simulate the timer firing (HRTIMER_SOFTIRQ dispatch path).
+; Transitions to RUNNING, invokes callback, returns to INACTIVE.
+; Returns whatever the callback returned.
+(define (hrtimer-fire t)
+  ((t 'set-state!) HRTIMER-STATE-RUNNING)
+  (let ((result ((t 'function))))
+    ((t 'set-state!) HRTIMER-STATE-INACTIVE)
+    result))
