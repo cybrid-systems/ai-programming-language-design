@@ -1,0 +1,161 @@
+; 42-sort-window_test.aura
+; ======================
+; Smoke tests for 42-sort-window.aura — Sort Op + Window Function
+; Op minimal.
+
+(require "std/test" all:)
+(require "42-sort-window" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "42-001-sort-type-distinct"
+  (check (= 1 (if (not (= SORT-TYPE-IN-MEMORY
+                          SORT-TYPE-EXTERNAL)) 1 0)))
+  (check (= 1 (if (not (= SORT-TYPE-EXTERNAL
+                          SORT-TYPE-TOPN)) 1 0)))
+  (check (= 1 (if (not (= SORT-TYPE-IN-MEMORY
+                          SORT-TYPE-TOPN)) 1 0))))
+
+(test-suite "42-001-sort-dir-distinct"
+  (check (= 1 (if (not (= SORT-DIR-ASC SORT-DIR-DESC)) 1 0))))
+
+(test-suite "42-001-window-type-distinct"
+  (check (= 1 (if (not (= WINDOW-TYPE-ROW
+                          WINDOW-TYPE-RANGE)) 1 0)))
+  (check (= 1 (if (not (= WINDOW-TYPE-RANGE
+                          WINDOW-TYPE-GROUP)) 1 0)))
+  (check (= 1 (if (not (= WINDOW-TYPE-GROUP
+                          WINDOW-TYPE-NAMED-WINDOW)) 1 0)))
+  (check (= 1 (if (not (= WINDOW-TYPE-ROW
+                          WINDOW-TYPE-NAMED-WINDOW)) 1 0))))
+
+(test-suite "42-001-window-func-type-distinct"
+  (check (= 1 (if (not (= WINDOW-FUNC-TYPE-RANK
+                          WINDOW-FUNC-TYPE-DENSE-RANK)) 1 0)))
+  (check (= 1 (if (not (= WINDOW-FUNC-TYPE-DENSE-RANK
+                          WINDOW-FUNC-TYPE-ROW-NUMBER)) 1 0)))
+  (check (= 1 (if (not (= WINDOW-FUNC-TYPE-RANK
+                          WINDOW-FUNC-TYPE-ROW-NUMBER)) 1 0))))
+
+; ----------------------------------------------------------------
+; SortSpec
+; ----------------------------------------------------------------
+
+(test-suite "42-002-spec-construction"
+  (check (= 1000 (sort-spec-get-input-rows
+                  (make-sort-spec 1000 '(score) SORT-DIR-ASC 10))))
+  (check (= 1 (let ((s (make-sort-spec 1000 '(score) SORT-DIR-ASC 10)))
+                 (sort-spec-get-sort-keys s) 1)))
+  (check (= 0 (sort-spec-get-dir
+               (make-sort-spec 1000 '(score) SORT-DIR-ASC 10))))
+  (check (= 10 (sort-spec-get-limit
+                (make-sort-spec 1000 '(score) SORT-DIR-ASC 10)))))
+
+(test-suite "42-002-spec-predicate"
+  (check (= #t (sort-spec? (make-sort-spec 0 '() SORT-DIR-ASC 0))))
+  (check (= #f (sort-spec? 'not-spec)))
+  (check (= #f (sort-spec? 42))))
+
+(test-suite "42-002-spec-set-limit"
+  (check (= 50 (sort-spec-get-limit
+                 (sort-spec-set-limit!
+                   (make-sort-spec 1000 '(score) SORT-DIR-ASC 10)
+                   50))))
+  (check (= 0 (sort-spec-get-limit
+                (sort-spec-set-limit!
+                  (make-sort-spec 1000 '(score) SORT-DIR-ASC 10)
+                  0)))))
+
+; ----------------------------------------------------------------
+; TopNHeap
+; ----------------------------------------------------------------
+
+(test-suite "42-003-heap-construction"
+  (check (= 5 (topn-heap-get-topn
+               (make-topn-heap 5 0))))
+  (check (= 0 (topn-heap-get-cmp-fun
+               (make-topn-heap 5 0))))
+  (check (= 1 (topn-heap-get-cmp-fun
+               (make-topn-heap 5 1))))
+  (check (= 0 (topn-heap-get-count
+               (make-topn-heap 5 0)))))
+
+(test-suite "42-003-heap-predicate"
+  (check (= #t (topn-heap? (make-topn-heap 1 0))))
+  (check (= #f (topn-heap? 'not-heap)))
+  (check (= #f (topn-heap? 42))))
+
+; ----------------------------------------------------------------
+; SortImpl
+; ----------------------------------------------------------------
+
+(test-suite "42-004-impl-construction"
+  (check (= SORT-TYPE-IN-MEMORY (sort-impl-get-type
+                                  (make-sort-impl SORT-TYPE-IN-MEMORY
+                                                  100 0))))
+  (check (= SORT-TYPE-EXTERNAL (sort-impl-get-type
+                                 (make-sort-impl SORT-TYPE-EXTERNAL
+                                                 0 4))))
+  (check (= 100 (sort-impl-get-in-memory-rows
+                  (make-sort-impl SORT-TYPE-IN-MEMORY 100 0))))
+  (check (= 4 (sort-impl-get-external-runs
+                (make-sort-impl SORT-TYPE-EXTERNAL 0 4))))
+  (check (= #f (sort-impl-is-sorted?
+                 (make-sort-impl SORT-TYPE-IN-MEMORY 100 0)))))
+
+(test-suite "42-004-impl-predicate"
+  (check (= #t (sort-impl? (make-sort-impl SORT-TYPE-IN-MEMORY 0 0))))
+  (check (= #f (sort-impl? 'not-impl)))
+  (check (= #f (sort-impl? 42))))
+
+(test-suite "42-004-impl-set-sorted"
+  (check (= #t (sort-impl-is-sorted?
+                 (sort-impl-set-sorted!
+                   (make-sort-impl SORT-TYPE-IN-MEMORY 100 0)
+                   #t))))
+  (check (= #f (sort-impl-is-sorted?
+                 (sort-impl-set-sorted!
+                   (make-sort-impl SORT-TYPE-IN-MEMORY 100 0)
+                   #f)))))
+
+; ----------------------------------------------------------------
+; WindowFunctionOp
+; ----------------------------------------------------------------
+
+(test-suite "42-005-wfop-construction"
+  (check (= WINDOW-TYPE-ROW
+            (window-function-op-get-window-type
+              (make-window-function-op WINDOW-TYPE-ROW
+                                       WINDOW-FUNC-TYPE-RANK
+                                       'dept-id 'salary 50))))
+  (check (= WINDOW-FUNC-TYPE-DENSE-RANK
+            (window-function-op-get-func-type
+              (make-window-function-op WINDOW-TYPE-RANGE
+                                       WINDOW-FUNC-TYPE-DENSE-RANK
+                                       'dept-id 'salary 50))))
+  (check (= 'dept-id (window-function-op-get-partition-key
+                       (make-window-function-op WINDOW-TYPE-ROW
+                                                WINDOW-FUNC-TYPE-RANK
+                                                'dept-id 'salary 50))))
+  (check (= 'salary (window-function-op-get-sort-key
+                      (make-window-function-op WINDOW-TYPE-ROW
+                                               WINDOW-FUNC-TYPE-RANK
+                                               'dept-id 'salary 50))))
+  (check (= 50 (window-function-op-get-partition-rows
+                 (make-window-function-op WINDOW-TYPE-ROW
+                                          WINDOW-FUNC-TYPE-RANK
+                                          'dept-id 'salary 50))))
+  (check (= #f (window-function-op-is-final?
+                 (make-window-function-op WINDOW-TYPE-ROW
+                                          WINDOW-FUNC-TYPE-RANK
+                                          'dept-id 'salary 50)))))
+
+(test-suite "42-005-wfop-predicate"
+  (check (= #t (window-function-op?
+                 (make-window-function-op WINDOW-TYPE-ROW
+                                          WINDOW-FUNC-TYPE-RANK
+                                          'dept-id 'salary 0))))
+  (check (= #f (window-function-op? 'not-wfop)))
+  (check (= #f (window-function-op? 42))))

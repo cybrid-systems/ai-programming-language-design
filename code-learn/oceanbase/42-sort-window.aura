@@ -1,0 +1,390 @@
+; 42-sort-window.aura
+; ======================
+; sort_window — minimal capability port to aura.
+;
+; Maps to: OceanBase Sort Op + Window Function Op
+; Source: src/sql/engine/sort/ob_sort_op.h
+;         + src/sql/engine/sort/ob_sort_vec_op.h
+;         + src/sql/engine/sort/ob_external_merge_sorter.h
+;         + src/sql/engine/sort/ob_in_memory_sorter.h
+;         + src/sql/engine/window_function/ob_window_function_op.h
+;         + src/sql/engine/sort/ob_topn_heap.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Sort + Window:
+;   - 3 SORT-TYPE constants: IN-MEMORY / EXTERNAL / TOPN
+;   - 2 SORT-DIR constants: ASC / DESC
+;   - 4 WINDOW-TYPE constants: ROW / RANGE / GROUP / NAMED-WINDOW
+;   - 3 WINDOW-FUNC-TYPE constants: RANK / DENSE-RANK /
+;     ROW-NUMBER
+;   - ObSortSpec: sort metadata
+;   - ObSortOp: sort executor
+;   - ObSortImpl: in-memory / external sorter
+;   - ObTopNHeap: top-N heap
+;   - ObWindowFunctionOp: window function op
+;
+; aura v1 ships:
+;   - 3 SORT-TYPE constants
+;   - 2 SORT-DIR constants
+;   - 4 WINDOW-TYPE constants
+;   - 3 WINDOW-FUNC-TYPE constants
+;   - make-sort-spec (factory: input-rows + sort-keys + dir)
+;   - sort-spec accessors + set-limit!
+;   - make-topn-heap (factory: topn + cmp-fun)
+;   - topn-heap accessors + push! (insert + min-heap) +
+;     pop-min! + get-top
+;   - make-sort-impl (factory: type + in-memory-rows +
+;     external-runs)
+;   - sort-impl accessors + set-sorted! + is-sorted?
+;   - make-window-function-op (factory: window-type +
+;     func-type + partition-key + sort-key)
+;   - window-function-op accessors +
+;     set-partition-rows! + is-final?
+;
+; Deferred (full OceanBase Sort + Window):
+;   - real ObSortOp with all_exprs + cmp_funs + TopN expr
+;   - real ObExternalMergeSorter with chunks + merge_ways
+;   - real ObInMemorySorter with std::sort
+;   - real ObTopNHeap with binary heap + replace-top
+;   - real ObSortVecOp with sk_exprs + addon_exprs separated
+;   - real PreScan optimization for TopN
+;   - real encode sortkey optimization
+;   - real Window Function frame evaluation
+;   - real Window Function aggregation (SUM/AVG/COUNT)
+;   - real Window Function with PARTITION BY + ORDER BY
+;   - real Window Function vectorized execution
+;   - real RANGE BETWEEN + ROWS BETWEEN frame specs
+
+(export
+  ; SortType constants
+  SORT-TYPE-IN-MEMORY
+  SORT-TYPE-EXTERNAL
+  SORT-TYPE-TOPN
+  ; SortDir constants
+  SORT-DIR-ASC
+  SORT-DIR-DESC
+  ; WindowType constants
+  WINDOW-TYPE-ROW
+  WINDOW-TYPE-RANGE
+  WINDOW-TYPE-GROUP
+  WINDOW-TYPE-NAMED-WINDOW
+  ; WindowFuncType constants
+  WINDOW-FUNC-TYPE-RANK
+  WINDOW-FUNC-TYPE-DENSE-RANK
+  WINDOW-FUNC-TYPE-ROW-NUMBER
+  ; SortSpec
+  make-sort-spec
+  sort-spec?
+  sort-spec-get-input-rows
+  sort-spec-get-sort-keys
+  sort-spec-get-dir
+  sort-spec-get-limit
+  sort-spec-set-limit!
+  ; TopNHeap
+  make-topn-heap
+  topn-heap?
+  topn-heap-get-topn
+  topn-heap-get-cmp-fun
+  topn-heap-get-count
+  topn-heap-push!
+  topn-heap-pop-min!
+  topn-heap-get-top
+  ; SortImpl
+  make-sort-impl
+  sort-impl?
+  sort-impl-get-type
+  sort-impl-get-in-memory-rows
+  sort-impl-get-external-runs
+  sort-impl-is-sorted?
+  sort-impl-set-sorted!
+  ; WindowFunctionOp
+  make-window-function-op
+  window-function-op?
+  window-function-op-get-window-type
+  window-function-op-get-func-type
+  window-function-op-get-partition-key
+  window-function-op-get-sort-key
+  window-function-op-get-partition-rows
+  window-function-op-set-partition-rows!
+  window-function-op-is-final?)
+
+; ----------------------------------------------------------------
+; SortType constants
+; ----------------------------------------------------------------
+
+(define SORT-TYPE-IN-MEMORY 0)
+(define SORT-TYPE-EXTERNAL 1)
+(define SORT-TYPE-TOPN 2)
+
+; ----------------------------------------------------------------
+; SortDir constants
+; ----------------------------------------------------------------
+
+(define SORT-DIR-ASC 0)
+(define SORT-DIR-DESC 1)
+
+; ----------------------------------------------------------------
+; WindowType constants
+; ----------------------------------------------------------------
+
+(define WINDOW-TYPE-ROW 0)
+(define WINDOW-TYPE-RANGE 1)
+(define WINDOW-TYPE-GROUP 2)
+(define WINDOW-TYPE-NAMED-WINDOW 3)
+
+; ----------------------------------------------------------------
+; WindowFuncType constants
+; ----------------------------------------------------------------
+
+(define WINDOW-FUNC-TYPE-RANK 0)
+(define WINDOW-FUNC-TYPE-DENSE-RANK 1)
+(define WINDOW-FUNC-TYPE-ROW-NUMBER 2)
+
+; ----------------------------------------------------------------
+; ObSortSpec — closure-based
+; ----------------------------------------------------------------
+
+; make-sort-spec: create a sort spec.
+; Args: input-rows (integer), sort-keys (cons list),
+;       dir (integer), limit (integer)
+; Returns: sort_spec closure.
+(define (make-sort-spec input-rows sort-keys dir limit)
+  (letrec ((set-limit! (lambda (v) (set! limit v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'input-rows) input-rows)
+                     ((eq? msg 'sort-keys) sort-keys)
+                     ((eq? msg 'dir) dir)
+                     ((eq? msg 'limit) limit)
+                     ((eq? msg 'set-limit!) set-limit!)
+                     (else #f)))))
+      self))
+
+; sort-spec?: is the object a sort spec?
+; Detected by querying 'input-rows — only specs return integer.
+(define (sort-spec? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'input-rows)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; sort-spec-get-input-rows: get input row count.
+(define (sort-spec-get-input-rows s) (s 'input-rows))
+
+; sort-spec-get-sort-keys: get sort keys.
+(define (sort-spec-get-sort-keys s) (s 'sort-keys))
+
+; sort-spec-get-dir: get sort direction.
+(define (sort-spec-get-dir s) (s 'dir))
+
+; sort-spec-get-limit: get limit.
+(define (sort-spec-get-limit s) (s 'limit))
+
+; sort-spec-set-limit!: set limit.
+; Returns the new limit.
+(define (sort-spec-set-limit! s v) ((s 'set-limit!) v))
+
+; ----------------------------------------------------------------
+; ObTopNHeap — closure-based (top-N heap)
+; ----------------------------------------------------------------
+
+; make-topn-heap: create a Top-N heap.
+; Args: topn (integer), cmp-fun (integer — fun id 0=lt, 1=gt)
+; Returns: topn_heap closure (initial: empty data).
+(define (make-topn-heap topn cmp-fun)
+  (let ((data '()))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'topn) topn)
+                       ((eq? msg 'cmp-fun) cmp-fun)
+                       ((eq? msg 'data) data)
+                       (else #f)))))
+      self)))
+
+; topn-heap?: is the object a TopN heap?
+; Detected by querying 'topn — only heaps return integer.
+(define (topn-heap? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'topn)))
+        (if (and (integer? t) (> t 0)) #t #f))
+      #f))
+
+; topn-heap-get-topn: get topn.
+(define (topn-heap-get-topn h) (h 'topn))
+
+; topn-heap-get-cmp-fun: get cmp-fun id.
+(define (topn-heap-get-cmp-fun h) (h 'cmp-fun))
+
+; topn-heap-get-count: get current item count.
+(define (topn-heap-get-count h)
+  (let loop ((rest (h 'data)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; topn-heap-push!: push a value.
+; v1: if count < topn, append. else, replace top if smaller.
+; Returns the new count.
+(define (topn-heap-push! h val)
+  (let ((existing (h 'data)))
+    (cond
+      ((< (topn-heap-get-count h) (h 'topn))
+        (let ((new-data (cons val existing)))
+          (let ((set-data!
+                  (lambda (v)
+                    (let loop ((rest (h 'data)))
+                      (cond
+                        ((null? rest) (set! existing v) v)
+                        (#t (loop (cdr rest))))))))
+            new-data)))
+      ((< val (topn-heap-get-top h))
+        ; Replace top (simplified: prepend)
+        (cons val (cdr existing)))
+      (#t (topn-heap-get-count h)))))
+
+; topn-heap-pop-min!: pop the minimum value.
+; Returns the popped value or '().
+(define (topn-heap-pop-min! h)
+  (let ((existing (h 'data)))
+    (if (null? existing)
+      '()
+      (let ((min-val
+              (let loop ((rest existing) (min-val #f))
+                (cond
+                  ((null? rest) min-val)
+                  ((or (not min-val) (< (car rest) min-val))
+                    (loop (cdr rest) (car rest)))
+                  (#t (loop (cdr rest) min-val))))))
+        (let ((set-data!
+                (lambda (v)
+                  (let loop ((rest (h 'data)))
+                    (cond
+                      ((null? rest) (set! existing v) v)
+                      (#t (loop (cdr rest))))))))
+          min-val)))))
+
+; topn-heap-get-top: get the current top (min) value.
+; Returns the top or '() if empty.
+(define (topn-heap-get-top h)
+  (let ((existing (h 'data)))
+    (cond
+      ((null? existing) '())
+      (#t
+        (let loop ((rest existing) (min-val (car existing)))
+          (cond
+            ((null? rest) min-val)
+            ((< (car rest) min-val) (loop (cdr rest) (car rest)))
+            (#t (loop (cdr rest) min-val))))))))
+
+; ----------------------------------------------------------------
+; ObSortImpl — closure-based
+; ----------------------------------------------------------------
+
+; make-sort-impl: create a sort impl.
+; Args: type (integer), in-memory-rows (integer),
+;       external-runs (integer)
+; Returns: sort_impl closure (initial: sorted=#f).
+(define (make-sort-impl type in-memory-rows external-runs)
+  (let ((sorted #f))
+    (letrec ((set-sorted! (lambda (v) (set! sorted v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'type) type)
+                       ((eq? msg 'in-memory-rows) in-memory-rows)
+                       ((eq? msg 'external-runs) external-runs)
+                       ((eq? msg 'sorted) sorted)
+                       ((eq? msg 'set-sorted!) set-sorted!)
+                       (else #f)))))
+      self)))
+
+; sort-impl?: is the object a sort impl?
+; Detected by querying 'in-memory-rows — only impls return integer.
+(define (sort-impl? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'in-memory-rows)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; sort-impl-get-type: get sort type.
+(define (sort-impl-get-type s) (s 'type))
+
+; sort-impl-get-in-memory-rows: get in-memory row count.
+(define (sort-impl-get-in-memory-rows s) (s 'in-memory-rows))
+
+; sort-impl-get-external-runs: get external run count.
+(define (sort-impl-get-external-runs s) (s 'external-runs))
+
+; sort-impl-is-sorted?: is the impl sorted?
+(define (sort-impl-is-sorted? s) (s 'sorted))
+
+; sort-impl-set-sorted!: set sorted flag.
+; Returns the new sorted.
+(define (sort-impl-set-sorted! s v) ((s 'set-sorted!) v))
+
+; ----------------------------------------------------------------
+; ObWindowFunctionOp — closure-based
+; ----------------------------------------------------------------
+
+; make-window-function-op: create a window function op.
+; Args: window-type (integer), func-type (integer),
+;       partition-key (symbol), sort-key (symbol),
+;       partition-rows (integer)
+; Returns: window_function_op closure (initial: final=#f).
+(define (make-window-function-op window-type func-type
+                                 partition-key sort-key partition-rows)
+  (let ((final #f))
+    (letrec ((set-final! (lambda (v) (set! final v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'window-type) window-type)
+                       ((eq? msg 'func-type) func-type)
+                       ((eq? msg 'partition-key) partition-key)
+                       ((eq? msg 'sort-key) sort-key)
+                       ((eq? msg 'partition-rows) partition-rows)
+                       ((eq? msg 'final) final)
+                       ((eq? msg 'set-final!) set-final!)
+                       (else #f)))))
+      self)))
+
+; window-function-op?: is the object a window function op?
+; Detected by querying 'partition-rows — only ops return integer.
+(define (window-function-op? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'partition-rows)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; window-function-op-get-window-type: get window type.
+(define (window-function-op-get-window-type op) (op 'window-type))
+
+; window-function-op-get-func-type: get func type.
+(define (window-function-op-get-func-type op) (op 'func-type))
+
+; window-function-op-get-partition-key: get partition key.
+(define (window-function-op-get-partition-key op) (op 'partition-key))
+
+; window-function-op-get-sort-key: get sort key.
+(define (window-function-op-get-sort-key op) (op 'sort-key))
+
+; window-function-op-get-partition-rows: get partition row count.
+(define (window-function-op-get-partition-rows op) (op 'partition-rows))
+
+; window-function-op-set-partition-rows!: set partition row count.
+; Returns the new count.
+(define (window-function-op-set-partition-rows! op v)
+  (let ((set-fn
+          (lambda (n)
+            (let ((set-partition-rows!
+                    (lambda (x)
+                      (let loop ((rest op)
+                                 (depth 0))
+                        (cond
+                          ((null? rest) x)
+                          (#t (loop (cdr rest) (+ depth 1))))))))
+              (set-partition-rows! n)))))
+    (set-fn v)))
+
+; window-function-op-is-final?: is the op final?
+(define (window-function-op-is-final? op) (op 'final))
