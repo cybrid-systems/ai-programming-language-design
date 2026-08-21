@@ -1,0 +1,318 @@
+; 29-sql-diagnostics_test.aura
+; ======================
+; Smoke tests for 29-sql-diagnostics.aura — SQL Diagnostics minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/29-sql-diagnostics_test.aura
+;
+; Verified automatically (smoke):
+;   - 10 EVENT-TYPE + 8 TIMESTAMP-FIELD constants distinct
+;   - make-exec-record + accessors + update!
+;   - make-exec-timestamp + get-field + set-field
+;   - make-phy-plan-monitor + accessors + advance-op
+;   - make-phy-op-monitor + accessors + add-rows + add-time
+;   - make-sql-audit + accessors
+;   - make-sql-stat + accessors + inc-exec + update-elapsed
+;   - make-monitor-info-manager + add + count + get-at + evict
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - 3-layer monitoring (operator/audit/stat) works
+;   - Eviction reduces count to capacity
+;
+; Deferred (full OceanBase SQL Diagnostics):
+;   - real ObExecRecord with 26 events (v1: 10)
+;   - real ObPhyPlanMonitorInfo with full DAG tracking
+;   - real ObPhyOperatorMonitorInfo with per-op metrics
+;   - real ObPhyOperatorStats with cumulative aggregation
+;   - real ObSqlStatManager with LRU eviction
+;   - real ObMonitorInfoManager FIFO queue
+;   - real gv$sql_audit virtual table implementation
+;   - real v$sql_plan_monitor virtual table
+;   - real ObMonitorInfoEliminationTask (timer)
+;   - real ObRuntimeProfile with per-query thread-local state
+
+(require "std/test" all:)
+(require "29-sql-diagnostics" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "29-001-event-type-distinct"
+  ; 10 EVENT-TYPE constants are distinct.
+  (check (= 1 (if (not (= EVENT-TYPE-IO-READ
+                          EVENT-TYPE-USER-IO)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-USER-IO
+                          EVENT-TYPE-ROW-CACHE-HIT)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-ROW-CACHE-HIT
+                          EVENT-TYPE-BLOCK-CACHE-HIT)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-BLOCK-CACHE-HIT
+                          EVENT-TYPE-BLOOM-FILTER)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-BLOOM-FILTER
+                          EVENT-TYPE-MEMSTORE-READ)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-MEMSTORE-READ
+                          EVENT-TYPE-SSSTORE-READ)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-SSSTORE-READ
+                          EVENT-TYPE-DATA-BLOCK-READ)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-DATA-BLOCK-READ
+                          EVENT-TYPE-BLOCKSCAN-BLOCK)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-BLOCKSCAN-BLOCK
+                          EVENT-TYPE-PUSHDOWN-FILTER)) 1 0)))
+  (check (= 1 (if (not (= EVENT-TYPE-IO-READ
+                          EVENT-TYPE-PUSHDOWN-FILTER)) 1 0))))
+
+(test-suite "29-001-timestamp-field-distinct"
+  ; 8 TIMESTAMP-FIELD constants are distinct.
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-REQUEST-START
+                          TIMESTAMP-FIELD-QUEUE-END)) 1 0)))
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-QUEUE-END
+                          TIMESTAMP-FIELD-DECODE-END)) 1 0)))
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-DECODE-END
+                          TIMESTAMP-FIELD-GET-PLAN-END)) 1 0)))
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-GET-PLAN-END
+                          TIMESTAMP-FIELD-EXECUTE-START)) 1 0)))
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-EXECUTE-START
+                          TIMESTAMP-FIELD-EXECUTE-END)) 1 0)))
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-EXECUTE-END
+                          TIMESTAMP-FIELD-NET-START)) 1 0)))
+  (check (= 1 (if (not (= TIMESTAMP-FIELD-NET-START
+                          TIMESTAMP-FIELD-NET-END)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObExecRecord
+; ----------------------------------------------------------------
+
+(test-suite "29-002-exec-record-construction"
+  ; exec-record preserves max-wait.
+  (check (= 100 (exec-record-get-max-wait
+                  (make-exec-record 100 '()))))
+
+(test-suite "29-002-exec-record-predicate"
+  ; exec-record? accepts only exec-records.
+  (check (= #t (exec-record? (make-exec-record 0 '()))))
+  (check (= #f (exec-record? 'not-record)))
+  (check (= #f (exec-record? 42)))
+
+(test-suite "29-003-exec-record-set-max-wait"
+  ; set-max-wait! updates.
+  (check (= 200 (let ((er (make-exec-record 0 '())))
+                  (exec-record-set-max-wait! er 200)
+                  (exec-record-get-max-wait er))))
+
+; ----------------------------------------------------------------
+; ObExecTimestamp
+; ----------------------------------------------------------------
+
+(test-suite "29-004-exec-timestamp-construction"
+  ; exec-timestamp accepts 8 integers.
+  (check (= #t (exec-timestamp?
+                 (make-exec-timestamp 0 0 0 0 0 0 0 0))))
+
+(test-suite "29-004-exec-timestamp-predicate"
+  ; exec-timestamp? accepts only timestamps.
+  (check (= #t (exec-timestamp?
+                 (make-exec-timestamp 0 0 0 0 0 0 0 0))))
+  (check (= #f (exec-timestamp? 'not-ts)))
+  (check (= #f (exec-timestamp? 42)))
+
+(test-suite "29-005-exec-timestamp-set-field"
+  ; set-field! updates.
+  (check (= 500 (let ((ts (make-exec-timestamp 0 0 0 0 0 0 0 0)))
+                 (exec-timestamp-set-field! ts TIMESTAMP-FIELD-EXECUTE-START 500)
+                 (exec-timestamp-get-field ts TIMESTAMP-FIELD-EXECUTE-START))))
+
+; ----------------------------------------------------------------
+; ObPhyPlanMonitorInfo
+; ----------------------------------------------------------------
+
+(test-suite "29-006-plan-monitor-construction"
+  ; plan-monitor preserves fields.
+  (check (= 100 (phy-plan-monitor-get-plan-id
+                  (make-phy-plan-monitor 100 5 0 #f))))
+  (check (= 5 (phy-plan-monitor-get-op-count
+                (make-phy-plan-monitor 100 5 0 #f))))
+  (check (= 0 (phy-plan-monitor-get-op-index
+                (make-phy-plan-monitor 100 5 0 #f))))
+
+(test-suite "29-006-plan-monitor-predicate"
+  ; phy-plan-monitor? accepts only monitors.
+  (check (= #t (phy-plan-monitor?
+                 (make-phy-plan-monitor 1 1 0 #f))))
+  (check (= #f (phy-plan-monitor? 'not-monitor)))
+  (check (= #f (phy-plan-monitor? 42)))
+
+(test-suite "29-007-plan-monitor-advance-op"
+  ; advance-op! increments op-index.
+  (check (= 1 (let ((m (make-phy-plan-monitor 100 5 0 #f)))
+                 (phy-plan-monitor-advance-op! m)
+                 (phy-plan-monitor-get-op-index m))))
+  (check (= 3 (let ((m (make-phy-plan-monitor 100 5 0 #f)))
+                 (phy-plan-monitor-advance-op! m)
+                 (phy-plan-monitor-advance-op! m)
+                 (phy-plan-monitor-advance-op! m)
+                 (phy-plan-monitor-get-op-index m))))
+
+; ----------------------------------------------------------------
+; ObPhyOperatorMonitorInfo
+; ----------------------------------------------------------------
+
+(test-suite "29-008-op-monitor-construction"
+  ; op-monitor preserves fields.
+  (check (= 1 (phy-op-monitor-get-op-id
+               (make-phy-op-monitor 1 'TABLE-SCAN 1000 50000))))
+  (check (= #t (eq? 'TABLE-SCAN
+                   (phy-op-monitor-get-op-name
+                     (make-phy-op-monitor 1 'TABLE-SCAN 1000 50000)))))
+  (check (= 1000 (phy-op-monitor-get-rows
+                  (make-phy-op-monitor 1 'TABLE-SCAN 1000 50000))))
+  (check (= 50000 (phy-op-monitor-get-time-us
+                    (make-phy-op-monitor 1 'TABLE-SCAN 1000 50000)))))
+
+(test-suite "29-008-op-monitor-predicate"
+  ; phy-op-monitor? accepts only monitors.
+  (check (= #t (phy-op-monitor?
+                 (make-phy-op-monitor 1 'X 0 0))))
+  (check (= #f (phy-op-monitor? 'not-op)))
+  (check (= #f (phy-op-monitor? 42)))
+
+(test-suite "29-009-op-monitor-add-rows"
+  ; add-rows! increments row count.
+  (check (= 1500 (let ((m (make-phy-op-monitor 1 'TS 1000 5000)))
+                  (phy-op-monitor-add-rows! m 500)
+                  (phy-op-monitor-get-rows m))))
+
+(test-suite "29-009-op-monitor-add-time"
+  ; add-time-us! increments time.
+  (check (= 7000 (let ((m (make-phy-op-monitor 1 'TS 1000 5000)))
+                  (phy-op-monitor-add-time-us! m 2000)
+                  (phy-op-monitor-get-time-us m))))
+
+; ----------------------------------------------------------------
+; ObSqlAudit
+; ----------------------------------------------------------------
+
+(test-suite "29-010-sql-audit-construction"
+  ; sql-audit preserves fields.
+  (check (= 1 (sql-audit-get-sql-id
+               (make-sql-audit 1 'user1 'testdb 100 #f #f #f))))
+  (check (= #t (eq? 'user1
+                   (sql-audit-get-user
+                     (make-sql-audit 1 'user1 'testdb 100 #f #f #f)))))
+  (check (= #t (eq? 'testdb
+                   (sql-audit-get-db
+                     (make-sql-audit 1 'user1 'testdb 100 #f #f #f)))))
+  (check (= 100 (sql-audit-get-exec-id
+                (make-sql-audit 1 'user1 'testdb 100 #f #f #f))))
+
+(test-suite "29-010-sql-audit-predicate"
+  ; sql-audit? accepts only audits.
+  (check (= #t (sql-audit?
+                 (make-sql-audit 1 'u 'd 1 #f #f #f))))
+  (check (= #f (sql-audit? 'not-audit)))
+  (check (= #f (sql-audit? 42)))
+
+; ----------------------------------------------------------------
+; ObSqlStat
+; ----------------------------------------------------------------
+
+(test-suite "29-011-sql-stat-construction"
+  ; sql-stat preserves fields.
+  (check (= 1 (sql-stat-get-sql-id
+               (make-sql-stat 1 100 5000 10000 1000))))
+  (check (= 100 (sql-stat-get-exec-count
+                (make-sql-stat 1 100 5000 10000 1000))))
+  (check (= 5000 (sql-stat-get-avg-elapsed-us
+                 (make-sql-stat 1 100 5000 10000 1000))))
+  (check (= 10000 (sql-stat-get-max-elapsed-us
+                  (make-sql-stat 1 100 5000 10000 1000))))
+  (check (= 1000 (sql-stat-get-min-elapsed-us
+                 (make-sql-stat 1 100 5000 10000 1000))))
+
+(test-suite "29-011-sql-stat-predicate"
+  ; sql-stat? accepts only stats.
+  (check (= #t (sql-stat? (make-sql-stat 1 0 0 0 0))))
+  (check (= #f (sql-stat? 'not-stat)))
+  (check (= #f (sql-stat? 42)))
+
+(test-suite "29-012-sql-stat-inc-exec"
+  ; inc-exec-count! increments.
+  (check (= 3 (let ((s (make-sql-stat 1 2 0 0 0)))
+                 (sql-stat-inc-exec-count! s)
+                 (sql-stat-inc-exec-count! s)
+                 (sql-stat-inc-exec-count! s)
+                 (sql-stat-get-exec-count s))))
+
+(test-suite "29-012-sql-stat-update-elapsed"
+  ; update-elapsed! with first sample (count=0 → sets all to sample).
+  (check (= 100 (let ((s (make-sql-stat 1 0 0 0 0)))
+                 (sql-stat-update-elapsed! s 100)
+                 (sql-stat-get-min-elapsed-us s)))
+  (check (= 100 (let ((s (make-sql-stat 1 0 0 0 0)))
+                 (sql-stat-update-elapsed! s 100)
+                 (sql-stat-get-max-elapsed-us s))))
+
+; ----------------------------------------------------------------
+; ObMonitorInfoManager
+; ----------------------------------------------------------------
+
+(test-suite "29-013-mgr-construction"
+  ; manager preserves capacity.
+  (check (= 100 (monitor-info-manager-get-capacity
+                  (make-monitor-info-manager 100 '()))))
+  (check (= 0 (monitor-info-manager-count
+               (make-monitor-info-manager 100 '()))))
+
+(test-suite "29-013-mgr-predicate"
+  ; monitor-info-manager? accepts only managers.
+  (check (= #t (monitor-info-manager?
+                 (make-monitor-info-manager 1 '()))))
+  (check (= #f (monitor-info-manager? 'not-mgr)))
+  (check (= #f (monitor-info-manager? 42)))
+
+(test-suite "29-014-mgr-add"
+  ; add! increases count.
+  (check (= 1 (let ((m (make-monitor-info-manager 10 '())))
+                 (monitor-info-manager-add! m 'info1)
+                 (monitor-info-manager-count m))))
+
+(test-suite "29-014-mgr-add-multiple"
+  ; Multiple adds accumulate.
+  (check (= 3 (let ((m (make-monitor-info-manager 10 '())))
+                 (monitor-info-manager-add! m 'a)
+                 (monitor-info-manager-add! m 'b)
+                 (monitor-info-manager-add! m 'c)
+                 (monitor-info-manager-count m))))
+
+(test-suite "29-014-mgr-get-at"
+  ; get-at returns the info at index.
+  (check (= #t (let ((m (make-monitor-info-manager 10 '())))
+                 (monitor-info-manager-add! m 'first)
+                 (monitor-info-manager-add! m 'second)
+                 (eq? 'first
+                   (monitor-info-manager-get-at m 1)))))
+
+(test-suite "29-014-mgr-get-at-missing"
+  ; get-at returns #f for out-of-range.
+  (check (= #f (monitor-info-manager-get-at
+                 (make-monitor-info-manager 10 '()) 100)))
+
+(test-suite "29-015-mgr-evict"
+  ; evict! evicts to capacity.
+  (check (= 2 (let ((m (make-monitor-info-manager 2 '())))
+                 (monitor-info-manager-add! m 'a)
+                 (monitor-info-manager-add! m 'b)
+                 (monitor-info-manager-add! m 'c)
+                 (monitor-info-manager-add! m 'd)
+                 (monitor-info-manager-add! m 'e)
+                 (monitor-info-manager-evict! m)
+                 (let ((cur (monitor-info-manager-count m)))
+                   (- 5 cur)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

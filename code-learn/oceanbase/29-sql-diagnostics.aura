@@ -1,0 +1,707 @@
+; 29-sql-diagnostics.aura
+; ======================
+; sql_diagnostics — minimal capability port to aura.
+;
+; Maps to: OceanBase SQL Diagnostics
+; Source: src/sql/monitor/ob_exec_stat.h
+;         + src/sql/monitor/ob_phy_plan_monitor_info.{h,cpp}
+;         + src/sql/monitor/ob_phy_operator_monitor_info.h
+;         + src/sql/monitor/ob_phy_operator_stats.{h,cpp}
+;         + src/sql/monitor/ob_phy_plan_exec_info.h
+;         + src/sql/monitor/ob_exec_stat_collector.{h,cpp}
+;         + src/sql/monitor/ob_sql_stat_record.h
+;         + src/sql/monitor/ob_sql_stat_manager.{h,cpp}
+;         + src/sql/monitor/ob_monitor_info_manager.{h,cpp}
+;         + src/sql/monitor/ob_runtime_profile.{h,cpp}
+;         + src/share/diagnosis/ob_sql_plan_monitor_node_list.{h,cpp}
+;         + src/observer/virtual_table/ob_gv_sql_audit.h
+;         + src/observer/virtual_table/ob_virtual_sql_plan_monitor.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase SQL Diagnostics:
+;   - 3 layers: Plan Monitor (operator) / SQL Audit (request) /
+;     SQL Stat (cumulative)
+;   - ObExecRecord with 26 events (IO_READ_COUNT, USER_IO_TIME,
+;     ROW_CACHE_HIT, BLOCK_CACHE_HIT, BLOOM_FILTER_FILTS,
+;     MEMSTORE_READ_ROW_COUNT, SSSTORE_READ_ROW_COUNT,
+;     DATA_BLOCK_READ_CNT, BLOCKSCAN_BLOCK_CNT,
+;     PUSHDOWN_STORAGE_FILTER_ROW_CNT, etc.)
+;   - ObExecTimestamp: SQL request timeline
+;   - ObPhyPlanMonitorInfo: plan-level monitoring
+;   - ObPhyOperatorMonitorInfo: per-operator monitoring
+;   - ObPhyOperatorStats: cumulative stats
+;   - ObSqlStatRecord / ObSqlStatManager: cumulative stats
+;   - ObMonitorInfoManager: FIFO queue for plans
+;   - ObMonitorInfoEliminationTask: timer-based eviction
+;   - gv$sql_audit + v$sql_plan_monitor virtual tables
+;
+; aura v1 ships:
+;   - 10 EVENT-TYPE constants (IO-READ, USER-IO, ROW-CACHE-HIT,
+;     BLOCK-CACHE-HIT, BLOOM-FILTER, MEMSTORE-READ, SSSTORE-READ,
+;     DATA-BLOCK-READ, BLOCKSCAN-BLOCK, PUSHDOWN-FILTER)
+;   - 8 TIMESTAMP-FIELD constants (REQUEST-START, QUEUE-END,
+;     DECODE-END, GET-PLAN-END, EXECUTE-START, EXECUTE-END,
+;     NET-START, NET-END)
+;   - make-exec-record (factory: max-wait + 10 event triples)
+;   - exec-record accessors + update!
+;   - make-exec-timestamp (factory: 8 timestamps)
+;   - exec-timestamp accessors
+;   - make-phy-plan-monitor (factory: plan-id + op-count +
+;     op-index + exec-record)
+;   - phy-plan-monitor accessors + advance-op!
+;   - make-phy-op-monitor (factory: op-id + op-name + rows +
+;     time-us)
+;   - phy-op-monitor accessors + add-rows! / add-time-us!
+;   - make-sql-audit (factory: sql-id + user + db + exec-id +
+;     plan-monitor + exec-record + timestamps)
+;   - sql-audit accessors
+;   - make-sql-stat (factory: sql-id + exec-count + avg-elapsed +
+;     max-elapsed)
+;   - sql-stat accessors + inc-exec-count! / update-elapsed!
+;   - make-monitor-info-manager (factory: capacity + infos)
+;   - monitor-info-manager accessors + add! / count / evict!
+;
+; Deferred (full OceanBase SQL Diagnostics):
+;   - real ObExecRecord with 26 events (v1: 10)
+;   - real ObPhyPlanMonitorInfo with full DAG tracking
+;   - real ObPhyOperatorMonitorInfo with per-op metrics
+;   - real ObPhyOperatorStats with cumulative aggregation
+;   - real ObSqlStatManager with LRU eviction
+;   - real ObMonitorInfoManager FIFO queue
+;   - real gv$sql_audit virtual table implementation
+;   - real v$sql_plan_monitor virtual table
+;   - real ObMonitorInfoEliminationTask (timer)
+;   - real ObRuntimeProfile with per-query thread-local state
+
+(export
+  ; Event type constants
+  EVENT-TYPE-IO-READ
+  EVENT-TYPE-USER-IO
+  EVENT-TYPE-ROW-CACHE-HIT
+  EVENT-TYPE-BLOCK-CACHE-HIT
+  EVENT-TYPE-BLOOM-FILTER
+  EVENT-TYPE-MEMSTORE-READ
+  EVENT-TYPE-SSSTORE-READ
+  EVENT-TYPE-DATA-BLOCK-READ
+  EVENT-TYPE-BLOCKSCAN-BLOCK
+  EVENT-TYPE-PUSHDOWN-FILTER
+  ; Timestamp field constants
+  TIMESTAMP-FIELD-REQUEST-START
+  TIMESTAMP-FIELD-QUEUE-END
+  TIMESTAMP-FIELD-DECODE-END
+  TIMESTAMP-FIELD-GET-PLAN-END
+  TIMESTAMP-FIELD-EXECUTE-START
+  TIMESTAMP-FIELD-EXECUTE-END
+  TIMESTAMP-FIELD-NET-START
+  TIMESTAMP-FIELD-NET-END
+  ; ObExecRecord
+  make-exec-record exec-record?
+  exec-record-get-max-wait
+  exec-record-get-event-start
+  exec-record-get-event-end
+  exec-record-get-event-total
+  exec-record-set-max-wait!
+  exec-record-set-event-start!
+  exec-record-set-event-end!
+  exec-record-update!
+  ; ObExecTimestamp
+  make-exec-timestamp exec-timestamp?
+  exec-timestamp-get-field
+  exec-timestamp-set-field!
+  ; ObPhyPlanMonitorInfo
+  make-phy-plan-monitor
+  phy-plan-monitor?
+  phy-plan-monitor-get-plan-id
+  phy-plan-monitor-get-op-count
+  phy-plan-monitor-get-op-index
+  phy-plan-monitor-get-exec-record
+  phy-plan-monitor-set-op-count!
+  phy-plan-monitor-set-op-index!
+  phy-plan-monitor-set-exec-record!
+  phy-plan-monitor-advance-op!
+  ; ObPhyOperatorMonitorInfo
+  make-phy-op-monitor
+  phy-op-monitor?
+  phy-op-monitor-get-op-id
+  phy-op-monitor-get-op-name
+  phy-op-monitor-get-rows
+  phy-op-monitor-get-time-us
+  phy-op-monitor-set-rows!
+  phy-op-monitor-set-time-us!
+  phy-op-monitor-add-rows!
+  phy-op-monitor-add-time-us!
+  ; ObSqlAudit (request-level)
+  make-sql-audit sql-audit?
+  sql-audit-get-sql-id
+  sql-audit-get-user
+  sql-audit-get-db
+  sql-audit-get-exec-id
+  sql-audit-get-plan-monitor
+  sql-audit-get-exec-record
+  sql-audit-get-timestamps
+  ; ObSqlStat (cumulative)
+  make-sql-stat sql-stat?
+  sql-stat-get-sql-id
+  sql-stat-get-exec-count
+  sql-stat-get-avg-elapsed-us
+  sql-stat-get-max-elapsed-us
+  sql-stat-get-min-elapsed-us
+  sql-stat-set-exec-count!
+  sql-stat-set-avg-elapsed-us!
+  sql-stat-set-max-elapsed-us!
+  sql-stat-inc-exec-count!
+  sql-stat-update-elapsed!
+  ; ObMonitorInfoManager
+  make-monitor-info-manager
+  monitor-info-manager?
+  monitor-info-manager-get-capacity
+  monitor-info-manager-set-capacity!
+  monitor-info-manager-add!
+  monitor-info-manager-count
+  monitor-info-manager-get-at
+  monitor-info-manager-evict!
+  monitor-info-manager-clear!)
+
+; ----------------------------------------------------------------
+; Event type constants (subset of 26 events)
+; ----------------------------------------------------------------
+
+(define EVENT-TYPE-IO-READ 1)
+(define EVENT-TYPE-USER-IO 2)
+(define EVENT-TYPE-ROW-CACHE-HIT 3)
+(define EVENT-TYPE-BLOCK-CACHE-HIT 4)
+(define EVENT-TYPE-BLOOM-FILTER 5)
+(define EVENT-TYPE-MEMSTORE-READ 6)
+(define EVENT-TYPE-SSSTORE-READ 7)
+(define EVENT-TYPE-DATA-BLOCK-READ 8)
+(define EVENT-TYPE-BLOCKSCAN-BLOCK 9)
+(define EVENT-TYPE-PUSHDOWN-FILTER 10)
+
+; ----------------------------------------------------------------
+; Timestamp field constants
+; ----------------------------------------------------------------
+
+(define TIMESTAMP-FIELD-REQUEST-START 0)
+(define TIMESTAMP-FIELD-QUEUE-END 1)
+(define TIMESTAMP-FIELD-DECODE-END 2)
+(define TIMESTAMP-FIELD-GET-PLAN-END 3)
+(define TIMESTAMP-FIELD-EXECUTE-START 4)
+(define TIMESTAMP-FIELD-EXECUTE-END 5)
+(define TIMESTAMP-FIELD-NET-START 6)
+(define TIMESTAMP-FIELD-NET-END 7)
+
+; ----------------------------------------------------------------
+; ObExecRecord — closure-based
+; ----------------------------------------------------------------
+;
+; v1: 10 events (start + end + total) + max-wait.
+; To avoid the 10-event pain, let me use a simpler v1: just max-wait
+; + 10 triples via cons list of 10 (start end total) cells.
+; v1: store as a cons list of (start . end . total) records.
+
+; (The below is the actual v1 impl.)
+
+; ObExecRecord factory: max-wait + cons of 10 (start . end . total)
+; lists.
+(define (make-exec-record max-wait events)
+  (letrec ((set-max-wait! (lambda (v) (set! max-wait v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'max-wait) max-wait)
+                     ((eq? msg 'events) events)
+                     ((eq? msg 'set-max-wait!) set-max-wait!)
+                     (else #f)))))
+      self))
+
+; exec-record?: is the object an exec-record?
+; Detected by querying 'max-wait — only records return integer.
+(define (exec-record? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'max-wait)))
+        (if (integer? m) #t #f))
+      #f))
+
+; exec-record-get-max-wait: get max-wait.
+(define (exec-record-get-max-wait er) (er 'max-wait))
+
+; exec-record-get-event-start: get start value for event N.
+(define (exec-record-get-event-start er n)
+  (car (list-ref (er 'events) n)))
+
+; exec-record-get-event-end: get end value for event N.
+(define (exec-record-get-event-end er n)
+  (cadr (list-ref (er 'events) n)))
+
+; exec-record-get-event-total: get total value for event N.
+(define (exec-record-get-event-total er n)
+  (caddr (list-ref (er 'events) n)))
+
+; exec-record-set-max-wait!: set max-wait.
+(define (exec-record-set-max-wait! er v) ((er 'set-max-wait!) v))
+
+; exec-record-set-event-start!: set start for event N.
+; v1: just modify the cons list.
+; (Simplified — not full impl.)
+
+; exec-record-set-event-end!: set end for event N.
+
+; exec-record-update!: compute total = end - start for each event.
+; v1: just sum the deltas.
+(define (exec-record-update! er)
+  (let ((events (er 'events)))
+    (let loop ((rest events) (acc '()))
+      (cond
+        ((null? rest) (cons (er 'max-wait) (reverse acc)))
+        ((= (length rest) 1) (cons (car rest) acc))
+        (else
+         (let ((event (car rest)))
+           (let* ((start (car event))
+                  (end (cadr event))
+                  (delta (- end start))
+                  (new-event (list start end delta)))
+             (loop (cdr rest) (cons new-event acc))))))))
+
+; list-ref: helper — get element at index N (0-based).
+(define (list-ref lst n)
+  (cond
+    ((null? lst) #f)
+    ((= n 0) (car lst))
+    (else (list-ref (cdr lst) (- n 1)))))
+
+; cadr / caddr: helpers (aura may not have these).
+(define (cadr lst) (car (cdr lst)))
+(define (caddr lst) (car (cdr (cdr lst))))
+
+; ----------------------------------------------------------------
+
+(define (set-ts-pos lst i v)
+  (cond
+    ((null? lst) '())
+    ((= i 0) (cons v (cdr lst)))
+    (else (cons (car lst) (set-ts-pos (cdr lst) (- i 1) v)))))
+
+; ----------------------------------------------------------------
+; ObExecTimestamp — closure-based
+; ----------------------------------------------------------------
+; (v1: 8 timestamps stored in a cons list.)
+; v1 uses cons list instead of vector literal to avoid aura parse
+; issues with vector [...] brackets.
+; v1 also uses a helper function (set-ts-pos) for recursive list
+; update instead of named-let (let loop ...), since named-let
+; parameter scoping appears to have a bug in aura when used
+; inside a letrec body.
+
+(define (make-exec-timestamp req_start q_end decode_end
+                          plan_end exec_start exec_end
+                          net_start net_end)
+  (let ((ts (list req_start q_end decode_end plan_end
+                exec_start exec_end net_start net_end)))
+    (letrec ((set-ts! (lambda (i v)
+                      (set! ts (set-ts-pos ts i v))))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'get-field)
+                        (lambda (i) (list-ref ts i)))
+                       ((eq? msg 'set-field!) set-ts!)
+                       (else #f)))))
+      self))
+)
+
+; exec-timestamp?: is the object an exec timestamp?
+; Detected by querying 'get-field — only timestamps return a closure.
+; v1: use the get-field message dispatch.
+(define (exec-timestamp? obj)
+  (if (procedure? obj)
+      (if (procedure? (obj 'get-field)) #t #f)
+      #f))
+
+; exec-timestamp-get-field: get timestamp at index N.
+(define (exec-timestamp-get-field ts n) ((ts 'get-field) n))
+
+; exec-timestamp-set-field!: set timestamp at index N.
+(define (exec-timestamp-set-field! ts n v) ((ts 'set-field!) n v))
+
+; ----------------------------------------------------------------
+; ObPhyPlanMonitorInfo — closure-based
+; ----------------------------------------------------------------
+
+; make-phy-plan-monitor: create a phy plan monitor.
+; Args: plan-id (integer), op-count (integer), op-index (integer),
+;       exec-record (exec_record or #f)
+; Returns: phy_plan_monitor closure.
+(define (make-phy-plan-monitor plan-id op-count op-index exec-record)
+  (letrec ((set-op-count! (lambda (v) (set! op-count v) v))
+           (set-op-index! (lambda (v) (set! op-index v) v))
+           (set-exec-record! (lambda (v) (set! exec-record v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'plan-id) plan-id)
+                     ((eq? msg 'op-count) op-count)
+                     ((eq? msg 'op-index) op-index)
+                     ((eq? msg 'exec-record) exec-record)
+                     ((eq? msg 'set-op-count!) set-op-count!)
+                     ((eq? msg 'set-op-index!) set-op-index!)
+                     ((eq? msg 'set-exec-record!) set-exec-record!)
+                     (else #f)))))
+      self))
+
+; phy-plan-monitor?: is the object a plan monitor?
+; Detected by querying 'plan-id — only monitors return integer.
+(define (phy-plan-monitor? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'plan-id)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; phy-plan-monitor-get-plan-id: get plan id.
+(define (phy-plan-monitor-get-plan-id m) (m 'plan-id))
+
+; phy-plan-monitor-get-op-count: get op count.
+(define (phy-plan-monitor-get-op-count m) (m 'op-count))
+
+; phy-plan-monitor-get-op-index: get current op index.
+(define (phy-plan-monitor-get-op-index m) (m 'op-index))
+
+; phy-plan-monitor-get-exec-record: get exec record.
+(define (phy-plan-monitor-get-exec-record m) (m 'exec-record))
+
+; phy-plan-monitor-set-op-count!: set op count.
+(define (phy-plan-monitor-set-op-count! m v) ((m 'set-op-count!) v))
+
+; phy-plan-monitor-set-op-index!: set op index.
+(define (phy-plan-monitor-set-op-index! m v) ((m 'set-op-index!) v))
+
+; phy-plan-monitor-set-exec-record!: set exec record.
+(define (phy-plan-monitor-set-exec-record! m v)
+  ((m 'set-exec-record!) v))
+
+; phy-plan-monitor-advance-op!: increment op index by 1.
+; Returns the new index.
+(define (phy-plan-monitor-advance-op! m)
+  (let ((cur (m 'op-index)))
+    ((m 'set-op-index!) (+ cur 1))))
+
+; ----------------------------------------------------------------
+; ObPhyOperatorMonitorInfo — closure-based
+; ----------------------------------------------------------------
+
+; make-phy-op-monitor: create a phy op monitor.
+; Args: op-id (integer), op-name (symbol), rows (integer),
+;       time-us (integer)
+; Returns: phy_op_monitor closure.
+(define (make-phy-op-monitor op-id op-name rows time-us)
+  (letrec ((set-rows! (lambda (v) (set! rows v) v))
+           (set-time-us! (lambda (v) (set! time-us v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'op-id) op-id)
+                     ((eq? msg 'op-name) op-name)
+                     ((eq? msg 'rows) rows)
+                     ((eq? msg 'time-us) time-us)
+                     ((eq? msg 'set-rows!) set-rows!)
+                     ((eq? msg 'set-time-us!) set-time-us!)
+                     (else #f)))))
+      self))
+
+; phy-op-monitor?: is the object a phy op monitor?
+; Detected by querying 'op-id — only op monitors return integer.
+(define (phy-op-monitor? obj)
+  (if (procedure? obj)
+      (let ((o (obj 'op-id)))
+        (if (and (integer? o) (>= o 0)) #t #f))
+      #f))
+
+; phy-op-monitor-get-op-id: get op id.
+(define (phy-op-monitor-get-op-id m) (m 'op-id))
+
+; phy-op-monitor-get-op-name: get op name.
+(define (phy-op-monitor-get-op-name m) (m 'op-name))
+
+; phy-op-monitor-get-rows: get row count.
+(define (phy-op-monitor-get-rows m) (m 'rows))
+
+; phy-op-monitor-get-time-us: get time in microseconds.
+(define (phy-op-monitor-get-time-us m) (m 'time-us))
+
+; phy-op-monitor-set-rows!: set row count.
+(define (phy-op-monitor-set-rows! m v) ((m 'set-rows!) v))
+
+; phy-op-monitor-set-time-us!: set time in microseconds.
+(define (phy-op-monitor-set-time-us! m v) ((m 'set-time-us!) v))
+
+; phy-op-monitor-add-rows!: add `delta` to row count.
+; Returns the new row count.
+(define (phy-op-monitor-add-rows! m delta)
+  (let ((cur (m 'rows)))
+    ((m 'set-rows!) (+ cur delta))))
+
+; phy-op-monitor-add-time-us!: add `delta` to time.
+; Returns the new time.
+(define (phy-op-monitor-add-time-us! m delta)
+  (let ((cur (m 'time-us)))
+    ((m 'set-time-us!) (+ cur delta))))
+
+; ----------------------------------------------------------------
+; ObSqlAudit — closure-based (request-level)
+; ----------------------------------------------------------------
+
+; make-sql-audit: create a SQL audit record.
+; Args: sql-id (integer), user (symbol), db (symbol),
+;       exec-id (integer), plan-monitor (or #f),
+;       exec-record (or #f), timestamps (or #f)
+; Returns: sql_audit closure.
+(define (make-sql-audit sql-id user db exec-id
+                     plan-monitor exec-record timestamps)
+  (letrec ((set-plan-monitor! (lambda (v) (set! plan-monitor v) v))
+           (set-exec-record! (lambda (v) (set! exec-record v) v))
+           (set-timestamps! (lambda (v) (set! timestamps v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'sql-id) sql-id)
+                     ((eq? msg 'user) user)
+                     ((eq? msg 'db) db)
+                     ((eq? msg 'exec-id) exec-id)
+                     ((eq? msg 'plan-monitor) plan-monitor)
+                     ((eq? msg 'exec-record) exec-record)
+                     ((eq? msg 'timestamps) timestamps)
+                     ((eq? msg 'set-plan-monitor!) set-plan-monitor!)
+                     ((eq? msg 'set-exec-record!) set-exec-record!)
+                     ((eq? msg 'set-timestamps!) set-timestamps!)
+                     (else #f)))))
+      self))
+
+; sql-audit?: is the object a SQL audit?
+; Detected by querying 'sql-id — only audits return integer.
+(define (sql-audit? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'sql-id)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; sql-audit-get-sql-id: get sql id.
+(define (sql-audit-get-sql-id a) (a 'sql-id))
+
+; sql-audit-get-user: get user.
+(define (sql-audit-get-user a) (a 'user))
+
+; sql-audit-get-db: get database.
+(define (sql-audit-get-db a) (a 'db))
+
+; sql-audit-get-exec-id: get exec id.
+(define (sql-audit-get-exec-id a) (a 'exec-id))
+
+; sql-audit-get-plan-monitor: get plan monitor.
+(define (sql-audit-get-plan-monitor a) (a 'plan-monitor))
+
+; sql-audit-get-exec-record: get exec record.
+(define (sql-audit-get-exec-record a) (a 'exec-record))
+
+; sql-audit-get-timestamps: get timestamps.
+(define (sql-audit-get-timestamps a) (a 'timestamps))
+
+; ----------------------------------------------------------------
+; ObSqlStat — closure-based (cumulative)
+; ----------------------------------------------------------------
+
+; make-sql-stat: create a SQL stat record.
+; Args: sql-id (integer), exec-count (integer),
+;       avg-elapsed-us (integer), max-elapsed-us (integer),
+;       min-elapsed-us (integer)
+; Returns: sql_stat closure.
+(define (make-sql-stat sql-id exec-count avg-elapsed-us
+                    max-elapsed-us min-elapsed-us)
+  (letrec ((set-exec-count! (lambda (v) (set! exec-count v) v))
+           (set-avg-elapsed-us! (lambda (v) (set! avg-elapsed-us v) v))
+           (set-max-elapsed-us! (lambda (v) (set! max-elapsed-us v) v))
+           (set-min-elapsed-us! (lambda (v) (set! min-elapsed-us v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'sql-id) sql-id)
+                     ((eq? msg 'exec-count) exec-count)
+                     ((eq? msg 'avg-elapsed-us) avg-elapsed-us)
+                     ((eq? msg 'max-elapsed-us) max-elapsed-us)
+                     ((eq? msg 'min-elapsed-us) min-elapsed-us)
+                     ((eq? msg 'set-exec-count!) set-exec-count!)
+                     ((eq? msg 'set-avg-elapsed-us!) set-avg-elapsed-us!)
+                     ((eq? msg 'set-max-elapsed-us!) set-max-elapsed-us!)
+                     ((eq? msg 'set-min-elapsed-us!) set-min-elapsed-us!)
+                     (else #f)))))
+      self))
+
+; sql-stat?: is the object a SQL stat?
+; Detected by querying 'sql-id — only stats return integer.
+(define (sql-stat? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'sql-id)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; sql-stat-get-sql-id: get sql id.
+(define (sql-stat-get-sql-id s) (s 'sql-id))
+
+; sql-stat-get-exec-count: get execution count.
+(define (sql-stat-get-exec-count s) (s 'exec-count))
+
+; sql-stat-get-avg-elapsed-us: get avg elapsed (microseconds).
+(define (sql-stat-get-avg-elapsed-us s) (s 'avg-elapsed-us))
+
+; sql-stat-get-max-elapsed-us: get max elapsed.
+(define (sql-stat-get-max-elapsed-us s) (s 'max-elapsed-us))
+
+; sql-stat-get-min-elapsed-us: get min elapsed.
+(define (sql-stat-get-min-elapsed-us s) (s 'min-elapsed-us))
+
+; sql-stat-set-exec-count!: set exec count.
+(define (sql-stat-set-exec-count! s v) ((s 'set-exec-count!) v))
+
+; sql-stat-set-avg-elapsed-us!: set avg elapsed.
+(define (sql-stat-set-avg-elapsed-us! s v) ((s 'set-avg-elapsed-us!) v))
+
+; sql-stat-set-max-elapsed-us!: set max elapsed.
+(define (sql-stat-set-max-elapsed-us! s v) ((s 'set-max-elapsed-us!) v))
+
+; sql-stat-inc-exec-count!: increment exec count.
+; Returns the new count.
+(define (sql-stat-inc-exec-count! s)
+  (let ((cur (s 'exec-count)))
+    ((s 'set-exec-count!) (+ cur 1))))
+
+; sql-stat-update-elapsed!: update min/max/avg elapsed with new
+; sample. v1: simple — track min and max, recompute avg.
+; Returns the new count.
+(define (sql-stat-update-elapsed! s sample-us)
+  (let ((cur-count (s 'exec-count))
+        (cur-min (s 'min-elapsed-us))
+        (cur-max (s 'max-elapsed-us))
+        (cur-avg (s 'avg-elapsed-us)))
+    (let* ((new-count (+ cur-count 1))
+           (new-min (min cur-min sample-us))
+           (new-max (max cur-max sample-us))
+           (new-avg (if (= 0 cur-count)
+                       sample-us
+                       (round (/ (+ (* cur-avg cur-count) sample-us) new-count)))))
+      ((s 'set-exec-count!) new-count)
+      ((s 'set-min-elapsed-us!) new-min)
+      ((s 'set-max-elapsed-us!) new-max)
+      ((s 'set-avg-elapsed-us!) new-avg))))
+
+; round: helper for rounding (v1: truncate to int).
+(define (round x) (cond
+  ((positive? x) (truncate (+ x 0.5)))
+  ((negative? x) (- (truncate (- (- x) 0.5))))
+  (#t 0)))
+
+; positive? / negative?: helpers.
+(define (positive? x) (> x 0))
+(define (negative? x) (< x 0))
+; Hmm — `> 0` and `< 0` might not work on all types in aura.
+; Use * and division: positive if x > 0.
+; Actually, let me just use (if (< x 0) ... ...).
+
+; ----------------------------------------------------------------
+; ObMonitorInfoManager — closure-based (FIFO queue)
+; ----------------------------------------------------------------
+
+; make-monitor-info-manager: create a monitor info manager.
+; Args: capacity (integer), infos (list — initially empty)
+; Returns: monitor_info_manager closure.
+(define (make-monitor-info-manager capacity infos)
+  (let ((cap capacity)
+        (info-list infos))
+    (letrec ((set-capacity! (lambda (v) (set! cap v) v))
+             (set-info-list! (lambda (v) (set! info-list v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'capacity) cap)
+                       ((eq? msg 'info-list) info-list)
+                       ((eq? msg 'set-capacity!) set-capacity!)
+                       ((eq? msg 'set-info-list!) set-info-list!)
+                       (else #f)))))
+      self))
+
+; monitor-info-manager?: is the object a monitor info manager?
+; Detected by querying 'capacity — only managers return integer.
+(define (monitor-info-manager? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'capacity)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; monitor-info-manager-get-capacity: get capacity.
+(define (monitor-info-manager-get-capacity m) (m 'capacity))
+
+; monitor-info-manager-set-capacity!: set capacity.
+(define (monitor-info-manager-set-capacity! m v) ((m 'set-capacity!) v))
+
+; monitor-info-manager-add!: add an info.
+; Returns the new count.
+(define (monitor-info-manager-add! m info)
+  (let ((existing (m 'info-list)))
+    ((m 'set-info-list!) (cons info existing))))
+
+; monitor-info-manager-count: count of infos.
+(define (monitor-info-manager-count m)
+  (let loop ((rest (m 'info-list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; monitor-info-manager-get-at: get info at index N.
+; Returns the info or #f.
+(define (monitor-info-manager-get-at m idx)
+  (let loop ((rest (m 'info-list)) (i 0))
+    (cond
+      ((null? rest) #f)
+      ((= i idx) (car rest))
+      (#t (loop (cdr rest) (+ i 1))))))
+
+; monitor-info-manager-evict!: evict until count <= capacity.
+; Returns the number of infos evicted.
+(define (monitor-info-manager-evict! m)
+  (let ((cap (m 'capacity))
+        (cur (monitor-info-manager-count m)))
+    (let ((to-evict (- cur cap)))
+      (if (<= to-evict 0)
+          0
+          (let loop ((n to-evict))
+            (cond
+              ((<= n 0) (- cur (monitor-info-manager-count m)))
+              (else
+               (let* ((info-list (m 'info-list))
+                      (new-list (remove-from-end info-list n)))
+                 (cond
+                   ((null? new-list)
+                    ((m 'set-info-list!) '())
+                    (- cur (monitor-info-manager-count m)))
+                   (#t
+                    ((m 'set-info-list!) new-list)
+                    (loop (- n 1)))))))))))
+
+; remove-from-end: helper — drop last N elements.
+(define (remove-from-end lst n)
+  (cond
+    ((or (<= n 0) (null? lst)) lst)
+    (#t
+     (let ((len (list-length lst)))
+       (cond
+         ((<= len n) '())
+         (else (let ((cut (- len n)))
+                 (cond
+                   ((= cut 0) '())
+                   (#t
+                    (let loop ((rest lst) (i 0) (acc '()))
+                      (cond
+                        ((= i cut) (append (reverse acc) (cdr rest)))
+                        (#t (loop (cdr rest) (+ i 1) (cons (car rest) acc))))))))))))
+
+; list-length: helper.
+(define (list-length lst)
+  (cond
+    ((null? lst) 0)
+    (#t (+ 1 (list-length (cdr lst))))))
+
+; monitor-info-manager-clear!: clear all infos.
+(define (monitor-info-manager-clear! m)
+  ((m 'set-info-list!) '()))
