@@ -1,0 +1,126 @@
+; 038-mlock.aura
+; =====================
+; mlock — minimal capability port to aura.
+;
+; Maps to: Linux kernel memory locking subsystem
+; Source: mm/mlock.c + include/linux/mman.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux mlock prevents pages from being evicted from memory:
+;   - mlock / munlock syscalls (lock/unlock single address range)
+;   - mlockall / munlockall syscalls (lock all pages)
+;   - MCL_FUTURE / MCL_CURRENT flags for mlockall
+;   - VM_LOCKED flag on VMA
+;   - LRU unevictable list for locked pages
+;   - /proc/<pid>/status VmLck field (locked pages count)
+;   - munlock_vma_pages (called when munlock)
+;   - userfaultfd-based mlock for hugepages
+;
+; aura has no VMAs, no LRU, no unevictable list. v1 ships:
+;   - make-mm-lock (locked-pages count, MCL_FUTURE flag)
+;   - mlock-page / munlock-page (count tracking)
+;   - mlockall (set MCL_FUTURE) / munlockall (clear MCL_FUTURE)
+;   - mm-lock-locked-pages / mm-lock-mcl-future?
+;   - mm-lock? predicate
+;
+; Deferred (full Linux mlock):
+;   - real mlock/munlock syscall with VMA walk
+;   - VM_LOCKED flag setting on VMAs
+;   - LRU unevictable list management
+;   - munlock_vma_pages_all
+;   - rlimit locking (RLIMIT_MEMLOCK)
+;   - mlock charge accounting
+;   - hugepage mlock handling
+;   - cgroup memory.mlock_pages_in
+
+(export
+  make-mm-lock
+  mm-lock?
+  mm-lock-locked-pages
+  mm-lock-mcl-future?
+  mlock-page
+  munlock-page
+  mlockall
+  munlockall
+  mm-lock-reset)
+
+; ----------------------------------------------------------------
+; mm_lock — closure-based, mutable state via letrec setters
+; ----------------------------------------------------------------
+
+; make-mm-lock: create a per-process mm_lock.
+; Returns: mm_lock closure (initial: 0 locked pages, MCL_FUTURE off).
+(define (make-mm-lock)
+  (let ((locked-pages 0)
+        (mcl-future? #f))
+    (letrec ((set-locked-pages! (lambda (v) (set! locked-pages v) v))
+             (set-mcl-future!   (lambda (v) (set! mcl-future? v) v))
+             (inc-locked-pages! (lambda () (set! locked-pages (+ locked-pages 1)) locked-pages))
+             (dec-locked-pages! (lambda () (set! locked-pages (- locked-pages 1)) locked-pages))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'locked-pages) locked-pages)
+                       ((eq? msg 'mcl-future?)   mcl-future?)
+                       ((eq? msg 'set-locked-pages!) set-locked-pages!)
+                       ((eq? msg 'set-mcl-future!)   set-mcl-future!)
+                       ((eq? msg 'inc-locked-pages!) inc-locked-pages!)
+                       ((eq? msg 'dec-locked-pages!) dec-locked-pages!)
+                       (else #f)))))
+      self)))
+
+; mm-lock?: is the object a mm_lock?
+; Detected by querying 'mcl-future? — only mm_lock closures return a
+; boolean for mcl-future?.
+(define (mm-lock? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mcl-future?)))
+        (if (or (eq? m #t) (eq? m #f)) #t #f))
+      #f))
+
+; mm-lock-locked-pages: get current locked pages count
+(define (mm-lock-locked-pages mml) (mml 'locked-pages))
+
+; mm-lock-mcl-future?: is MCL_FUTURE set?
+(define (mm-lock-mcl-future? mml) (mml 'mcl-future?))
+
+; mm-lock-reset: reset all mm_lock state to 0 / off.
+; Returns the new locked-pages count.
+(define (mm-lock-reset mml)
+  ((mml 'set-locked-pages!) 0)
+  ((mml 'set-mcl-future!) #f))
+
+; ----------------------------------------------------------------
+; mlock / munlock
+; ----------------------------------------------------------------
+
+; mlock-page: simulate mlock of one page.
+; Increments locked-pages count.
+; Returns the new locked-pages count.
+(define (mlock-page mml)
+  ((mml 'inc-locked-pages!)))
+
+; munlock-page: simulate munlock of one page.
+; Decrements locked-pages count (clamped at 0).
+; Returns the new locked-pages count.
+(define (munlock-page mml)
+  (let ((current (mml 'locked-pages)))
+    (if (= current 0)
+        0
+        ((mml 'dec-locked-pages!)))))
+
+; ----------------------------------------------------------------
+; mlockall / munlockall
+; ----------------------------------------------------------------
+
+; mlockall: set MCL_FUTURE flag (lock all pages touched from now on).
+; Returns the new mcl-future? state.
+(define (mlockall mml)
+  ((mml 'set-mcl-future!) #t))
+
+; munlockall: clear MCL_FUTURE flag.
+; Resets locked-pages to 0.
+; Returns the new mcl-future? state.
+(define (munlockall mml)
+  ((mml 'set-mcl-future!) #f)
+  ((mml 'set-locked-pages!) 0))

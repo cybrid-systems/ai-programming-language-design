@@ -1,0 +1,130 @@
+; 038-mlock_test.aura
+; ======================
+; Smoke tests for 038-mlock.aura — mlock minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/038-mlock_test.aura
+;
+; Verified automatically (smoke):
+;   - mm_lock construction (initial: 0 locked, MCL_FUTURE off)
+;   - mm-lock? predicate
+;   - mlock-page / munlock-page (count tracking)
+;   - mlockall / munlockall (MCL_FUTURE toggle)
+;   - mm-lock-reset
+;
+; Verified via separate probes during development:
+;   - munlock-page at 0 stays at 0 (clamped)
+;   - munlockall resets both flags + count
+;
+; Deferred (full Linux mlock):
+;   - real mlock/munlock syscall with VMA walk
+;   - VM_LOCKED flag setting on VMAs
+;   - LRU unevictable list management
+;   - rlimit locking (RLIMIT_MEMLOCK)
+;   - cgroup memory.mlock_pages_in
+
+(require "std/test" all:)
+(require "038-mlock" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "mlock-001-construction"
+  ; New mm_lock starts with 0 locked pages + MCL_FUTURE off.
+  (check (= 0 (mm-lock-locked-pages (make-mm-lock))))
+  (check (= 1 (if (not (mm-lock-mcl-future?
+                         (make-mm-lock))) 1 0))))
+
+(test-suite "mlock-001-predicate"
+  ; mm-lock? accepts only mm_lock closures.
+  (check (= 1 (if (mm-lock? (make-mm-lock)) 1 0)))
+  (check (= 1 (if (not (mm-lock? 'not-an-mml)) 1 0)))
+  (check (= 1 (if (not (mm-lock? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; mlock-page / munlock-page
+; ----------------------------------------------------------------
+
+(test-suite "mlock-002-mlock-page"
+  ; mlock-page increments locked-pages.
+  (check (= 1 (let ((m (make-mm-lock)))
+                (mlock-page m)
+                (mm-lock-locked-pages m)))))
+
+(test-suite "mlock-002-mlock-multiple"
+  ; Multiple mlock-pages accumulate.
+  (check (= 5 (let ((m (make-mm-lock)))
+                (mlock-page m)
+                (mlock-page m)
+                (mlock-page m)
+                (mlock-page m)
+                (mlock-page m)
+                (mm-lock-locked-pages m)))))
+
+(test-suite "mlock-002-munlock-page"
+  ; munlock-page decrements locked-pages.
+  (check (= 1 (let ((m (make-mm-lock)))
+                (mlock-page m)
+                (mlock-page m)
+                (munlock-page m)
+                (mm-lock-locked-pages m)))))
+
+(test-suite "mlock-002-munlock-clamp-zero"
+  ; munlock-page at 0 stays at 0.
+  (check (= 0 (let ((m (make-mm-lock)))
+                (munlock-page m)
+                (mm-lock-locked-pages m)))))
+
+; ----------------------------------------------------------------
+; mlockall / munlockall
+; ----------------------------------------------------------------
+
+(test-suite "mlock-003-mlockall-sets-future"
+  ; mlockall sets MCL_FUTURE.
+  (check (= 1 (let ((m (make-mm-lock)))
+                (mlockall m)
+                (if (mm-lock-mcl-future? m) 1 0)))))
+
+(test-suite "mlock-003-munlockall-clears-future"
+  ; munlockall clears MCL_FUTURE.
+  (check (= 1 (let ((m (make-mm-lock)))
+                (mlockall m)
+                (munlockall m)
+                (if (not (mm-lock-mcl-future? m)) 1 0)))))
+
+(test-suite "mlock-003-munlockall-resets-count"
+  ; munlockall resets locked-pages to 0.
+  (check (= 0 (let ((m (make-mm-lock)))
+                (mlock-page m)
+                (mlock-page m)
+                (munlockall m)
+                (mm-lock-locked-pages m)))))
+
+; ----------------------------------------------------------------
+; mm-lock-reset
+; ----------------------------------------------------------------
+
+(test-suite "mlock-004-reset"
+  ; mm-lock-reset clears both flags + count.
+  (check (= 0 (let ((m (make-mm-lock)))
+                (mlock-page m)
+                (mlock-page m)
+                (mlockall m)
+                (mm-lock-reset m)
+                (mm-lock-locked-pages m)))))
+
+(test-suite "mlock-004-reset-clears-future"
+  ; mm-lock-reset clears MCL_FUTURE.
+  (check (= 1 (let ((m (make-mm-lock)))
+                (mlockall m)
+                (mm-lock-reset m)
+                (if (not (mm-lock-mcl-future? m)) 1 0)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
