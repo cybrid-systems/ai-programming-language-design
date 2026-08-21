@@ -1,0 +1,141 @@
+; 032-audit.aura
+; =====================
+; audit — minimal capability port to aura.
+;
+; Maps to: Linux kernel audit subsystem
+; Source: kernel/audit.c + include/linux/audit.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux audit subsystem records security-relevant events:
+;   - struct audit_buffer (in-flight audit record)
+;   - struct audit_context (per-task audit state)
+;   - audit_log_start / audit_log_format / audit_log_end (record build)
+;   - audit_log (emit a one-off message)
+;   - Event types: AUDIT_LOGIN, AUDIT_LOGOUT, AUDIT_SYSCALL,
+;     AUDIT_FILE_ACCESS, AUDIT_CONFIG_CHANGE, AUDIT_ANOM_ABEND, etc.
+;   - Audit rules: audit_add_rule / audit_del_rule
+;   - netlink transport to auditd userspace daemon
+;
+; aura has no kernel events, no netlink, no userspace. v1 ships:
+;   - make-audit-buffer (factory: event-type, data, finalized?)
+;   - audit-buffer? / audit-event-type / audit-buffer-data
+;   - audit-log-start (create new buffer)
+;   - audit-log-format (append a formatted string)
+;   - audit-log-end (finalize + return count)
+;   - audit-event-count (total events emitted)
+;   - Event symbols: 'login / 'logout / 'syscall / 'file-access /
+;     'config-change / 'anom-abend
+;
+; Deferred (full Linux audit):
+;   - real netlink transport to auditd
+;   - audit rule matching (syscall, path, etc.)
+;   - per-task audit_context
+;   - audit syscall entry/exit hooks
+;   - audit watch list (filesystem inotify-style)
+;   - audit panic / failure modes (auditing=0/1/2)
+
+(export
+  make-audit-buffer
+  audit-buffer?
+  audit-event-type
+  audit-buffer-data
+  audit-buffer-finalized?
+  audit-log-start
+  audit-log-format
+  audit-log-end
+  audit-event-count
+  audit-reset
+  'login
+  'logout
+  'syscall
+  'file-access
+  'config-change
+  'anom-abend)
+
+; ----------------------------------------------------------------
+; audit_buffer — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-audit-buffer: create an audit buffer for an event type.
+; Args: event-type (symbol)
+; Returns: audit_buffer closure (initial: empty data, not finalized).
+(define (make-audit-buffer event-type)
+  (let ((data '())
+        (finalized? #f))
+    (letrec ((set-data!       (lambda (v) (set! data v) v))
+             (set-finalized!  (lambda (v) (set! finalized? v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'event-type) event-type)
+                       ((eq? msg 'data) data)
+                       ((eq? msg 'finalized?) finalized?)
+                       ((eq? msg 'set-data!) set-data!)
+                       ((eq? msg 'set-finalized!) set-finalized!)
+                       (else #f)))))
+      self)))
+
+; audit-buffer?: is the object an audit buffer?
+; Detected by querying 'finalized? — only audit_buffer closures
+; return a boolean.
+(define (audit-buffer? obj)
+  (if (procedure? obj)
+      (let ((f (obj 'finalized?)))
+        (if (or (eq? f #t) (eq? f #f)) #t #f))
+      #f))
+
+; audit-event-type: get buffer's event type symbol
+(define (audit-event-type buf) (buf 'event-type))
+
+; audit-buffer-data: get buffer's accumulated formatted data
+(define (audit-buffer-data buf) (buf 'data))
+
+; audit-buffer-finalized?: has the buffer been finalized?
+(define (audit-buffer-finalized? buf) (buf 'finalized?))
+
+; ----------------------------------------------------------------
+; Event counter — closure-based, mutable via letrec setter
+; ----------------------------------------------------------------
+
+; make-audit-counter: empty counter.
+(define (make-audit-counter)
+  (let ((count 0))
+    (letrec ((set-count! (lambda (v) (set! count v) v))
+             (inc!       (lambda () (set! count (+ count 1)) count))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'count) count)
+                       ((eq? msg 'set-count!) set-count!)
+                       ((eq? msg 'inc!) inc!)
+                       (else #f)))))
+      self)))
+
+; Global event counter
+(define g-audit-counter (make-audit-counter))
+
+; audit-event-count: total events emitted since boot
+(define (audit-event-count) (g-audit-counter 'count))
+
+; audit-reset: reset event counter to 0 (for testing)
+(define (audit-reset)
+  ((g-audit-counter 'set-count!) 0))
+
+; ----------------------------------------------------------------
+; Audit log API
+; ----------------------------------------------------------------
+
+; audit-log-start: begin building an audit record for event-type.
+; Returns a new audit_buffer.
+(define (audit-log-start event-type)
+  (make-audit-buffer event-type))
+
+; audit-log-format: append a formatted string to buffer.
+; Returns the new data list.
+(define (audit-log-format buf str)
+  ((buf 'set-data!) (cons str (buf 'data))))
+
+; audit-log-end: finalize buffer + increment event counter.
+; Returns the new total event count.
+(define (audit-log-end buf)
+  ((buf 'set-finalized!) #t)
+  ((g-audit-counter 'inc!)))

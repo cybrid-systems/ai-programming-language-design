@@ -1,0 +1,115 @@
+; 032-audit_test.aura
+; ======================
+; Smoke tests for 032-audit.aura — audit subsystem minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/032-audit_test.aura
+;
+; Verified automatically (smoke):
+;   - audit-log-start creates buffer with event-type
+;   - audit-buffer? predicate
+;   - audit-log-format appends data
+;   - audit-log-end finalizes + increments counter
+;   - audit-event-count tracks total
+;   - audit-reset
+;
+; Verified via separate probes during development:
+;   - Multiple log-start + format + end sequences accumulate
+;   - Buffer finalized state transitions #f → #t
+;
+; Deferred (full Linux audit):
+;   - real netlink transport to auditd
+;   - audit rule matching
+;   - per-task audit_context
+;   - audit syscall hooks
+
+(require "std/test" all:)
+(require "032-audit" all:)
+
+; ----------------------------------------------------------------
+; Buffer construction + predicate
+; ----------------------------------------------------------------
+
+; Reset counter at file load so test counts are deterministic.
+(audit-reset)
+
+(test-suite "audit-001-start"
+  ; audit-log-start creates buffer with event-type, empty data, not finalized.
+  (check (= 'login (audit-event-type (audit-log-start 'login))))
+  (check (= 1 (if (not (audit-buffer-finalized?
+                         (audit-log-start 'login))) 1 0)))
+  (check (= 1 (if (null? (audit-buffer-data
+                            (audit-log-start 'login))) 1 0))))
+
+(test-suite "audit-001-predicate"
+  ; audit-buffer? accepts only audit_buffer closures.
+  (check (= 1 (if (audit-buffer? (audit-log-start 'login)) 1 0)))
+  (check (= 1 (if (not (audit-buffer? 'not-a-buffer)) 1 0)))
+  (check (= 1 (if (not (audit-buffer? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Format + end
+; ----------------------------------------------------------------
+
+(test-suite "audit-002-format"
+  ; audit-log-format appends to buffer data.
+  (check (= 1 (let ((buf (audit-log-start 'login)))
+                (audit-log-format buf "uid=1000")
+                (if (null? (audit-buffer-data buf)) 0 1)))))
+
+(test-suite "audit-002-format-multiple"
+  ; Multiple formats accumulate (reversed order due to cons).
+  (check (= 3 (let ((buf (audit-log-start 'syscall)))
+                (audit-log-format buf "a")
+                (audit-log-format buf "b")
+                (audit-log-format buf "c")
+                (length (audit-buffer-data buf))))))
+
+(test-suite "audit-002-end-finalizes"
+  ; audit-log-end sets finalized? to #t.
+  (check (= 1 (let ((buf (audit-log-start 'login)))
+                (audit-log-end buf)
+                (if (audit-buffer-finalized? buf) 1 0)))))
+
+; ----------------------------------------------------------------
+; Counter
+; ----------------------------------------------------------------
+
+(test-suite "audit-003-count-start"
+  ; audit-event-count starts at 0 after reset.
+  (check (= 0 (audit-event-count))))
+
+(test-suite "audit-003-count-after-end"
+  ; audit-log-end increments counter.
+  (check (= 1 (let ((buf (audit-log-start 'login)))
+                (audit-log-end buf)
+                (audit-event-count)))))
+
+(test-suite "audit-003-count-multiple"
+  ; Multiple log-end calls accumulate.
+  (check (= 3 (begin
+                (audit-reset)
+                (audit-log-end (audit-log-start 'login))
+                (audit-log-end (audit-log-start 'logout))
+                (audit-log-end (audit-log-start 'syscall))
+                (audit-event-count)))))
+
+; ----------------------------------------------------------------
+; Reset
+; ----------------------------------------------------------------
+
+(test-suite "audit-004-reset"
+  ; audit-reset zeros the counter.
+  (check (= 0 (begin
+                (audit-log-end (audit-log-start 'login))
+                (audit-log-end (audit-log-start 'syscall))
+                (audit-reset)
+                (audit-event-count)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
