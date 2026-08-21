@@ -1,0 +1,291 @@
+; 28-gts-time-model_test.aura
+; ======================
+; Smoke tests for 28-gts-time-model.aura — GTS + SCN minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/28-gts-time-model_test.aura
+;
+; Verified automatically (smoke):
+;   - 4 SCN constants distinct
+;   - 2 GTS-REQUEST-TYPE + 3 GTS-STATUS constants distinct
+;   - make-scn + accessors + set + inc-update + dec-update
+;   - make-monotonic-ts + accessors + inc!
+;   - make-gts-source + accessors + inc-monotonic!
+;   - make-gts-local-cache + accessors + update!
+;   - make-ts-mgr + accessors + add-source + find-source
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - SCN comparison and atomic update work correctly
+;   - Cache update from gts + srr works
+;
+; Deferred (full OceanBase GTS + Time model):
+;   - real ObTsMgr with 200+ files
+;   - real ObGtsSource with GET_GTS + WAIT_GTS queues
+;   - real ObGTSLocalCache with thread-local cache
+;   - real ObIDService for SCN allocation
+;   - real MonotonicTs with hardware-clock + atomics
+;   - real SCN with full bitfield (62-bit ts_ns + 2-bit v)
+;   - real atomic CAS operations (atomic_bcas / atomic_vcas)
+;   - real ObIDService::persist_and_log
+;   - real multi-tenant GTS routing
+
+(require "std/test" all:)
+(require "28-gts-time-model" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "28-001-scn-constants-distinct"
+  ; 4 SCN constants are distinct.
+  (check (= 1 (if (not (= (scn-min-val) (scn-base-val))) 1 0)))
+  (check (= 1 (if (not (= (scn-base-val) (scn-max-val))) 1 0)))
+  (check (= 1 (if (not (= (scn-max-val) (scn-invalid-val))) 1 0)))
+  (check (= 1 (if (not (= (scn-min-val) (scn-max-val))) 1 0))))
+
+(test-suite "28-001-gts-request-type-distinct"
+  ; 2 GTS-REQUEST-TYPE constants are distinct.
+  (check (= 1 (if (not (= GTS-REQUEST-TYPE-GET-GTS
+                          GTS-REQUEST-TYPE-WAIT-GTS)) 1 0))))
+
+(test-suite "28-001-gts-status-distinct"
+  ; 3 GTS-STATUS constants are distinct.
+  (check (= 1 (if (not (= GTS-STATUS-IDLE GTS-STATUS-BUSY)) 1 0)))
+  (check (= 1 (if (not (= GTS-STATUS-BUSY GTS-STATUS-ERROR)) 1 0)))
+  (check (= 1 (if (not (= GTS-STATUS-IDLE GTS-STATUS-ERROR)) 1 0))))
+
+; ----------------------------------------------------------------
+; SCN
+; ----------------------------------------------------------------
+
+(test-suite "28-002-scn-construction"
+  ; scn preserves fields.
+  (check (= 1000 (scn-get-val (make-scn 1000 0))))
+  (check (= 0 (scn-get-version (make-scn 1000 0))))
+
+(test-suite "28-002-scn-predicate"
+  ; scn? accepts only scns.
+  (check (= #t (scn? (make-scn 0 0))))
+  (check (= #f (scn? 'not-scn)))
+  (check (= #f (scn? 42)))
+
+(test-suite "28-003-scn-equal"
+  ; scn-equal? checks val.
+  (check (= #t (let ((a (make-scn 100 0))
+                      (b (make-scn 100 0)))
+                 (scn-equal? a b))))
+  (check (= #f (let ((a (make-scn 100 0))
+                      (b (make-scn 200 0)))
+                 (scn-equal? a b))))
+
+(test-suite "28-003-scn-less"
+  ; scn-less? checks val comparison.
+  (check (= #t (let ((a (make-scn 100 0))
+                      (b (make-scn 200 0)))
+                 (scn-less? a b))))
+  (check (= #f (let ((a (make-scn 200 0))
+                      (b (make-scn 100 0)))
+                 (scn-less? a b))))
+
+(test-suite "28-003-scn-set"
+  ; set-val! / set-ts-ns! / set-version! update.
+  (check (= 500 (let ((s (make-scn 100 0)))
+                 (scn-set-val! s 500)
+                 (scn-get-val s))))
+
+(test-suite "28-004-scn-inc-update"
+  ; inc-update! takes max of self and ref.
+  (check (= 200 (let ((a (make-scn 100 0))
+                      (b (make-scn 200 0)))
+                 (scn-inc-update! a b)
+                 (scn-get-val a))))
+  (check (= 100 (let ((a (make-scn 100 0))
+                      (b (make-scn 50 0)))
+                 (scn-inc-update! a b)
+                 (scn-get-val a))))
+
+(test-suite "28-004-scn-dec-update"
+  ; dec-update! takes min of self and ref.
+  (check (= 50 (let ((a (make-scn 100 0))
+                     (b (make-scn 50 0)))
+                 (scn-dec-update! a b)
+                 (scn-get-val a))))
+  (check (= 100 (let ((a (make-scn 100 0))
+                      (b (make-scn 200 0)))
+                 (scn-dec-update! a b)
+                 (scn-get-val a))))
+
+; ----------------------------------------------------------------
+; MonotonicTs
+; ----------------------------------------------------------------
+
+(test-suite "28-005-mts-construction"
+  ; mts preserves fields.
+  (check (= 1000 (monotonic-ts-get-value
+                   (make-monotonic-ts 1000 5))))
+  (check (= 5 (monotonic-ts-get-last-rr-id
+                (make-monotonic-ts 1000 5))))
+
+(test-suite "28-005-mts-predicate"
+  ; monotonic-ts? accepts only mts.
+  (check (= #t (monotonic-ts? (make-monotonic-ts 0 0))))
+  (check (= #f (monotonic-ts? 'not-mts)))
+  (check (= #f (monotonic-ts? 42)))
+
+(test-suite "28-005-mts-set"
+  ; set-value! / set-last-rr-id! update.
+  (check (= 500 (let ((m (make-monotonic-ts 100 5)))
+                 (monotonic-ts-set-value! m 500)
+                 (monotonic-ts-get-value m))))
+  (check (= 99 (let ((m (make-monotonic-ts 100 5)))
+                 (monotonic-ts-set-last-rr-id! m 99)
+                 (monotonic-ts-get-last-rr-id m))))
+
+(test-suite "28-006-mts-inc"
+  ; inc! increments value.
+  (check (= 1 (let ((m (make-monotonic-ts 0 0)))
+                 (monotonic-ts-inc! m)
+                 (monotonic-ts-get-value m))))
+  (check (= 5 (let ((m (make-monotonic-ts 0 0)))
+                 (monotonic-ts-inc! m)
+                 (monotonic-ts-inc! m)
+                 (monotonic-ts-inc! m)
+                 (monotonic-ts-inc! m)
+                 (monotonic-ts-inc! m)
+                 (monotonic-ts-get-value m))))
+
+; ----------------------------------------------------------------
+; ObGtsSource
+; ----------------------------------------------------------------
+
+(test-suite "28-007-gts-source-construction"
+  ; gts-source preserves fields.
+  (check (= 1004 (gts-source-get-tenant-id
+                   (make-gts-source 1004 1234 5000
+                     (make-monotonic-ts 0 0)))))
+  (check (= 1234 (gts-source-get-srr
+                 (make-gts-source 1004 1234 5000
+                   (make-monotonic-ts 0 0)))))
+  (check (= 5000 (gts-source-get-gts
+                 (make-gts-source 1004 1234 5000
+                   (make-monotonic-ts 0 0)))))
+
+(test-suite "28-007-gts-source-predicate"
+  ; gts-source? accepts only gts sources.
+  (check (= #t (gts-source?
+                 (make-gts-source 1 0 0 (make-monotonic-ts 0 0)))))
+  (check (= #f (gts-source? 'not-gts)))
+  (check (= #f (gts-source? 42)))
+
+(test-suite "28-007-gts-source-set"
+  ; set-srr! / set-gts! update.
+  (check (= 9999 (let ((s (make-gts-source 1 0 0
+                                  (make-monotonic-ts 0 0))))
+                  (gts-source-set-srr! s 9999)
+                  (gts-source-get-srr s))))
+
+(test-suite "28-008-gts-source-inc-monotonic"
+  ; inc-monotonic! increments the embedded monotonic ts.
+  (check (= 1 (let ((s (make-gts-source 1 0 0
+                                 (make-monotonic-ts 100 0))))
+                 (gts-source-inc-monotonic! s)
+                 (monotonic-ts-get-value (s 'monotonic)))))
+
+; ----------------------------------------------------------------
+; ObGTSLocalCache
+; ----------------------------------------------------------------
+
+(test-suite "28-009-cache-construction"
+  ; gts-local-cache preserves fields.
+  (check (= 1004 (gts-local-cache-get-tenant-id
+                   (make-gts-local-cache 1004 1234 5000 1100))))
+  (check (= 1234 (gts-local-cache-get-srr
+                 (make-gts-local-cache 1004 1234 5000 1100))))
+  (check (= 5000 (gts-local-cache-get-gts
+                 (make-gts-local-cache 1004 1234 5000 1100))))
+  (check (= 1100 (gts-local-cache-get-latest-srr
+                 (make-gts-local-cache 1004 1234 5000 1100))))
+
+(test-suite "28-009-cache-predicate"
+  ; gts-local-cache? accepts only caches.
+  (check (= #t (gts-local-cache?
+                 (make-gts-local-cache 1 0 0 0))))
+  (check (= #f (gts-local-cache? 'not-cache)))
+  (check (= #f (gts-local-cache? 42)))
+
+(test-suite "28-010-cache-update"
+  ; update! sets both gts and latest-srr.
+  (check (= #t (let ((cache (make-gts-local-cache 1 0 0 0)))
+                 (gts-local-cache-update! cache 5000 1200)
+                 (and (= 5000 (gts-local-cache-get-gts cache))
+                      (= 1200 (gts-local-cache-get-latest-srr cache))))))
+
+(test-suite "28-010-cache-setters"
+  ; set-srr! / set-gts! / set-latest-srr! update.
+  (check (= 777 (let ((c (make-gts-local-cache 1 0 0 0)))
+                 (gts-local-cache-set-srr! c 777)
+                 (gts-local-cache-get-srr c))))
+  (check (= 888 (let ((c (make-gts-local-cache 1 0 0 0)))
+                 (gts-local-cache-set-gts! c 888)
+                 (gts-local-cache-get-gts c))))
+  (check (= 999 (let ((c (make-gts-local-cache 1 0 0 0)))
+                 (gts-local-cache-set-latest-srr! c 999)
+                 (gts-local-cache-get-latest-srr c))))
+
+; ----------------------------------------------------------------
+; ObTsMgr
+; ----------------------------------------------------------------
+
+(test-suite "28-011-ts-mgr-construction"
+  ; ts-mgr preserves fields.
+  (check (= 1004 (ts-mgr-get-tenant-id
+                   (make-ts-mgr 1004 '()))))
+  (check (= 0 (ts-mgr-count-sources
+               (make-ts-mgr 1004 '()))))
+
+(test-suite "28-011-ts-mgr-predicate"
+  ; ts-mgr? accepts only managers.
+  (check (= #t (ts-mgr? (make-ts-mgr 1 '()))))
+  (check (= #f (ts-mgr? 'not-mgr)))
+  (check (= #f (ts-mgr? 42)))
+
+(test-suite "28-012-ts-mgr-add-source"
+  ; add-source! increases count.
+  (check (= 1 (let ((m (make-ts-mgr 1 '()))
+                    (s (make-gts-source 1 0 0
+                                  (make-monotonic-ts 0 0))))
+                (ts-mgr-add-source! m s)
+                (ts-mgr-count-sources m))))
+
+(test-suite "28-012-ts-mgr-add-multiple"
+  ; Multiple adds accumulate.
+  (check (= 3 (let ((m (make-ts-mgr 1 '())))
+                (ts-mgr-add-source! m
+                  (make-gts-source 1 0 0 (make-monotonic-ts 0 0)))
+                (ts-mgr-add-source! m
+                  (make-gts-source 2 0 0 (make-monotonic-ts 0 0)))
+                (ts-mgr-add-source! m
+                  (make-gts-source 3 0 0 (make-monotonic-ts 0 0)))
+                (ts-mgr-count-sources m))))
+
+(test-suite "28-012-ts-mgr-find-source"
+  ; find-source returns the source with matching tenant-id.
+  (check (= #t (let ((m (make-ts-mgr 1 '()))
+                    (s1 (make-gts-source 100 0 0 (make-monotonic-ts 0 0)))
+                    (s2 (make-gts-source 200 0 0 (make-monotonic-ts 0 0))))
+                (ts-mgr-add-source! m s1)
+                (ts-mgr-add-source! m s2)
+                (eq? s1 (ts-mgr-find-source m 100)))))
+
+(test-suite "28-012-ts-mgr-find-missing"
+  ; find-source returns #f for unknown tenant-id.
+  (check (= #f (ts-mgr-find-source (make-ts-mgr 1 '()) 999)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
