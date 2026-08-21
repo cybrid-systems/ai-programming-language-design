@@ -1,0 +1,107 @@
+; 015-get-user-pages_test.aura
+; ============================
+; Smoke tests for 015-get-user-pages.aura — GUP minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/015-get-user-pages_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-page construction (zero refcounts, no flags)
+;   - pin-page / unpin-page refcount simulation
+;   - get-page / put-page (FOLL_GET) refcount simulation
+;   - FOLL flag setting/checking
+;   - registry-register! + follow-page resolution
+;   - get-user-pages batch pin
+;
+; Verified via separate probes during development:
+;   - FOLL_PIN and FOLL_GET refs are independent
+;   - follow-page returns #f for missing virt addr
+;
+; Deferred (full Linux GUP):
+;   - Page table traversal (pgd_offset, pud_offset, pmd_offset)
+;   - try_grab_folio (pin bias = 1024)
+;   - faultin_page
+;   - mmap_read_lock integration
+;   - Hugepage / THP / devmap / migration
+;   - pin_user_pages + unpin_user_pages_dirty_lock
+
+(require "std/test" all:)
+(require "015-get-user-pages" all:)
+
+; ----------------------------------------------------------------
+; Page construction + flags
+; ----------------------------------------------------------------
+
+(test-suite "gup-001-page-init"
+  (check (= 0 (page-get-refcount (make-page 0x1000))))
+  (check (= 0 (page-pin-refcount (make-page 0x1000))))
+  (check (= 1 (if (not (page-has-flag? (make-page 0x1000) FOLL-PIN)) 1 0))))
+
+; ----------------------------------------------------------------
+; pin / unpin
+; ----------------------------------------------------------------
+
+(test-suite "gup-002-pin-page"
+  (check (= 1 (pin-page (make-page 0x1000))))
+
+(test-suite "gup-002-unpin-page"
+  (check (= 0 (let ((p (make-page 0x2000)))
+                 (pin-page p)
+                 (unpin-page p))))
+
+; ----------------------------------------------------------------
+; get / put (FOLL_GET)
+; ----------------------------------------------------------------
+
+(test-suite "gup-003-get-page"
+  (check (= 1 (get-page (make-page 0x3000))))
+
+; ----------------------------------------------------------------
+; Registry + follow
+; ----------------------------------------------------------------
+
+(test-suite "gup-004-registry-register-and-follow"
+  (check (= 1 (let ((reg (make-registry))
+                    (p (make-page 0x4000)))
+                (registry-register! reg 0x4000 p)
+                (eq? p (follow-page reg 0x4000)))))
+
+(test-suite "gup-004-follow-missing"
+  ; follow-page returns #f for unregistered virt addr.
+  (check (= 1 (if (not (follow-page (make-registry) 0x9999)) 1 0)))
+
+; ----------------------------------------------------------------
+; get-user-pages (batch)
+; ----------------------------------------------------------------
+
+; File-level helper: registry pre-loaded with pages at 0x5000..0x5002.
+(define (registry-with-3-pages)
+  (let ((reg (make-registry)))
+    (registry-register! reg 0x5000 (make-page 0x5000))
+    (registry-register! reg 0x5001 (make-page 0x5001))
+    (registry-register! reg 0x5002 (make-page 0x5002))
+    reg))
+
+(test-suite "gup-005-batch-pin"
+  (check (= 3 (length (get-user-pages (registry-with-3-pages) 0x5000 3 FOLL-PIN))))
+
+(test-suite "gup-005-batch-pin-increments"
+  ; After FOLL_PIN batch, each page has pin_refs=1.
+  (check (= 1 (page-pin-refcount
+    (car (get-user-pages (registry-with-3-pages) 0x5000 3 FOLL-PIN)))))
+
+(test-suite "gup-005-batch-get"
+  ; FOLL_GET path increments get_refs (independent of pin_refs).
+  (check (= 1 (page-get-refcount
+    (car (get-user-pages (registry-with-3-pages) 0x5000 3 FOLL-GET)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

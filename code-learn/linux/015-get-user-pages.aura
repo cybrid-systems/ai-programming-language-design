@@ -1,0 +1,200 @@
+; 015-get-user-pages.aura
+; ===============================
+; Get User Pages (GUP) — minimal capability port to aura.
+;
+; Maps to: 015-get-user-pages-analysis.md
+; Source: mm/gup.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux GUP is a multi-path virt→page resolver with refcount management:
+;   - __get_user_pages main loop (find_vma + follow_page_mask + faultin_page)
+;   - FOLL_GET (legacy get_page/put_page) vs FOLL_PIN (independent pin count)
+;   - try_grab_folio (refcount manipulation)
+;   - mmap_read_lock integration
+;   - Hugepage / THP / devmap / migration handling
+;   - 157 symbols in mm/gup.c
+;
+; aura has no MMU, no page tables, no mmap_lock, no atomic refcount.
+; v1 ships the page abstraction + pin/unpin refcount simulation + FOLL_* flag tracking:
+;   - make-page (closure with virt_addr, get-refs, pin-refs, flags)
+;   - page-virt-addr / page-get-refcount / page-pin-refcount
+;   - page-set-flag! / page-has-flag?
+;   - make-registry (closure-backed virt → page lookup)
+;   - registry-register! / follow-page (resolution)
+;   - pin-page / unpin-page (FOLL_PIN refcount)
+;   - get-page / put-page (FOLL_GET refcount)
+;   - get-user-pages (batch pin via registry)
+;   - FOLL_GET / FOLL_PIN / FOLL_WRITE / FOLL_FORCE / FOLL_TOUCHED / FOLL_MIGRATION flags
+;
+; Note: we don't use aura's `hash` because #3235 — `hash-set!` crashes. The
+; registry is a closure with a list-of-pairs store.
+;
+; Deferred (full Linux GUP, separate issues):
+;   - Page table traversal (pgd_offset, pud_offset, pmd_offset)
+;   - try_grab_folio (full refcount logic with pin bias = 1024)
+;   - faultin_page (handle faults on missing pages)
+;   - mmap_read_lock integration
+;   - Hugepage / THP / devmap / migration
+;   - pin_user_pages + unpin_user_pages_dirty_lock (batch variants)
+;   - DMA / O_DIRECT integration
+
+(export
+  ; Page
+  make-page
+  page-virt-addr
+  page-get-refcount
+  page-pin-refcount
+  page-set-flag!
+  page-has-flag?
+  ; Registry (virt → page)
+  make-registry
+  registry-register!
+  follow-page
+  ; Pin/unpin
+  pin-page
+  unpin-page
+  ; Get/put (legacy)
+  get-page
+  put-page
+  ; Batch
+  get-user-pages
+  ; Flags
+  FOLL-GET
+  FOLL-PIN
+  FOLL-WRITE
+  FOLL-FORCE
+  FOLL-TOUCHED
+  FOLL-MIGRATION)
+
+; FOLL_* flag bit positions (analogous to Linux include/linux/mm.h)
+(define FOLL-GET       1)   ; bit 0
+(define FOLL-PIN       2)   ; bit 1
+(define FOLL-WRITE     4)   ; bit 2
+(define FOLL-FORCE     8)   ; bit 3
+(define FOLL-TOUCHED  16)   ; bit 4
+(define FOLL-MIGRATION 32)  ; bit 5
+
+; ----------------------------------------------------------------
+; Page (closure with virt_addr + refcounts + flags)
+; ----------------------------------------------------------------
+
+; Make a page at the given virtual address. Initially unpinned.
+(define (make-page virt-addr)
+  (let ((virt virt-addr)
+        (get-refs 0)              ; legacy get_page refcount
+        (pin-refs 0)              ; pin refcount (independent of get-refs)
+        (flags 0))                ; bitfield of page-level flags
+    (letrec ((set-flags! (lambda (v) (set! flags v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'virt) virt)
+                       ((eq? msg 'get-refs) get-refs)
+                       ((eq? msg 'pin-refs) pin-refs)
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'set-flags!) set-flags!)
+                       ((eq? msg 'inc-get!) (begin (set! get-refs (+ get-refs 1)) get-refs))
+                       ((eq? msg 'dec-get!) (begin (set! get-refs (- get-refs 1)) get-refs))
+                       ((eq? msg 'inc-pin!) (begin (set! pin-refs (+ pin-refs 1)) pin-refs))
+                       ((eq? msg 'dec-pin!) (begin (set! pin-refs (- pin-refs 1)) pin-refs))
+                       ((eq? msg 'has-flag?) (lambda (bit) (not (zero? (modulo flags bit)))))
+                       (else #f)))))
+      self)))
+
+; page-virt-addr: get the page's virtual address.
+(define (page-virt-addr p) (p 'virt))
+
+; page-get-refcount: current get_refs count (FOLL_GET style).
+(define (page-get-refcount p) (p 'get-refs))
+
+; page-pin-refcount: current pin_refs count (FOLL_PIN style).
+(define (page-pin-refcount p) (p 'pin-refs))
+
+; page-set-flag!: set a page-level flag bit. Returns the new flags.
+(define (page-set-flag! p bit)
+  ((p 'set-flags!) (+ (p 'flags) bit)))
+
+; page-has-flag?: is the page's flag bit set?
+(define (page-has-flag? p bit)
+  ((p 'has-flag?) bit))
+
+; ----------------------------------------------------------------
+; Registry (virt addr → page) — closure-backed list-of-pairs store
+; ----------------------------------------------------------------
+
+; make-registry: empty virt → page registry.
+; (Replaces aura's `hash` because `hash-set!` crashes per #3235.)
+(define (make-registry)
+  (let ((entries '()))             ; list of (virt . page) pairs
+    (letrec ((set-entries! (lambda (e) (set! entries e) e))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'entries) entries)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       ((eq? msg 'size) (length entries))
+                       (else #f)))))
+      self)))
+
+; registry-register!: add (virt → page) mapping to the registry.
+; Replaces an existing entry with the same virt address.
+(define (registry-register! reg virt-addr page)
+  ; Remove any existing entry with the same virt, then cons new entry.
+  (let ((filtered (filter (lambda (kv) (not (eq? (car kv) virt-addr)))
+                          (reg 'entries))))
+    ((reg 'set-entries!) (cons (cons virt-addr page) filtered))))
+
+; follow-page: resolve virt addr to page via registry, or #f if absent.
+(define (follow-page reg virt-addr)
+  (let loop ((rest (reg 'entries)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (car (car rest)) virt-addr) (cdr (car rest)))
+      (else (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; Pin / unpin (FOLL_PIN style — independent refcount)
+; ----------------------------------------------------------------
+
+; pin-page: increment pin-refs + set FOLL_PIN flag. Returns new count.
+(define (pin-page p)
+  (page-set-flag! p FOLL-PIN)
+  ((p 'inc-pin!)))
+
+; unpin-page: decrement pin-refs. Returns new count.
+(define (unpin-page p)
+  ((p 'dec-pin!)))
+
+; ----------------------------------------------------------------
+; Get / put (FOLL_GET style — legacy)
+; ----------------------------------------------------------------
+
+; get-page: increment get-refs + set FOLL_GET flag. Returns new count.
+(define (get-page p)
+  (page-set-flag! p FOLL-GET)
+  ((p 'inc-get!)))
+
+; put-page: decrement get-refs. Returns new count.
+(define (put-page p)
+  ((p 'dec-get!)))
+
+; ----------------------------------------------------------------
+; Batch: get_user_pages
+; ----------------------------------------------------------------
+
+; get-user-pages: pin pages for virt range [start, start+nr) via registry.
+; Returns list of pinned pages in virt-addr order. Stops at first missing
+; page (analogous to Linux behavior).
+; Flags: FOLL_GET (legacy) or FOLL_PIN (independent pin). Set bit on each page.
+(define (get-user-pages reg virt-start nr-pages flags)
+  (let loop ((offset 0) (acc '()))
+    (if (>= offset nr-pages)
+        (reverse acc)
+        (let* ((virt (+ virt-start offset))
+               (page (follow-page reg virt)))
+          (if (not page)
+              (reverse acc)
+              (begin
+                (if (not (zero? (modulo flags FOLL-PIN)))
+                    (pin-page page)
+                    (get-page page))
+                (loop (+ offset 1) (cons page acc))))))))
