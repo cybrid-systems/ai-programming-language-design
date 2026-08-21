@@ -1,0 +1,193 @@
+; 027-perf-event_test.aura
+; =========================
+; Smoke tests for 027-perf-event.aura — perf_event minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/027-perf-event_test.aura
+;
+; Verified automatically (smoke):
+;   - perf_event construction (type, config, state, count, id)
+;   - perf-event? predicate
+;   - perf-enable / perf-disable transitions
+;   - perf-read returns count (always 0 in v1, no actual counting)
+;   - perf-reset
+;   - PMU construction + register / find / unregister
+;
+; Verified via separate probes during development:
+;   - Multiple event types coexist (hardware + software + tracepoint)
+;   - pmu-find returns #f for unknown name
+;   - pmu-unregister returns #f for unregistered pmu
+;   - perf-event-set-id! updates id
+;
+; Deferred (full Linux perf):
+;   - actual counter increment
+;   - ring buffer sampling
+;   - per-CPU events
+;   - inheritance / cgroup events
+;   - bpf-driven perf
+;   - precise_ip / sample_period
+
+(require "std/test" all:)
+(require "027-perf-event" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "perf-001-construction-hardware"
+  ; Hardware event type + config preserved.
+  (check (= 'hardware (perf-event-type
+                       (make-perf-event 'hardware 'cpu-cycles))))
+  (check (= 'cpu-cycles (perf-event-config
+                          (make-perf-event 'hardware 'cpu-cycles)))))
+
+(test-suite "perf-001-construction-software"
+  ; Software event type + config preserved.
+  (check (= 'software (perf-event-type
+                        (make-perf-event 'software 'page-faults))))
+  (check (= 'page-faults (perf-event-config
+                           (make-perf-event 'software 'page-faults)))))
+
+(test-suite "perf-001-construction-tracepoint"
+  ; Tracepoint event type preserved.
+  (check (= 'tracepoint (perf-event-type
+                          (make-perf-event 'tracepoint 'sys-enter)))))
+
+(test-suite "perf-001-construction-hw-cache"
+  ; HW-cache event type preserved.
+  (check (= 'hw-cache (perf-event-type
+                        (make-perf-event 'hw-cache 'l1d-read-miss)))))
+
+; ----------------------------------------------------------------
+; perf-event? predicate
+; ----------------------------------------------------------------
+
+; wrap: wrap a value in a procedure returning it from 'type field —
+; used to test predicate rejection of non-perf_event procedures.
+(define (wrap v)
+  (let ((val v))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'type) val)
+                       (else #f)))))
+      self)))
+
+(test-suite "perf-002-predicate"
+  ; (perf-event? X) accepts only perf_event closures.
+  (check (= 1 (if (perf-event? (make-perf-event 'hardware 'cpu-cycles)) 1 0)))
+  (check (= 1 (if (not (perf-event? 'not-an-event)) 1 0)))
+  (check (= 1 (if (not (perf-event? 42)) 1 0)))
+  (check (= 1 (if (not (perf-event? #f)) 1 0)))
+  (check (= 1 (if (not (perf-event? (wrap 'hardware))) 1 0))))
+
+; ----------------------------------------------------------------
+; State transitions
+; ----------------------------------------------------------------
+
+(test-suite "perf-003-initial-state-disabled"
+  ; New event starts disabled.
+  (check (= 'disabled (perf-event-state
+                       (make-perf-event 'hardware 'cpu-cycles)))))
+
+(test-suite "perf-003-enable"
+  ; perf-enable sets state to 'enabled.
+  (check (= 'enabled (let ((e (make-perf-event 'hardware 'cpu-cycles)))
+                       (perf-enable e)
+                       (perf-event-state e))))
+
+(test-suite "perf-003-disable"
+  ; perf-disable sets state to 'disabled (after enable).
+  (check (= 'disabled (let ((e (make-perf-event 'hardware 'cpu-cycles)))
+                        (perf-enable e)
+                        (perf-disable e)
+                        (perf-event-state e)))))
+
+; ----------------------------------------------------------------
+; Counter read / reset
+; ----------------------------------------------------------------
+
+(test-suite "perf-004-read-zero"
+  ; Initial counter is 0.
+  (check (= 0 (perf-read (make-perf-event 'hardware 'cpu-cycles)))))
+
+(test-suite "perf-004-reset"
+  ; perf-reset on a 0-count event leaves count at 0.
+  (check (= 0 (let ((e (make-perf-event 'hardware 'cpu-cycles)))
+                (perf-reset e)
+                (perf-read e)))))
+
+(test-suite "perf-004-count-set"
+  ; Direct count mutation via internal setter.
+  (check (= 100 (let ((e (make-perf-event 'hardware 'cpu-cycles)))
+                  ((e 'set-count!) 100)
+                  (perf-read e)))))
+
+; ----------------------------------------------------------------
+; perf-event-set-id!
+; ----------------------------------------------------------------
+
+(test-suite "perf-005-set-id"
+  ; perf-event-set-id! updates id field.
+  (check (= 42 (let ((e (make-perf-event 'hardware 'cpu-cycles)))
+                 (perf-event-set-id! e 42)
+                 (perf-event-id e)))))
+
+; ----------------------------------------------------------------
+; PMU construction + pmu? predicate
+; ----------------------------------------------------------------
+
+(test-suite "perf-006-pmu-construction"
+  ; PMU name preserved.
+  (check (= 'cpu-pmu (pmu-name (make-pmu 'cpu-pmu))))
+  (check (= 0 (pmu-id (make-pmu 'cpu-pmu)))))
+
+(test-suite "perf-006-pmu-predicate"
+  ; pmu? accepts only PMU closures.
+  (check (= 1 (if (pmu? (make-pmu 'cpu-pmu)) 1 0)))
+  (check (= 1 (if (not (pmu? 'not-a-pmu)) 1 0)))
+  (check (= 1 (if (not (pmu? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; PMU register / find / unregister
+; ----------------------------------------------------------------
+
+(test-suite "perf-007-register"
+  ; pmu-register assigns sequential id.
+  (check (= 1 (pmu-register (make-pmu 'unq-pmu-007-register))))
+  ; Same pmu-id after register.
+  (check (= 1 (let ((p (make-pmu 'unq-pmu-007-register)))
+                (pmu-register p)
+                (pmu-id p)))))
+
+(test-suite "perf-007-find"
+  ; pmu-find returns the registered PMU.
+  (check (= 1 (let ((p (make-pmu 'unq-pmu-007-find)))
+                (pmu-register p)
+                (if (eq? p (pmu-find 'unq-pmu-007-find)) 1 0)))))
+
+(test-suite "perf-007-find-missing"
+  ; pmu-find returns #f for unknown name.
+  (check (= 1 (if (not (pmu-find 'unq-pmu-007-not-exist)) 1 0))))
+
+(test-suite "perf-007-unregister"
+  ; pmu-unregister removes and pmu-find then returns #f.
+  (check (= 1 (let ((p (make-pmu 'unq-pmu-007-unreg)))
+                (pmu-register p)
+                (pmu-unregister p)
+                (if (not (pmu-find 'unq-pmu-007-unreg)) 1 0)))))
+
+(test-suite "perf-007-unregister-missing"
+  ; pmu-unregister of an unregistered PMU returns #f.
+  (check (= 1 (if (not (pmu-unregister (make-pmu 'unq-pmu-007-orphan))) 1 0))))
+
+(test-suite "perf-007-count"
+  ; pmu-registered-count tracks the registry size.
+  (check (= 1 (> (pmu-registered-count) 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

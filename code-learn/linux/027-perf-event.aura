@@ -1,0 +1,271 @@
+; 027-perf-event.aura
+; =====================
+; perf_event — minimal capability port to aura.
+;
+; Maps to: Linux kernel perf_event subsystem
+; Source: include/linux/perf_event.h + kernel/events/ (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux perf_event is the performance monitoring subsystem providing:
+;   - struct perf_event (event metadata + state)
+;   - perf_event_open syscall (create events)
+;   - Hardware events (CPU cycles, instructions, cache misses)
+;   - Software events (page faults, context switches)
+;   - Tracepoint events
+;   - PMU (Performance Monitoring Unit) abstraction
+;   - read() syscall (counter value)
+;   - mmap() ring buffer (sample data)
+;   - enable/disable/reset controls
+;
+; aura has no CPU, no PMU, no sampling. v1 ships:
+;   - make-perf-event (closure with type, config, state, count)
+;   - perf event types: 'hardware / 'software / 'tracepoint / 'hw-cache
+;   - perf-enable / perf-disable / perf-read / perf-reset
+;   - make-pmu (PMU factory)
+;   - pmu-register / pmu-unregister / pmu-find
+;   - perf-event? / pmu? predicates
+;
+; Deferred (full Linux perf):
+;   - actual hardware counter counting
+;   - ring buffer / sample data
+;   - per-CPU events
+;   - inheritance
+;   - cgroup events
+;   - bpf-driven perf
+;   - precise_ip / skid control
+;   - sample_period / freq
+;   - PERF_FORMAT_GROUP
+
+(export
+  make-perf-event
+  perf-event?
+  perf-event-type
+  perf-event-config
+  perf-event-state
+  perf-event-count
+  perf-event-id
+  perf-event-set-id!
+  perf-enable
+  perf-disable
+  perf-read
+  perf-reset
+  ; PMU
+  make-pmu
+  pmu?
+  pmu-name
+  pmu-id
+  pmu-register
+  pmu-unregister
+  pmu-find
+  pmu-registered-count)
+
+; ----------------------------------------------------------------
+; Constants — perf_event types and configs
+; ----------------------------------------------------------------
+;
+; Linux definitions (kept here for reference):
+;   enum perf_type_id {
+;     PERF_TYPE_HARDWARE      = 0,
+;     PERF_TYPE_SOFTWARE      = 1,
+;     PERF_TYPE_TRACEPOINT    = 2,
+;     PERF_TYPE_HW_CACHE      = 3,
+;     PERF_TYPE_RAW           = 4,
+;     PERF_TYPE_BREAKPOINT    = 5,
+;   };
+;   enum perf_hw_id {
+;     PERF_COUNT_HW_CPU_CYCLES          = 0,
+;     PERF_COUNT_HW_INSTRUCTIONS        = 1,
+;     PERF_COUNT_HW_CACHE_REFERENCES    = 2,
+;     PERF_COUNT_HW_CACHE_MISSES        = 3,
+;     PERF_COUNT_HW_BRANCH_INSTRUCTIONS = 4,
+;     PERF_COUNT_HW_BRANCH_MISSES       = 5,
+;     PERF_COUNT_HW_BUS_CYCLES          = 6,
+;   };
+;   enum perf_sw_ids {
+;     PERF_COUNT_SW_PAGE_FAULTS        = 0,
+;     PERF_COUNT_SW_CONTEXT_SWITCHES   = 1,
+;     PERF_COUNT_SW_CPU_MIGRATIONS     = 2,
+;     PERF_COUNT_SW_PAGE_FAULTS_MIN    = 3,
+;     PERF_COUNT_SW_PAGE_FAULTS_MAJ    = 4,
+;   };
+;
+; v1 uses symbols for type/config (no actual counting).
+
+; ----------------------------------------------------------------
+; perf_event (closure-based, mutable state via letrec setters)
+; ----------------------------------------------------------------
+
+; make-perf-event: create a perf_event.
+; Args: type (one of 'hardware / 'software / 'tracepoint / 'hw-cache)
+;       config (event-specific identifier)
+; Returns: perf_event closure.
+(define (make-perf-event type config)
+  (let ((state 'disabled)
+        (count 0)
+        (id 0))
+    (letrec ((set-state! (lambda (v) (set! state v) v))
+             (set-count! (lambda (v) (set! count v) v))
+             (set-id!    (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'type)   type)
+                       ((eq? msg 'config) config)
+                       ((eq? msg 'state)  state)
+                       ((eq? msg 'count)  count)
+                       ((eq? msg 'id)     id)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'set-count!) set-count!)
+                       ((eq? msg 'set-id!)    set-id!)
+                       (else #f)))))
+      self)))
+
+; perf-event?: is the object a perf_event?
+; Detected by querying 'type — only perf_event closures return
+; one of the known type symbols.
+(define (perf-event? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'type)))
+        (if (or (eq? r 'hardware) (eq? r 'software)
+                (eq? r 'tracepoint) (eq? r 'hw-cache))
+            #t #f))
+      #f))
+
+; perf-event-type: get event type symbol
+(define (perf-event-type event) (event 'type))
+
+; perf-event-config: get event config
+(define (perf-event-config event) (event 'config))
+
+; perf-event-state: get current state ('disabled / 'enabled)
+(define (perf-event-state event) (event 'state))
+
+; perf-event-count: get current counter value
+(define (perf-event-count event) (event 'count))
+
+; perf-event-id: get event id
+(define (perf-event-id event) (event 'id))
+
+; perf-event-set-id!: set event id (for testing)
+(define (perf-event-set-id! event new-id)
+  ((event 'set-id!) new-id))
+
+; perf-enable: start counting (set state to 'enabled)
+(define (perf-enable event)
+  ((event 'set-state!) 'enabled))
+
+; perf-disable: stop counting (set state to 'disabled)
+(define (perf-disable event)
+  ((event 'set-state!) 'disabled))
+
+; perf-read: get current counter value
+(define (perf-read event) (event 'count))
+
+; perf-reset: reset counter to 0
+(define (perf-reset event)
+  ((event 'set-count!) 0))
+
+; ----------------------------------------------------------------
+; PMU (Performance Monitoring Unit) — closure-based
+; ----------------------------------------------------------------
+
+; make-pmu: create a PMU with a name.
+; Args: name (symbol identifying the PMU)
+; Returns: pmu closure.
+(define (make-pmu name)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'id)   id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; pmu?: is the object a PMU?
+; Detected by querying 'name — only pmu closures return a symbol.
+(define (pmu? obj)
+  (if (procedure? obj)
+      (if (symbol? (obj 'name)) #t #f)
+      #f))
+
+; pmu-name: get PMU name
+(define (pmu-name pmu) (pmu 'name))
+
+; pmu-id: get PMU id (0 if not yet registered)
+(define (pmu-id pmu) (pmu 'id))
+
+; ----------------------------------------------------------------
+; PMU registry (closure-based, mutable via letrec setters)
+; ----------------------------------------------------------------
+
+; make-pmu-registry: empty registry.
+(define (make-pmu-registry)
+  (let ((pmus '())
+        (next-id 0))
+    (letrec ((set-pmus!    (lambda (v) (set! pmus v) v))
+             (set-next-id! (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) pmus)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-pmus!)    set-pmus!)
+                       ((eq? msg 'set-next-id!) set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global PMU registry
+(define g-pmu-registry (make-pmu-registry))
+
+; pmu-register: register a PMU, assign a unique id.
+; Returns the assigned id.
+(define (pmu-register pmu)
+  (let ((new-id (+ (g-pmu-registry 'next-id) 1)))
+    ((g-pmu-registry 'set-next-id!) new-id)
+    ((pmu 'set-id!) new-id)
+    ((g-pmu-registry 'set-pmus!)
+     (cons pmu (g-pmu-registry 'list)))
+    new-id))
+
+; pmu-unregister: remove a PMU from the registry.
+; Returns #t if removed, #f if not found.
+(define (pmu-unregister pmu)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-pmu-registry 'set-pmus!)
+                             (cons-rev acc '()))
+                            ((g-pmu-registry 'set-pmus!) acc))
+                        found?)
+                       ((eq? (car rest) pmu)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-pmu-registry 'list) '())))
+
+; cons-rev: helper to reverse cons list — single-pass equivalent of
+; (append (reverse acc) rest).
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; pmu-find: find a PMU by name.
+; Returns the PMU or #f if not found.
+(define (pmu-find name)
+  (let loop ((rest (g-pmu-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (pmu-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; pmu-registered-count: count of registered PMUs
+(define (pmu-registered-count)
+  (let loop ((rest (g-pmu-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
