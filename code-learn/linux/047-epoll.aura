@@ -1,0 +1,229 @@
+; 047-epoll.aura
+; =====================
+; epoll — minimal capability port to aura.
+;
+; Maps to: Linux kernel epoll (event poll) subsystem
+; Source: fs/eventpoll.c + include/uapi/linux/eventpoll.h
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux epoll provides scalable I/O event notification:
+;   - struct eventpoll (epoll descriptor: wq, rbtree, ready list)
+;   - struct epoll_event (fd + events mask + data)
+;   - epoll_create / epoll_create1
+;   - epoll_ctl (EPOLL_CTL_ADD / MOD / DEL)
+;   - epoll_wait / epoll_pwait
+;   - ep_insert / ep_remove / ep_modify
+;   - ep_poll_callback (fired when fd becomes ready)
+;   - event types: EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP,
+;     EPOLLPRI, EPOLLRDHUP, EPOLLET (edge-triggered), EPOLLONESHOT
+;
+; aura has no I/O, no file descriptors, no wait queues. v1 ships:
+;   - make-epoll (registry of registered events)
+;   - make-epoll-event (fd, events, data)
+;   - epoll-ctl-add (add fd + events to epoll)
+;   - epoll-ctl-mod (modify events for fd)
+;   - epoll-ctl-del (remove fd from epoll)
+;   - epoll-wait (return ready events list)
+;   - epoll-count (count of registered fds)
+;   - epoll-find (find event by fd)
+;   - epoll-event-set-events! (for mod)
+;   - Event type symbols: 'in / 'out / 'err / 'hup / 'pri / 'rdhup /
+;     'et / 'oneshot
+;   - epoll? / epoll-event? predicates
+;
+; Deferred (full Linux epoll):
+;   - real ep_poll_callback fired by VFS / drivers
+;   - epoll_wait with timeout / signal interruption
+;   - epoll_pwait with sigmask
+;   - epoll-LT (level-triggered) vs ET (edge-triggered)
+;   - epoll wake-up queue (epwakeup_source)
+;   - epoll inotify integration
+;   - epoll_event auto-removal on EPOLLONESHOT
+;   - epoll_lock nesting (ep->mtx, ep->lock)
+;   - /proc/<pid>/fdinfo/<epfd> reporting
+;   - epoll v1 + epoll v2 (eventpoll v2 for sys/epoll_pwait2)
+
+(export
+  make-epoll
+  epoll?
+  epoll-count
+  epoll-find
+  make-epoll-event
+  epoll-event?
+  epoll-event-fd
+  epoll-event-events
+  epoll-event-data
+  epoll-event-set-events!
+  epoll-ctl-add
+  epoll-ctl-mod
+  epoll-ctl-del
+  epoll-wait
+  'in
+  'out
+  'err
+  'hup
+  'pri
+  'rdhup
+  'et
+  'oneshot)
+
+; ----------------------------------------------------------------
+; epoll_event — closure-based, mutable events mask
+; ----------------------------------------------------------------
+
+; make-epoll-event: create an epoll event record.
+; Args: fd (integer), events (list of event-type symbols), data (any)
+; Returns: epoll_event closure.
+(define (make-epoll-event fd events data)
+  (letrec ((set-events! (lambda (v) (set! events v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'fd) fd)
+                     ((eq? msg 'events) events)
+                     ((eq? msg 'data) data)
+                     ((eq? msg 'set-events!) set-events!)
+                     (else #f)))))
+    self))
+
+; epoll-event?: is the object an epoll_event?
+; Detected by querying 'events — only epoll_event closures return a
+; list for events.
+(define (epoll-event? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'events)) #t #f)
+      #f))
+
+; epoll-event-fd: get file descriptor
+(define (epoll-event-fd ev) (ev 'fd))
+
+; epoll-event-events: get events mask (list of symbols)
+(define (epoll-event-events ev) (ev 'events))
+
+; epoll-event-data: get user data
+(define (epoll-event-data ev) (ev 'data))
+
+; epoll-event-set-events!: set new events mask.
+; Returns the new events list.
+(define (epoll-event-set-events! ev new-events)
+  ((ev 'set-events!) new-events))
+
+; ----------------------------------------------------------------
+; epoll_eventpoll — closure-based, mutable registered events list
+; ----------------------------------------------------------------
+
+; make-epoll: create an epoll descriptor.
+; Returns: epoll_eventpoll closure (initial: 0 registered fds).
+(define (make-epoll)
+  (let ((registered '()))
+    (letrec ((set-registered! (lambda (v) (set! registered v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'registered) registered)
+                       ((eq? msg 'set-registered!) set-registered!)
+                       (else #f)))))
+      self)))
+
+; epoll?: is the object an epoll_eventpoll?
+; Detected by querying 'registered — only epoll_eventpoll closures
+; return a list.
+(define (epoll? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'registered)) #t #f)
+      #f))
+
+; epoll-count: count of registered events
+(define (epoll-count ep)
+  (let loop ((rest (ep 'registered)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; epoll-find: find an event by fd.
+; Returns the event or #f if not found.
+(define (epoll-find ep fd)
+  (let loop ((rest (ep 'registered)))
+    (cond
+      ((null? rest) #f)
+      ((= (epoll-event-fd (car rest)) fd) (car rest))
+      (else (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; Helper — cons-rev (used by ctl-add / mod / del)
+; ----------------------------------------------------------------
+
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; ----------------------------------------------------------------
+; epoll_ctl_add / mod / del
+; ----------------------------------------------------------------
+
+; epoll-ctl-add: add an event to the epoll instance.
+; Returns #t if added, #f if fd was already registered.
+(define (epoll-ctl-add ep event)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((ep 'set-registered!) (cons-rev acc '()))
+                            ((ep 'set-registered!)
+                             (cons event (cons-rev acc '()))))
+                        (not found?))
+                       ((= (epoll-event-fd (car rest))
+                           (epoll-event-fd event))
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (ep 'registered) '())))
+
+; epoll-ctl-mod: modify events for an existing fd.
+; Returns #t if modified, #f if fd not found.
+(define (epoll-ctl-mod ep event)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        ((ep 'set-registered!) (cons-rev acc '()))
+                        found?)
+                       ((= (epoll-event-fd (car rest))
+                           (epoll-event-fd event))
+                        (set! found? #t)
+                        (search (cdr rest)
+                                (cons event acc)))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (ep 'registered) '())))
+
+; epoll-ctl-del: remove an event from the epoll instance.
+; Returns #t if removed, #f if not found.
+(define (epoll-ctl-del ep fd)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((ep 'set-registered!) (cons-rev acc '()))
+                            ((ep 'set-registered!) acc))
+                        found?)
+                       ((= (epoll-event-fd (car rest)) fd)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (ep 'registered) '())))
+
+; ----------------------------------------------------------------
+; epoll_wait
+; ----------------------------------------------------------------
+
+; epoll-wait: return all registered events as "ready" list.
+; v1: returns all events (no actual kernel notification).
+; Returns a list of epoll_events.
+(define (epoll-wait ep)
+  (ep 'registered))

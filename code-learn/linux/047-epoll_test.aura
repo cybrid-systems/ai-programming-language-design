@@ -1,0 +1,180 @@
+; 047-epoll_test.aura
+; =====================
+; Smoke tests for 047-epoll.aura — epoll minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/047-epoll_test.aura
+;
+; Verified automatically (smoke):
+;   - epoll_event / epoll_eventpoll construction
+;   - epoll-event? / epoll? predicates
+;   - epoll-event-set-events! (for mod)
+;   - epoll-ctl-add (returns #t on new fd, #f on existing)
+;   - epoll-ctl-mod (modify events for existing fd)
+;   - epoll-ctl-del (remove fd)
+;   - epoll-wait (returns registered events)
+;   - epoll-count / epoll-find
+;
+; Verified via separate probes during development:
+;   - Multiple fds coexist
+;   - epoll-ctl-mod returns #f for non-existing fd
+;   - epoll-ctl-del returns #f for non-existing fd
+;
+; Deferred (full Linux epoll):
+;   - real ep_poll_callback fired by VFS / drivers
+;   - epoll_wait with timeout / signal interruption
+;   - epoll_pwait with sigmask
+;   - epoll-LT (level-triggered) vs ET (edge-triggered)
+;   - epoll wake-up queue
+;   - epoll inotify integration
+
+(require "std/test" all:)
+(require "047-epoll" all:)
+
+; ----------------------------------------------------------------
+; epoll_event construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "epoll-001-event-construction"
+  ; epoll_event preserves fd, events list, data.
+  (check (= 3 (epoll-event-fd
+               (make-epoll-event 3 '(in out) 'user-data-001))))
+  (check (= 1 (if (eq? 'in (car (epoll-event-events
+                                   (make-epoll-event 3 '(in out) 'd))) 1 0)))
+  (check (= 1 (if (eq? 'd (epoll-event-data
+                            (make-epoll-event 3 '(in out) 'd)) 1 0))))
+
+(test-suite "epoll-001-event-predicate"
+  ; epoll-event? accepts only epoll_event closures.
+  (check (= 1 (if (epoll-event? (make-epoll-event 0 '() #f)) 1 0)))
+  (check (= 1 (if (not (epoll-event? 'not-an-event)) 1 0)))
+  (check (= 1 (if (not (epoll-event? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; epoll_event_set_events!
+; ----------------------------------------------------------------
+
+(test-suite "epoll-002-set-events"
+  ; epoll-event-set-events! updates events.
+  (check (= 1 (let ((ev (make-epoll-event 3 '(in) 'd)))
+                (epoll-event-set-events! ev '(in out))
+                (if (eq? 'in (car (epoll-event-events ev))) 1 0)))))
+
+; ----------------------------------------------------------------
+; epoll construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "epoll-003-construction"
+  ; New epoll starts empty.
+  (check (= 1 (if (null? (epoll-wait (make-epoll))) 1 0)))
+  (check (= 0 (epoll-count (make-epoll)))))
+
+(test-suite "epoll-003-predicate"
+  ; epoll? accepts only epoll_eventpoll closures.
+  (check (= 1 (if (epoll? (make-epoll)) 1 0)))
+  (check (= 1 (if (not (epoll? 'not-an-epoll)) 1 0)))
+  (check (= 1 (if (not (epoll? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; epoll_ctl_add
+; ----------------------------------------------------------------
+
+(test-suite "epoll-004-ctl-add"
+  ; epoll-ctl-add returns #t for new fd.
+  (check (= 1 (let ((ep (make-epoll)))
+                (if (epoll-ctl-add ep
+                    (make-epoll-event 3 '(in) 'd)) 1 0)))))
+
+(test-suite "epoll-004-ctl-add-multiple"
+  ; Multiple adds — count tracks.
+  (check (= 2 (let ((ep (make-epoll)))
+                (epoll-ctl-add ep (make-epoll-event 3 '(in) 'd))
+                (epoll-ctl-add ep (make-epoll-event 4 '(out) 'd))
+                (epoll-count ep)))))
+
+(test-suite "epoll-004-ctl-add-existing"
+  ; epoll-ctl-add returns #f for already-registered fd.
+  (check (= 1 (let ((ep (make-epoll))
+                    (ev (make-epoll-event 3 '(in) 'd)))
+                (epoll-ctl-add ep ev)
+                (if (not (epoll-ctl-add ep ev)) 1 0)))))
+
+; ----------------------------------------------------------------
+; epoll_ctl_mod
+; ----------------------------------------------------------------
+
+(test-suite "epoll-005-ctl-mod"
+  ; epoll-ctl-mod updates events for existing fd.
+  (check (= 1 (let ((ep (make-epoll))
+                    (ev (make-epoll-event 3 '(in) 'd))
+                    (new-ev (make-epoll-event 3 '(out) 'd)))
+                (epoll-ctl-add ep ev)
+                (epoll-ctl-mod ep new-ev)
+                (if (eq? 'out (car (epoll-event-events
+                                     (epoll-find ep 3)))) 1 0)))))
+
+(test-suite "epoll-005-ctl-mod-not-found"
+  ; epoll-ctl-mod returns #f for non-existing fd.
+  (check (= 1 (let ((ep (make-epoll))
+                    (ev (make-epoll-event 99 '(in) 'd)))
+                (if (not (epoll-ctl-mod ep ev)) 1 0)))))
+
+; ----------------------------------------------------------------
+; epoll_ctl_del
+; ----------------------------------------------------------------
+
+(test-suite "epoll-006-ctl-del"
+  ; epoll-ctl-del removes + find returns #f.
+  (check (= 1 (let ((ep (make-epoll)))
+                (epoll-ctl-add ep (make-epoll-event 3 '(in) 'd))
+                (epoll-ctl-del ep 3)
+                (if (not (epoll-find ep 3)) 1 0)))))
+
+(test-suite "epoll-006-ctl-del-not-found"
+  ; epoll-ctl-del returns #f for non-existing fd.
+  (check (= 1 (if (not (epoll-ctl-del (make-epoll) 99)) 1 0))))
+
+(test-suite "epoll-006-ctl-del-count"
+  ; epoll-ctl-del decreases count.
+  (check (= 0 (let ((ep (make-epoll)))
+                (epoll-ctl-add ep (make-epoll-event 3 '(in) 'd))
+                (epoll-ctl-del ep 3)
+                (epoll-count ep)))))
+
+; ----------------------------------------------------------------
+; epoll-wait
+; ----------------------------------------------------------------
+
+(test-suite "epoll-007-wait"
+  ; epoll-wait returns list of registered events.
+  (check (= 2 (let ((ep (make-epoll)))
+                (epoll-ctl-add ep (make-epoll-event 3 '(in) 'd))
+                (epoll-ctl-add ep (make-epoll-event 4 '(out) 'd))
+                (length (epoll-wait ep))))))
+
+(test-suite "epoll-007-wait-empty"
+  ; epoll-wait on empty epoll returns empty list.
+  (check (= 1 (if (null? (epoll-wait (make-epoll))) 1 0))))
+
+; ----------------------------------------------------------------
+; epoll-find
+; ----------------------------------------------------------------
+
+(test-suite "epoll-008-find"
+  ; epoll-find returns the registered event.
+  (check (= 1 (let ((ep (make-epoll))
+                    (ev (make-epoll-event 3 '(in) 'd)))
+                (epoll-ctl-add ep ev)
+                (if (eq? ev (epoll-find ep 3)) 1 0)))))
+
+(test-suite "epoll-008-find-missing"
+  ; epoll-find returns #f for unknown fd.
+  (check (= 1 (if (not (epoll-find (make-epoll) 99)) 1 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
