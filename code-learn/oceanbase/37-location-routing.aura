@@ -1,0 +1,344 @@
+; 37-location-routing.aura
+; ======================
+; location_routing — minimal capability port to aura.
+;
+; Maps to: OceanBase Location Cache + Request Routing
+; Source: src/share/location/ob_location_service.h
+;         + src/share/location/ob_tablet_ls_service.h
+;         + src/share/location/ob_ls_location_service.h
+;         + src/sql/das/ob_das_location_router.h
+;         + src/share/tablet/ob_tablet_to_ls_operator.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Location Cache + Routing:
+;   - ObLocationService: unified entry with get() / nonblock_get()
+;   - ObTabletLSService: tablet_id → ls_id mapping
+;   - ObLSLocationService: ls_id → leader + replicas
+;   - ObLSLocation: location (leader_addr + replica list)
+;   - 4 LS-LOCATION-STATUS constants (NORMAL, RENEWING,
+;     EXPIRED, INVALID)
+;   - 3 CACHE-MODE constants (BLOCKING, NONBLOCK, ASYNC_RENEW)
+;   - TabletToLSMap: 64K bucket hash
+;   - LSLocationMap: 256 bucket hash
+;
+; aura v1 ships:
+;   - 4 LS-LOCATION-STATUS constants
+;   - 3 CACHE-MODE constants
+;   - make-tablet-ls-mapping (factory: tablet-id + ls-id)
+;   - tablet-ls-mapping accessors + set-ls-id!
+;   - make-ls-location (factory: ls-id + leader-addr + replicas)
+;   - ls-location accessors + set-leader-addr!
+;   - ls-location-get-replica-count
+;   - make-tablet-ls-service (factory: tablet-ls-map)
+;   - tablet-ls-service-get-mapping-count
+;   - tablet-ls-service-put-mapping!
+;   - tablet-ls-service-find-by-tablet-id
+;   - make-ls-location-service (factory: ls-locations)
+;   - ls-location-service-get-location-count
+;   - ls-location-service-put-location!
+;   - ls-location-service-find-by-ls-id
+;   - make-location-service (factory: tablet-ls + ls-loc + mode)
+;   - location-service-get-mode + set-mode!
+;   - location-service-get-tablet-ls + get-ls-loc
+;
+; Deferred (full OceanBase Location Cache + Routing):
+;   - real ObLocationService with expire_renew_time semantics
+;   - real 64K-bucket ObTabletLSMap hash
+;   - real 256-bucket ObLSLocationMap hash
+;   - real __all_tablet_to_ls system table query
+;   - real __all_ls_meta_table system table query
+;   - real RPC retry + failover to next replica
+;   - real async renew task queue
+;   - real cache invalidation on leader election
+;   - real ObVTableLocationService (virtual table location)
+;   - real ObDASTabletMapper (partition key → tablet_id)
+;   - real ObDASLocationRouter (DAS task creation)
+
+(export
+  ; LSLocationStatus constants
+  LS-LOCATION-STATUS-NORMAL
+  LS-LOCATION-STATUS-RENEWING
+  LS-LOCATION-STATUS-EXPIRED
+  LS-LOCATION-STATUS-INVALID
+  ; CacheMode constants
+  CACHE-MODE-BLOCKING
+  CACHE-MODE-NONBLOCK
+  CACHE-MODE-ASYNC-RENEW
+  ; TabletLSMapping
+  make-tablet-ls-mapping
+  tablet-ls-mapping?
+  tablet-ls-mapping-get-tablet-id
+  tablet-ls-mapping-get-ls-id
+  tablet-ls-mapping-set-ls-id!
+  ; LSLocation
+  make-ls-location
+  ls-location?
+  ls-location-get-ls-id
+  ls-location-get-leader-addr
+  ls-location-get-replicas
+  ls-location-get-status
+  ls-location-set-leader-addr!
+  ls-location-set-status!
+  ls-location-get-replica-count
+  ; TabletLSService
+  make-tablet-ls-service
+  tablet-ls-service?
+  tablet-ls-service-get-mapping-count
+  tablet-ls-service-put-mapping!
+  tablet-ls-service-find-by-tablet-id
+  ; LSLocationService
+  make-ls-location-service
+  ls-location-service?
+  ls-location-service-get-location-count
+  ls-location-service-put-location!
+  ls-location-service-find-by-ls-id
+  ; LocationService
+  make-location-service
+  location-service?
+  location-service-get-mode
+  location-service-set-mode!
+  location-service-get-tablet-ls
+  location-service-get-ls-loc)
+
+; ----------------------------------------------------------------
+; LSLocationStatus constants
+; ----------------------------------------------------------------
+
+(define LS-LOCATION-STATUS-NORMAL 0)
+(define LS-LOCATION-STATUS-RENEWING 1)
+(define LS-LOCATION-STATUS-EXPIRED 2)
+(define LS-LOCATION-STATUS-INVALID 3)
+
+; ----------------------------------------------------------------
+; CacheMode constants
+; ----------------------------------------------------------------
+
+(define CACHE-MODE-BLOCKING 0)
+(define CACHE-MODE-NONBLOCK 1)
+(define CACHE-MODE-ASYNC-RENEW 2)
+
+; ----------------------------------------------------------------
+; TabletLSMapping — closure-based
+; ----------------------------------------------------------------
+
+; make-tablet-ls-mapping: create a tablet → LS mapping.
+; Args: tablet-id (integer), ls-id (integer)
+; Returns: tablet_ls_mapping closure.
+(define (make-tablet-ls-mapping tablet-id ls-id)
+  (letrec ((set-ls-id! (lambda (v) (set! ls-id v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tablet-id) tablet-id)
+                     ((eq? msg 'ls-id) ls-id)
+                     ((eq? msg 'set-ls-id!) set-ls-id!)
+                     (else #f)))))
+      self))
+
+; tablet-ls-mapping?: is the object a tablet→LS mapping?
+; Detected by querying 'tablet-id — only mappings return integer.
+(define (tablet-ls-mapping? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'tablet-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; tablet-ls-mapping-get-tablet-id: get tablet id.
+(define (tablet-ls-mapping-get-tablet-id m) (m 'tablet-id))
+
+; tablet-ls-mapping-get-ls-id: get LS id.
+(define (tablet-ls-mapping-get-ls-id m) (m 'ls-id))
+
+; tablet-ls-mapping-set-ls-id!: set LS id.
+; Returns the new LS id.
+(define (tablet-ls-mapping-set-ls-id! m v) ((m 'set-ls-id!) v))
+
+; ----------------------------------------------------------------
+; LSLocation — closure-based
+; ----------------------------------------------------------------
+
+; make-ls-location: create an LS location.
+; Args: ls-id (integer), leader-addr (symbol),
+;       replicas (cons list of symbols),
+;       status (integer)
+; Returns: ls_location closure.
+(define (make-ls-location ls-id leader-addr replicas status)
+  (letrec ((set-leader-addr! (lambda (v) (set! leader-addr v) v))
+           (set-status! (lambda (v) (set! status v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'ls-id) ls-id)
+                     ((eq? msg 'leader-addr) leader-addr)
+                     ((eq? msg 'replicas) replicas)
+                     ((eq? msg 'status) status)
+                     ((eq? msg 'set-leader-addr!) set-leader-addr!)
+                     ((eq? msg 'set-status!) set-status!)
+                     (else #f)))))
+      self))
+
+; ls-location?: is the object an LS location?
+; Detected by querying 'ls-id — only locations return integer.
+(define (ls-location? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'ls-id)))
+        (if (and (integer? l) (>= l 0)) #t #f))
+      #f))
+
+; ls-location-get-ls-id: get LS id.
+(define (ls-location-get-ls-id loc) (loc 'ls-id))
+
+; ls-location-get-leader-addr: get leader address.
+(define (ls-location-get-leader-addr loc) (loc 'leader-addr))
+
+; ls-location-get-replicas: get replicas list.
+(define (ls-location-get-replicas loc) (loc 'replicas))
+
+; ls-location-get-status: get status.
+(define (ls-location-get-status loc) (loc 'status))
+
+; ls-location-set-leader-addr!: set leader address.
+; Returns the new address.
+(define (ls-location-set-leader-addr! loc v) ((loc 'set-leader-addr!) v))
+
+; ls-location-set-status!: set status.
+; Returns the new status.
+(define (ls-location-set-status! loc v) ((loc 'set-status!) v))
+
+; ls-location-get-replica-count: count replicas.
+(define (ls-location-get-replica-count loc)
+  (let loop ((rest (loc 'replicas)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; ObTabletLSService — closure-based
+; ----------------------------------------------------------------
+
+; make-tablet-ls-service: create a tablet→LS service.
+; Returns: tablet_ls_service closure (initial: empty map).
+(define (make-tablet-ls-service)
+  (let ((mappings '()))
+    (letrec ((set-mappings! (lambda (v) (set! mappings v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'mappings) mappings)
+                       ((eq? msg 'set-mappings!) set-mappings!)
+                       (else #f)))))
+      self)))
+
+; tablet-ls-service?: is the object a tablet→LS service?
+; Detected by querying 'mappings — only services return a cons.
+(define (tablet-ls-service? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'mappings)) #t #f)
+      #f))
+
+; tablet-ls-service-get-mapping-count: get mapping count.
+(define (tablet-ls-service-get-mapping-count svc)
+  (let loop ((rest (svc 'mappings)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; tablet-ls-service-put-mapping!: add a mapping.
+; Returns the new count.
+(define (tablet-ls-service-put-mapping! svc mapping)
+  (let ((existing (svc 'mappings)))
+    ((svc 'set-mappings!) (cons mapping existing))))
+
+; tablet-ls-service-find-by-tablet-id: find by tablet id.
+; Returns the mapping or #f.
+(define (tablet-ls-service-find-by-tablet-id svc tablet-id)
+  (let loop ((rest (svc 'mappings)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'tablet-id) tablet-id) (car rest))
+      (#t (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; ObLSLocationService — closure-based
+; ----------------------------------------------------------------
+
+; make-ls-location-service: create an LS location service.
+; Returns: ls_location_service closure (initial: empty locations).
+(define (make-ls-location-service)
+  (let ((locations '()))
+    (letrec ((set-locations! (lambda (v) (set! locations v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'locations) locations)
+                       ((eq? msg 'set-locations!) set-locations!)
+                       (else #f)))))
+      self)))
+
+; ls-location-service?: is the object an LS location service?
+; Detected by querying 'locations — only services return a cons.
+(define (ls-location-service? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'locations)) #t #f)
+      #f))
+
+; ls-location-service-get-location-count: get location count.
+(define (ls-location-service-get-location-count svc)
+  (let loop ((rest (svc 'locations)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; ls-location-service-put-location!: add a location.
+; Returns the new count.
+(define (ls-location-service-put-location! svc loc)
+  (let ((existing (svc 'locations)))
+    ((svc 'set-locations!) (cons loc existing))))
+
+; ls-location-service-find-by-ls-id: find by LS id.
+; Returns the location or #f.
+(define (ls-location-service-find-by-ls-id svc ls-id)
+  (let loop ((rest (svc 'locations)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'ls-id) ls-id) (car rest))
+      (#t (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; ObLocationService — closure-based (unified entry)
+; ----------------------------------------------------------------
+
+; make-location-service: create a unified location service.
+; Args: tablet-ls (tablet_ls_service or #f),
+;       ls-loc (ls_location_service or #f),
+;       mode (integer — CACHE-MODE-*)
+; Returns: location_service closure.
+(define (make-location-service tablet-ls ls-loc mode)
+  (letrec ((set-mode! (lambda (v) (set! mode v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tablet-ls) tablet-ls)
+                     ((eq? msg 'ls-loc) ls-loc)
+                     ((eq? msg 'mode) mode)
+                     ((eq? msg 'set-mode!) set-mode!)
+                     (else #f)))))
+      self)))
+
+; location-service?: is the object a location service?
+; Detected by querying 'mode — only services return integer.
+(define (location-service? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mode)))
+        (if (and (integer? m) (>= m 0)) #t #f))
+      #f))
+
+; location-service-get-mode: get cache mode.
+(define (location-service-get-mode svc) (svc 'mode))
+
+; location-service-set-mode!: set cache mode.
+; Returns the new mode.
+(define (location-service-set-mode! svc v) ((svc 'set-mode!) v))
+
+; location-service-get-tablet-ls: get tablet→LS service.
+(define (location-service-get-tablet-ls svc) (svc 'tablet-ls))
+
+; location-service-get-ls-loc: get LS location service.
+(define (location-service-get-ls-loc svc) (svc 'ls-loc))
