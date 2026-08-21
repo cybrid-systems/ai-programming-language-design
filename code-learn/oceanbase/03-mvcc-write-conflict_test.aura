@@ -1,0 +1,263 @@
+; 03-mvcc-write-conflict_test.aura
+; ================================
+; Smoke tests for 03-mvcc-write-conflict.aura — write-write conflict minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/03-mvcc-write-conflict_test.aura
+;
+; Verified automatically (smoke):
+;   - NODE-TYPE-* constants distinct
+;   - LockWaitNode construction + accessors
+;   - LockWaitMgr registry + add/remove/find/count
+;   - Deadlock cycle detection (has-cycle?)
+;   - check-row-locked 5-case state machine (empty + committed +
+;     aborted + locked)
+;
+; Verified via separate probes during development:
+;   - add-node! returns #f on duplicate tx-id
+;   - remove-node! returns #f on non-existing
+;   - has-cycle? returns #f on no cycle
+;
+; Deferred (full OB write-write conflict):
+;   - real ObLockWaitMgr with 16384-bucket hash table
+;   - lock_seq_ sequence tracking per bucket
+;   - post_lock / wait_ / handle_local_node_
+;   - register_local_node_to_deadlock_
+;   - check_wait_node_session_stat_
+;   - ObRowConflictHandler::post_row_read_conflict
+;   - is_delayed_cleanout_ handling + tx_table_guard_ cleanout
+;   - remote lock coordination (REMOTE_CTRL_SIDE / REMOTE_EXEC_SIDE)
+;   - lock wait timeout + deadlock recovery
+
+(require "std/test" all:)
+(require "01-mvcc-row" all:)
+(require "02-mvcc-iterator" all:)
+(require "03-mvcc-write-conflict" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; make-row-with-locked-head: create row with 1 uncommitted version
+; (locked by tx-id). Helper for check-row-locked tests.
+(define (make-row-with-locked-head holder-tx-id)
+  (let ((row (make-mvcc-row 0 0))
+        (n (make-mvcc-trans-node holder-tx-id 0 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row n)
+    row))
+
+; make-row-with-committed-head: create row with 1 committed version.
+(define (make-row-with-committed-head trans-version)
+  (let ((row (make-mvcc-row 0 0))
+        (n (make-mvcc-trans-node 100 trans-version 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row n)
+    (mvcc-trans-node-trans-commit! n trans-version 100)
+    row))
+
+; make-row-with-aborted-head: create row with 1 aborted version at
+; head (followed by 1 committed version below).
+(define (make-row-with-aborted-head)
+  (let ((row (make-mvcc-row 0 0))
+        (a (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f))
+        (b (make-mvcc-trans-node 200 100 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row a)
+    (mvcc-row-add-version! row b)
+    (mvcc-trans-node-trans-abort! b 200)
+    row))
+
+; ----------------------------------------------------------------
+; Node type constants
+; ----------------------------------------------------------------
+
+(test-suite "03-001-node-type-constants"
+  ; NODE-TYPE constants are distinct.
+  (check (= 1 (if (not (= NODE-TYPE-LOCAL NODE-TYPE-REMOTE-CTRL-SIDE)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-LOCAL NODE-TYPE-REMOTE-EXEC-SIDE)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-REMOTE-CTRL-SIDE NODE-TYPE-REMOTE-EXEC-SIDE)) 1 0))))
+
+; ----------------------------------------------------------------
+; LockWaitNode construction + accessors
+; ----------------------------------------------------------------
+
+(test-suite "03-002-node-construction"
+  ; lock-wait-node preserves tx-id, holder-tx-id, hash, lock-seq.
+  (check (= 100 (lock-wait-node-tx-id
+                  (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 200 (lock-wait-node-holder-tx-id
+                  (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 999 (lock-wait-node-hash
+                 (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 1 (lock-wait-node-lock-seq
+                (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 42 (lock-wait-node-key
+                 (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 7 (lock-wait-node-ls-id
+               (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 8 (lock-wait-node-tablet-id
+                 (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= 5 (lock-wait-node-sessid
+               (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL))))
+  (check (= NODE-TYPE-LOCAL (lock-wait-node-node-type
+                               (make-lock-wait-node 100 200 999 1 42 7 8 5 NODE-TYPE-LOCAL)))))
+
+(test-suite "03-002-node-predicate"
+  ; lock-wait-node? accepts only node closures.
+  (check (= #t (lock-wait-node?
+                 (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL))))
+  (check (= #f (lock-wait-node? 'not-a-node)))
+  (check (= #f (lock-wait-node? 42))))
+
+; ----------------------------------------------------------------
+; LockWaitNode setters
+; ----------------------------------------------------------------
+
+(test-suite "03-003-set-lock-seq"
+  ; lock-wait-node-set-lock-seq! updates.
+  (check (= 99 (let ((n (make-lock-wait-node 1 2 3 5 0 0 0 0 NODE-TYPE-LOCAL)))
+                (lock-wait-node-set-lock-seq! n 99)
+                (lock-wait-node-lock-seq n)))))
+
+(test-suite "03-003-set-holder-tx-id"
+  ; lock-wait-node-set-holder-tx-id! updates.
+  (check (= 999 (let ((n (make-lock-wait-node 1 2 3 5 0 0 0 0 NODE-TYPE-LOCAL)))
+                  (lock-wait-node-set-holder-tx-id! n 999)
+                  (lock-wait-node-holder-tx-id n)))))
+
+; ----------------------------------------------------------------
+; LockWaitMgr
+; ----------------------------------------------------------------
+
+(test-suite "03-004-mgr-construction"
+  ; new mgr starts empty.
+  (check (= 0 (lock-wait-mgr-count (make-lock-wait-mgr)))))
+
+(test-suite "03-004-mgr-predicate"
+  ; lock-wait-mgr? accepts only mgr closures.
+  (check (= #t (lock-wait-mgr? (make-lock-wait-mgr))))
+  (check (= #f (lock-wait-mgr? 'not-a-mgr)))
+  (check (= #f (lock-wait-mgr? 42))))
+
+(test-suite "03-005-mgr-add-node"
+  ; add-node! increases count.
+  (check (= 1 (let ((mgr (make-lock-wait-mgr))
+                    (n (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL)))
+                (lock-wait-mgr-add-node! mgr n)
+                (lock-wait-mgr-count mgr)))))
+
+(test-suite "03-005-mgr-add-multiple"
+  ; multiple adds accumulate.
+  (check (= 3 (let ((mgr (make-lock-wait-mgr)))
+                (lock-wait-mgr-add-node! mgr
+                  (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL))
+                (lock-wait-mgr-add-node! mgr
+                  (make-lock-wait-node 4 5 6 0 0 0 0 0 NODE-TYPE-LOCAL))
+                (lock-wait-mgr-add-node! mgr
+                  (make-lock-wait-node 7 8 9 0 0 0 0 0 NODE-TYPE-LOCAL))
+                (lock-wait-mgr-count mgr)))))
+
+(test-suite "03-005-mgr-add-duplicate"
+  ; add-node! returns #f for duplicate tx-id.
+  (check (= #f (let ((mgr (make-lock-wait-mgr))
+                    (n (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL)))
+                (lock-wait-mgr-add-node! mgr n)
+                (lock-wait-mgr-add-node! mgr n))))
+
+(test-suite "03-005-mgr-find-by-tx"
+  ; find-by-tx returns the node.
+  (check (= #t (let ((mgr (make-lock-wait-mgr))
+                    (n (make-lock-wait-node 42 100 3 0 0 0 0 0 NODE-TYPE-LOCAL)))
+                (lock-wait-mgr-add-node! mgr n)
+                (eq? n (lock-wait-mgr-find-by-tx mgr 42))))))
+
+(test-suite "03-005-mgr-find-missing"
+  ; find-by-tx returns #f for unknown tx-id.
+  (check (= #f (lock-wait-mgr-find-by-tx (make-lock-wait-mgr) 99))))
+
+(test-suite "03-006-mgr-remove"
+  ; remove-node! removes + find returns #f.
+  (check (= #t (let ((mgr (make-lock-wait-mgr))
+                    (n (make-lock-wait-node 42 100 3 0 0 0 0 0 NODE-TYPE-LOCAL)))
+                (lock-wait-mgr-add-node! mgr n)
+                (lock-wait-mgr-remove-node! mgr 42)
+                (eq? #f (lock-wait-mgr-find-by-tx mgr 42))))))
+
+(test-suite "03-006-mgr-remove-not-found"
+  ; remove-node! returns #f for non-existing.
+  (check (= #f (lock-wait-mgr-remove-node! (make-lock-wait-mgr) 99))))
+
+(test-suite "03-006-mgr-remove-count"
+  ; remove-node! decreases count.
+  (check (= 0 (let ((mgr (make-lock-wait-mgr)))
+                (lock-wait-mgr-add-node! mgr
+                  (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL))
+                (lock-wait-mgr-remove-node! mgr 1)
+                (lock-wait-mgr-count mgr)))))
+
+; ----------------------------------------------------------------
+; Deadlock detection (has-cycle?)
+; ----------------------------------------------------------------
+
+(test-suite "03-007-has-cycle-no-cycle"
+  ; has-cycle? returns #f on simple non-cyclic graph.
+  (check (= #f (let ((mgr (make-lock-wait-mgr)))
+                 (lock-wait-mgr-add-node! mgr
+                   (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL))
+                 (lock-wait-mgr-add-node! mgr
+                   (make-lock-wait-node 2 3 4 0 0 0 0 0 NODE-TYPE-LOCAL))
+                 (lock-wait-mgr-add-node! mgr
+                   (make-lock-wait-node 3 4 5 0 0 0 0 0 NODE-TYPE-LOCAL))
+                 (lock-wait-mgr-has-cycle? mgr)))))
+
+(test-suite "03-007-has-cycle-yes"
+  ; has-cycle? returns #t on cyclic graph (1→2→1).
+  (check (= #t (let ((mgr (make-lock-wait-mgr)))
+                 (lock-wait-mgr-add-node! mgr
+                   (make-lock-wait-node 1 2 3 0 0 0 0 0 NODE-TYPE-LOCAL))
+                 (lock-wait-mgr-add-node! mgr
+                   (make-lock-wait-node 2 1 4 0 0 0 0 0 NODE-TYPE-LOCAL))
+                 (lock-wait-mgr-has-cycle? mgr)))))
+
+(test-suite "03-007-has-cycle-empty"
+  ; has-cycle? on empty mgr returns #f.
+  (check (= #f (lock-wait-mgr-has-cycle? (make-lock-wait-mgr)))))
+
+; ----------------------------------------------------------------
+; check-row-locked (5-case state machine)
+; ----------------------------------------------------------------
+
+(test-suite "03-008-check-empty"
+  ; Case 1: empty row → is_locked=false, trans-version=0, flag=NOT_EXIST.
+  (check (= #t (let ((row (make-mvcc-row 0 0))
+                      (ls (check-row-locked row)))
+                 (and (eq? #f (store-row-lock-state-is-locked ls))
+                      (= 0 (store-row-lock-state-trans-version ls))
+                      (= DML-NOT-EXIST (store-row-lock-state-lock-dml-flag ls)))))))
+
+(test-suite "03-008-check-committed"
+  ; Case 3: committed head → is_locked=false, trans-version preserved.
+  (check (= #t (let ((row (make-row-with-committed-head 50))
+                      (ls (check-row-locked row)))
+                 (and (eq? #f (store-row-lock-state-is-locked ls))
+                      (= 50 (store-row-lock-state-trans-version ls)))))))
+
+(test-suite "03-008-check-locked"
+  ; Case 5: undecided head → is_locked=true, holder-tx-id=tx_id.
+  (check (= #t (let ((row (make-row-with-locked-head 100))
+                      (ls (check-row-locked row)))
+                 (and (eq? #t (store-row-lock-state-is-locked ls))
+                      (= 100 (store-row-lock-state-lock-trans-id ls)))))))
+
+(test-suite "03-008-check-aborted-walk"
+  ; Case 4: aborted head → walk to prev (committed). is_locked=false.
+  (check (= #t (let ((row (make-row-with-aborted-head))
+                      (ls (check-row-locked row)))
+                 (and (eq? #f (store-row-lock-state-is-locked ls))
+                      (= 50 (store-row-lock-state-trans-version ls)))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

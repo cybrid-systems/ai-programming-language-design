@@ -1,0 +1,383 @@
+; 03-mvcc-write-conflict.aura
+; ==============================
+; mvcc_write_conflict — minimal capability port to aura.
+;
+; Maps to: OceanBase write-write conflict detection + lock waiting
+; Source: src/storage/memtable/mvcc/ob_mvcc_row.cpp (check_row_locked)
+;         + src/storage/tx/ob_lock_wait_mgr.h + .cpp (LockWaitMgr)
+;         + src/storage/memtable/ob_row_conflict_handler.cpp
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase write-write conflict detection:
+;   - ObMvccRow::check_row_locked: 5-case state machine that detects
+;     if the head version node is locked by another transaction
+;   - ObStoreRowLockState: descriptor returned by check_row_locked
+;     (8 fields including is_locked, holder_tx_id, lock_dml_flag,
+;     etc.)
+;   - ObLockWaitMgr: 16384-bucket hash table for tracking waiting
+;     lock requests (LOCAL / REMOTE_CTRL_SIDE / REMOTE_EXEC_SIDE
+;     node types)
+;   - ObLockWaitNode: per-request node (tx_id, holder_tx_id, hash,
+;     lock_seq, key, ls_id, tablet_id, sessid, etc.)
+;   - Deadlock detection: cycle detection across wait-for graph
+;
+; aura has no concurrency, no real waits. v1 ships:
+;   - 3 NODE-TYPE constants (LOCAL, REMOTE_CTRL_SIDE,
+;     REMOTE_EXEC_SIDE)
+;   - make-lock-wait-node + accessors + setters (lock_seq,
+;     holder-tx-id)
+;   - make-lock-wait-mgr (registry of waiting nodes by tx-id)
+;   - lock-wait-mgr-add-node! / remove-node! / find-by-tx /
+;     count / has-cycle? (deadlock detection)
+;   - check-row-locked (5-case state machine, returns
+;     store_row_lock_state from 02-mvcc-iterator)
+;
+; Deferred (full OB write-write conflict):
+;   - real ObLockWaitMgr with 16384-bucket hash table (FixedHash2)
+;   - lock_seq_ sequence number tracking per bucket
+;   - post_lock / wait_ / handle_local_node_ implementation
+;   - register_local_node_to_deadlock_ + deadlock victim selection
+;   - check_wait_node_session_stat_
+;   - ObRowConflictHandler::post_row_read_conflict
+;   - is_delayed_cleanout_ handling + tx_table_guard_ cleanout
+;   - remote lock coordination (REMOTE_CTRL_SIDE / REMOTE_EXEC_SIDE)
+;   - lock wait timeout + deadlock recovery
+;   - session state management (sessid mapping)
+
+(export
+  ; Node type constants
+  NODE-TYPE-LOCAL NODE-TYPE-REMOTE-CTRL-SIDE NODE-TYPE-REMOTE-EXEC-SIDE
+  ; LockWaitNode
+  make-lock-wait-node lock-wait-node?
+  lock-wait-node-tx-id lock-wait-node-holder-tx-id
+  lock-wait-node-hash lock-wait-node-lock-seq
+  lock-wait-node-key lock-wait-node-ls-id
+  lock-wait-node-tablet-id lock-wait-node-sessid
+  lock-wait-node-last-wait-hash lock-wait-node-is-placeholder?
+  lock-wait-node-node-type
+  lock-wait-node-set-lock-seq! lock-wait-node-set-holder-tx-id!
+  ; LockWaitMgr
+  make-lock-wait-mgr lock-wait-mgr?
+  lock-wait-mgr-add-node! lock-wait-mgr-remove-node!
+  lock-wait-mgr-find-by-tx lock-wait-mgr-count
+  lock-wait-mgr-has-cycle?)
+
+; ----------------------------------------------------------------
+; Node type constants
+; ----------------------------------------------------------------
+;
+; Per OB (rpc::ObLockWaitNode::NODE_TYPE):
+;   LOCAL              = 0  // local transaction waiting for local lock
+;   REMOTE_CTRL_SIDE   = 1  // coordinator of remote txn waiting
+;   REMOTE_EXEC_SIDE   = 2  // executor of remote txn being notified
+
+(define NODE-TYPE-LOCAL 0)
+(define NODE-TYPE-REMOTE-CTRL-SIDE 1)
+(define NODE-TYPE-REMOTE-EXEC-SIDE 2)
+
+; ----------------------------------------------------------------
+; ObLockWaitNode — closure-based
+; ----------------------------------------------------------------
+
+; make-lock-wait-node: create a lock wait request node.
+; Args: tx-id (integer), holder-tx-id (integer), hash (integer),
+;       lock-seq (integer), key (integer — fake row key), ls-id,
+;       tablet-id, sessid, node-type
+; Returns: lock_wait_node closure.
+(define (make-lock-wait-node tx-id holder-tx-id hash lock-seq key
+                            ls-id tablet-id sessid node-type)
+  (let ((s lock-seq)
+        (h holder-tx-id))
+    (letrec ((set-lock-seq! (lambda (v) (set! s v) v))
+             (set-holder-tx-id! (lambda (v) (set! h v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tx-id) tx-id)
+                       ((eq? msg 'holder-tx-id) h)
+                       ((eq? msg 'hash) hash)
+                       ((eq? msg 'lock-seq) s)
+                       ((eq? msg 'key) key)
+                       ((eq? msg 'ls-id) ls-id)
+                       ((eq? msg 'tablet-id) tablet-id)
+                       ((eq? msg 'sessid) sessid)
+                       ((eq? msg 'last-wait-hash) hash)
+                       ((eq? msg 'is-placeholder?) #f)
+                       ((eq? msg 'node-type) node-type)
+                       ((eq? msg 'set-lock-seq!) set-lock-seq!)
+                       ((eq? msg 'set-holder-tx-id!) set-holder-tx-id!)
+                       (else #f)))))
+      self)))
+
+; lock-wait-node?: is the object a lock_wait_node?
+; Detected by querying 'node-type — only nodes return an integer 0/1/2.
+(define (lock-wait-node? obj)
+  (if (procedure? obj)
+      (let ((nt (obj 'node-type)))
+        (if (or (= nt 0) (= nt 1) (= nt 2)) #t #f))
+      #f))
+
+; lock-wait-node-tx-id: get requester tx_id
+(define (lock-wait-node-tx-id n) (n 'tx-id))
+
+; lock-wait-node-holder-tx-id: get holder tx_id
+(define (lock-wait-node-holder-tx-id n) (n 'holder-tx-id))
+
+; lock-wait-node-hash: get lock hash
+(define (lock-wait-node-hash n) (n 'hash))
+
+; lock-wait-node-lock-seq: get current lock sequence
+(define (lock-wait-node-lock-seq n) (n 'lock-seq))
+
+; lock-wait-node-key: get lock key (row/tablet key)
+(define (lock-wait-node-key n) (n 'key))
+
+; lock-wait-node-ls-id: get log stream id
+(define (lock-wait-node-ls-id n) (n 'ls-id))
+
+; lock-wait-node-tablet-id: get tablet id
+(define (lock-wait-node-tablet-id n) (n 'tablet-id))
+
+; lock-wait-node-sessid: get session id
+(define (lock-wait-node-sessid n) (n 'sessid))
+
+; lock-wait-node-last-wait-hash: get last_wait_hash (for wakeup)
+(define (lock-wait-node-last-wait-hash n) (n 'last-wait-hash))
+
+; lock-wait-node-is-placeholder?: is this a placeholder node?
+(define (lock-wait-node-is-placeholder? n) (n 'is-placeholder?))
+
+; lock-wait-node-node-type: get node type (LOCAL/REMOTE_*)
+(define (lock-wait-node-node-type n) (n 'node-type))
+
+; lock-wait-node-set-lock-seq!: set lock sequence (for retry detection).
+; Returns the new lock-seq.
+(define (lock-wait-node-set-lock-seq! n v) ((n 'set-lock-seq!) v))
+
+; lock-wait-node-set-holder-tx-id!: set holder tx_id (after change).
+; Returns the new holder-tx-id.
+(define (lock-wait-node-set-holder-tx-id! n v) ((n 'set-holder-tx-id!) v))
+
+; ----------------------------------------------------------------
+; ObLockWaitMgr — closure-based registry
+; ----------------------------------------------------------------
+;
+; In real OB: 16384-bucket FixedHash2<Node>.
+; aura v1: cons-based list of nodes (linear scan).
+;
+; Grouping strategy: each node is grouped by tx_id (requester) so
+; deadlock detection can be done by walking tx_id → holder_tx_id chain.
+
+; make-lock-wait-mgr: create an empty LockWaitMgr.
+; Returns: lock_wait_mgr closure (initial: empty).
+(define (make-lock-wait-mgr)
+  (let ((nodes '()))
+    (letrec ((set-nodes! (lambda (v) (set! nodes v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) nodes)
+                       ((eq? msg 'set-nodes!) set-nodes!)
+                       (else #f)))))
+      self)))
+
+; lock-wait-mgr?: is the object a lock_wait_mgr?
+; Detected by querying 'list — only mgr closures return a list.
+(define (lock-wait-mgr? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'list)) #t #f)
+      #f))
+
+; lock-wait-mgr-add-node!: add a node to the mgr.
+; Returns the node (or #f if duplicate tx-id).
+(define (lock-wait-mgr-add-node! mgr node)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((mgr 'set-nodes!) (cons-rev-helper acc '()))
+                            ((mgr 'set-nodes!)
+                             (cons node (cons-rev-helper acc '()))))
+                        (not found?))
+                       ((= (car-rest 'tx-id rest)
+                          (node 'tx-id))
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (mgr 'list) '())))
+
+; car-rest: helper — get (car rest).tx-id without complex macro.
+(define (car-rest field rest)
+  ((car rest) field))
+
+; cons-rev-helper: helper — (cons-rev-helper acc rest) = (append (reverse acc) rest)
+(define (cons-rev-helper acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev-helper (cdr acc) (cons (car acc) rest))))
+
+; lock-wait-mgr-remove-node!: remove a node by tx-id.
+; Returns #t if removed, #f if not found.
+(define (lock-wait-mgr-remove-node! mgr tx-id)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((mgr 'set-nodes!)
+                             (cons-rev-helper acc '()))
+                            ((mgr 'set-nodes!) acc))
+                        found?)
+                       ((= ((car rest) 'tx-id) tx-id)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (mgr 'list) '())))
+
+; lock-wait-mgr-find-by-tx: find a node by requester tx_id.
+; Returns the node or #f.
+(define (lock-wait-mgr-find-by-tx mgr tx-id)
+  (let loop ((rest (mgr 'list)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'tx-id) tx-id) (car rest))
+      (else (loop (cdr rest))))))
+
+; lock-wait-mgr-count: count of registered nodes.
+(define (lock-wait-mgr-count mgr)
+  (let loop ((rest (mgr 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; Deadlock detection — cycle detection across tx-id → holder-tx-id
+; ----------------------------------------------------------------
+;
+; Simple DFS-based cycle detection. Returns #t if any cycle exists
+; (tx waits for itself transitively).
+;
+; Algorithm:
+;   for each node n in mgr:
+;     walk n.tx-id → n.holder-tx-id → next.holder-tx-id → ...
+;     if we revisit the starting tx-id → cycle exists
+;   return #f otherwise
+
+; lock-wait-mgr-has-cycle?: detect deadlock cycle.
+; Returns #t if any cycle exists.
+(define (lock-wait-mgr-has-cycle? mgr)
+  (let ((all-txids (collect-all-txids mgr)))
+    (let loop ((rest all-txids) (found #f))
+      (cond
+        (found #t)
+        ((null? rest) #f)
+        (else
+         (let ((start (car rest)))
+           (if (has-cycle-from? mgr start start (list start))
+               #t
+               (loop (cdr rest) #f))))))))
+
+; collect-all-txids: gather unique tx_ids from mgr.
+(define (collect-all-txids mgr)
+  (let loop ((rest (mgr 'list)) (acc '()))
+    (cond
+      ((null? rest) acc)
+      (else
+       (let ((tx-id ((car rest) 'tx-id)))
+         (if (member? tx-id acc)
+             (loop (cdr rest) acc)
+             (loop (cdr rest) (cons tx-id acc))))))))
+
+; member?: helper — is x a member of list?
+(define (member? x lst)
+  (cond
+    ((null? lst) #f)
+    ((= (car lst) x) #t)
+    (else (member? x (cdr lst)))))
+
+; has-cycle-from?: walk the wait-for chain from `start` following
+; holder-tx-ids, tracking visited tx-ids. Returns #t if `start` is
+; revisited.
+(define (has-cycle-from? mgr start current visited)
+  (let ((next-tx (find-holder-of mgr current)))
+    (cond
+      ((eq? next-tx #f) #f)
+      ((= next-tx start) #t)
+      ((member? next-tx visited) #f)
+      (else
+       (has-cycle-from? mgr start next-tx (cons next-tx visited))))))
+
+; find-holder-of: find the holder_tx_id for a requester tx_id.
+; Returns the holder-tx-id or #f if not found.
+(define (find-holder-of mgr tx-id)
+  (let loop ((rest (mgr 'list)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'tx-id) tx-id)
+       ((car rest) 'holder-tx-id))
+      (else (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; check_row_locked — 5-case state machine
+; ----------------------------------------------------------------
+;
+; In real OB, check_row_locked walks the version chain and returns
+; a lock_state via reference parameter. Aura v1: returns the
+; store_row_lock_state closure from 02-mvcc-iterator.
+;
+; The state machine:
+;   Case 1: iter == NULL → is_locked=false, flag=NOT_EXIST, trans_ver=0
+;   Case 2: is_delayed_cleanout && !is_committed && !is_aborted
+;           → return un-locked state with current version's info
+;           (in v1, simplified to walk past to next)
+;   Case 3: is_committed || is_elr → is_locked=false, with version info
+;   Case 4: is_aborted → walk to prev, retry
+;   Case 5: otherwise (undecided + not self) → is_locked=true with
+;           lock holder info
+;
+; Aura v1: cases 2/4 simplified to "skip to prev" (no cleanout).
+
+; check-row-locked: returns a store_row_lock_state for the row.
+; Args: row (mvcc-row)
+; Returns: store_row_lock_state closure (from 02-mvcc-iterator).
+;
+; Note: we need DML flag for lock_state. Since 01-mvcc-row doesn't
+; track dml-flag on version nodes, we use the row's last-dml-flag
+; as a proxy.
+(define (check-row-locked row)
+  (let ((node (row 'list-head)))
+    (check-row-locked-loop row node)))
+
+; check-row-locked-loop: tail-recursive helper.
+(define (check-row-locked-loop row iter)
+  (cond
+    ((eq? iter #f)
+     ; Case 1: empty list
+     (make-store-row-lock-state 0 0 0 DML-NOT-EXIST #f row 0 #f))
+    (else
+     (let ((flag (iter 'flag))
+           (tv (iter 'trans-version))
+           (tx-id (iter 'tx-id))
+           (seq (iter 'seq))
+           (scn (iter 'scn)))
+       (cond
+         ((= flag F-COMMITTED)
+          ; Case 3: committed → not locked
+          (make-store-row-lock-state tv 0 seq
+                                      (row 'last-dml-flag) #f row scn #f))
+         ((= flag F-ELR)
+          ; Case 3: ELR → not locked
+          (make-store-row-lock-state tv 0 seq
+                                      (row 'last-dml-flag) #f row scn #f))
+         ((= flag F-ABORTED)
+          ; Case 4: aborted → walk to prev
+          (check-row-locked-loop row (iter 'prev)))
+         (else
+          ; Case 5: undecided → locked by tx-id
+          (make-store-row-lock-state 0 tx-id seq
+                                      (row 'last-dml-flag)
+                                      (iter 'is-delayed-cleanout?)
+                                      row scn #t)))))))
