@@ -1,0 +1,216 @@
+; 031-crypto-api.aura
+; =======================
+; crypto_api — minimal capability port to aura.
+;
+; Maps to: Linux kernel crypto API
+; Source: include/linux/crypto.h + crypto/ (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux crypto API is the unified cryptographic algorithm framework
+; providing:
+;   - struct crypto_alg (algorithm: name, type, priority, blocksize)
+;   - struct crypto_tfm (transform: alg + per-instance state)
+;   - struct crypto_shash / crypto_ahash / crypto_skcipher (variants)
+;   - Registration: crypto_register_alg / crypto_unregister_alg
+;   - Lookup: crypto_alg_mod_lookup / crypto_find_alg
+;   - Operations: encrypt / decrypt (cipher), init/update/final (hash)
+;   - Algorithm types: CRYPTO_ALG_TYPE_CIPHER, _SHASH, _AHASH,
+;     _AEAD, _SKCIPHER, _KPP, etc.
+;   - Algorithms: aes, des, sha1, sha256, chacha20, poly1305, etc.
+;
+; aura has no crypto backend. v1 ships:
+;   - make-alg (algorithm factory: name, type, priority, blocksize)
+;   - make-tfm (transform factory: alg, state)
+;   - crypto-alg? / crypto-tfm? predicates
+;   - crypto-alg-name / crypto-alg-type / crypto-alg-priority /
+;     crypto-alg-blocksize
+;   - crypto-tfm-alg / crypto-tfm-state
+;   - crypto-register-alg / crypto-unregister-alg / crypto-find-alg
+;   - crypto-alg-count / crypto-tfm-create
+;   - Type symbols: 'cipher / 'shash / 'aead / 'skcipher / 'kpp
+;
+; Deferred (full Linux crypto):
+;   - actual encrypt/decrypt/hash operations
+;   - async crypto (ahash, skcipher)
+;   - crypto_alloc_* variants
+;   - crypto_shash_init/update/final
+;   - algorithm lookup with priority fallback
+;   - hardware offload (crypto-engine)
+;   - template instantiation (cryptd, cbc, ecb)
+;   - rng / akcipher / kpp variants
+
+(export
+  make-alg
+  crypto-alg?
+  crypto-alg-name
+  crypto-alg-type
+  crypto-alg-priority
+  crypto-alg-blocksize
+  make-tfm
+  crypto-tfm?
+  crypto-tfm-alg
+  crypto-tfm-state
+  crypto-register-alg
+  crypto-unregister-alg
+  crypto-find-alg
+  crypto-alg-count
+  crypto-tfm-create
+  'cipher
+  'shash
+  'aead
+  'skcipher
+  'kpp)
+
+; ----------------------------------------------------------------
+; crypto_alg — closure-based
+; ----------------------------------------------------------------
+
+; make-alg: create a crypto_alg.
+; Args: name (symbol), type (one of 'cipher / 'shash / etc.),
+;       priority (integer), blocksize (integer)
+; Returns: crypto_alg closure.
+(define (make-alg name type priority blocksize)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'type) type)
+                       ((eq? msg 'priority) priority)
+                       ((eq? msg 'blocksize) blocksize)
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; crypto-alg?: is the object a crypto_alg?
+; Detected by querying 'blocksize — only crypto_alg closures return
+; a non-negative integer.
+(define (crypto-alg? obj)
+  (if (procedure? obj)
+      (let ((bs (obj 'blocksize)))
+        (if (and (integer? bs) (>= bs 0)) #t #f))
+      #f))
+
+; crypto-alg-name: get algorithm name (symbol)
+(define (crypto-alg-name alg) (alg 'name))
+
+; crypto-alg-type: get algorithm type symbol
+(define (crypto-alg-type alg) (alg 'type))
+
+; crypto-alg-priority: get algorithm priority (higher = preferred)
+(define (crypto-alg-priority alg) (alg 'priority))
+
+; crypto-alg-blocksize: get block size in bytes
+(define (crypto-alg-blocksize alg) (alg 'blocksize))
+
+; ----------------------------------------------------------------
+; crypto_tfm — closure-based, mutable state
+; ----------------------------------------------------------------
+
+; make-tfm: create a crypto_tfm wrapping an alg.
+; Args: alg (crypto_alg)
+; Returns: crypto_tfm closure.
+(define (make-tfm alg)
+  (let ((state 'init))
+    (letrec ((set-state! (lambda (v) (set! state v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'alg) alg)
+                       ((eq? msg 'state) state)
+                       ((eq? msg 'set-state!) set-state!)
+                       (else #f)))))
+      self)))
+
+; crypto-tfm?: is the object a crypto_tfm?
+; Detected by querying 'alg — only crypto_tfm closures return a
+; value satisfying crypto-alg? predicate.
+(define (crypto-tfm? obj)
+  (if (procedure? obj)
+      (if (crypto-alg? (obj 'alg)) #t #f)
+      #f))
+
+; crypto-tfm-alg: get owning algorithm
+(define (crypto-tfm-alg tfm) (tfm 'alg))
+
+; crypto-tfm-state: get current state ('init / 'active / 'done)
+(define (crypto-tfm-state tfm) (tfm 'state))
+
+; ----------------------------------------------------------------
+; Algorithm registry — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-alg-registry: empty registry.
+(define (make-alg-registry)
+  (let ((algs '())
+        (next-id 0))
+    (letrec ((set-algs!    (lambda (v) (set! algs v) v))
+             (set-next-id! (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) algs)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-algs!)    set-algs!)
+                       ((eq? msg 'set-next-id!) set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global algorithm registry
+(define g-alg-registry (make-alg-registry))
+
+; crypto-register-alg: register an algorithm, assign unique id.
+; Returns the assigned id.
+(define (crypto-register-alg alg)
+  (let ((new-id (+ (g-alg-registry 'next-id) 1)))
+    ((g-alg-registry 'set-next-id!) new-id)
+    ((alg 'set-id!) new-id)
+    ((g-alg-registry 'set-algs!)
+     (cons alg (g-alg-registry 'list)))
+    new-id))
+
+; crypto-unregister-alg: remove an algorithm from the registry.
+; Returns #t if removed, #f if not found.
+(define (crypto-unregister-alg alg)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-alg-registry 'set-algs!)
+                             (cons-rev acc '()))
+                            ((g-alg-registry 'set-algs!) acc))
+                        found?)
+                       ((eq? (car rest) alg)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-alg-registry 'list) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; crypto-find-alg: find algorithm by name.
+; Returns the algorithm or #f if not found.
+(define (crypto-find-alg name)
+  (let loop ((rest (g-alg-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (crypto-alg-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; crypto-alg-count: count of registered algorithms
+(define (crypto-alg-count)
+  (let loop ((rest (g-alg-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; crypto-tfm-create: allocate a new crypto_tfm wrapping an alg.
+; Returns the new transform.
+(define (crypto-tfm-create alg)
+  (make-tfm alg))

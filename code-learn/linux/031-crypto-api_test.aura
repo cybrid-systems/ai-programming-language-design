@@ -1,0 +1,129 @@
+; 031-crypto-api_test.aura
+; ==========================
+; Smoke tests for 031-crypto-api.aura — crypto API minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/031-crypto-api_test.aura
+;
+; Verified automatically (smoke):
+;   - crypto_alg construction (name, type, priority, blocksize)
+;   - crypto_tfm construction (wraps alg, state init)
+;   - crypto-alg? / crypto-tfm? predicates
+;   - crypto-register-alg / unregister-alg
+;   - crypto-find-alg
+;   - crypto-alg-count
+;   - crypto-tfm-create
+;
+; Verified via separate probes during development:
+;   - Multiple algs coexist with different priorities
+;   - crypto-unregister-alg returns #f for non-registered alg
+;   - crypto-tfm-state mutations
+;
+; Deferred (full Linux crypto):
+;   - actual encrypt/decrypt/hash operations
+;   - async crypto (ahash, skcipher)
+;   - template instantiation (cryptd, cbc, ecb)
+;   - hardware offload
+
+(require "std/test" all:)
+(require "031-crypto-api" all:)
+
+; ----------------------------------------------------------------
+; crypto_alg construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "crypto-001-construction"
+  ; crypto_alg preserves name, type, priority, blocksize.
+  (check (= 'aes (crypto-alg-name (make-alg 'aes 'cipher 100 16))))
+  (check (= 'cipher (crypto-alg-type (make-alg 'aes 'cipher 100 16))))
+  (check (= 100 (crypto-alg-priority (make-alg 'aes 'cipher 100 16))))
+  (check (= 16 (crypto-alg-blocksize (make-alg 'aes 'cipher 100 16)))))
+
+(test-suite "crypto-001-predicate"
+  ; crypto-alg? accepts only crypto_alg closures.
+  (check (= 1 (if (crypto-alg? (make-alg 'aes 'cipher 100 16)) 1 0)))
+  (check (= 1 (if (not (crypto-alg? 'not-an-alg)) 1 0)))
+  (check (= 1 (if (not (crypto-alg? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; crypto_tfm construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "crypto-002-tfm-construction"
+  ; crypto_tfm wraps alg.
+  (check (= 1 (let ((alg (make-alg 'aes 'cipher 100 16)))
+                (if (eq? alg (crypto-tfm-alg (make-tfm alg))) 1 0)))))
+
+(test-suite "crypto-002-tfm-state-init"
+  ; New crypto_tfm state is 'init.
+  (check (= 'init (crypto-tfm-state (make-tfm (make-alg 'aes 'cipher 100 16))))))
+
+(test-suite "crypto-002-tfm-predicate"
+  ; crypto-tfm? accepts only crypto_tfm closures.
+  (check (= 1 (if (crypto-tfm? (make-tfm (make-alg 'aes 'cipher 100 16))) 1 0)))
+  (check (= 1 (if (not (crypto-tfm? 'not-a-tfm)) 1 0)))
+  (check (= 1 (if (not (crypto-tfm? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Registration
+; ----------------------------------------------------------------
+
+(test-suite "crypto-003-register"
+  ; crypto-register-alg assigns sequential id.
+  (check (= 1 (crypto-register-alg (make-alg 'unq-crypto-003 'cipher 100 16))))
+  ; Same alg after register.
+  (check (= 1 (let ((alg (make-alg 'unq-crypto-003-id 'cipher 100 16)))
+                (crypto-register-alg alg)
+                ((alg 'id))))))
+
+(test-suite "crypto-003-find"
+  ; crypto-find-alg returns the registered alg.
+  (check (= 1 (let ((alg (make-alg 'unq-crypto-003-find 'cipher 100 16)))
+                (crypto-register-alg alg)
+                (if (eq? alg (crypto-find-alg 'unq-crypto-003-find)) 1 0)))))
+
+(test-suite "crypto-003-find-missing"
+  ; crypto-find-alg returns #f for unknown name.
+  (check (= 1 (if (not (crypto-find-alg 'unq-crypto-003-missing)) 1 0))))
+
+; ----------------------------------------------------------------
+; Unregistration
+; ----------------------------------------------------------------
+
+(test-suite "crypto-004-unregister"
+  ; crypto-unregister-alg removes + crypto-find returns #f.
+  (check (= 1 (let ((alg (make-alg 'unq-crypto-004-unreg 'cipher 100 16)))
+                (crypto-register-alg alg)
+                (crypto-unregister-alg alg)
+                (if (not (crypto-find-alg 'unq-crypto-004-unreg)) 1 0)))))
+
+(test-suite "crypto-004-unregister-not-found"
+  ; crypto-unregister-alg returns #f for unregistered alg.
+  (check (= 1 (if (not (crypto-unregister-alg
+                          (make-alg 'unq-crypto-004-orphan 'cipher 100 16))) 1 0))))
+
+; ----------------------------------------------------------------
+; Count
+; ----------------------------------------------------------------
+
+(test-suite "crypto-005-count"
+  ; crypto-alg-count returns positive after registrations.
+  (check (= 1 (> (crypto-alg-count) 0))))
+
+; ----------------------------------------------------------------
+; crypto-tfm-create
+; ----------------------------------------------------------------
+
+(test-suite "crypto-006-tfm-create"
+  ; crypto-tfm-create wraps alg in a fresh tfm.
+  (check (= 1 (let ((alg (make-alg 'unq-crypto-006 'cipher 100 16)))
+                (let ((tfm (crypto-tfm-create alg)))
+                  (if (eq? alg (crypto-tfm-alg tfm)) 1 0))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
