@@ -1,0 +1,176 @@
+; 041-oom-killer_test.aura
+; ===========================
+; Smoke tests for 041-oom-killer.aura — OOM killer minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/041-oom-killer_test.aura
+;
+; Verified automatically (smoke):
+;   - oom_control / oom_killer / oom_task construction
+;   - oom-control? / oom-killer? / oom-task? predicates
+;   - oom-kill (counter + victim)
+;   - oom-badness (score + score-adj)
+;   - oom-select-victim (returns highest badness)
+;
+; Verified via separate probes during development:
+;   - oom-select-victim returns #f on empty list
+;   - Multiple kills accumulate
+;
+; Deferred (full Linux OOM):
+;   - real memory pressure detection
+;   - actual process kill (kill_pid / send_sig)
+;   - memcg-aware OOM
+;   - cgroup-aware oom_score_adj
+
+(require "std/test" all:)
+(require "041-oom-killer" all:)
+
+; ----------------------------------------------------------------
+; oom_control construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "oom-001-control-construction"
+  ; oom_control preserves gfp-mask, order, totalpages.
+  (check (= 0x1 (oom-control-gfp-mask
+                  (make-oom-control 0x1 0 1000))))
+  (check (= 0 (oom-control-order
+               (make-oom-control 0x1 0 1000))))
+  (check (= 1000 (oom-control-totalpages
+                   (make-oom-control 0x1 0 1000)))))
+
+(test-suite "oom-001-control-predicate"
+  ; oom-control? accepts only oom_control closures.
+  (check (= 1 (if (oom-control? (make-oom-control 0 0 0)) 1 0)))
+  (check (= 1 (if (not (oom-control? 'not-a-control)) 1 0)))
+  (check (= 1 (if (not (oom-control? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; oom_killer construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "oom-002-killer-construction"
+  ; New oom_killer starts with 0 kills + victim=-1.
+  (check (= 0 (oom-killer-kills-total (make-oom-killer))))
+  (check (= -1 (oom-killer-victim (make-oom-killer)))))
+
+(test-suite "oom-002-killer-predicate"
+  ; oom-killer? accepts only oom_killer closures.
+  (check (= 1 (if (oom-killer? (make-oom-killer)) 1 0)))
+  (check (= 1 (if (not (oom-killer? 'not-a-killer)) 1 0)))
+  (check (= 1 (if (not (oom-killer? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; oom_task construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "oom-003-task-construction"
+  ; oom_task preserves pid, score.
+  (check (= 1234 (oom-task-pid (make-oom-task 1234 100))))
+  (check (= 100 (oom-task-score (make-oom-task 1234 100)))))
+
+(test-suite "oom-003-task-set-score"
+  ; oom-task-set-score! updates score.
+  (check (= 500 (let ((t (make-oom-task 1234 100)))
+                  (oom-task-set-score! t 500)
+                  (oom-task-score t)))))
+
+(test-suite "oom-003-task-predicate"
+  ; oom-task? accepts only oom_task closures.
+  (check (= 1 (if (oom-task? (make-oom-task 1234 100)) 1 0)))
+  (check (= 1 (if (not (oom-task? 'not-a-task)) 1 0)))
+  (check (= 1 (if (not (oom-task? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; oom-kill
+; ----------------------------------------------------------------
+
+(test-suite "oom-004-kill"
+  ; oom-kill increments kills-total + sets victim.
+  (check (= 1 (let ((k (make-oom-killer)))
+                (oom-kill k 1234)
+                (oom-killer-kills-total k)))))
+
+(test-suite "oom-004-kill-victim"
+  ; oom-kill sets victim to given pid.
+  (check (= 1234 (let ((k (make-oom-killer)))
+                   (oom-kill k 1234)
+                   (oom-killer-victim k)))))
+
+(test-suite "oom-004-kill-multiple"
+  ; Multiple kills accumulate.
+  (check (= 3 (let ((k (make-oom-killer)))
+                (oom-kill k 100)
+                (oom-kill k 200)
+                (oom-kill k 300)
+                (oom-killer-kills-total k)))))
+
+; ----------------------------------------------------------------
+; oom-badness
+; ----------------------------------------------------------------
+
+(test-suite "oom-005-badness"
+  ; oom-badness = score + score-adj.
+  (check (= 50 (oom-badness (make-oom-task 100 100) -50))))
+
+(test-suite "oom-005-badness-positive"
+  ; oom-badness with positive score-adj.
+  (check (= 150 (oom-badness (make-oom-task 100 100) 50))))
+
+; ----------------------------------------------------------------
+; oom-select-victim
+; ----------------------------------------------------------------
+
+; zero-adj: helper score-adj-fn returning 0 for all tasks.
+(define (zero-adj task)
+  0)
+
+(test-suite "oom-006-select-victim"
+  ; oom-select-victim returns task with highest score.
+  (check (= 1 (let ((tasks (list (make-oom-task 100 50)
+                                 (make-oom-task 200 90)
+                                 (make-oom-task 300 70))))
+                (let ((victim (oom-select-victim tasks zero-adj)))
+                  (if (= (oom-task-pid victim) 200) 1 0))))))
+
+(test-suite "oom-006-select-victim-empty"
+  ; oom-select-victim on empty list returns #f.
+  (check (= 1 (if (not (oom-select-victim '() zero-adj)) 1 0))))
+
+(test-suite "oom-006-select-victim-with-adj"
+  ; oom-select-victim considers score-adj.
+  ; Task with low raw score but high adj should win.
+  (check (= 1 (let ((tasks (list (make-oom-task 100 10)
+                                 (make-oom-task 200 20))))
+                (let ((adj (lambda (t)
+                             (if (= (oom-task-pid t) 100)
+                                 100
+                                 0))))
+                  (let ((victim (oom-select-victim tasks adj)))
+                    (if (= (oom-task-pid victim) 100) 1 0)))))))
+
+; ----------------------------------------------------------------
+; oom-killer-reset
+; ----------------------------------------------------------------
+
+(test-suite "oom-007-reset"
+  ; oom-killer-reset clears kills-total + victim.
+  (check (= 0 (let ((k (make-oom-killer)))
+                (oom-kill k 100)
+                (oom-kill k 200)
+                (oom-killer-reset k)
+                (oom-killer-kills-total k)))))
+
+(test-suite "oom-007-reset-victim"
+  ; oom-killer-reset clears victim to -1.
+  (check (= -1 (let ((k (make-oom-killer)))
+                 (oom-kill k 100)
+                 (oom-killer-reset k)
+                 (oom-killer-victim k)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

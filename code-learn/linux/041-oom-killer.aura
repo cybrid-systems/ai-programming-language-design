@@ -1,0 +1,208 @@
+; 041-oom-killer.aura
+; =======================
+; oom_killer — minimal capability port to aura.
+;
+; Maps to: Linux kernel Out-Of-Memory killer
+; Source: mm/oom_kill.c + include/linux/oom.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux OOM killer selects and kills a process when memory is exhausted:
+;   - struct oom_control (gfp_mask, order, totalpages)
+;   - try_out_of_memory / out_of_memory (entry point)
+;   - oom_kill_process / oom_badness (victim scoring)
+;   - select_bad_process / select_victim
+;   - oom_score / oom_score_adj per task
+;   - oom_kills_total (system-wide kill counter)
+;   - /proc/<pid>/oom_score_adj
+;
+; aura has no processes, no memory allocation, no /proc. v1 ships:
+;   - make-oom-control (gfp-mask, order, totalpages)
+;   - make-oom-killer (kills-total, victim pid)
+;   - oom-kill (increment counter, set victim)
+;   - make-oom-task (pid, score)
+;   - oom-badness (compute score with adjustment)
+;   - oom-select-victim (find max badness in task list)
+;   - oom-control? / oom-killer? / oom-task? predicates
+;
+; Deferred (full Linux OOM):
+;   - real memory pressure detection
+;   - actual process kill (kill_pid / send_sig)
+;   - memcg-aware OOM
+;   - cgroup-aware oom_score_adj
+;   - memcg oom_kill_memory_event
+;   - oom_policy_node iteration
+;   - oom_kills_total per-cgroup
+;   - /proc/<pid>/oom_score_adj per-cgroup write
+
+(export
+  make-oom-control
+  oom-control?
+  oom-control-gfp-mask
+  oom-control-order
+  oom-control-totalpages
+  make-oom-killer
+  oom-killer?
+  oom-killer-kills-total
+  oom-killer-victim
+  oom-killer-reset
+  oom-kill
+  make-oom-task
+  oom-task?
+  oom-task-pid
+  oom-task-score
+  oom-task-set-score!
+  oom-badness
+  oom-select-victim)
+
+; ----------------------------------------------------------------
+; oom_control — closure-based
+; ----------------------------------------------------------------
+
+; make-oom-control: create an OOM control descriptor.
+; Args: gfp-mask (integer — page allocator flags), order (integer —
+;       allocation order), totalpages (integer — total pages)
+; Returns: oom_control closure.
+(define (make-oom-control gfp-mask order totalpages)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'gfp-mask) gfp-mask)
+                     ((eq? msg 'order) order)
+                     ((eq? msg 'totalpages) totalpages)
+                     (else #f)))))
+    self))
+
+; oom-control?: is the object an oom_control?
+; Detected by querying 'totalpages — only oom_control closures
+; return a non-negative integer.
+(define (oom-control? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'totalpages)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; oom-control-gfp-mask: get GFP mask
+(define (oom-control-gfp-mask c) (c 'gfp-mask))
+
+; oom-control-order: get allocation order
+(define (oom-control-order c) (c 'order))
+
+; oom-control-totalpages: get total pages
+(define (oom-control-totalpages c) (c 'totalpages))
+
+; ----------------------------------------------------------------
+; oom_killer — closure-based, mutable counters + victim pid
+; ----------------------------------------------------------------
+
+; make-oom-killer: create OOM killer state.
+; Returns: oom_killer closure (initial: 0 kills, no victim).
+(define (make-oom-killer)
+  (let ((kills-total 0)
+        (victim -1))
+    (letrec ((set-kills-total! (lambda (v) (set! kills-total v) v))
+             (set-victim!      (lambda (v) (set! victim v) v))
+             (inc-kills!       (lambda () (set! kills-total (+ kills-total 1)) kills-total))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'kills-total) kills-total)
+                       ((eq? msg 'victim)      victim)
+                       ((eq? msg 'set-kills-total!) set-kills-total!)
+                       ((eq? msg 'set-victim!)      set-victim!)
+                       ((eq? msg 'inc-kills!)       inc-kills!)
+                       (else #f)))))
+      self)))
+
+; oom-killer?: is the object an oom_killer?
+; Detected by querying 'kills-total — only oom_killer closures
+; return a non-negative integer.
+(define (oom-killer? obj)
+  (if (procedure? obj)
+      (let ((k (obj 'kills-total)))
+        (if (and (integer? k) (>= k 0)) #t #f))
+      #f))
+
+; oom-killer-kills-total: get total OOM kills
+(define (oom-killer-kills-total k) (k 'kills-total))
+
+; oom-killer-victim: get last victim pid (-1 if none)
+(define (oom-killer-victim k) (k 'victim))
+
+; oom-killer-reset: reset oom_killer state.
+; Returns the new kills-total.
+(define (oom-killer-reset k)
+  ((k 'set-kills-total!) 0)
+  ((k 'set-victim!) -1))
+
+; ----------------------------------------------------------------
+; oom_kill — record a kill event
+; ----------------------------------------------------------------
+
+; oom-kill: record an OOM kill of `pid`.
+; Increments kills-total + sets victim.
+; Returns the new kills-total.
+(define (oom-kill k pid)
+  ((k 'set-victim!) pid)
+  ((k 'inc-kills!)))
+
+; ----------------------------------------------------------------
+; oom_task — closure-based, mutable score
+; ----------------------------------------------------------------
+
+; make-oom-task: create a task for OOM consideration.
+; Args: pid (integer), score (integer — badness score)
+; Returns: oom_task closure.
+(define (make-oom-task pid score)
+  (letrec ((set-score! (lambda (v) (set! score v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'pid) pid)
+                     ((eq? msg 'score) score)
+                     ((eq? msg 'set-score!) set-score!)
+                     (else #f)))))
+    self))
+
+; oom-task?: is the object an oom_task?
+; Detected by querying 'pid — only oom_task closures return a
+; non-negative integer for pid.
+(define (oom-task? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'pid)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; oom-task-pid: get task pid
+(define (oom-task-pid t) (t 'pid))
+
+; oom-task-score: get task badness score
+(define (oom-task-score t) (t 'score))
+
+; oom-task-set-score!: set task badness score (for testing)
+(define (oom-task-set-score! t new-score)
+  ((t 'set-score!) new-score))
+
+; ----------------------------------------------------------------
+; oom_badness + oom_select_victim
+; ----------------------------------------------------------------
+
+; oom-badness: compute badness score for a task given oom_score_adj.
+; Args: task (oom_task), score-adj (integer — /proc/<pid>/oom_score_adj)
+; Returns the final badness score (with adjustment).
+(define (oom-badness task score-adj)
+  (+ (oom-task-score task) score-adj))
+
+; oom-select-victim: scan task list + return the task with the
+; highest badness score (after applying per-task score-adj via a
+; lookup procedure). Returns #f if list is empty.
+; Args: tasks (list of oom_task), score-adj-fn (procedure:
+;       task → integer)
+(define (oom-select-victim tasks score-adj-fn)
+  (let loop ((rest tasks) (best #f) (best-score -1))
+    (cond
+      ((null? rest) best)
+      (else
+       (let* ((task (car rest))
+              (adj (score-adj-fn task))
+              (badness (oom-badness task adj)))
+         (if (> badness best-score)
+             (loop (cdr rest) task badness)
+             (loop (cdr rest) best best-score)))))))
