@@ -1,0 +1,428 @@
+; 21-px-execution.aura
+; ======================
+; px_execution — minimal capability port to aura.
+;
+; Maps to: OceanBase PX (Parallel eXecution) framework
+; Source: src/sql/engine/px/ob_px_coord_op.{h,cpp}
+;         + src/sql/engine/px/ob_px_sqc_meta.{h,cpp}
+;         + src/sql/engine/px/ob_px_worker.{h,cpp}
+;         + src/sql/engine/px/ob_px_dtl_transmit.{h,cpp}
+;         + src/sql/engine/px/ob_px_dtl_receive.{h,cpp}
+;         + src/sql/engine/px/ob_px_dfo.{h,cpp}
+;         + src/sql/engine/px/ob_px_coord.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase PX (Parallel eXecution) framework:
+;   - 3-layer architecture: QC / SQC / Worker
+;   - DFO (Data Flow Operator): minimal scheduling unit, DAG
+;   - Exchange operators: TRANSMIT / RECEIVE / REPART
+;   - DTL (Data Transfer Layer): cross-node channel
+;   - QC (ObPxCoordOp): query coordinator
+;   - SQC (ObPxSqcMeta): sub-query coordinator
+;   - Worker (ObPxWorker): DFO execution thread
+;   - GranulePump: dynamic scan task dispatch
+;
+; aura v1 ships:
+;   - 3 PX-ROLE constants (QC, SQC, WORKER)
+;   - 4 DFO-STATUS constants (PENDING, RUNNING, DONE, FAILED)
+;   - 3 EXCHANGE-TYPE constants (TRANSMIT, RECEIVE, REPART)
+;   - 3 DTL-STATUS constants (IDLE, TRANSFERRING, CLOSED)
+;   - make-dfo (factory: dfo-id + child + parent)
+;   - dfo-get-id / get-status / set-status!
+;   - dfo-set-child! / set-parent!
+;   - dfo-add-input-row! / get-row-count
+;   - dfo-is-final? (status == DONE)
+;   - make-exchange (factory: exchange-type + source-dfo +
+;     target-dfo)
+;   - exchange-get-type / get-source-dfo-id / get-target-dfo-id
+;   - make-px-coord-op (QC factory: session-id + dfo-list)
+;   - px-coord-get-session-id / get-dfos
+;   - px-coord-add-dfo!
+;   - px-coord-count-dfos
+;   - make-px-sqc-meta (SQC factory: server-addr + coord)
+;   - px-sqc-meta-get-server-addr / get-coord
+;   - px-sqc-meta-set-running!
+;   - make-px-worker (Worker factory: sqc + thread-id)
+;   - px-worker-get-sqc / get-thread-id
+;   - px-worker-set-status!
+;   - make-dtl-channel (DTL factory: src-addr + dst-addr +
+;     exchange-type)
+;   - dtl-channel-get-src-addr / get-dst-addr / get-exchange-type
+;   - dtl-channel-get-status / set-status!
+;   - dtl-channel-send-row! / get-rows-sent
+;
+; Deferred (full OceanBase PX):
+;   - real ObPxCoordOp with DFO DAG scheduling + RPC
+;   - real ObPxSqcMeta with Worker thread pool
+;   - real ObPxWorker with operator open/get_next_row/close
+;   - real ObPxDtlTransmit / ObPxDtlReceive with network transport
+;   - real GranulePump with dynamic table scan partition dispatch
+;   - real ObExchangeOp with serial/deserial transport layer
+;   - real repartition for hash join / sort merge join
+;   - real PX coordination via ObRpcChannel
+
+(export
+  ; PX role constants
+  PX-ROLE-QC PX-ROLE-SQC PX-ROLE-WORKER
+  ; DFO status constants
+  DFO-STATUS-PENDING DFO-STATUS-RUNNING
+  DFO-STATUS-DONE DFO-STATUS-FAILED
+  ; Exchange type constants
+  EXCHANGE-TYPE-TRANSMIT EXCHANGE-TYPE-RECEIVE
+  EXCHANGE-TYPE-REPART
+  ; DTL status constants
+  DTL-STATUS-IDLE DTL-STATUS-TRANSFERRING
+  DTL-STATUS-CLOSED
+  ; DFO
+  make-dfo dfo?
+  dfo-get-id dfo-get-status dfo-set-status!
+  dfo-set-child! dfo-set-parent!
+  dfo-get-child dfo-get-parent
+  dfo-add-input-row! dfo-get-row-count
+  dfo-is-final?
+  ; Exchange
+  make-exchange exchange?
+  exchange-get-type exchange-get-source-dfo-id
+  exchange-get-target-dfo-id
+  ; ObPxCoordOp
+  make-px-coord-op px-coord-op?
+  px-coord-get-session-id px-coord-get-dfos
+  px-coord-add-dfo! px-coord-count-dfos
+  ; ObPxSqcMeta
+  make-px-sqc-meta px-sqc-meta?
+  px-sqc-meta-get-server-addr px-sqc-meta-get-coord
+  px-sqc-meta-set-running!
+  ; ObPxWorker
+  make-px-worker px-worker?
+  px-worker-get-sqc px-worker-get-thread-id
+  px-worker-set-status!
+  ; DTL channel
+  make-dtl-channel dtl-channel?
+  dtl-channel-get-src-addr dtl-channel-get-dst-addr
+  dtl-channel-get-exchange-type dtl-channel-get-status
+  dtl-channel-set-status! dtl-channel-send-row!
+  dtl-channel-get-rows-sent)
+
+; ----------------------------------------------------------------
+; PX role constants
+; ----------------------------------------------------------------
+;
+; Per OB:
+;   QC     = Query Coordinator (top-level)
+;   SQC    = Sub Query Coordinator (per-node)
+;   WORKER = actual execution thread
+
+(define PX-ROLE-QC 0)
+(define PX-ROLE-SQC 1)
+(define PX-ROLE-WORKER 2)
+
+; ----------------------------------------------------------------
+; DFO status constants
+; ----------------------------------------------------------------
+
+(define DFO-STATUS-PENDING 0)
+(define DFO-STATUS-RUNNING 1)
+(define DFO-STATUS-DONE 2)
+(define DFO-STATUS-FAILED 3)
+
+; ----------------------------------------------------------------
+; Exchange type constants
+; ----------------------------------------------------------------
+
+(define EXCHANGE-TYPE-TRANSMIT 0)
+(define EXCHANGE-TYPE-RECEIVE 1)
+(define EXCHANGE-TYPE-REPART 2)
+
+; ----------------------------------------------------------------
+; DTL status constants
+; ----------------------------------------------------------------
+
+(define DTL-STATUS-IDLE 0)
+(define DTL-STATUS-TRANSFERRING 1)
+(define DTL-STATUS-CLOSED 2)
+
+; ----------------------------------------------------------------
+; DFO — closure-based
+; ----------------------------------------------------------------
+
+; make-dfo: create a DFO.
+; Args: dfo-id (integer), child (dfo or #f), parent (dfo or #f)
+; Returns: dfo closure (initial: status=PENDING, row-count=0).
+(define (make-dfo dfo-id child parent)
+  (let ((status DFO-STATUS-PENDING)
+        (row-count 0))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (set-child! (lambda (v) (set! child v) v))
+             (set-parent! (lambda (v) (set! parent v) v))
+             (set-row-count! (lambda (v) (set! row-count v) v))
+             (inc-row-count! (lambda () (set! row-count (+ row-count 1)) row-count))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'id) dfo-id)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'child) child)
+                       ((eq? msg 'parent) parent)
+                       ((eq? msg 'row-count) row-count)
+                       ((eq? msg 'set-status!) set-status!)
+                       ((eq? msg 'set-child!) set-child!)
+                       ((eq? msg 'set-parent!) set-parent!)
+                       ((eq? msg 'set-row-count!) set-row-count!)
+                       ((eq? msg 'inc-row-count!) inc-row-count!)
+                       (else #f)))))
+      self)))
+
+; dfo?: is the object a DFO?
+; Detected by querying 'row-count — only DFOs return integer >= 0.
+(define (dfo? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'row-count)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; dfo-get-id: get DFO id.
+(define (dfo-get-id d) (d 'id))
+
+; dfo-get-status: get current status.
+(define (dfo-get-status d) (d 'status))
+
+; dfo-set-status!: set status.
+; Returns the new status.
+(define (dfo-set-status! d v) ((d 'set-status!) v))
+
+; dfo-set-child!: set child DFO.
+(define (dfo-set-child! d v) ((d 'set-child!) v))
+
+; dfo-set-parent!: set parent DFO.
+(define (dfo-set-parent! d v) ((d 'set-parent!) v))
+
+; dfo-get-child: get child DFO (or #f).
+(define (dfo-get-child d) (d 'child))
+
+; dfo-get-parent: get parent DFO (or #f).
+(define (dfo-get-parent d) (d 'parent))
+
+; dfo-add-input-row!: increment row count.
+; Returns the new row count.
+(define (dfo-add-input-row! d) ((d 'inc-row-count!)))
+
+; dfo-get-row-count: get row count.
+(define (dfo-get-row-count d) (d 'row-count))
+
+; dfo-is-final?: is the DFO in final state (DONE)?
+(define (dfo-is-final? d)
+  (= (d 'status) DFO-STATUS-DONE))
+
+; ----------------------------------------------------------------
+; Exchange — closure-based
+; ----------------------------------------------------------------
+
+; make-exchange: create an Exchange op.
+; Args: exchange-type (integer), source-dfo-id (integer),
+;       target-dfo-id (integer)
+; Returns: exchange closure.
+(define (make-exchange exchange-type source-dfo-id target-dfo-id)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'type) exchange-type)
+                     ((eq? msg 'source-dfo-id) source-dfo-id)
+                     ((eq? msg 'target-dfo-id) target-dfo-id)
+                     (else #f)))))
+      self))
+
+; exchange?: is the object an Exchange op?
+; Detected by querying 'source-dfo-id — only exchanges return integer.
+(define (exchange? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'source-dfo-id)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; exchange-get-type: get exchange type.
+(define (exchange-get-type e) (e 'type))
+
+; exchange-get-source-dfo-id: get source DFO id.
+(define (exchange-get-source-dfo-id e) (e 'source-dfo-id))
+
+; exchange-get-target-dfo-id: get target DFO id.
+(define (exchange-get-target-dfo-id e) (e 'target-dfo-id))
+
+; ----------------------------------------------------------------
+; ObPxCoordOp — closure-based (QC)
+; ----------------------------------------------------------------
+
+; make-px-coord-op: create a Query Coordinator.
+; Args: session-id (integer), dfos (list of dfos — initially empty)
+; Returns: px_coord_op closure.
+(define (make-px-coord-op session-id dfos)
+  (letrec ((set-dfos! (lambda (v) (set! dfos v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'session-id) session-id)
+                     ((eq? msg 'dfos) dfos)
+                     ((eq? msg 'set-dfos!) set-dfos!)
+                     (else #f)))))
+      self))
+
+; px-coord-op?: is the object a QC?
+; Detected by querying 'session-id — only QCs return integer.
+(define (px-coord-op? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'session-id)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; px-coord-get-session-id: get session id.
+(define (px-coord-get-session-id qc) (qc 'session-id))
+
+; px-coord-get-dfos: get list of DFOs.
+(define (px-coord-get-dfos qc) (qc 'dfos))
+
+; px-coord-add-dfo!: add a DFO to the coord.
+; Returns the new count of DFOs.
+(define (px-coord-add-dfo! qc dfo)
+  (let ((existing (qc 'dfos)))
+    ((qc 'set-dfos!) (cons dfo existing))))
+
+; px-coord-count-dfos: count of DFOs.
+(define (px-coord-count-dfos qc)
+  (let loop ((rest (qc 'dfos)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; ObPxSqcMeta — closure-based (SQC)
+; ----------------------------------------------------------------
+
+; make-px-sqc-meta: create a Sub Query Coordinator.
+; Args: server-addr (symbol), coord (px_coord_op)
+; Returns: px_sqc_meta closure.
+(define (make-px-sqc-meta server-addr coord)
+  (let ((running? #f))
+    (letrec ((set-running! (lambda (v) (set! running? v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'server-addr) server-addr)
+                       ((eq? msg 'coord) coord)
+                       ((eq? msg 'running?) running?)
+                       ((eq? msg 'set-running!) set-running!)
+                       (else #f)))))
+      self))
+
+; px-sqc-meta?: is the object an SQC?
+; Detected by querying 'running? — only SQCs return boolean.
+(define (px-sqc-meta? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'running?)))
+        (if (or (eq? r #t) (eq? r #f)) #t #f))
+      #f))
+
+; px-sqc-meta-get-server-addr: get server address.
+(define (px-sqc-meta-get-server-addr sqc) (sqc 'server-addr))
+
+; px-sqc-meta-get-coord: get parent QC.
+(define (px-sqc-meta-get-coord sqc) (sqc 'coord))
+
+; px-sqc-meta-set-running!: set running state.
+; Returns the new running state.
+(define (px-sqc-meta-set-running! sqc v) ((sqc 'set-running!) v))
+
+; ----------------------------------------------------------------
+; ObPxWorker — closure-based
+; ----------------------------------------------------------------
+
+; make-px-worker: create a Worker.
+; Args: sqc (px_sqc_meta), thread-id (integer)
+; Returns: px_worker closure (initial: status=PENDING).
+(define (make-px-worker sqc thread-id)
+  (let ((status DFO-STATUS-PENDING))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'sqc) sqc)
+                       ((eq? msg 'thread-id) thread-id)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self))
+
+; px-worker?: is the object a Worker?
+; Detected by querying 'thread-id — only workers return integer.
+(define (px-worker? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'thread-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; px-worker-get-sqc: get parent SQC.
+(define (px-worker-get-sqc w) (w 'sqc))
+
+; px-worker-get-thread-id: get thread id.
+(define (px-worker-get-thread-id w) (w 'thread-id))
+
+; px-worker-set-status!: set status.
+; Returns the new status.
+(define (px-worker-set-status! w v) ((w 'set-status!) v))
+
+; ----------------------------------------------------------------
+; DTL channel — closure-based
+; ----------------------------------------------------------------
+
+; make-dtl-channel: create a DTL (Data Transfer Layer) channel.
+; Args: src-addr (symbol), dst-addr (symbol),
+;       exchange-type (integer)
+; Returns: dtl_channel closure (initial: status=IDLE, rows-sent=0).
+(define (make-dtl-channel src-addr dst-addr exchange-type)
+  (let ((status DTL-STATUS-IDLE)
+        (rows-sent 0))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (set-rows-sent! (lambda (v) (set! rows-sent v) v))
+             (inc-rows-sent! (lambda () (set! rows-sent (+ rows-sent 1)) rows-sent))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'src-addr) src-addr)
+                       ((eq? msg 'dst-addr) dst-addr)
+                       ((eq? msg 'exchange-type) exchange-type)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'rows-sent) rows-sent)
+                       ((eq? msg 'set-status!) set-status!)
+                       ((eq? msg 'set-rows-sent!) set-rows-sent!)
+                       ((eq? msg 'inc-rows-sent!) inc-rows-sent!)
+                       (else #f)))))
+      self))
+
+; dtl-channel?: is the object a DTL channel?
+; Detected by querying 'rows-sent — only channels return integer >= 0.
+(define (dtl-channel? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'rows-sent)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; dtl-channel-get-src-addr: get source address.
+(define (dtl-channel-get-src-addr ch) (ch 'src-addr))
+
+; dtl-channel-get-dst-addr: get destination address.
+(define (dtl-channel-get-dst-addr ch) (ch 'dst-addr))
+
+; dtl-channel-get-exchange-type: get exchange type.
+(define (dtl-channel-get-exchange-type ch) (ch 'exchange-type))
+
+; dtl-channel-get-status: get current status.
+(define (dtl-channel-get-status ch) (ch 'status))
+
+; dtl-channel-set-status!: set status.
+; Returns the new status.
+(define (dtl-channel-set-status! ch v) ((ch 'set-status!) v))
+
+; dtl-channel-send-row!: send a row through the channel.
+; Increments rows-sent + sets status to TRANSFERRING.
+; Returns the new rows-sent.
+(define (dtl-channel-send-row! ch)
+  ((ch 'set-status!) DTL-STATUS-TRANSFERRING)
+  ((ch 'inc-rows-sent!)))
+
+; dtl-channel-get-rows-sent: get rows-sent count.
+(define (dtl-channel-get-rows-sent ch) (ch 'rows-sent))

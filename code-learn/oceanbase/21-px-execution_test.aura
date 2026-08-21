@@ -1,0 +1,278 @@
+; 21-px-execution_test.aura
+; ======================
+; Smoke tests for 21-px-execution.aura — PX (Parallel eXecution) minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/21-px-execution_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 PX-ROLE + 4 DFO-STATUS + 3 EXCHANGE-TYPE + 3 DTL-STATUS distinct
+;   - make-dfo + accessors + setters + add-input-row! + is-final?
+;   - make-exchange + accessors
+;   - make-px-coord-op + add-dfo! + count-dfos
+;   - make-px-sqc-meta + set-running!
+;   - make-px-worker + set-status!
+;   - make-dtl-channel + send-row! + status transitions
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - DFO parent/child link works
+;   - DTL send-row! updates status + rows-sent
+;
+; Deferred (full OceanBase PX):
+;   - real ObPxCoordOp with DFO DAG scheduling + RPC
+;   - real ObPxSqcMeta with Worker thread pool
+;   - real ObPxWorker with operator open/get_next_row/close
+;   - real ObPxDtlTransmit / ObPxDtlReceive with network transport
+;   - real GranulePump with dynamic table scan partition dispatch
+;   - real ObExchangeOp with serial/deserial transport layer
+;   - real repartition for hash join / sort merge join
+;   - real PX coordination via ObRpcChannel
+
+(require "std/test" all:)
+(require "21-px-execution" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "21-001-px-role-distinct"
+  ; 3 PX-ROLE constants are distinct.
+  (check (= 1 (if (not (= PX-ROLE-QC PX-ROLE-SQC)) 1 0)))
+  (check (= 1 (if (not (= PX-ROLE-SQC PX-ROLE-WORKER)) 1 0)))
+  (check (= 1 (if (not (= PX-ROLE-QC PX-ROLE-WORKER)) 1 0))))
+
+(test-suite "21-001-dfo-status-distinct"
+  ; 4 DFO-STATUS constants are distinct.
+  (check (= 1 (if (not (= DFO-STATUS-PENDING DFO-STATUS-RUNNING)) 1 0)))
+  (check (= 1 (if (not (= DFO-STATUS-RUNNING DFO-STATUS-DONE)) 1 0)))
+  (check (= 1 (if (not (= DFO-STATUS-DONE DFO-STATUS-FAILED)) 1 0)))
+  (check (= 1 (if (not (= DFO-STATUS-PENDING DFO-STATUS-FAILED)) 1 0))))
+
+(test-suite "21-001-exchange-type-distinct"
+  ; 3 EXCHANGE-TYPE constants are distinct.
+  (check (= 1 (if (not (= EXCHANGE-TYPE-TRANSMIT
+                          EXCHANGE-TYPE-RECEIVE)) 1 0)))
+  (check (= 1 (if (not (= EXCHANGE-TYPE-RECEIVE
+                          EXCHANGE-TYPE-REPART)) 1 0))))
+
+(test-suite "21-001-dtl-status-distinct"
+  ; 3 DTL-STATUS constants are distinct.
+  (check (= 1 (if (not (= DTL-STATUS-IDLE
+                          DTL-STATUS-TRANSFERRING)) 1 0)))
+  (check (= 1 (if (not (= DTL-STATUS-TRANSFERRING
+                          DTL-STATUS-CLOSED)) 1 0))))
+
+; ----------------------------------------------------------------
+; DFO
+; ----------------------------------------------------------------
+
+(test-suite "21-002-dfo-construction"
+  ; dfo preserves id + initial status.
+  (check (= 1 (dfo-get-id (make-dfo 1 #f #f))))
+  (check (= DFO-STATUS-PENDING (dfo-get-status (make-dfo 1 #f #f))))
+  (check (= 0 (dfo-get-row-count (make-dfo 1 #f #f)))))
+
+(test-suite "21-002-dfo-predicate"
+  ; dfo? accepts only dfos.
+  (check (= #t (dfo? (make-dfo 1 #f #f))))
+  (check (= #f (dfo? 'not-a-dfo)))
+  (check (= #f (dfo? 42)))
+
+(test-suite "21-003-dfo-set-status"
+  ; set-status! updates.
+  (check (= DFO-STATUS-RUNNING
+             (let ((d (make-dfo 1 #f #f)))
+               (dfo-set-status! d DFO-STATUS-RUNNING)
+               (dfo-get-status d))))
+
+(test-suite "21-003-dfo-set-child"
+  ; set-child! links child.
+  (check (= #t (let ((parent (make-dfo 1 #f #f))
+                      (child (make-dfo 2 #f #f)))
+                 (dfo-set-child! parent child)
+                 (eq? child (dfo-get-child parent)))))
+
+(test-suite "21-003-dfo-set-parent"
+  ; set-parent! links parent.
+  (check (= #t (let ((child (make-dfo 1 #f #f))
+                      (parent (make-dfo 0 #f #f)))
+                 (dfo-set-parent! child parent)
+                 (eq? parent (dfo-get-parent child)))))
+
+(test-suite "21-004-dfo-add-input-row"
+  ; add-input-row! increments row-count.
+  (check (= 1 (let ((d (make-dfo 1 #f #f)))
+                 (dfo-add-input-row! d)
+                 (dfo-get-row-count d))))
+  (check (= 5 (let ((d (make-dfo 1 #f #f)))
+                 (dfo-add-input-row! d)
+                 (dfo-add-input-row! d)
+                 (dfo-add-input-row! d)
+                 (dfo-add-input-row! d)
+                 (dfo-add-input-row! d)
+                 (dfo-get-row-count d))))
+
+(test-suite "21-004-dfo-is-final"
+  ; is-final? true only when DONE.
+  (check (= #f (dfo-is-final? (make-dfo 1 #f #f))))
+  (check (= #t (let ((d (make-dfo 1 #f #f)))
+                 (dfo-set-status! d DFO-STATUS-DONE)
+                 (dfo-is-final? d))))
+
+; ----------------------------------------------------------------
+; Exchange
+; ----------------------------------------------------------------
+
+(test-suite "21-005-exchange-construction"
+  ; exchange preserves fields.
+  (check (= EXCHANGE-TYPE-TRANSMIT
+             (exchange-get-type (make-exchange EXCHANGE-TYPE-TRANSMIT 1 2))))
+  (check (= 1 (exchange-get-source-dfo-id
+               (make-exchange EXCHANGE-TYPE-TRANSMIT 1 2))))
+  (check (= 2 (exchange-get-target-dfo-id
+               (make-exchange EXCHANGE-TYPE-TRANSMIT 1 2)))))
+
+(test-suite "21-005-exchange-predicate"
+  ; exchange? accepts only exchanges.
+  (check (= #t (exchange? (make-exchange EXCHANGE-TYPE-TRANSMIT 1 2))))
+  (check (= #f (exchange? 'not-an-exchange)))
+  (check (= #f (exchange? 42)))
+
+; ----------------------------------------------------------------
+; ObPxCoordOp (QC)
+; ----------------------------------------------------------------
+
+(test-suite "21-006-qc-construction"
+  ; qc preserves session-id.
+  (check (= 100 (px-coord-get-session-id (make-px-coord-op 100 '()))))
+  (check (= 0 (px-coord-count-dfos (make-px-coord-op 100 '()))))
+
+(test-suite "21-006-qc-predicate"
+  ; px-coord-op? accepts only QCs.
+  (check (= #t (px-coord-op? (make-px-coord-op 1 '()))))
+  (check (= #f (px-coord-op? 'not-a-qc)))
+  (check (= #f (px-coord-op? 42)))
+
+(test-suite "21-007-qc-add-dfo"
+  ; add-dfo! increases count.
+  (check (= 1 (let ((qc (make-px-coord-op 1 '()))
+                    (d (make-dfo 1 #f #f)))
+                (px-coord-add-dfo! qc d)
+                (px-coord-count-dfos qc))))
+  (check (= 3 (let ((qc (make-px-coord-op 1 '())))
+                (px-coord-add-dfo! qc (make-dfo 1 #f #f))
+                (px-coord-add-dfo! qc (make-dfo 2 #f #f))
+                (px-coord-add-dfo! qc (make-dfo 3 #f #f))
+                (px-coord-count-dfos qc))))
+
+; ----------------------------------------------------------------
+; ObPxSqcMeta (SQC)
+; ----------------------------------------------------------------
+
+(test-suite "21-008-sqc-construction"
+  ; sqc preserves fields.
+  (check (= #t (eq? 'server-a
+                   (px-sqc-meta-get-server-addr
+                     (make-px-sqc-meta 'server-a #f)))))
+  (check (= #f (px-sqc-meta-get-coord (make-px-sqc-meta 'sa #f))))
+
+(test-suite "21-008-sqc-predicate"
+  ; px-sqc-meta? accepts only SQCs.
+  (check (= #t (px-sqc-meta? (make-px-sqc-meta 'sa #f))))
+  (check (= #f (px-sqc-meta? 'not-sqc)))
+  (check (= #f (px-sqc-meta? 42)))
+
+(test-suite "21-008-sqc-set-running"
+  ; set-running! updates.
+  (check (= #t (let ((sqc (make-px-sqc-meta 'sa #f)))
+                 (px-sqc-meta-set-running! sqc #t)
+                 (eq? #t ((sqc 'running?))))))
+
+; ----------------------------------------------------------------
+; ObPxWorker
+; ----------------------------------------------------------------
+
+(test-suite "21-009-worker-construction"
+  ; worker preserves fields.
+  (check (= 5 (px-worker-get-thread-id
+                (make-px-worker #f 5))))
+  (check (= DFO-STATUS-PENDING
+             (let ((w (make-px-worker #f 1)))
+               ((w 'status)))))
+
+(test-suite "21-009-worker-predicate"
+  ; px-worker? accepts only workers.
+  (check (= #t (px-worker? (make-px-worker #f 1))))
+  (check (= #f (px-worker? 'not-a-worker)))
+  (check (= #f (px-worker? 42)))
+
+(test-suite "21-009-worker-set-status"
+  ; set-status! updates.
+  (check (= DFO-STATUS-DONE
+             (let ((w (make-px-worker #f 1)))
+               (px-worker-set-status! w DFO-STATUS-DONE)
+               ((w 'status)))))
+
+; ----------------------------------------------------------------
+; DTL channel
+; ----------------------------------------------------------------
+
+(test-suite "21-010-dtl-construction"
+  ; dtl-channel preserves fields.
+  (check (= #t (eq? 'src-server
+                   (dtl-channel-get-src-addr
+                     (make-dtl-channel 'src-server 'dst-server
+                       EXCHANGE-TYPE-TRANSMIT)))))
+  (check (= #t (eq? 'dst-server
+                   (dtl-channel-get-dst-addr
+                     (make-dtl-channel 'src-server 'dst-server
+                       EXCHANGE-TYPE-TRANSMIT)))))
+  (check (= EXCHANGE-TYPE-TRANSMIT
+             (dtl-channel-get-exchange-type
+               (make-dtl-channel 'src-server 'dst-server
+                 EXCHANGE-TYPE-TRANSMIT))))
+  (check (= DTL-STATUS-IDLE
+             (dtl-channel-get-status
+               (make-dtl-channel 'src 'dst EXCHANGE-TYPE-TRANSMIT))))
+  (check (= 0 (dtl-channel-get-rows-sent
+               (make-dtl-channel 'src 'dst EXCHANGE-TYPE-TRANSMIT)))))
+
+(test-suite "21-010-dtl-predicate"
+  ; dtl-channel? accepts only channels.
+  (check (= #t (dtl-channel? (make-dtl-channel 'a 'b EXCHANGE-TYPE-TRANSMIT))))
+  (check (= #f (dtl-channel? 'not-dtl)))
+  (check (= #f (dtl-channel? 42)))
+
+(test-suite "21-011-dtl-send-row-updates-stats"
+  ; send-row! sets status to TRANSFERRING + increments rows-sent.
+  (check (= #t (let ((ch (make-dtl-channel 'a 'b EXCHANGE-TYPE-TRANSMIT)))
+                 (dtl-channel-send-row! ch)
+                 (and (= DTL-STATUS-TRANSFERRING
+                       (dtl-channel-get-status ch))
+                      (= 1 (dtl-channel-get-rows-sent ch))))))
+
+(test-suite "21-011-dtl-send-multiple-rows"
+  ; Multiple send-rows! accumulate.
+  (check (= 5 (let ((ch (make-dtl-channel 'a 'b EXCHANGE-TYPE-TRANSMIT)))
+                 (dtl-channel-send-row! ch)
+                 (dtl-channel-send-row! ch)
+                 (dtl-channel-send-row! ch)
+                 (dtl-channel-send-row! ch)
+                 (dtl-channel-send-row! ch)
+                 (dtl-channel-get-rows-sent ch))))
+
+(test-suite "21-011-dtl-set-status"
+  ; set-status! updates.
+  (check (= DTL-STATUS-CLOSED
+             (let ((ch (make-dtl-channel 'a 'b EXCHANGE-TYPE-TRANSMIT)))
+               (dtl-channel-set-status! ch DTL-STATUS-CLOSED)
+               (dtl-channel-get-status ch))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
