@@ -1,0 +1,437 @@
+; 12-election.aura
+; =====================
+; election — minimal capability port to aura.
+;
+; Maps to: OceanBase Election module (Paxos leader election)
+; Source: src/logservice/palf/election/interface/election.h
+;         + algorithm/election_proposer.h + election_acceptor.h
+;         + algorithm/election_impl.h
+;         + message/election_message.h
+;         + utils/election_common_define.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Election module:
+;   - 3 Proposer Roles: FOLLOWER / CANDIDATE / LEADER
+;   - 5 RoleChangeReason values:
+;     DevoteToBeLeader (Follower → Leader, fresh election),
+;     ChangeLeaderToBeLeader (Follower → Leader, forced),
+;     LeaseExpiredToRevoke (Leader → Follower, lease expired),
+;     ChangeLeaderToRevoke (Leader → Follower, forced),
+;     StopToRevoke (Leader → Follower, stopped)
+;   - 3 Prepare/Accept message results:
+;     Prepare_OK / Prepare_REJECT / Prepare_UNKNOWN
+;   - BallotNumber (monotonically increasing — identifies a ballot)
+;   - Proposer (state machine per replica)
+;   - Acceptor (per-replica vote store)
+;   - ElectionImpl (coordinates Proposer + Acceptor)
+;
+; aura has no Paxos, no leader election. v1 ships:
+;   - 3 ROLE constants (FOLLOWER, CANDIDATE, LEADER)
+;   - 5 ROLE-CHANGE-REASON constants
+;   - 3 PREPARE-RESULT constants
+;   - 3 ACCEPT-RESULT constants
+;   - 3 PHASE constants (IDLE, PREPARE, ACCEPT)
+;   - make-ballot-number (factory: number + proposer)
+;   - ballot-number-get + gt? (greater-than for priority compare)
+;   - make-proposer (factory: role + ballot + leader-id + last-leader-id)
+;   - proposer-set-role! + set-ballot! + set-leader-id! + advance-ballot!
+;   - make-acceptor (factory: ballot + state + prepared)
+;   - acceptor-set-ballot! + set-state! + set-prepared!
+;   - acceptor-set-prepared-ballot! (record Prepare response)
+;   - make-election (factory: proposer + acceptor)
+;   - election-set-proposer! / set-acceptor!
+;   - election-process-prepare! (Prepare → accept or reject)
+;   - election-process-accept! (Accept → accept or reject)
+;   - election-role-transition (FOLLOWER → CANDIDATE → LEADER)
+;
+; Deferred (full OceanBase Election):
+;   - real ElectionImpl with priority strategy
+;   - real Proposer + Acceptor with full state machines
+;   - real Lease / heartbeat mechanism
+;   - real ElectionMsgSender (network messages)
+;   - real member list change handling
+;   - real change_leader_to (active leader switch)
+;   - real ballot_number conflict resolution
+;   - real ElectionPriority interface (priority strategy)
+
+(export
+  ; Role constants
+  ROLE-FOLLOWER ROLE-CANDIDATE ROLE-LEADER
+  ; RoleChangeReason constants
+  RC-DEVOTE-TO-BE-LEADER
+  RC-CHANGE-LEADER-TO-BE-LEADER
+  RC-LEASE-EXPIRED-TO-REVOKE
+  RC-CHANGE-LEADER-TO-REVOKE
+  RC-STOP-TO-REVOKE
+  ; Prepare/Accept result constants
+  PREPARE-OK PREPARE-REJECT PREPARE-UNKNOWN
+  ACCEPT-OK ACCEPT-REJECT ACCEPT-UNKNOWN
+  ; Phase constants
+  PHASE-IDLE PHASE-PREPARE PHASE-ACCEPT
+  ; BallotNumber
+  make-ballot-number ballot-number?
+  ballot-number-get-number ballot-number-get-proposer
+  ballot-number-gt? ballot-number-eq?
+  ; Proposer
+  make-proposer proposer?
+  proposer-get-role proposer-set-role!
+  proposer-get-ballot proposer-set-ballot!
+  proposer-get-leader-id proposer-set-leader-id!
+  proposer-get-last-leader-id proposer-set-last-leader-id!
+  proposer-advance-ballot!
+  ; Acceptor
+  make-acceptor acceptor?
+  acceptor-get-ballot acceptor-set-ballot!
+  acceptor-get-state acceptor-set-state!
+  acceptor-get-prepared acceptor-set-prepared!
+  acceptor-set-prepared-ballot!
+  ; Election
+  make-election election?
+  election-get-proposer election-get-acceptor
+  election-set-proposer! election-set-acceptor!
+  election-process-prepare! election-process-accept!
+  ; Role transitions
+  election-follower-to-candidate! election-candidate-to-leader!
+  election-leader-to-follower!)
+
+; ----------------------------------------------------------------
+; Role constants (per election_proposer.h:role_)
+; ----------------------------------------------------------------
+
+(define ROLE-FOLLOWER 0)
+(define ROLE-CANDIDATE 1)
+(define ROLE-LEADER 2)
+
+; ----------------------------------------------------------------
+; RoleChangeReason constants (per election.h:RoleChangeReason)
+; ----------------------------------------------------------------
+
+(define RC-DEVOTE-TO-BE-LEADER 1)
+(define RC-CHANGE-LEADER-TO-BE-LEADER 2)
+(define RC-LEASE-EXPIRED-TO-REVOKE 3)
+(define RC-CHANGE-LEADER-TO-REVOKE 4)
+(define RC-STOP-TO-REVOKE 5)
+
+; ----------------------------------------------------------------
+; Prepare/Accept result constants
+; ----------------------------------------------------------------
+
+(define PREPARE-OK 1)
+(define PREPARE-REJECT 3)
+(define PREPARE-UNKNOWN 5)
+
+(define ACCEPT-OK 2)
+(define ACCEPT-REJECT 4)
+(define ACCEPT-UNKNOWN 6)
+
+; ----------------------------------------------------------------
+; Phase constants (per election_common_define.h:LogPhase)
+; ----------------------------------------------------------------
+
+(define PHASE-IDLE 0)
+(define PHASE-PREPARE 1)
+(define PHASE-ACCEPT 2)
+
+; ----------------------------------------------------------------
+; BallotNumber — closure-based (number + proposer)
+; ----------------------------------------------------------------
+
+; make-ballot-number: create a BallotNumber.
+; Args: number (integer — monotonically increasing ballot id),
+;       proposer (integer — replica id proposing this ballot)
+; Returns: ballot_number closure.
+(define (make-ballot-number number proposer)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'number) number)
+                     ((eq? msg 'proposer) proposer)
+                     (else #f)))))
+      self)))
+
+; ballot-number?: is the object a ballot number?
+; Detected by querying 'proposer — only ballots return an integer.
+(define (ballot-number? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'proposer)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; ballot-number-get-number: get ballot number.
+(define (ballot-number-get-number b) (b 'number))
+
+; ballot-number-get-proposer: get proposer replica id.
+(define (ballot-number-get-proposer b) (b 'proposer))
+
+; ballot-number-gt?: is ballot a > ballot b?
+; Compare first by number (higher wins), then by proposer id.
+(define (ballot-number-gt? a b)
+  (let ((na (a 'number))
+        (nb (b 'number))
+        (pa (a 'proposer))
+        (pb (b 'proposer)))
+    (cond
+      ((> na nb) #t)
+      ((< na nb) #f)
+      ((> pa pb) #t)
+      (else #f))))
+
+; ballot-number-eq?: is ballot a == ballot b?
+(define (ballot-number-eq? a b)
+  (and (= (a 'number) (b 'number))
+       (= (a 'proposer) (b 'proposer))))
+
+; ----------------------------------------------------------------
+; Proposer — closure-based
+; ----------------------------------------------------------------
+
+; make-proposer: create a Proposer.
+; Args: role (integer — initial role), ballot (ballot_number or #f),
+;       leader-id (integer — current leader replica id, or -1),
+;       last-leader-id (integer — previous leader, or -1)
+; Returns: proposer closure.
+(define (make-proposer role ballot leader-id last-leader-id)
+  (letrec ((set-role! (lambda (v) (set! role v) v))
+           (set-ballot! (lambda (v) (set! ballot v) v))
+           (set-leader-id! (lambda (v) (set! leader-id v) v))
+           (set-last-leader-id! (lambda (v) (set! last-leader-id v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'role) role)
+                     ((eq? msg 'ballot) ballot)
+                     ((eq? msg 'leader-id) leader-id)
+                     ((eq? msg 'last-leader-id) last-leader-id)
+                     ((eq? msg 'set-role!) set-role!)
+                     ((eq? msg 'set-ballot!) set-ballot!)
+                     ((eq? msg 'set-leader-id!) set-leader-id!)
+                     ((eq? msg 'set-last-leader-id!) set-last-leader-id!)
+                     (else #f)))))
+      self)))
+
+; proposer?: is the object a proposer?
+; Detected by querying 'leader-id — only proposers return an integer.
+(define (proposer? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'leader-id)))
+        (if (integer? l) #t #f))
+      #f))
+
+; proposer-get-role: get current role.
+(define (proposer-get-role p) (p 'role))
+
+; proposer-set-role!: set current role.
+(define (proposer-set-role! p v) ((p 'set-role!) v))
+
+; proposer-get-ballot: get current ballot (or #f).
+(define (proposer-get-ballot p) (p 'ballot))
+
+; proposer-set-ballot!: set current ballot.
+(define (proposer-set-ballot! p v) ((p 'set-ballot!) v))
+
+; proposer-get-leader-id: get current leader replica id.
+(define (proposer-get-leader-id p) (p 'leader-id))
+
+; proposer-set-leader-id!: set current leader replica id.
+(define (proposer-set-leader-id! p v) ((p 'set-leader-id!) v))
+
+; proposer-get-last-leader-id: get previous leader.
+(define (proposer-get-last-leader-id p) (p 'last-leader-id))
+
+; proposer-set-last-leader-id!: set previous leader.
+(define (proposer-set-last-leader-id! p v)
+  ((p 'set-last-leader-id!) v))
+
+; proposer--advance-ballot!: increment ballot number by 1, keep proposer.
+; Returns the new ballot_number.
+(define (proposer--advance-ballot! p)
+  (let ((old-ballot (p 'ballot))
+        (proposer-id (p 'leader-id)))
+    (let ((new-ballot (make-ballot-number
+                       (+ (ballot-number-get-number old-ballot) 1)
+                       proposer-id)))
+      ((p 'set-ballot!) new-ballot)
+      new-ballot)))
+
+; ----------------------------------------------------------------
+; Acceptor — closure-based
+; ----------------------------------------------------------------
+
+; make-acceptor: create an Acceptor.
+; Args: ballot (ballot_number or #f), state (integer — phase),
+;       prepared? (boolean — has accepted Prepare?)
+; Returns: acceptor closure.
+(define (make-acceptor ballot state prepared?)
+  (letrec ((set-ballot! (lambda (v) (set! ballot v) v))
+           (set-state! (lambda (v) (set! state v) v))
+           (set-prepared! (lambda (v) (set! prepared? v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'ballot) ballot)
+                     ((eq? msg 'state) state)
+                     ((eq? msg 'prepared?) prepared?)
+                     ((eq? msg 'set-ballot!) set-ballot!)
+                     ((eq? msg 'set-state!) set-state!)
+                     ((eq? msg 'set-prepared!) set-prepared!)
+                     (else #f)))))
+      self)))
+
+; acceptor?: is the object an acceptor?
+; Detected by querying 'prepared? — only acceptors return a boolean.
+(define (acceptor? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'prepared?)))
+        (if (or (eq? p #t) (eq? p #f)) #t #f))
+      #f))
+
+; acceptor-get-ballot: get current ballot.
+(define (acceptor-get-ballot a) (a 'ballot))
+
+; acceptor-set-ballot!: set current ballot.
+(define (acceptor-set-ballot! a v) ((a 'set-ballot!) v))
+
+; acceptor-get-state: get current state (phase).
+(define (acceptor-get-state a) (a 'state))
+
+; acceptor-set-state!: set current state.
+(define (acceptor-set-state! a v) ((a 'set-state!) v))
+
+; acceptor-get-prepared: get prepared? flag.
+(define (acceptor-get-prepared a) (a 'prepared?))
+
+; acceptor-set-prepared!: set prepared? flag.
+(define (acceptor-set-prepared! a v) ((a 'set-prepared!) v))
+
+; acceptor-set-preprepared-ballot!: record a Prepare response.
+; Sets prepared? = #t AND ballot = given-ballot.
+(define (acceptor-set-prepared-ballot! a ballot)
+  ((a 'set-prepared!) #t)
+  ((a 'set-ballot!) ballot))
+
+; ----------------------------------------------------------------
+; Election — closure-based (Proposer + Acceptor pair)
+; ----------------------------------------------------------------
+
+; make-election: create an Election.
+; Args: proposer (proposer closure), acceptor (acceptor closure)
+; Returns: election closure.
+(define (make-election proposer acceptor)
+  (letrec ((set-proposer! (lambda (v) (set! proposer v) v))
+           (set-acceptor! (lambda (v) (set! acceptor v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'proposer) proposer)
+                     ((eq? msg 'acceptor) acceptor)
+                     ((eq? msg 'set-proposer!) set-proposer!)
+                     ((eq? msg 'set-acceptor!) set-acceptor!)
+                     (else #f)))))
+      self)))
+
+; election?: is the object an election?
+; Detected by querying 'proposer — only elections return a proposer.
+(define (election? obj)
+  (if (procedure? obj)
+      (if (procedure? (obj 'proposer)) #t #f)
+      #f))
+
+; election-get-proposer: get proposer.
+(define (election-get-proposer e) (e 'proposer))
+
+; election-get-acceptor: get acceptor.
+(define (election-get-acceptor e) (e 'acceptor))
+
+; election-set-proposer!: set proposer.
+(define (election-set-proposer! e v) ((e 'set-proposer!) v))
+
+; election-set-acceptor!: set acceptor.
+(define (election-set-acceptor! e v) ((e 'set-acceptor!) v))
+
+; ----------------------------------------------------------------
+; Prepare / Accept message processing
+; ----------------------------------------------------------------
+;
+; Per OB (election_impl.h):
+;   - process_prepare: accept if ballot >= acceptor's ballot, else reject
+;   - process_accept: accept if ballot == acceptor's ballot
+
+; election-process-prepare!: process a Prepare message with ballot.
+; If ballot > acceptor.ballot → accept (return PREPARE-OK + update
+; acceptor.ballot).
+; Otherwise → reject (return PREPARE-REJECT).
+; Returns: prepare-result symbol/integer.
+(define (election-process-prepare! e ballot)
+  (let ((acceptor (e 'acceptor)))
+    (let ((acc-ballot (acceptor 'ballot)))
+      (cond
+        ((eq? acc-ballot #f)
+         ; First Prepare — accept.
+         ((acceptor 'set-ballot!) ballot)
+         (acceptor-set-prepared! acceptor #t)
+         PREPARE-OK)
+        ((ballot-number-gt? ballot acc-ballot)
+         ; Higher ballot — accept.
+         (acceptor-set-prepared-ballot! acceptor ballot)
+         PREPARE-OK)
+        (else
+         ; Lower or equal ballot — reject.
+         PREPARE-REJECT)))))
+
+; election-process-accept!: process an Accept message with ballot.
+; If ballot == acceptor.ballot → accept (ACCEPT-OK).
+; If ballot < acceptor.ballot → reject (ACCEPT-REJECT).
+; If acceptor never received Prepare → unknown.
+; Returns: accept-result.
+(define (election-process-accept! e ballot)
+  (let ((acceptor (e 'acceptor)))
+    (let ((acc-ballot (acceptor 'ballot))
+          (prepared? (acceptor 'prepared?)))
+      (cond
+        ((eq? acc-ballot #f)
+         ; Acceptor never received Prepare.
+         ACCEPT-UNKNOWN)
+        ((ballot-number-eq? ballot acc-ballot)
+         ; Ballots match — accept.
+         ((acceptor 'set-state!) PHASE-ACCEPT)
+         ACCEPT-OK)
+        ((ballot-number-gt? ballot acc-ballot)
+         ; Incoming ballot is higher — shouldn't happen normally,
+         ; treat as unknown.
+         ACCEPT-UNKNOWN)
+        (else
+         ; Incoming ballot is lower — reject.
+         ((acceptor 'set-state!) PHASE-IDLE)
+         ACCEPT-REJECT)))))
+
+; ----------------------------------------------------------------
+; Role transitions
+; ----------------------------------------------------------------
+
+; election-follower-to-candidate!: FOLLOWER → CANDIDATE.
+; Returns the new role.
+(define (election-follower-to-candidate! e)
+  (let ((proposer (e 'proposer)))
+    (if (= (proposer 'role) ROLE-FOLLOWER)
+        (begin
+          ((proposer 'set-role!) ROLE-CANDIDATE)
+          ROLE-CANDIDATE)
+        (proposer 'role))))
+
+; election-candidate-to-leader!: CANDIDATE → LEADER.
+; Returns the new role.
+(define (election-candidate-to-leader! e)
+  (let ((proposer (e 'proposer)))
+    (if (= (proposer 'role) ROLE-CANDIDATE)
+        (begin
+          ((proposer 'set-role!) ROLE-LEADER)
+          ROLE-LEADER)
+        (proposer 'role))))
+
+; election-leader-to-follower!: LEADER → FOLLOWER.
+; Returns the new role.
+(define (election-leader-to-follower! e)
+  (let ((proposer (e 'proposer)))
+    (if (= (proposer 'role) ROLE-LEADER)
+        (begin
+          ((proposer 'set-role!) ROLE-FOLLOWER)
+          ROLE-FOLLOWER)
+        (proposer 'role))))

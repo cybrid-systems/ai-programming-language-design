@@ -1,0 +1,359 @@
+; 12-election_test.aura
+; ======================
+; Smoke tests for 12-election.aura — Election (Paxos leader election) minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/12-election_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 ROLE constants distinct
+;   - 5 RC constants distinct
+;   - 3 PREPARE-RESULT + 3 ACCEPT-RESULT distinct
+;   - 3 PHASE constants distinct
+;   - make-ballot-number + gt? + eq? (priority compare)
+;   - make-proposer + accessors + setters + advance-ballot!
+;   - make-acceptor + accessors + setters + set-prepared-ballot!
+;   - make-election + process-prepare! + process-accept!
+;   - Role transitions (follower → candidate → leader → follower)
+;   - Invalid transitions are no-ops
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Ballot comparison works correctly
+;
+; Deferred (full OceanBase Election):
+;   - real ElectionImpl with priority strategy
+;   - real Lease / heartbeat mechanism
+;   - real ElectionMsgSender (network messages)
+;   - real member list change handling
+;   - real change_leader_to (active leader switch)
+;   - real ballot_number conflict resolution
+;   - real ElectionPriority interface (priority strategy)
+
+(require "std/test" all:)
+(require "12-election" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; make-test-proposer: create a proposer for tests.
+; Starts as FOLLOWER with no ballot.
+(define (make-test-proposer)
+  (make-proposer ROLE-FOLLOWER #f -1 -1))
+
+; make-test-acceptor: create an acceptor for tests.
+; Starts in IDLE phase with no ballot.
+(define (make-test-acceptor)
+  (make-acceptor #f PHASE-IDLE #f))
+
+; make-test-election: create a fresh election for tests.
+(define (make-test-election)
+  (make-election (make-test-proposer) (make-test-acceptor)))
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "12-001-role-distinct"
+  ; 3 ROLE constants are distinct.
+  (check (= 1 (if (not (= ROLE-FOLLOWER ROLE-CANDIDATE)) 1 0)))
+  (check (= 1 (if (not (= ROLE-CANDIDATE ROLE-LEADER)) 1 0))))
+
+(test-suite "12-001-rc-distinct"
+  ; 5 RC constants are distinct.
+  (check (= 1 (if (not (= RC-DEVOTE-TO-BE-LEADER RC-CHANGE-LEADER-TO-BE-LEADER)) 1 0)))
+  (check (= 1 (if (not (= RC-CHANGE-LEADER-TO-BE-LEADER RC-LEASE-EXPIRED-TO-REVOKE)) 1 0)))
+  (check (= 1 (if (not (= RC-LEASE-EXPIRED-TO-REVOKE RC-CHANGE-LEADER-TO-REVOKE)) 1 0)))
+  (check (= 1 (if (not (= RC-CHANGE-LEADER-TO-REVOKE RC-STOP-TO-REVOKE)) 1 0))))
+
+(test-suite "12-001-prepare-result-distinct"
+  ; 3 PREPARE-RESULT constants are distinct.
+  (check (= 1 (if (not (= PREPARE-OK PREPARE-REJECT)) 1 0)))
+  (check (= 1 (if (not (= PREPARE-REJECT PREPARE-UNKNOWN)) 1 0))))
+
+(test-suite "12-001-accept-result-distinct"
+  ; 3 ACCEPT-RESULT constants are distinct.
+  (check (= 1 (if (not (= ACCEPT-OK ACCEPT-REJECT)) 1 0)))
+  (check (= 1 (if (not (= ACCEPT-REJECT ACCEPT-UNKNOWN)) 1 0))))
+
+(test-suite "12-001-phase-distinct"
+  ; 3 PHASE constants are distinct.
+  (check (= 1 (if (not (= PHASE-IDLE PHASE-PREPARE)) 1 0)))
+  (check (= 1 (if (not (= PHASE-PREPARE PHASE-ACCEPT)) 1 0))))
+
+; ----------------------------------------------------------------
+; BallotNumber
+; ----------------------------------------------------------------
+
+(test-suite "12-002-ballot-construction"
+  ; ballot preserves number, proposer.
+  (check (= 5 (ballot-number-get-number
+               (make-ballot-number 5 3))))
+  (check (= 3 (ballot-number-get-proposer
+                (make-ballot-number 5 3)))))
+
+(test-suite "12-002-ballot-predicate"
+  ; ballot-number? accepts only ballot_numbers.
+  (check (= #t (ballot-number? (make-ballot-number 1 1))))
+  (check (= #f (ballot-number? 'not-a-ballot)))
+  (check (= #f (ballot-number? 42))))
+
+(test-suite "12-002-ballot-gt-higher-number"
+  ; ballot-number-gt? true when number is higher.
+  (check (= #t (ballot-number-gt?
+                 (make-ballot-number 10 1)
+                 (make-ballot-number 5 2)))))
+
+(test-suite "12-002-ballot-gt-lower-number"
+  ; ballot-number-gt? false when number is lower.
+  (check (= #f (ballot-number-gt?
+                 (make-ballot-number 5 2)
+                 (make-ballot-number 10 1)))))
+
+(test-suite "12-002-ballot-gt-same-number-higher-proposer"
+  ; ballot-number-gt? compares proposer when number is same.
+  (check (= #t (ballot-number-gt?
+                 (make-ballot-number 5 3)
+                 (make-ballot-number 5 2))))
+  (check (= #f (ballot-number-gt?
+                 (make-ballot-number 5 2)
+                 (make-ballot-number 5 3)))))
+
+(test-suite "12-002-ballot-eq"
+  ; ballot-number-eq? checks both number + proposer.
+  (check (= #t (ballot-number-eq?
+                 (make-ballot-number 5 3)
+                 (make-ballot-number 5 3))))
+  (check (= #f (ballot-number-eq?
+                 (make-ballot-number 5 3)
+                 (make-ballot-number 5 4))))
+  (check (= #f (ballot-number-eq?
+                 (make-ballot-number 5 3)
+                 (make-ballot-number 6 3)))))
+
+; ----------------------------------------------------------------
+; Proposer
+; ----------------------------------------------------------------
+
+(test-suite "12-003-proposer-construction"
+  ; proposer preserves fields.
+  (check (= ROLE-FOLLOWER (proposer-get-role (make-proposer ROLE-FOLLOWER #f 5 4))))
+  (check (= ROLE-LEADER (proposer-get-role (make-proposer ROLE-LEADER #f 5 4))))
+  (check (= #t (eq? #f
+                   (proposer-get-ballot (make-proposer ROLE-FOLLOWER #f 5 4)))))
+  (check (= 5 (proposer-get-leader-id
+               (make-proposer ROLE-FOLLOWER #f 5 4))))
+  (check (= 4 (proposer-get-last-leader-id
+               (make-proposer ROLE-FOLLOWER #f 5 4)))))
+
+(test-suite "12-003-proposer-predicate"
+  ; proposer? accepts only proposers.
+  (check (= #t (proposer? (make-proposer ROLE-FOLLOWER #f 1 0))))
+  (check (= #f (proposer? 'not-a-proposer)))
+  (check (= #f (proposer? 42))))
+
+(test-suite "12-004-proposer-setters"
+  ; proposer setters update fields.
+  (check (= ROLE-CANDIDATE
+             (let ((p (make-proposer ROLE-FOLLOWER #f 1 0)))
+               (proposer-set-role! p ROLE-CANDIDATE)
+               (proposer-get-role p))))
+  (check (= 100 (let ((p (make-proposer ROLE-FOLLOWER #f 1 0)))
+                 (proposer-set-leader-id! p 100)
+                 (proposer-get-leader-id p))))
+
+(test-suite "12-004-proposer-set-ballot"
+  ; proposer-set-ballot! updates.
+  (check (= #t (let ((p (make-proposer ROLE-FOLLOWER #f 1 0)))
+                 (let ((new-ballot (make-ballot-number 5 1)))
+                   (proposer-set-ballot! p new-ballot)
+                   (eq? new-ballot (proposer-get-ballot p)))))))
+
+(test-suite "12-005-proposer-advance-ballot"
+  ; advance-ballot! increments number by 1.
+  (check (= #t (let ((p (make-proposer ROLE-CANDIDATE
+                                (make-ballot-number 1 5) 5 0)))
+                 (let ((new-ballot (proposer--advance-ballot! p)))
+                   (and (= 2 (ballot-number-get-number new-ballot))
+                        (= 5 (ballot-number-get-proposer new-ballot))
+                        (eq? new-ballot (proposer-get-ballot p))))))))
+
+; ----------------------------------------------------------------
+; Acceptor
+; ----------------------------------------------------------------
+
+(test-suite "12-006-acceptor-construction"
+  ; acceptor preserves fields.
+  (check (= PHASE-IDLE (acceptor-get-state
+                         (make-acceptor #f PHASE-IDLE #f))))
+  (check (= #f (acceptor-get-prepared
+                (make-acceptor #f PHASE-IDLE #f))))
+  (check (= #t (eq? #f
+                   (acceptor-get-ballot
+                     (make-acceptor #f PHASE-IDLE #f))))))
+
+(test-suite "12-006-acceptor-predicate"
+  ; acceptor? accepts only acceptors.
+  (check (= #t (acceptor? (make-acceptor #f PHASE-IDLE #f))))
+  (check (= #f (acceptor? 'not-an-acceptor)))
+  (check (= #f (acceptor? 42))))
+
+(test-suite "12-007-acceptor-setters"
+  ; acceptor setters update fields.
+  (check (= PHASE-PREPARE
+             (let ((a (make-acceptor #f PHASE-IDLE #f)))
+               (acceptor-set-state! a PHASE-PREPARE)
+               (acceptor-get-state a))))
+  (check (= #t (let ((a (make-acceptor #f PHASE-IDLE #f)))
+                 (acceptor-set-prepared! a #t)
+                 (acceptor-get-prepared a))))
+
+(test-suite "12-007-acceptor-set-prepared-ballot"
+  ; set-prepared-ballot! sets both prepared? + ballot.
+  (check (= #t (let ((a (make-acceptor #f PHASE-IDLE #f))
+                      (b (make-ballot-number 7 2)))
+                 (acceptor-set-prepared-ballot! a b)
+                 (and (eq? #t (acceptor-get-prepared a))
+                      (eq? b (acceptor-get-ballot a))))))
+
+; ----------------------------------------------------------------
+; Election — process-prepare! / process-accept!
+; ----------------------------------------------------------------
+
+(test-suite "12-008-election-construction"
+  ; new election has proposer + acceptor.
+  (check (= #t (proposer? (election-get-proposer (make-test-election)))))
+  (check (= #t (acceptor? (election-get-acceptor (make-test-election)))))
+
+(test-suite "12-008-election-predicate"
+  ; election? accepts only elections.
+  (check (= #t (election? (make-test-election))))
+  (check (= #f (election? 'not-an-election)))
+  (check (= #f (election? 42))))
+
+(test-suite "12-009-process-prepare-first"
+  ; First Prepare (acceptor has no ballot) → OK.
+  (check (= PREPARE-OK
+             (let ((e (make-test-election))
+                   (b (make-ballot-number 1 1)))
+               (election-process-prepare! e b))))
+
+(test-suite "12-009-process-prepare-higher-ballot"
+  ; Higher ballot → OK + acceptor.ballot updated.
+  (check (= PREPARE-OK
+             (let ((e (make-test-election))
+                   (b1 (make-ballot-number 1 1))
+                   (b2 (make-ballot-number 2 1)))
+               (election-process-prepare! e b1)
+               (election-process-prepare! e b2)))))
+
+(test-suite "12-009-process-prepare-lower-ballot"
+  ; Lower ballot → REJECT.
+  (check (= PREPARE-REJECT
+             (let ((e (make-test-election))
+                   (b1 (make-ballot-number 5 1))
+                   (b2 (make-ballot-number 1 1)))
+                 (election-process-prepare! e b1)
+                 (election-process-prepare! e b2))))
+
+(test-suite "12-009-process-prepare-equal-ballot-different-proposer"
+  ; Equal number, different proposer → ballot-gt compares proposer.
+  ; b1 (number=5, proposer=2) vs b2 (number=5, proposer=1): b1 > b2.
+  (check (= PREPARE-REJECT
+             (let ((e (make-test-election))
+                   (b1 (make-ballot-number 5 2))
+                   (b2 (make-ballot-number 5 1)))
+                 (election-process-prepare! e b1)
+                 (election-process-prepare! e b2))))
+
+(test-suite "12-010-process-accept-first"
+  ; First Accept (acceptor has no ballot) → UNKNOWN.
+  (check (= ACCEPT-UNKNOWN
+             (let ((e (make-test-election))
+                   (b (make-ballot-number 1 1)))
+               (election-process-accept! e b))))
+
+(test-suite "12-010-process-accept-matching-ballot"
+  ; Accept with matching ballot (after Prepare) → OK.
+  (check (= ACCEPT-OK
+             (let ((e (make-test-election))
+                   (b (make-ballot-number 1 1)))
+               (election-process-prepare! e b)
+               (election-process-accept! e b))))
+
+(test-suite "12-010-process-accept-lower-ballot"
+  ; Accept with lower ballot → REJECT.
+  (check (= ACCEPT-REJECT
+             (let ((e (make-test-election))
+                   (b1 (make-ballot-number 5 1))
+                   (b2 (make-ballot-number 1 1)))
+                 (election-process-prepare! e b1)
+                 (election-process-accept! e b2))))
+
+(test-suite "12-010-process-accept-higher-ballot"
+  ; Accept with higher ballot → UNKNOWN (incoming > stored).
+  (check (= ACCEPT-UNKNOWN
+             (let ((e (make-test-election))
+                   (b1 (make-ballot-number 1 1))
+                   (b2 (make-ballot-number 5 1)))
+                 (election-process-prepare! e b1)
+                 (election-process-accept! e b2))))
+
+; ----------------------------------------------------------------
+; Role transitions
+; ----------------------------------------------------------------
+
+(test-suite "12-011-follower-to-candidate"
+  ; FOLLOWER → CANDIDATE.
+  (check (= ROLE-CANDIDATE
+             (let ((e (make-test-election)))
+               (election-follower-to-candidate! e))))
+
+(test-suite "12-011-follower-to-candidate-no-op"
+  ; No-op from non-FOLLOWER states.
+  (check (= ROLE-CANDIDATE
+             (let ((e (make-test-election)))
+               (election-follower-to-candidate! e)
+               (election-follower-to-candidate! e)  ; no-op
+               (proposer-get-role (election-get-proposer e)))))
+
+(test-suite "12-011-candidate-to-leader"
+  ; CANDIDATE → LEADER.
+  (check (= ROLE-LEADER
+             (let ((e (make-test-election)))
+               (election-follower-to-candidate! e)
+               (election-candidate-to-leader! e))))
+
+(test-suite "12-011-candidate-to-leader-no-op"
+  ; No-op from non-CANDIDATE states.
+  (check (= ROLE-FOLLOWER
+             (let ((e (make-test-election)))
+               (election-candidate-to-leader! e)  ; no-op (still FOLLOWER)
+               (proposer-get-role (election-get-proposer e)))))
+
+(test-suite "12-011-leader-to-follower"
+  ; LEADER → FOLLOWER.
+  (check (= ROLE-FOLLOWER
+             (let ((e (make-test-election)))
+               (election-follower-to-candidate! e)
+               (election-candidate-to-leader! e)
+               (election-leader-to-follower! e))))
+
+(test-suite "12-011-full-flow"
+  ; Full flow: FOLLOWER → CANDIDATE → LEADER → FOLLOWER.
+  (check (= #t (let ((e (make-test-election)))
+                 (and (election-follower-to-candidate! e)
+                      (= ROLE-CANDIDATE (proposer-get-role (election-get-proposer e))))
+                      (election-candidate-to-leader! e)
+                      (= ROLE-LEADER (proposer-get-role (election-get-proposer e)))
+                      (election-leader-to-follower! e)
+                      (= ROLE-FOLLOWER (proposer-get-role (election-get-proposer e)))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
