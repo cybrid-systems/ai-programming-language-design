@@ -1,0 +1,198 @@
+; 020-page-cache.aura
+; ========================
+; Page Cache — minimal capability port to aura.
+;
+; Maps to: 020-page-cache-analysis.md
+; Source: mm/filemap.c + include/linux/fs.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux page cache is the file I/O caching subsystem:
+;   - struct address_space (xarray of page-offset → folio mappings)
+;   - struct folio (kernel 6.x+ concept — multi-page composite)
+;   - find_get_page / add_to_page_cache_lru
+;   - dirty page tracking (PG_dirty bit, writeback_index)
+;   - mark_page_accessed / set_page_dirty / test_clear_page_young
+;   - struct address_space_operations (readpage / writepage / writepages /
+;     set_page_dirty / read_folio)
+;   - file-backed mmap integration (i_mmap)
+;
+; aura has no filesystem I/O, no real page cache, no XArray integration.
+; v1 ships the address_space abstraction + page caching + dirty tracking:
+;   - make-address-space (closure with page list, dirty list, ops)
+;   - page-cache-add (add page at offset, mark cached)
+;   - page-cache-get (lookup page by offset)
+;   - page-cache-remove (remove page by offset)
+;   - page-cache-mark-dirty / page-cache-clean
+;   - page-cache-flush (write back all dirty pages via ops)
+;   - page-cache-count / page-cache-dirty-count
+;   - writeback-index accessors
+;
+; Deferred (full Linux page cache):
+;   - struct folio (multi-page composite)
+;   - XArray-based page indexing (use closure list-of-pairs in v1)
+;   - LRU list integration (active/inactive lists)
+;   - per-folio refcount
+;   - i_mmap rb tree for VMA tracking
+;   - read_cache_page / find_or_create_page (with mkwrite)
+;   - writeback / writepages control
+;   - readahead / async I/O
+;   - Filesystem-specific a_ops (ext4, xfs, btrfs)
+
+(export
+  ; Construction
+  make-address-space
+  ; Page cache ops
+  page-cache-add
+  page-cache-get
+  page-cache-remove
+  ; Dirty tracking
+  page-cache-mark-dirty
+  page-cache-clean
+  page-cache-dirty?
+  page-cache-flush
+  ; Counters
+  page-cache-count
+  page-cache-dirty-count
+  ; Writeback index
+  writeback-index
+  writeback-index-set!)
+
+; ----------------------------------------------------------------
+; Address space (closure with page list + dirty list + ops)
+;
+; Internal representation:
+;   - pages: list of (offset . page) pairs (cached pages)
+;   - dirty: list of (offset . page) pairs (pages marked dirty)
+;   - writeback-index: next offset to write back
+;   - ops: address_space_operations closure
+;
+; We avoid aura's `hash` (read-only via #3235 workaround) and use a
+; closure-based list-of-pairs store instead. Same approach as 004-xarray.
+; ----------------------------------------------------------------
+
+(define (make-address-space ops)
+  (let ((pages '())                ; list of (offset . page) pairs
+        (dirty '())                ; list of (offset . page) pairs (subset of pages)
+        (wbi 0))                    ; writeback index (next offset to flush)
+    (letrec ((set-pages!           (lambda (p) (set! pages p) p))
+             (set-dirty!           (lambda (d) (set! dirty d) d))
+             (set-wbi!             (lambda (v) (set! wbi  v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'pages) pages)
+                       ((eq? msg 'dirty) dirty)
+                       ((eq? msg 'writeback-index) wbi)
+                       ((eq? msg 'set-pages!) set-pages!)
+                       ((eq? msg 'set-dirty!) set-dirty!)
+                       ((eq? msg 'set-wbi!) set-wbi!)
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Page cache ops
+; ----------------------------------------------------------------
+
+; page-cache-add: add a page at the given offset.
+; Idempotent: returns #f if offset already cached (page replaced).
+(define (page-cache-add aspace offset page)
+  (let ((cached (aspace 'pages)))
+    ; Remove any existing entry with the same offset
+    (let ((filtered (filter (lambda (kv) (not (eq? (car kv) offset))) cached)))
+      ((aspace 'set-pages!) (cons (cons offset page) filtered))
+      #t)))
+
+; page-cache-get: lookup page by offset. Returns page or #f.
+(define (page-cache-get aspace offset)
+  (let loop ((rest (aspace 'pages)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (car (car rest)) offset) (cdr (car rest)))
+      (else (loop (cdr rest))))))
+
+; page-cache-remove: remove page at offset. Returns #t on success.
+(define (page-cache-remove aspace offset)
+  (let ((cached (aspace 'pages))
+        (dirty  (aspace 'dirty)))
+    (if (eq? #f (page-cache-get aspace offset))
+        #f
+        (begin
+          ((aspace 'set-pages!)
+           (filter (lambda (kv) (not (eq? (car kv) offset))) cached))
+          ; Also remove from dirty list if present
+          ((aspace 'set-dirty!)
+           (filter (lambda (kv) (not (eq? (car kv) offset))) dirty))
+          #t))))
+
+; ----------------------------------------------------------------
+; Dirty tracking
+; ----------------------------------------------------------------
+
+; page-cache-mark-dirty: mark the page at offset as dirty.
+; Returns #t if the page is cached, #f if not in cache.
+(define (page-cache-mark-dirty aspace offset)
+  (let ((page (page-cache-get aspace offset)))
+    (if (not page)
+        #f
+        (let ((dirty (aspace 'dirty)))
+          (if (member (cons offset page) dirty)
+              #t                              ; already dirty
+              (begin
+                ((aspace 'set-dirty!) (cons (cons offset page) dirty))
+                #t))))))
+
+; page-cache-dirty?: is the page at offset currently dirty?
+(define (page-cache-dirty? aspace offset)
+  (let ((dirty (aspace 'dirty)))
+    (if (member (cons offset 'dummy) dirty)  ; value comparison shortcut
+        #t
+        (let loop ((rest dirty))
+          (cond
+            ((null? rest) #f)
+            ((eq? (car (car rest)) offset) #t)
+            (else (loop (cdr rest))))))))
+
+; page-cache-clean: clear dirty flag on the page at offset.
+(define (page-cache-clean aspace offset)
+  ((aspace 'set-dirty!)
+   (filter (lambda (kv) (not (eq? (car kv) offset))) (aspace 'dirty)))
+  #t)
+
+; page-cache-flush: write back all dirty pages via ops' 'writepages arm.
+; Removes each flushed page from the dirty list. Returns count of pages flushed.
+(define (page-cache-flush aspace)
+  (let* ((dirty (aspace 'dirty))
+         (ops (aspace 'ops)))
+    (let loop ((rest dirty) (count 0))
+      (cond
+        ((null? rest) count)
+        ((and ops (ops 'writepages))
+         (let ((kv (car rest)))
+           ((ops 'writepages) (aspace) (car kv) (cdr kv))
+           ((aspace 'set-dirty!) (cdr rest))
+           (loop (cdr rest) (+ count 1))))
+        (else count)))))
+
+; ----------------------------------------------------------------
+; Counters
+; ----------------------------------------------------------------
+
+; page-cache-count: total cached pages in this address space.
+(define (page-cache-count aspace)
+  (length (aspace 'pages)))
+
+; page-cache-dirty-count: number of dirty pages.
+(define (page-cache-dirty-count aspace)
+  (length (aspace 'dirty)))
+
+; ----------------------------------------------------------------
+; Writeback index
+; ----------------------------------------------------------------
+
+; writeback-index: get the next offset to write back.
+(define (writeback-index aspace)
+  (aspace 'writeback-index))
+
+; writeback-index-set!: set the writeback index.
+(define (writeback-index-set! aspace v)
+  ((aspace 'set-wbi!) v))

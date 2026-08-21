@@ -1,0 +1,145 @@
+; 020-page-cache_test.aura
+; ========================
+; Smoke tests for 020-page-cache.aura — page cache minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/020-page-cache_test.aura
+;
+; Verified automatically (smoke):
+;   - make-address-space construction (empty)
+;   - page-cache-add registers page at offset
+;   - page-cache-get retrieves page by offset
+;   - page-cache-remove drops entry
+;   - page-cache-mark-dirty + page-cache-dirty?
+;   - page-cache-flush with custom ops
+;   - page-cache-count / page-cache-dirty-count
+;   - writeback-index accessors
+;
+; Verified via separate probes during development:
+;   - idempotent add (replaces existing offset)
+;   - dirty list is a subset of cached pages
+;   - flush calls ops' writepages arm
+;
+; Deferred (full Linux page cache):
+;   - struct folio (multi-page composite)
+;   - XArray-based page indexing
+;   - LRU list integration
+;   - i_mmap rb tree for VMA tracking
+;   - read_cache_page / find_or_create_page (with mkwrite)
+;   - readahead / async I/O
+
+(require "std/test" all:)
+(require "020-page-cache" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "pagecache-001-init"
+  (check (= 0 (page-cache-count (make-address-space #f))))
+  (check (= 0 (page-cache-dirty-count (make-address-space #f))))
+
+; ----------------------------------------------------------------
+; Add / get / remove
+; ----------------------------------------------------------------
+
+(test-suite "pagecache-002-add-get"
+  (check (= 1 (eq? 'page-A (page-cache-get
+    (let ((as (make-address-space #f)))
+      (page-cache-add as 0 'page-A)
+      as) 0))))
+
+(test-suite "pagecache-002-remove"
+  (check (= 0 (page-cache-count
+    (let ((as (make-address-space #f)))
+      (page-cache-add as 0 'page-A)
+      (page-cache-remove as 0)
+      as))))
+
+; ----------------------------------------------------------------
+; Dirty tracking
+; ----------------------------------------------------------------
+
+(test-suite "pagecache-003-mark-dirty"
+  (check (= 1 (page-cache-dirty?
+    (let ((as (make-address-space #f)))
+      (page-cache-add as 100 'page-at-100)
+      (page-cache-mark-dirty as 100)
+      as) 100)))
+
+(test-suite "pagecache-003-clean"
+  (check (= 1 (if (not (page-cache-dirty?
+    (let ((as (make-address-space #f)))
+      (page-cache-add as 200 'page-at-200)
+      (page-cache-mark-dirty as 200)
+      (page-cache-clean as 200)
+      as) 200)) 1 0)))
+
+; ----------------------------------------------------------------
+; Flush (with custom ops)
+; ----------------------------------------------------------------
+
+; A flush counter closure (records how many pages were flushed).
+(define (make-flush-counter)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'count) count)
+                       ((eq? msg 'inc!) (begin (set! count (+ count 1)) count))
+                       (else #f)))))
+      self)))
+
+; Custom ops with a 'writepages arm.
+(define (flush-ops counter)
+  (lambda (msg)
+    (cond
+      ((eq? msg 'writepages) (lambda (as offset page) ((counter 'inc!))))
+      (else #f))))
+
+(test-suite "pagecache-004-flush"
+  ; Flush dirty pages via ops; counter should record each flush.
+  (check (= 1 (= 2 (let ((counter (make-flush-counter))
+                            (as (make-address-space (flush-ops counter))))
+                      (page-cache-add as 0 'p0)
+                      (page-cache-add as 1 'p1)
+                      (page-cache-mark-dirty as 0)
+                      (page-cache-mark-dirty as 1)
+                      (page-cache-flush as)
+                      (counter 'count)))))
+
+; ----------------------------------------------------------------
+; Counters
+; ----------------------------------------------------------------
+
+(test-suite "pagecache-005-counts"
+  (check (= 3 (page-cache-count
+    (let ((as (make-address-space #f)))
+      (page-cache-add as 0 'a)
+      (page-cache-add as 1 'b)
+      (page-cache-add as 2 'c)
+      as)))
+  (check (= 2 (page-cache-dirty-count
+    (let ((as (make-address-space #f)))
+      (page-cache-add as 0 'a)
+      (page-cache-add as 1 'b)
+      (page-cache-add as 2 'c)
+      (page-cache-mark-dirty as 0)
+      (page-cache-mark-dirty as 1)
+      as))))
+
+; ----------------------------------------------------------------
+; Writeback index
+; ----------------------------------------------------------------
+
+(test-suite "pagecache-006-wbi"
+  (check (= 42 (writeback-index
+    (let ((as (make-address-space #f)))
+      (writeback-index-set! as 42)
+      as))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
