@@ -1,0 +1,265 @@
+; 06-memtable-freezer_test.aura
+; ============================
+; Smoke tests for 06-memtable-freezer.aura — memtable freeze + SSTable minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/06-memtable-freezer_test.aura
+;
+; Verified automatically (smoke):
+;   - 7 FREEZE-STATE constants distinct
+;   - 5 CHECKPOINT-LOC constants distinct
+;   - 3 FREEZE-SOURCE constants distinct
+;   - make-freezer + get-freeze-clock (starts at 0)
+;   - advance-freeze-clock (increments)
+;   - set-freeze-mark / clear-freeze-mark
+;   - freeze-snapshot-version + max-decided-scn setters
+;   - stat counters
+;   - make-memtable + state + location + rec-scn setters
+;   - ready-for-flush? / is-frozen-checkpoint? / rec-scn-is-stable?
+;
+; Verified via separate probes during development:
+;   - Predicates work correctly
+;   - State machine transitions
+;
+; Deferred (full OceanBase freeze):
+;   - real ObFreezer::logstream_freeze / tablet_freeze / major_freeze
+;   - actual tablet-level freeze synchronization
+;   - real ObITabletMemtable::flush (writes to SSTable)
+;   - finish_freeze with log submission + sync
+
+(require "std/test" all:)
+(require "06-memtable-freezer" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "06-001-freeze-states-distinct"
+  ; All 7 freeze states are distinct.
+  (check (= 1 (if (not (= FREEZE-STATE-INVALID FREEZE-STATE-ACTIVE)) 1 0)))
+  (check (= 1 (if (not (= FREEZE-STATE-ACTIVE FREEZE-STATE-FREEZING)) 1 0)))
+  (check (= 1 (if (not (= FREEZE-STATE-FREEZING FREEZE-STATE-READY-FOR-FLUSH)) 1 0)))
+  (check (= 1 (if (not (= FREEZE-STATE-READY-FOR-FLUSH FREEZE-STATE-FLUSHED)) 1 0)))
+  (check (= 1 (if (not (= FREEZE-STATE-FLUSHED FREEZE-STATE-RELEASED)) 1 0)))
+  (check (= 1 (if (not (= FREEZE-STATE-RELEASED FREEZE-STATE-FORCE-RELEASED)) 1 0))))
+
+(test-suite "06-001-checkpoint-loc-distinct"
+  ; All 5 location states are distinct.
+  (check (= 1 (if (not (= CHECKPOINT-LOC-INVALID CHECKPOINT-LOC-LS-FROZEN)) 1 0)))
+  (check (= 1 (if (not (= CHECKPOINT-LOC-LS-FROZEN CHECKPOINT-LOC-NEW-CREATE)) 1 0)))
+  (check (= 1 (if (not (= CHECKPOINT-LOC-NEW-CREATE CHECKPOINT-LOC-ACTIVE)) 1 0)))
+  (check (= 1 (if (not (= CHECKPOINT-LOC-ACTIVE CHECKPOINT-LOC-PREPARE)) 1 0)))
+  (check (= 1 (if (not (= CHECKPOINT-LOC-PREPARE CHECKPOINT-LOC-OUT)) 1 0))))
+
+(test-suite "06-001-freeze-sources-distinct"
+  ; All 3 freeze sources are distinct.
+  (check (= 1 (if (not (= FREEZE-SOURCE-MINOR FREEZE-SOURCE-MAJOR)) 1 0)))
+  (check (= 1 (if (not (= FREEZE-SOURCE-MAJOR FREEZE-SOURCE-TABLET)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObFreezer construction
+; ----------------------------------------------------------------
+
+(test-suite "06-002-freezer-construction"
+  ; New freezer starts with clock=0.
+  (check (= 0 (freezer-get-freeze-clock (make-freezer 1))))
+  (check (= #f (freezer-get-freeze-mark? (make-freezer 1))))
+  (check (= 0 (freezer-get-freeze-snapshot-version (make-freezer 1))))
+  (check (= 0 (freezer-get-max-decided-scn (make-freezer 1))))
+  (check (= 0 (freezer-get-stat-frozen (make-freezer 1))))
+  (check (= 0 (freezer-get-stat-flushed (make-freezer 1)))))
+
+(test-suite "06-002-freezer-predicate"
+  ; freezer? accepts only freezer closures.
+  (check (= #t (freezer? (make-freezer 1))))
+  (check (= #f (freezer? 'not-a-freezer)))
+  (check (= #f (freezer? 42))))
+
+; ----------------------------------------------------------------
+; freeze_clock
+; ----------------------------------------------------------------
+
+(test-suite "06-003-advance-freeze-clock"
+  ; advance-freeze-clock increments.
+  (check (= 1 (let ((f (make-freezer 1)))
+                 (freezer-advance-freeze-clock f))))
+  (check (= 5 (let ((f (make-freezer 1)))
+                 (freezer-advance-freeze-clock f)
+                 (freezer-advance-freeze-clock f)
+                 (freezer-advance-freeze-clock f)
+                 (freezer-advance-freeze-clock f)
+                 (freezer-advance-freeze-clock f))))
+
+(test-suite "06-003-advance-freeze-clock-preserves-mark"
+  ; advance-freeze-clock preserves mark state.
+  (check (= #t (let ((f (make-freezer 1)))
+                 (freezer-set-freeze-mark! f)
+                 (freezer-advance-freeze-clock f)
+                 (freezer-get-freeze-mark? f))))
+
+; ----------------------------------------------------------------
+; freeze_mark
+; ----------------------------------------------------------------
+
+(test-suite "06-004-set-freeze-mark"
+  ; set-freeze-mark sets top bit.
+  (check (= #t (let ((f (make-freezer 1)))
+                 (freezer-set-freeze-mark! f)
+                 (freezer-get-freeze-mark? f))))
+
+(test-suite "06-004-clear-freeze-mark"
+  ; clear-freeze-mark clears top bit.
+  (check (= #f (let ((f (make-freezer 1)))
+                 (freezer-set-freeze-mark! f)
+                 (freezer-clear-freeze-mark! f)
+                 (freezer-get-freeze-mark? f))))
+
+; ----------------------------------------------------------------
+; freeze-snapshot-version + max-decided-scn
+; ----------------------------------------------------------------
+
+(test-suite "06-005-freeze-snapshot-version"
+  ; freeze-snapshot-version settable.
+  (check (= 1000 (let ((f (make-freezer 1)))
+                   (freezer-set-freeze-snapshot-version! f 1000)
+                   (freezer-get-freeze-snapshot-version f))))
+
+(test-suite "06-005-max-decided-scn"
+  ; max-decided-scn settable.
+  (check (= 2000 (let ((f (make-freezer 1)))
+                   (freezer-set-max-decided-scn! f 2000)
+                   (freezer-get-max-decided-scn f))))
+
+; ----------------------------------------------------------------
+; stat counters
+; ----------------------------------------------------------------
+
+(test-suite "06-006-stat-frozen-inc"
+  ; inc-stat-frozen increments.
+  (check (= 1 (let ((f (make-freezer 1)))
+                 (freezer-inc-stat-frozen! f))))
+  (check (= 3 (let ((f (make-freezer 1)))
+                 (freezer-inc-stat-frozen! f)
+                 (freezer-inc-stat-frozen! f)
+                 (freezer-inc-stat-frozen! f))))
+
+(test-suite "06-006-stat-flushed-inc"
+  ; inc-stat-flushed increments.
+  (check (= 2 (let ((f (make-freezer 1)))
+                 (freezer-inc-stat-flushed! f)
+                 (freezer-inc-stat-flushed! f))))
+
+(test-suite "06-006-stat-setters"
+  ; stat setters work.
+  (check (= 50 (let ((f (make-freezer 1)))
+                 (freezer-set-stat-frozen! f 50)
+                 (freezer-get-stat-frozen f))))
+
+; ----------------------------------------------------------------
+; ObITabletMemtable construction + fields
+; ----------------------------------------------------------------
+
+(test-suite "06-007-memtable-construction"
+  ; New memtable starts with INVALID state.
+  (check (= FREEZE-STATE-INVALID (memtable-get-state (make-memtable 0))))
+  (check (= CHECKPOINT-LOC-INVALID (memtable-get-location (make-memtable 0))))
+  (check (= 0 (memtable-get-rec-scn (make-memtable 0))))
+  (check (= 0 (memtable-get-freeze-snapshot (make-memtable 0))))
+  (check (= 0 (memtable-get-freeze-clock (make-memtable 0)))))
+
+(test-suite "06-007-memtable-construction-with-clock"
+  ; memtable records the freeze_clock at creation.
+  (check (= 7 (memtable-get-freeze-clock (make-memtable 7))))
+
+(test-suite "06-007-memtable-predicate"
+  ; memtable? accepts only memtable closures.
+  (check (= #t (memtable? (make-memtable 0))))
+  (check (= #f (memtable? 'not-a-memtable)))
+  (check (= #f (memtable? 42))))
+
+; ----------------------------------------------------------------
+; memtable setters
+; ----------------------------------------------------------------
+
+(test-suite "06-008-memtable-set-state"
+  ; set-state! updates freeze state.
+  (check (= FREEZE-STATE-ACTIVE
+             (let ((m (make-memtable 0)))
+               (memtable-set-state! m FREEZE-STATE-ACTIVE)
+               (memtable-get-state m)))))
+
+(test-suite "06-008-memtable-set-location"
+  ; set-location! updates checkpoint location.
+  (check (= CHECKPOINT-LOC-ACTIVE
+             (let ((m (make-memtable 0)))
+               (memtable-set-location! m CHECKPOINT-LOC-ACTIVE)
+               (memtable-get-location m)))))
+
+(test-suite "06-008-memtable-set-rec-scn"
+  ; set-rec-scn! updates rec_scn.
+  (check (= 500 (let ((m (make-memtable 0)))
+                 (memtable-set-rec-scn! m 500)
+                 (memtable-get-rec-scn m))))
+
+(test-suite "06-008-memtable-set-freeze-snapshot"
+  ; set-freeze-snapshot! updates freeze_snapshot_version.
+  (check (= 800 (let ((m (make-memtable 0)))
+                  (memtable-set-freeze-snapshot! m 800)
+                  (memtable-get-freeze-snapshot m))))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+(test-suite "06-009-ready-for-flush"
+  ; ready-for-flush? true when state == READY_FOR_FLUSH.
+  (check (= #f (memtable-ready-for-flush?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-ACTIVE)
+                   m))))
+  (check (= #t (memtable-ready-for-flush?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-READY-FOR-FLUSH)
+                   m))))
+
+(test-suite "06-009-is-frozen-checkpoint"
+  ; is-frozen-checkpoint? true when state is past ACTIVE.
+  (check (= #f (memtable-is-frozen-checkpoint?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-ACTIVE)
+                   m))))
+  (check (= #t (memtable-is-frozen-checkpoint?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-FREEZING)
+                   m))))
+  (check (= #t (memtable-is-frozen-checkpoint?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-READY-FOR-FLUSH)
+                   m))))
+  (check (= #t (memtable-is-frozen-checkpoint?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-RELEASED)
+                   m))))
+
+(test-suite "06-009-rec-scn-is-stable"
+  ; rec-scn-is-stable? true when state past FREEZING.
+  (check (= #f (memtable-rec-scn-is-stable?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-FREEZING)
+                   m))))
+  (check (= #t (memtable-rec-scn-is-stable?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-READY-FOR-FLUSH)
+                   m))))
+  (check (= #t (memtable-rec-scn-is-stable?
+                 (let ((m (make-memtable 0)))
+                   (memtable-set-state! m FREEZE-STATE-FLUSHED)
+                   m))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

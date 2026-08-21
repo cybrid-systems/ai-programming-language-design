@@ -1,0 +1,383 @@
+; 06-memtable-freezer.aura
+; ========================
+; memtable_freezer — minimal capability port to aura.
+;
+; Maps to: OceanBase memtable freeze + SSTable persistence
+; Source: src/storage/ls/ob_freezer.h + ob_freezer.cpp
+;         + storage/ob_i_tablet_memtable.h
+;         + storage/memtable/ob_memtable.h + ob_memtable.cpp
+;         + storage/checkpoint/ob_freeze_checkpoint.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase memtable freeze flow:
+;   - 3 freeze types: LS Freeze (minor), Tablet Freeze, Major Freeze
+;   - ObFreezeCheckpoint: base class with location state
+;     (LS_FROZEN, NEW_CREATE, ACTIVE, PREPARE, OUT)
+;   - TabletMemtableFreezeState: state machine with 7 states
+;     (INVALID → ACTIVE → FREEZING → READY_FOR_FLUSH → FLUSHED →
+;      RELEASED → FORCE_RELEASED)
+;   - ObFreezer: coordinator with freeze_flag_ encoding
+;     (1 bit freeze_mark + 31 bits freeze_clock)
+;   - freeze_snapshot_version: snapshot boundary at freeze time
+;   - max_decided_scn: max decided log SCN
+;   - Virtual methods on ObFreezeCheckpoint: rec_scn_is_stable,
+;     ready_for_flush, flush, is_frozen_checkpoint, finish_freeze
+;
+; aura has no latches, no SCN clock. v1 ships:
+;   - 7 FREEZE-STATE constants (INVALID → FORCE_RELEASED)
+;   - 5 CHECKPOINT-LOC constants
+;   - 3 FREEZE-SOURCE constants (MINOR, MAJOR, TABLET)
+;   - make-freezer (coordinator with freeze-flag + clock +
+;     snapshot + max-decided-scn + stats)
+;   - get-freeze-clock / advance-freeze-clock
+;   - set-freeze-mark / clear-freeze-mark
+;   - make-memtable (with state + location + rec-scn + freeze-snapshot)
+;   - set-freeze-state! / set-checkpoint-loc!
+;   - ready-for-flush? / is-frozen-checkpoint?
+;   - rec-scn-is-stable? (placeholder)
+;
+; Deferred (full OceanBase freeze):
+;   - real ObFreezer::logstream_freeze / tablet_freeze / major_freeze
+;   - actual tablet-level freeze synchronization
+;   - real ObITabletMemtable::flush (writes to SSTable)
+;   - finish_freeze with log submission + sync
+;   - ObFreezerStat counters
+;   - ObFreezeCheckpoint linked-list management (ObDLinkBase)
+;   - ObDataCheckpoint scheduling
+;   - major freeze RootServer coordination
+
+(export
+  ; Freeze state constants
+  FREEZE-STATE-INVALID FREEZE-STATE-ACTIVE FREEZE-STATE-FREEZING
+  FREEZE-STATE-READY-FOR-FLUSH FREEZE-STATE-FLUSHED FREEZE-STATE-RELEASED
+  FREEZE-STATE-FORCE-RELEASED
+  ; Checkpoint location constants
+  CHECKPOINT-LOC-INVALID CHECKPOINT-LOC-LS-FROZEN
+  CHECKPOINT-LOC-NEW-CREATE CHECKPOINT-LOC-ACTIVE CHECKPOINT-LOC-PREPARE
+  CHECKPOINT-LOC-OUT
+  ; Freeze source constants
+  FREEZE-SOURCE-MINOR FREEZE-SOURCE-MAJOR FREEZE-SOURCE-TABLET
+  ; Freeze mark bit
+  FREEZE-MARK-BIT
+  ; ObFreezer (coordinator)
+  make-freezer freezer?
+  freezer-get-freeze-clock freezer-advance-freeze-clock
+  freezer-get-freeze-mark? freezer-set-freeze-mark!
+  freezer-clear-freeze-mark!
+  freezer-get-freeze-snapshot-version freezer-set-freeze-snapshot-version!
+  freezer-get-max-decided-scn freezer-set-max-decided-scn!
+  freezer-get-stat-frozen freezer-get-stat-flushed
+  freezer-inc-stat-frozen! freezer-inc-stat-flushed!
+  freezer-set-stat-frozen! freezer-set-stat-flushed!
+  ; ObITabletMemtable
+  make-memtable memtable?
+  memtable-get-state memtable-set-state!
+  memtable-get-location memtable-set-location!
+  memtable-get-rec-scn memtable-set-rec-scn!
+  memtable-get-freeze-snapshot memtable-set-freeze-snapshot!
+  memtable-get-freeze-clock
+  ; Predicates
+  memtable-ready-for-flush? memtable-is-frozen-checkpoint?
+  memtable-rec-scn-is-stable?)
+
+; ----------------------------------------------------------------
+; Freeze state constants
+; ----------------------------------------------------------------
+;
+; Linux definitions (per ob_i_tablet_memtable.h:116-137):
+;   INVALID        = 0
+;   ACTIVE         = 1
+;   FREEZING       = 2
+;   READY_FOR_FLUSH = 3
+;   FLUSHED        = 4
+;   RELEASED       = 5
+;   FORCE_RELEASED = 6
+
+(define FREEZE-STATE-INVALID 0)
+(define FREEZE-STATE-ACTIVE 1)
+(define FREEZE-STATE-FREEZING 2)
+(define FREEZE-STATE-READY-FOR-FLUSH 3)
+(define FREEZE-STATE-FLUSHED 4)
+(define FREEZE-STATE-RELEASED 5)
+(define FREEZE-STATE-FORCE-RELEASED 6)
+
+; ----------------------------------------------------------------
+; Checkpoint location constants
+; ----------------------------------------------------------------
+;
+; Per ob_freeze_checkpoint.h:
+;   LS_FROZEN  = 1
+;   NEW_CREATE = 2
+;   ACTIVE     = 4
+;   PREPARE    = 8
+;   OUT        = 16
+
+(define CHECKPOINT-LOC-INVALID 0)
+(define CHECKPOINT-LOC-LS-FROZEN 1)
+(define CHECKPOINT-LOC-NEW-CREATE 2)
+(define CHECKPOINT-LOC-ACTIVE 4)
+(define CHECKPOINT-LOC-PREPARE 8)
+(define CHECKPOINT-LOC-OUT 16)
+
+; ----------------------------------------------------------------
+; Freeze source flags (per ob_freezer_define.h)
+; ----------------------------------------------------------------
+
+(define FREEZE-SOURCE-MINOR 1)
+(define FREEZE-SOURCE-MAJOR 2)
+(define FREEZE-SOURCE-TABLET 4)
+
+; ----------------------------------------------------------------
+; Freeze mark bit position (per ob_freezer.h:249)
+; ----------------------------------------------------------------
+
+(define FREEZE-MARK-BIT 31)
+
+; ----------------------------------------------------------------
+; Helpers — bit operations on freeze_flag_
+; ----------------------------------------------------------------
+
+; freeze-flag-clock-mask: bit mask to extract clock bits (lower 31).
+(define freeze-flag-clock-mask
+  ; 0x7FFFFFFF = (1 << 31) - 1 = 0x7FFFFFFF
+  ; In aura minimal, hardcode:
+  2147483647)
+
+; freeze-flag-mark-bit: bit flag for freeze_mark (top bit).
+(define freeze-flag-mark-bit
+  ; (1 << 31) = 0x80000000 = 2147483648
+  2147483648)
+
+; freeze-flag-get-clock: extract lower 31 bits.
+(define (freeze-flag-get-clock f)
+  (mod f freeze-flag-clock-mask))
+
+; freeze-flag-set-mark: set top bit.
+(define (freeze-flag-set-mark f)
+  (+ f freeze-flag-mark-bit))
+
+; freeze-flag-clear-mark: clear top bit.
+(define (freeze-flag-clear-mark f)
+  (mod f freeze-flag-clock-mask))
+
+; freeze-flag-get-mark?: check top bit.
+(define (freeze-flag-get-mark? f)
+  (if (>= f freeze-flag-mark-bit) #t #f))
+
+; ----------------------------------------------------------------
+; ObFreezer — coordinator
+; ----------------------------------------------------------------
+
+; make-freezer: create ObFreezer coordinator.
+; Args: ls-id (integer — log stream id)
+; Returns: freezer closure.
+(define (make-freezer ls-id)
+  (let ((freeze-flag 0)
+        (freeze-snapshot 0)
+        (max-decided-scn 0)
+        (stat-frozen 0)
+        (stat-flushed 0)
+        (frozen 0)
+        (flushed 0))
+    (letrec ((set-freeze-flag! (lambda (v) (set! freeze-flag v) v))
+             (set-freeze-snapshot! (lambda (v) (set! freeze-snapshot v) v))
+             (set-max-decided-scn! (lambda (v) (set! max-decided-scn v) v))
+             (set-stat-frozen! (lambda (v) (set! stat-frozen v) v))
+             (set-stat-flushed! (lambda (v) (set! stat-flushed v) v))
+             (set-frozen! (lambda (v) (set! frozen v) v))
+             (set-flushed! (lambda (v) (set! flushed v) v))
+             (inc-frozen! (lambda () (set! frozen (+ frozen 1)) frozen))
+             (inc-flushed! (lambda () (set! flushed (+ flushed 1)) flushed))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'ls-id) ls-id)
+                       ((eq? msg 'freeze-flag) freeze-flag)
+                       ((eq? msg 'freeze-snapshot) freeze-snapshot)
+                       ((eq? msg 'max-decided-scn) max-decided-scn)
+                       ((eq? msg 'stat-frozen) stat-frozen)
+                       ((eq? msg 'stat-flushed) stat-flushed)
+                       ((eq? msg 'frozen) frozen)
+                       ((eq? msg 'flushed) flushed)
+                       ((eq? msg 'set-freeze-flag!) set-freeze-flag!)
+                       ((eq? msg 'set-freeze-snapshot!) set-freeze-snapshot!)
+                       ((eq? msg 'set-max-decided-scn!) set-max-decided-scn!)
+                       ((eq? msg 'set-stat-frozen!) set-stat-frozen!)
+                       ((eq? msg 'set-stat-flushed!) set-stat-flushed!)
+                       ((eq? msg 'set-frozen!) set-frozen!)
+                       ((eq? msg 'set-flushed!) set-flushed!)
+                       ((eq? msg 'inc-frozen!) inc-frozen!)
+                       ((eq? msg 'inc-flushed!) inc-flushed!)
+                       (else #f)))))
+      self)))
+
+; freezer?: is the object an ObFreezer?
+; Detected by querying 'frozen — only freezer closures return an
+; integer counter.
+(define (freezer? obj)
+  (if (procedure? obj)
+      (let ((f (obj 'frozen)))
+        (if (and (integer? f) (>= f 0)) #t #f))
+      #f))
+
+; freezer-get-freeze-clock: get freeze_clock (lower 31 bits).
+(define (freezer-get-freeze-clock f)
+  (freeze-flag-get-clock (f 'freeze-flag)))
+
+; freezer-advance-freeze-clock: increment freeze_clock.
+; Returns the new clock.
+(define (freezer-advance-freeze-clock f)
+  (let ((new-clock (+ (freezer-get-freeze-clock f) 1)))
+    ((f 'set-freeze-flag!)
+     (freeze-flag-clear-mark (f 'freeze-flag)))
+    ((f 'set-freeze-flag!) new-clock)
+    new-clock))
+
+; freezer-get-freeze-mark?: is freeze_mark set?
+(define (freezer-get-freeze-mark? f)
+  (freeze-flag-get-mark? (f 'freeze-flag)))
+
+; freezer-set-freeze-mark!: set freeze_mark (top bit).
+; Returns the new freeze-flag.
+(define (freezer-set-freeze-mark! f)
+  ((f 'set-freeze-flag!)
+   (freeze-flag-set-mark (f 'freeze-flag))))
+
+; freezer-clear-freeze-mark!: clear freeze_mark.
+; Returns the new freeze-flag.
+(define (freezer-clear-freeze-mark! f)
+  ((f 'set-freeze-flag!)
+   (freeze-flag-clear-mark (f 'freeze-flag))))
+
+; freezer-get-freeze-snapshot-version: get freeze_snapshot_version_.
+(define (freezer-get-freeze-snapshot-version f)
+  (f 'freeze-snapshot))
+
+; freezer-set-freeze-snapshot-version!: set freeze_snapshot_version_.
+(define (freezer-set-freeze-snapshot-version! f v)
+  ((f 'set-freeze-snapshot!) v))
+
+; freezer-get-max-decided-scn: get max_decided_scn_.
+(define (freezer-get-max-decided-scn f)
+  (f 'max-decided-scn))
+
+; freezer-set-max-decided-scn!: set max_decided_scn_.
+(define (freezer-set-max-decided-scn! f v)
+  ((f 'set-max-decided-scn!) v))
+
+; freezer-get-stat-frozen: get stat.frozen counter.
+(define (freezer-get-stat-frozen f)
+  (f 'stat-frozen))
+
+; freezer-get-stat-flushed: get stat.flushed counter.
+(define (freezer-get-stat-flushed f)
+  (f 'stat-flushed))
+
+; freezer-inc-stat-frozen!: increment stat.frozen counter.
+(define (freezer-inc-stat-frozen! f)
+  ((f 'inc-frozen!)))
+
+; freezer-inc-stat-flushed!: increment stat.flushed counter.
+(define (freezer-inc-stat-flushed! f)
+  ((f 'inc-flushed!)))
+
+; freezer-set-stat-frozen!: set stat.frozen counter.
+(define (freezer-set-stat-frozen! f v)
+  ((f 'set-stat-frozen!) v))
+
+; freezer-set-stat-flushed!: set stat.flushed counter.
+(define (freezer-set-stat-flushed! f v)
+  ((f 'set-stat-flushed!) v))
+
+; ----------------------------------------------------------------
+; ObITabletMemtable — memtable with freeze state
+; ----------------------------------------------------------------
+
+; make-memtable: create ObITabletMemtable.
+; Args: freeze-clock (integer — recorded at creation time)
+; Returns: memtable closure.
+(define (make-memtable freeze-clock)
+  (let ((state FREEZE-STATE-INVALID)
+        (location CHECKPOINT-LOC-INVALID)
+        (rec-scn 0)
+        (freeze-snapshot 0))
+    (letrec ((set-state! (lambda (v) (set! state v) v))
+             (set-location! (lambda (v) (set! location v) v))
+             (set-rec-scn! (lambda (v) (set! rec-scn v) v))
+             (set-freeze-snapshot! (lambda (v) (set! freeze-snapshot v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'freeze-clock) freeze-clock)
+                       ((eq? msg 'state) state)
+                       ((eq? msg 'location) location)
+                       ((eq? msg 'rec-scn) rec-scn)
+                       ((eq? msg 'freeze-snapshot) freeze-snapshot)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'set-location!) set-location!)
+                       ((eq? msg 'set-rec-scn!) set-rec-scn!)
+                       ((eq? msg 'set-freeze-snapshot!) set-freeze-snapshot!)
+                       (else #f)))))
+      self)))
+
+; memtable?: is the object a memtable?
+; Detected by querying 'freeze-clock — only memtable closures return
+; a non-negative integer.
+(define (memtable? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'freeze-clock)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; memtable-get-state: get freeze state.
+(define (memtable-get-state m) (m 'state))
+
+; memtable-set-state!: set freeze state.
+(define (memtable-set-state! m v) ((m 'set-state!) v))
+
+; memtable-get-location: get checkpoint location.
+(define (memtable-get-location m) (m 'location))
+
+; memtable-set-location!: set checkpoint location.
+(define (memtable-set-location! m v) ((m 'set-location!) v))
+
+; memtable-get-rec-scn: get rec_scn (record SCN).
+(define (memtable-get-rec-scn m) (m 'rec-scn))
+
+; memtable-set-rec-scn!: set rec_scn.
+(define (memtable-set-rec-scn! m v) ((m 'set-rec-scn!) v))
+
+; memtable-get-freeze-snapshot: get freeze_snapshot_version.
+(define (memtable-get-freeze-snapshot m) (m 'freeze-snapshot))
+
+; memtable-set-freeze-snapshot!: set freeze_snapshot_version.
+(define (memtable-set-freeze-snapshot! m v) ((m 'set-freeze-snapshot!) v))
+
+; memtable-get-freeze-clock: get recorded freeze_clock.
+(define (memtable-get-freeze-clock m) (m 'freeze-clock))
+
+; ----------------------------------------------------------------
+; Predicates (from ObFreezeCheckpoint virtual methods)
+; ----------------------------------------------------------------
+
+; memtable-ready-for-flush?: is the memtable ready to flush?
+; True when state == READY_FOR_FLUSH.
+(define (memtable-ready-for-flush? m)
+  (= (m 'state) FREEZE-STATE-READY-FOR-FLUSH))
+
+; memtable-is-frozen-checkpoint?: is the memtable a frozen checkpoint?
+; True when state is past ACTIVE (FREEZING, READY_FOR_FLUSH,
+; FLUSHED, RELEASED).
+(define (memtable-is-frozen-checkpoint? m)
+  (let ((s (m 'state)))
+    (or (= s FREEZE-STATE-FREEZING)
+        (= s FREEZE-STATE-READY-FOR-FLUSH)
+        (= s FREEZE-STATE-FLUSHED)
+        (= s FREEZE-STATE-RELEASED)
+        (= s FREEZE-STATE-FORCE-RELEASED))))
+
+; memtable-rec-scn-is-stable?: is rec_scn stable?
+; True when state is past FREEZING.
+(define (memtable-rec-scn-is-stable? m)
+  (or (= (m 'state) FREEZE-STATE-READY-FOR-FLUSH)
+      (= (m 'state) FREEZE-STATE-FLUSHED)))
