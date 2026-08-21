@@ -1,0 +1,124 @@
+; 013-workqueue.aura
+; ========================
+; Workqueue — minimal capability port to aura.
+;
+; Maps to: 013-workqueue-analysis.md
+; Source: include/linux/workqueue.h + kernel/workqueue.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux workqueue is one of the largest kernel subsystems (~4000 LOC):
+;   - CMWQ (Concurrency Managed Workqueue) with worker_pool threading
+;   - 3 architecture iterations: traditional → CMWQ → BH workqueue
+;   - 159 symbols in workqueue.h, 649 in workqueue.c
+;   - Pending/inactive/PWQ/LINKED state flags + color bits in work_struct.data
+;   - max_active throttling, flush, cancel, delay
+;
+; aura has no scheduler, no threads, no workqueue subsystem.
+; v1 ships the work_struct + queue + drain mechanism (single-threaded):
+;   - make-work-struct (closure with func + PENDING flag)
+;   - make-workqueue (queue with pending works)
+;   - queue-work (add work, set PENDING)
+;   - drain-workqueue (pop all pending works; return list)
+;   - invoke-work (execute work function, clear PENDING)
+;   - work-pending? predicate
+;   - workqueue-empty? / workqueue-size predicates
+;
+; Deferred (full Linux workqueue, separate issues):
+;   - Worker threads (worker_pool, kworker creation)
+;   - max_active throttling + INACTIVE flag
+;   - Color bits (flush/cancel mechanism)
+;   - Delayed work (delayed_work, timer_list)
+;   - BH workqueue (softirq context)
+;   - flush_work / cancel_work_sync
+;   - Alloc/free flags (WQ_MEM_RECLAIM, etc.)
+;   - Power management (freezeable)
+
+(export
+  ; Work struct
+  make-work-struct
+  work-func
+  work-pending?
+  invoke-work
+  ; Workqueue
+  make-workqueue
+  queue-work
+  drain-workqueue
+  workqueue-empty?
+  workqueue-size)
+
+; ----------------------------------------------------------------
+; Work struct (closure with func + PENDING flag)
+; ----------------------------------------------------------------
+
+; Make a work_struct. Initially NOT pending.
+; func is the work function to call when work is invoked.
+; In v1 we use a simple boolean PENDING flag (Linux uses bit-encoded
+; data field with PENDING / INACTIVE / PWQ / LINKED + color bits).
+(define (make-work-struct func)
+  (let ((pending? #f))
+    (letrec ((set-pending! (lambda (v) (set! pending? v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'func) func)
+                       ((eq? msg 'pending?) pending?)
+                       ((eq? msg 'set-pending!) set-pending!)
+                       (else #f)))))
+      self)))
+
+; work-func: get the work function.
+(define (work-func w) (w 'func))
+
+; work-pending?: is the work in PENDING state?
+(define (work-pending? w) (w 'pending?))
+
+; invoke-work: execute the work function, clear PENDING flag.
+; Returns the result of the work function.
+(define (invoke-work w)
+  ((w 'set-pending!) #f)
+  ((w 'func)))
+
+; ----------------------------------------------------------------
+; Workqueue (closure with pending work list)
+; ----------------------------------------------------------------
+
+; Make an empty workqueue.
+(define (make-workqueue)
+  (let ((works '()))                 ; list of work_struct closures (FIFO)
+    (letrec ((set-works! (lambda (w) (set! works w) w))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'works) works)
+                       ((eq? msg 'set-works!) set-works!)
+                       ((eq? msg 'empty?) (null? works))
+                       ((eq? msg 'size) (length works))
+                       (else #f)))))
+      self)))
+
+; queue-work: add a work_struct to the queue, mark PENDING.
+; Idempotent: returns #f if the work is already queued.
+(define (queue-work wq w)
+  (if ((w 'pending?))
+      #f
+      (begin
+        ((w 'set-pending!) #t)
+        ((wq 'set-works!) (cons w (wq 'works)))
+        #t)))
+
+; drain-workqueue: pop all pending works (in FIFO order — most recent
+; first because we consed to head, but worker threads traditionally drain
+; from head of list, so first-queued = first-drained).
+; Returns the list of pending works (caller is responsible for invoking
+; each via invoke-work).
+(define (drain-workqueue wq)
+  (let ((pending (reverse (wq 'works))))
+    ((wq 'set-works!) '())
+    pending))
+
+; workqueue-empty?: is the workqueue empty?
+(define (workqueue-empty? wq)
+  (null? (wq 'works)))
+
+; workqueue-size: number of pending works in the queue.
+(define (workqueue-size wq)
+  (length (wq 'works)))

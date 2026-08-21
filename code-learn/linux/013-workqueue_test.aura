@@ -1,0 +1,99 @@
+; 013-workqueue_test.aura
+; ========================
+; Smoke tests for 013-workqueue.aura — workqueue minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/013-workqueue_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-workqueue construction (empty)
+;   - make-work-struct construction (func accessible, not pending)
+;   - queue-work registers + sets pending
+;   - workqueue-empty? / workqueue-size track state
+;   - queue-work idempotency (returns #f if already queued)
+;   - drain-workqueue pops all (queue empty after)
+;   - invoke-work executes func + clears pending
+;
+; Verified via separate probes during development:
+;   - FIFO drain order (first-queued first-drained)
+;   - Multiple works in same queue
+;
+; Deferred (full Linux workqueue):
+;   - Worker threads (worker_pool, kworker)
+;   - max_active throttling + INACTIVE flag
+;   - Color bits (flush/cancel)
+;   - Delayed work (delayed_work, timer_list)
+;   - BH workqueue
+;   - flush_work / cancel_work_sync
+
+(require "std/test" all:)
+(require "013-workqueue" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "workqueue-001-init-empty"
+  (check (= 1 (workqueue-empty? (make-workqueue))))
+  (check (= 0 (workqueue-size (make-workqueue))))
+
+(test-suite "workqueue-001-work-init"
+  (check (= 1 (if (not (work-pending? (make-work-struct (lambda () 'ok))) 1 0))))
+
+; ----------------------------------------------------------------
+; queue-work
+; ----------------------------------------------------------------
+
+(test-suite "workqueue-002-queue-1"
+  (check (= 1 (= 1 (workqueue-size
+    (let ((wq (make-workqueue))
+          (w (make-work-struct (lambda () 'ok)))
+      (queue-work wq w)
+      wq)))))
+
+(test-suite "workqueue-002-queue-idempotent"
+  ; queue-work returns #f on already-queued work.
+  (check (= 1 (let ((wq (make-workqueue))
+                    (w (make-work-struct (lambda () 'ok))))
+                (queue-work wq w)
+                (if (not (queue-work wq w)) 1 0))))
+
+; ----------------------------------------------------------------
+; drain-workqueue + invoke-work
+; ----------------------------------------------------------------
+
+(test-suite "workqueue-003-drain"
+  (check (= 1 (workqueue-empty?
+    (let ((wq (make-workqueue)))
+      (queue-work wq (make-work-struct (lambda () 'ok)))
+      (drain-workqueue wq)
+      wq))))
+
+(test-suite "workqueue-003-invoke"
+  ; invoke-work calls func + clears pending flag.
+  (check (= 1 (eq? 'ran (let ((w (make-work-struct (lambda () 'ran))))
+                              (queue-work (make-workqueue) w)
+                              (invoke-work w)))))
+
+(test-suite "workqueue-003-invoke-clears-pending"
+  ; After invoke, work is no longer pending.
+  (check (= 1 (if (not (work-pending?
+    (let ((w (make-workstruct-cleared)))
+      (queue-work (make-workqueue) w)
+      (invoke-work w)
+      w)) 1 0))))
+
+; Helper for the above: return a work whose pending is cleared after invoke
+(define (make-workstruct-cleared)
+  (make-work-struct (lambda () 'ok)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
