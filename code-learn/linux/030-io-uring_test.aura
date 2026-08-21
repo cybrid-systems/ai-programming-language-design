@@ -1,0 +1,117 @@
+; 030-io-uring_test.aura
+; ========================
+; Smoke tests for 030-io-uring.aura — io_uring minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/030-io-uring_test.aura
+;
+; Verified automatically (smoke):
+;   - io_uring-setup (depth, SQ/CQ init)
+;   - SQE construction (op, fd, offset, addr, len, flags, user-data)
+;   - CQE construction (result, flags, user-data)
+;   - io-uring-submit (SQ tail advances)
+;   - io-uring-complete (CQ tail advances)
+;   - sqe? / cqe? / io-uring? predicates
+;
+; Verified via separate probes during development:
+;   - Multiple SQEs coexist
+;   - SQ head stays 0 until completion
+;   - sqe? predicate rejects non-sqe procedures
+;
+; Deferred (full Linux io_uring):
+;   - real kernel SQ/CQ rings + memory barriers
+;   - io_uring_enter syscall + task work
+;   - 60+ op codes
+;   - linked SQE chains
+;   - IORING_SETUP_SQPOLL
+
+(require "std/test" all:)
+(require "030-io-uring" all:)
+
+; ----------------------------------------------------------------
+; io_uring setup + predicate
+; ----------------------------------------------------------------
+
+(test-suite "iur-001-setup"
+  ; io-uring-setup creates ring with given depth.
+  (check (= 32 (io-uring-depth (io-uring-setup 32))))
+  (check (= 0 (io-uring-sq-tail (io-uring-setup 32))))
+  (check (= 0 (io-uring-cq-tail (io-uring-setup 32)))))
+
+(test-suite "iur-001-predicate"
+  ; io-uring? accepts only io_uring closures.
+  (check (= 1 (if (io-uring? (io-uring-setup 16)) 1 0)))
+  (check (= 1 (if (not (io-uring? 'not-a-ring)) 1 0)))
+  (check (= 1 (if (not (io-uring? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; SQE construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "iur-002-sqe-construction"
+  ; SQE preserves op, fd, offset, addr, len, flags, user-data.
+  (check (= 'read (sqe-op (make-sqe 'read 3 0 1000 4096 0 99))))
+  (check (= 3 (sqe-fd (make-sqe 'read 3 0 1000 4096 0 99))))
+  (check (= 0 (sqe-offset (make-sqe 'read 3 0 1000 4096 0 99))))
+  (check (= 1000 (sqe-addr (make-sqe 'read 3 0 1000 4096 0 99))))
+  (check (= 4096 (sqe-len (make-sqe 'read 3 0 1000 4096 0 99))))
+  (check (= 99 (sqe-user-data (make-sqe 'read 3 0 1000 4096 0 99)))))
+
+(test-suite "iur-002-sqe-predicate"
+  ; sqe? accepts only sqe closures.
+  (check (= 1 (if (sqe? (make-sqe 'read 0 0 0 0 0 0)) 1 0)))
+  (check (= 1 (if (not (sqe? 'not-a-sqe)) 1 0)))
+  (check (= 1 (if (not (sqe? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; CQE construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "iur-003-cqe-construction"
+  ; CQE preserves result, flags, user-data.
+  (check (= 4096 (cqe-result (make-cqe 4096 0 99))))
+  (check (= 0 (cqe-flags (make-cqe 4096 0 99))))
+  (check (= 99 (cqe-user-data (make-cqe 4096 0 99)))))
+
+(test-suite "iur-003-cqe-predicate"
+  ; cqe? accepts only cqe closures.
+  (check (= 1 (if (cqe? (make-cqe 0 0 0)) 1 0)))
+  (check (= 1 (if (not (cqe? 'not-a-cqe)) 1 0))))
+
+; ----------------------------------------------------------------
+; io-uring-submit / io-uring-complete
+; ----------------------------------------------------------------
+
+(test-suite "iur-004-submit"
+  ; io-uring-submit enqueues SQE + advances SQ tail.
+  (check (= 1 (let ((ring (io-uring-setup 16)))
+                (io-uring-submit ring (make-sqe 'read 0 0 0 0 0 0))
+                (io-uring-sq-tail ring)))))
+
+(test-suite "iur-004-submit-multiple"
+  ; Multiple submits advance tail further.
+  (check (= 3 (let ((ring (io-uring-setup 16)))
+                (io-uring-submit ring (make-sqe 'read 0 0 0 0 0 0))
+                (io-uring-submit ring (make-sqe 'write 1 0 0 0 0 1))
+                (io-uring-submit ring (make-sqe 'fsync 2 0 0 0 0 2))
+                (io-uring-sq-tail ring)))))
+
+(test-suite "iur-004-complete"
+  ; io-uring-complete enqueues CQE + advances CQ tail.
+  (check (= 1 (let ((ring (io-uring-setup 16)))
+                (io-uring-complete ring (make-cqe 0 0 0))
+                (io-uring-cq-tail ring)))))
+
+(test-suite "iur-004-sq-head-stays"
+  ; SQ head stays 0 until completion.
+  (check (= 0 (let ((ring (io-uring-setup 16)))
+                (io-uring-submit ring (make-sqe 'read 0 0 0 0 0 0))
+                (io-uring-sq-head ring)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

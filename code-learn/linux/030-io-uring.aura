@@ -1,0 +1,264 @@
+; 030-io-uring.aura
+; =====================
+; io_uring — minimal capability port to aura.
+;
+; Maps to: Linux kernel io_uring subsystem
+; Source: include/uapi/linux/io_uring.h + fs/io_uring.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux io_uring is the high-performance async I/O framework providing:
+;   - struct io_uring (SQ + CQ + state)
+;   - struct io_uring_sqe (submission queue entry: op + flags + fd +
+;     off, addr, len)
+;   - struct io_uring_cqe (completion queue entry: result + flags)
+;   - io_uring_setup (create ring)
+;   - io_uring_register (register files / buffers)
+;   - io_uring_enter (drive submission + wait for completion)
+;   - Operations: IORING_OP_NOP, READ, WRITE, OPEN, CLOSE, ACCEPT,
+;     CONNECT, POLL, FSYNC, SYNC_FILE_RANGE, SEND, RECV, TIMEOUT, etc.
+;
+; aura has no kernel, no syscalls, no file descriptors. v1 ships:
+;   - make-io-uring (factory: depth, sq, cq)
+;   - io-uring? predicate
+;   - io-uring-depth / io-uring-sq / io-uring-cq
+;   - io-uring-setup (create with depth)
+;   - make-sqe (submission queue entry: op, fd, off, addr, len, flags)
+;   - sqe? / sqe-op / sqe-fd / sqe-offset / sqe-len
+;   - make-cqe (completion queue entry: result, flags)
+;   - cqe? / cqe-result
+;   - io-uring-submit (move SQ head forward)
+;   - io-uring-complete (move CQ tail forward)
+;   - Operation symbols: 'nop / 'read / 'write / 'open / 'close /
+;     'accept / 'connect / 'poll / 'fsync / 'send / 'recv / 'timeout
+;
+; Deferred (full Linux io_uring):
+;   - real kernel SQ/CQ rings + memory barriers
+;   - io_uring_enter syscall + task work
+;   - registered files / buffers / personality
+;   - linked SQE chains
+;   - IORING_SETUP_SQPOLL (kernel-side polling)
+;   - IORING_SETUP_IOPOLL
+;   - 60+ op codes
+;   - fixed file descriptors
+;   - io_uring_register restrictions
+
+(export
+  make-io-uring
+  io-uring?
+  io-uring-depth
+  io-uring-sq
+  io-uring-cq
+  io-uring-sq-head
+  io-uring-sq-tail
+  io-uring-cq-head
+  io-uring-cq-tail
+  io-uring-setup
+  io-uring-submit
+  io-uring-complete
+  ; SQE (submission queue entry)
+  make-sqe
+  sqe?
+  sqe-op
+  sqe-fd
+  sqe-offset
+  sqe-addr
+  sqe-len
+  sqe-flags
+  sqe-user-data
+  ; CQE (completion queue entry)
+  make-cqe
+  cqe?
+  cqe-result
+  cqe-flags
+  cqe-user-data
+  ; Operations
+  'nop
+  'read
+  'write
+  'open
+  'close
+  'accept
+  'connect
+  'poll
+  'fsync
+  'send
+  'recv
+  'timeout)
+
+; ----------------------------------------------------------------
+; SQE (submission queue entry) — closure-based
+; ----------------------------------------------------------------
+
+; make-sqe: create a submission queue entry.
+; Args: op (symbol), fd (integer), off (integer), addr (integer),
+;       len (integer), flags (integer), user-data (integer)
+; Returns: sqe closure.
+(define (make-sqe op fd off addr len flags user-data)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'op) op)
+                     ((eq? msg 'fd) fd)
+                     ((eq? msg 'offset) off)
+                     ((eq? msg 'addr) addr)
+                     ((eq? msg 'len) len)
+                     ((eq? msg 'flags) flags)
+                     ((eq? msg 'user-data) user-data)
+                     (else #f)))))
+    self))
+
+; sqe?: is the object a SQE?
+; Detected by querying 'op — only sqe closures return one of the
+; known io_uring op symbols.
+(define (sqe? obj)
+  (if (procedure? obj)
+      (let ((op (obj 'op)))
+        (if (or (eq? op 'nop) (eq? op 'read) (eq? op 'write)
+                (eq? op 'open) (eq? op 'close) (eq? op 'accept)
+                (eq? op 'connect) (eq? op 'poll) (eq? op 'fsync)
+                (eq? op 'send) (eq? op 'recv) (eq? op 'timeout))
+            #t #f))
+      #f))
+
+; sqe-op: get SQE op
+(define (sqe-op s) (s 'op))
+
+; sqe-fd: get SQE file descriptor
+(define (sqe-fd s) (s 'fd))
+
+; sqe-offset: get SQE offset
+(define (sqe-offset s) (s 'offset))
+
+; sqe-addr: get SQE buffer address
+(define (sqe-addr s) (s 'addr))
+
+; sqe-len: get SQE length
+(define (sqe-len s) (s 'len))
+
+; sqe-flags: get SQE flags
+(define (sqe-flags s) (s 'flags))
+
+; sqe-user-data: get SQE user data
+(define (sqe-user-data s) (s 'user-data))
+
+; ----------------------------------------------------------------
+; CQE (completion queue entry) — closure-based
+; ----------------------------------------------------------------
+
+; make-cqe: create a completion queue entry.
+; Args: result (integer), flags (integer), user-data (integer)
+; Returns: cqe closure.
+(define (make-cqe result flags user-data)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'result) result)
+                     ((eq? msg 'flags) flags)
+                     ((eq? msg 'user-data) user-data)
+                     (else #f)))))
+    self))
+
+; cqe?: is the object a CQE?
+; Detected by querying 'result — only cqe closures return a value
+; for 'result.
+(define (cqe? obj)
+  (if (procedure? obj)
+      (if (integer? (obj 'result)) #t #f)
+      #f))
+
+; cqe-result: get CQE result code
+(define (cqe-result c) (c 'result))
+
+; cqe-flags: get CQE flags
+(define (cqe-flags c) (c 'flags))
+
+; cqe-user-data: get CQE user data
+(define (cqe-user-data c) (c 'user-data))
+
+; ----------------------------------------------------------------
+; io_uring — closure-based, mutable SQ/CQ state
+; ----------------------------------------------------------------
+
+; make-io-uring: create an io_uring with given depth.
+; Args: depth (integer — max SQ entries)
+; Returns: io_uring closure.
+(define (make-io-uring depth)
+  (let ((sq '())
+        (cq '())
+        (sq-head 0)
+        (sq-tail 0)
+        (cq-head 0)
+        (cq-tail 0))
+    (letrec ((set-sq!      (lambda (v) (set! sq v) v))
+             (set-cq!      (lambda (v) (set! cq v) v))
+             (set-sq-head! (lambda (v) (set! sq-head v) v))
+             (set-sq-tail! (lambda (v) (set! sq-tail v) v))
+             (set-cq-head! (lambda (v) (set! cq-head v) v))
+             (set-cq-tail! (lambda (v) (set! cq-tail v) v))
+             (inc-sq-tail! (lambda () (set! sq-tail (+ sq-tail 1)) sq-tail))
+             (inc-cq-tail! (lambda () (set! cq-tail (+ cq-tail 1)) cq-tail))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'depth) depth)
+                       ((eq? msg 'sq) sq)
+                       ((eq? msg 'cq) cq)
+                       ((eq? msg 'sq-head) sq-head)
+                       ((eq? msg 'sq-tail) sq-tail)
+                       ((eq? msg 'cq-head) cq-head)
+                       ((eq? msg 'cq-tail) cq-tail)
+                       ((eq? msg 'set-sq!)      set-sq!)
+                       ((eq? msg 'set-cq!)      set-cq!)
+                       ((eq? msg 'set-sq-head!) set-sq-head!)
+                       ((eq? msg 'set-sq-tail!) set-sq-tail!)
+                       ((eq? msg 'set-cq-head!) set-cq-head!)
+                       ((eq? msg 'set-cq-tail!) set-cq-tail!)
+                       ((eq? msg 'inc-sq-tail!) inc-sq-tail!)
+                       ((eq? msg 'inc-cq-tail!) inc-cq-tail!)
+                       (else #f)))))
+      self)))
+
+; io-uring?: is the object a io_uring?
+; Detected by querying 'depth — only io_uring closures return a
+; positive integer.
+(define (io-uring? obj)
+  (if (procedure? obj)
+      (let ((d (obj 'depth)))
+        (if (and (integer? d) (> d 0)) #t #f))
+      #f))
+
+; io-uring-depth: get ring depth
+(define (io-uring-depth ring) (ring 'depth))
+
+; io-uring-sq: get submission queue (list of sqe)
+(define (io-uring-sq ring) (ring 'sq))
+
+; io-uring-cq: get completion queue (list of cqe)
+(define (io-uring-cq ring) (ring 'cq))
+
+; io-uring-sq-head: get SQ head pointer
+(define (io-uring-sq-head ring) (ring 'sq-head))
+
+; io-uring-sq-tail: get SQ tail pointer
+(define (io-uring-sq-tail ring) (ring 'sq-tail))
+
+; io-uring-cq-head: get CQ head pointer
+(define (io-uring-cq-head ring) (ring 'cq-head))
+
+; io-uring-cq-tail: get CQ tail pointer
+(define (io-uring-cq-tail ring) (ring 'cq-tail))
+
+; io-uring-setup: create an io_uring of given depth.
+; Returns the new ring.
+(define (io-uring-setup depth)
+  (make-io-uring depth))
+
+; io-uring-submit: enqueue an SQE into the ring.
+; Returns the new SQ tail.
+(define (io-uring-submit ring sqe)
+  ((ring 'set-sq!) (cons sqe (ring 'sq)))
+  ((ring 'inc-sq-tail!)))
+
+; io-uring-complete: enqueue a CQE into the ring.
+; Returns the new CQ tail.
+(define (io-uring-complete ring cqe)
+  ((ring 'set-cq!) (cons cqe (ring 'cq)))
+  ((ring 'inc-cq-tail!)))
