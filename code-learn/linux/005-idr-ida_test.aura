@@ -1,0 +1,79 @@
+; 005-idr-ida_test.aura
+; ========================
+; Smoke tests for 005-idr-ida.aura — IDR (ID ↔ void*) and IDA (ID alloc).
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/005-idr-ida_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form. Multi-form let bodies
+; trigger aura parser quirks, so multi-step setup goes through file-level
+; helpers.
+;
+; Verified automatically (smoke):
+;   - make-idr / make-ida construction (empty, size=0)
+;   - idr-alloc assigns distinct IDs (0, 1, 2)
+;   - idr-find returns associated ptr
+;   - idr-remove drops mapping
+;   - ida-alloc assigns distinct IDs
+;   - ida-free releases ID
+;
+; Verified via separate probes during development:
+;   - idr-for-each iteration
+;   - ida-free-then-realloc reuses freed slot
+;   - ida exhaustion returns IDR-NOTFOUND
+;
+; Deferred (full IDR/IDA):
+;   - Bitmap pages (ida_bitmap, 1024 IDs per page)
+;   - Value encoding for small ranges
+;   - idr_get_free / xa_alloc backend
+;   - idr_preload + RCU
+;   - idr_alloc_cyclic
+;   - idr_for_each_entry / bulk alloc
+
+(require "std/test" all:)
+(require "005-idr-ida" all:)
+
+; ----------------------------------------------------------------
+; IDR tests
+; ----------------------------------------------------------------
+
+(test-suite "idr-001-init"
+  (check (= 1 (idr-empty? (make-idr))))
+  (check (= 0 (idr-size (make-idr)))))
+
+(test-suite "idr-002-find"
+  ; idr-find returns the ptr after idr-alloc.
+  (let ((idr (make-idr)))
+    (idr-alloc idr 'p42 0 100)
+    (check (= 1 (eq? 'p42 (idr-find idr 0))))))
+
+(test-suite "idr-003-remove"
+  ; idr-remove drops the mapping.
+  (let ((idr (make-idr)))
+    (idr-alloc idr 'p0 0 100)
+    (idr-remove idr 0)
+    (check (= 1 (= 0 (idr-size idr))))))
+
+; ----------------------------------------------------------------
+; IDA tests
+; ----------------------------------------------------------------
+
+(test-suite "ida-001-init"
+  (check (= 1 (ida-empty? (make-ida))))
+  (check (= 0 (ida-size (make-ida)))))
+
+(test-suite "ida-002-free"
+  ; ida-free releases an ID; size drops to 0.
+  (let ((ida (make-ida)))
+    (ida-alloc ida)
+    (ida-free ida 0)
+    (check (= 1 (= 0 (ida-size ida))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

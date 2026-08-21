@@ -1,0 +1,194 @@
+; 005-idr-ida.aura
+; ====================
+; IDR + IDA — minimal capability ports to aura.
+;
+; Maps to: 005-idr-ida-analysis.md
+; Source: include/linux/idr.h + lib/idr.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux IDR/IDA uses XArray internally (since 4.19), with bitmap
+; pages (ida_bitmap, 1024 IDs per page) + value encoding for small
+; ranges. aura has none of these primitives.
+;
+; v1 ships the core ID allocation + pointer-association API:
+;   - idr_alloc: assign next free ID in range [start, end), associate ptr
+;   - idr_remove: drop ID ↔ ptr mapping
+;   - idr_find: look up ptr by ID
+;   - idr_for_each: iterate all mappings
+;   - ida_alloc: assign next free ID
+;   - ida_free: release an ID
+;
+; Deferred (separate issues):
+;   - Bitmap pages (ida_bitmap, 1024 IDs per page)
+;   - Value encoding for small ranges
+;   - idr_get_free / xa_alloc backend
+;   - idr_preload + RCU (idr_preload_end, idr_find_rcu)
+;   - idr_alloc_cyclic (cyclic allocation hint)
+;   - idr_for_each_entry / bulk alloc
+;   - ida_get_new / ida_simple_get (older APIs)
+;
+; ## Design notes
+;
+; aura has no fixed-width integers beyond its number type, no bitmaps,
+; no xarray, no kmalloc, no GFP flags, no RCU. We model IDR/IDA with a
+; closure-based list-of-pairs storage (same pattern as 004-xarray v1):
+;
+;   idr = closure holding (id . ptr) pairs + next-hint cursor
+;   ida = closure holding list of allocated IDs + cursor
+;
+; IDs are integers. ID exhaustion returns -1 (Linux returns error code).
+
+(export
+  ; IDR ops
+  make-idr
+  idr-alloc idr-remove idr-find
+  idr-empty? idr-size
+  idr-for-each
+  ; IDA ops
+  make-ida
+  ida-alloc ida-free
+  ida-empty? ida-size
+  ; Sentinel
+  IDR-NOTFOUND)
+
+(define IDR-NOTFOUND -1)
+
+; ----------------------------------------------------------------
+; IDR (ID ↔ void* mapping)
+; ----------------------------------------------------------------
+
+; make-idr: empty IDR.
+(define (make-idr)
+  (let ((entries '())           ; list of (id . ptr) pairs
+        (cursor 0))            ; next alloc hint
+    (letrec ((set-entries! (lambda (e) (set! entries e) e))
+             (set-cursor!  (lambda (c) (set! cursor  c) c))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'entries) entries)
+                       ((eq? msg 'cursor) cursor)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       ((eq? msg 'set-cursor!) set-cursor!)
+                       ((eq? msg 'empty?) (null? entries))
+                       ((eq? msg 'size) (length entries))
+                       (else #f)))))
+      self)))
+
+; idr-empty?: is the IDR empty?
+(define (idr-empty? idr)
+  (null? (idr 'entries)))
+
+; idr-size: number of allocated IDs.
+(define (idr-size idr)
+  (length (idr 'entries)))
+
+; idr-find: look up ptr by ID. Returns ptr or IDR-NOTFOUND.
+(define (idr-find idr id)
+  (let loop ((rest (idr 'entries)))
+    (cond
+      ((null? rest) IDR-NOTFOUND)
+      ((eq? (caar rest) id) (cdar rest))
+      (else (loop (cdr rest))))))
+
+; idr-alloc: assign next free ID in [start, end) (exclusive end),
+; associate with ptr. Returns ID, or IDR-NOTFOUND if exhausted.
+; Uses cursor + start as the starting hint; scans forward for first free.
+(define (idr-alloc idr ptr start end)
+  ; Build candidate: start at cursor, but bounded by [start, end)
+  (let* ((cur (max start (idr 'cursor)))
+         (max-id (- end 1)))
+    (let loop ((cand cur))
+      (cond
+        ((> cand max-id)
+         ; wrap around to start
+         (let loop2 ((c start))
+           (cond
+             ((> c max-id) IDR-NOTFOUND)  ; exhausted
+             ((eq? IDR-NOTFOUND (idr-find idr c)) (alloc-and-link idr c ptr))
+             (else (loop2 (+ c 1))))))
+        ((eq? IDR-NOTFOUND (idr-find idr cand)) (alloc-and-link idr cand ptr))
+        (else (loop (+ cand 1)))))))
+
+; alloc-and-link: helper — add (id . ptr) to idr, advance cursor.
+(define (alloc-and-link idr id ptr)
+  ((idr 'set-entries!)
+   (cons (cons id ptr) (idr 'entries)))
+  ((idr 'set-cursor!) (+ id 1))
+  id)
+
+; idr-remove: drop ID ↔ ptr mapping. Returns the removed entry (or #f).
+(define (idr-remove idr id)
+  (let ((old (idr 'entries)))
+    (let loop ((rest old) (acc '()))
+      (cond
+        ((null? rest)
+         ((idr 'set-entries!) (reverse acc))
+         #f)
+        ((eq? (caar rest) id)
+         ((idr 'set-entries!) (append (reverse acc) (cdr rest)))
+         (cdar rest))
+        (else (loop (cdr rest) (cons (car rest) acc)))))))
+
+; idr-for-each: apply (f id ptr) to each mapping.
+; Iteration order is reverse insertion order (list walk).
+(define (idr-for-each f idr)
+  (for-each
+    (lambda (kv) (f (car kv) (cdr kv)))
+    (reverse (idr 'entries))))
+
+; ----------------------------------------------------------------
+; IDA (ID allocation, no pointer)
+; ----------------------------------------------------------------
+
+; make-ida: empty IDA.
+(define (make-ida)
+  (let ((ids '())               ; list of allocated IDs
+        (cursor 0))
+    (letrec ((set-ids! (lambda (e) (set! ids e) e))
+             (set-cursor! (lambda (c) (set! cursor c) c))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'ids) ids)
+                       ((eq? msg 'cursor) cursor)
+                       ((eq? msg 'set-ids!) set-ids!)
+                       ((eq? msg 'set-cursor!) set-cursor!)
+                       ((eq? msg 'empty?) (null? ids))
+                       ((eq? msg 'size) (length ids))
+                       (else #f)))))
+      self)))
+
+; ida-empty?: is the IDA empty?
+(define (ida-empty? ida)
+  (null? (ida 'ids)))
+
+; ida-size: number of allocated IDs.
+(define (ida-size ida)
+  (length (ida 'ids)))
+
+; ida-alloc: assign next free ID. Returns ID, or IDR-NOTFOUND if exhausted.
+; (Linux IDA has a max ID; v1 has no upper bound.)
+(define (ida-alloc ida)
+  (let ((cur (ida 'cursor)))
+    (let loop ((c cur))
+      (if (member? c (ida 'ids))
+          (loop (+ c 1))
+          (begin
+            ((ida 'set-ids!) (cons c (ida 'ids)))
+            ((ida 'set-cursor!) (+ c 1))
+            c)))))
+
+; member?: linear-search helper (aura has no built-in for membership).
+(define (member? x lst)
+  (cond
+    ((null? lst) #f)
+    ((eq? (car lst) x) #t)
+    (else (member? x (cdr lst)))))
+
+; ida-free: release an ID. Returns the freed ID, or #f if not allocated.
+(define (ida-free ida id)
+  (if (member? id (ida 'ids))
+      (begin
+        ((ida 'set-ids!) (filter (lambda (x) (not (eq? x id))) (ida 'ids)))
+        id)
+      #f))
