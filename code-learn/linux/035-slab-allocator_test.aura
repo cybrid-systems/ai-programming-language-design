@@ -1,0 +1,128 @@
+; 035-slab-allocator_test.aura
+; ===============================
+; Smoke tests for 035-slab-allocator.aura — SLAB/SLUB minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/035-slab-allocator_test.aura
+;
+; Verified automatically (smoke):
+;   - kmem_cache construction (name, object-size, align)
+;   - kmem-cache? predicate
+;   - kmem-cache-create / find / destroy
+;   - kmem-cache-alloc / free (active count tracking)
+;   - kmem-cache-count (registry size)
+;
+; Verified via separate probes during development:
+;   - kmem-cache-free at 0 stays at 0 (clamped)
+;   - kmem-cache-destroy removes + find returns #f
+;   - kmem-cache? predicate rejects non-cache procedures
+;
+; Deferred (full Linux SLAB / SLUB):
+;   - real slab page allocation
+;   - per-CPU / per-node partial slabs
+;   - freelist randomization
+;   - ctor / dtor hooks
+;   - kmalloc / kfree generic allocator
+
+(require "std/test" all:)
+(require "035-slab-allocator" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "slab-001-construction"
+  ; kmem_cache preserves name, object-size, align.
+  (check (= 'task-struct (kmem-cache-name
+                          (make-kmem-cache 'task-struct 4096 64))))
+  (check (= 4096 (kmem-cache-object-size
+                   (make-kmem-cache 'task-struct 4096 64))))
+  (check (= 64 (kmem-cache-align
+                (make-kmem-cache 'task-struct 4096 64)))))
+
+(test-suite "slab-001-predicate"
+  ; kmem-cache? accepts only kmem_cache closures.
+  (check (= 1 (if (kmem-cache? (make-kmem-cache 'unq-slab-001 128 8)) 1 0)))
+  (check (= 1 (if (not (kmem-cache? 'not-a-cache)) 1 0)))
+  (check (= 1 (if (not (kmem-cache? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Cache create / find / destroy
+; ----------------------------------------------------------------
+
+(test-suite "slab-002-create"
+  ; kmem-cache-create assigns sequential id.
+  (check (= 1 (kmem-cache-create
+               (make-kmem-cache 'unq-slab-002-create 128 8)))))
+
+(test-suite "slab-002-find"
+  ; kmem-cache-find returns the registered cache.
+  (check (= 1 (let ((c (make-kmem-cache 'unq-slab-002-find 128 8)))
+                (kmem-cache-create c)
+                (if (eq? c (kmem-cache-find 'unq-slab-002-find)) 1 0)))))
+
+(test-suite "slab-002-find-missing"
+  ; kmem-cache-find returns #f for unknown name.
+  (check (= 1 (if (not (kmem-cache-find 'unq-slab-002-missing)) 1 0))))
+
+(test-suite "slab-002-destroy"
+  ; kmem-cache-destroy removes + find returns #f.
+  (check (= 1 (let ((c (make-kmem-cache 'unq-slab-002-destroy 128 8)))
+                (kmem-cache-create c)
+                (kmem-cache-destroy c)
+                (if (not (kmem-cache-find 'unq-slab-002-destroy)) 1 0)))))
+
+(test-suite "slab-002-destroy-not-found"
+  ; kmem-cache-destroy returns #f for non-registered cache.
+  (check (= 1 (if (not (kmem-cache-destroy
+                          (make-kmem-cache 'unq-slab-002-orphan 128 8))) 1 0))))
+
+(test-suite "slab-002-count"
+  ; kmem-cache-count tracks registry size.
+  (check (= 1 (> (kmem-cache-count) 0))))
+
+; ----------------------------------------------------------------
+; alloc / free
+; ----------------------------------------------------------------
+
+(test-suite "slab-003-alloc"
+  ; kmem-cache-alloc increments active count.
+  (check (= 1 (let ((c (make-kmem-cache 'unq-slab-003-alloc 128 8)))
+                (kmem-cache-create c)
+                (kmem-cache-alloc c)
+                (kmem-cache-active-count c)))))
+
+(test-suite "slab-003-alloc-multiple"
+  ; Multiple allocs accumulate.
+  (check (= 5 (let ((c (make-kmem-cache 'unq-slab-003-allocm 128 8)))
+                (kmem-cache-create c)
+                (kmem-cache-alloc c)
+                (kmem-cache-alloc c)
+                (kmem-cache-alloc c)
+                (kmem-cache-alloc c)
+                (kmem-cache-alloc c)
+                (kmem-cache-active-count c)))))
+
+(test-suite "slab-003-free"
+  ; kmem-cache-free decrements active count.
+  (check (= 1 (let ((c (make-kmem-cache 'unq-slab-003-free 128 8)))
+                (kmem-cache-create c)
+                (kmem-cache-alloc c)
+                (kmem-cache-alloc c)
+                (kmem-cache-free c)
+                (kmem-cache-active-count c)))))
+
+(test-suite "slab-003-free-clamp-zero"
+  ; kmem-cache-free at 0 stays at 0.
+  (check (= 0 (let ((c (make-kmem-cache 'unq-slab-003-freez 128 8)))
+                (kmem-cache-create c)
+                (kmem-cache-free c)
+                (kmem-cache-active-count c)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

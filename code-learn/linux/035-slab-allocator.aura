@@ -1,0 +1,198 @@
+; 035-slab-allocator.aura
+; =========================
+; slab_alloc — minimal capability port to aura.
+;
+; Maps to: Linux kernel SLAB / SLUB object allocator
+; Source: mm/slab.c + mm/slub.c + include/linux/slab.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux SLAB/SLUB is the kernel object allocator providing type-safe
+; allocation of same-sized objects from per-type caches:
+;   - struct kmem_cache (cache: name, object_size, align, ctor, dtor)
+;   - struct slab (slab metadata: free list, active count)
+;   - struct kmem_cache_cpu (per-CPU partial slabs — SLUB)
+;   - struct kmem_cache_node (per-node partial slabs — SLUB)
+;   - kmem_cache_create / kmem_cache_destroy
+;   - kmem_cache_alloc / kmem_cache_free
+;   - kmalloc / kfree (generic slab-backed allocation)
+;   - KMALLOC_SHIFT_MAX / cache line alignment
+;   - Constructor / destructor hooks
+;
+; aura has no kernel, no memory allocator, no SLUB metadata. v1 ships:
+;   - make-kmem-cache (factory: name, object-size, align)
+;   - kmem-cache-create / kmem-cache-destroy / kmem-cache-find
+;   - kmem-cache-alloc (returns id, increments active count)
+;   - kmem-cache-free (decrements active count, clamped at 0)
+;   - kmem-cache-active-count / kmem-cache-count
+;   - kmem-cache? predicate
+;
+; Deferred (full Linux SLAB / SLUB):
+;   - real slab page allocation
+;   - per-CPU partial slabs
+;   - per-node partial slabs
+;   - freelist randomization
+;   - ctor / dtor hooks
+;   - kmalloc / kfree generic allocator
+;   - SLAB_HWCACHE_ALIGN / SLAB_PANIC / SLAB_ACCOUNT
+;   - mergeable caches
+;   - SLAB_TYPESAFE_BY_RCU
+;   - memcg accounting
+
+(export
+  make-kmem-cache
+  kmem-cache?
+  kmem-cache-name
+  kmem-cache-object-size
+  kmem-cache-align
+  kmem-cache-create
+  kmem-cache-destroy
+  kmem-cache-find
+  kmem-cache-alloc
+  kmem-cache-free
+  kmem-cache-active-count
+  kmem-cache-count
+  kmem-cache-reset)
+
+; ----------------------------------------------------------------
+; kmem_cache — closure-based, mutable active count
+; ----------------------------------------------------------------
+
+; make-kmem-cache: create a kmem_cache.
+; Args: name (symbol), object-size (integer), align (integer)
+; Returns: kmem_cache closure.
+(define (make-kmem-cache name object-size align)
+  (let ((active 0)
+        (next-id 0))
+    (letrec ((set-active! (lambda (v) (set! active v) v))
+             (set-next-id! (lambda (v) (set! next-id v) v))
+             (inc-active!  (lambda () (set! active (+ active 1)) active))
+             (dec-active!  (lambda () (set! active (- active 1)) active))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'object-size) object-size)
+                       ((eq? msg 'align) align)
+                       ((eq? msg 'active) active)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-active!) set-active!)
+                       ((eq? msg 'set-next-id!) set-next-id!)
+                       ((eq? msg 'inc-active!) inc-active!)
+                       ((eq? msg 'dec-active!) dec-active!)
+                       (else #f)))))
+      self)))
+
+; kmem-cache?: is the object a kmem_cache?
+; Detected by querying 'object-size — only kmem_cache closures
+; return a positive integer for object-size.
+(define (kmem-cache? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'object-size)))
+        (if (and (integer? s) (> s 0)) #t #f))
+      #f))
+
+; kmem-cache-name: get cache name (symbol)
+(define (kmem-cache-name cache) (cache 'name))
+
+; kmem-cache-object-size: get object size in bytes
+(define (kmem-cache-object-size cache) (cache 'object-size))
+
+; kmem-cache-align: get required alignment in bytes
+(define (kmem-cache-align cache) (cache 'align))
+
+; kmem-cache-active-count: get count of currently allocated objects
+(define (kmem-cache-active-count cache) (cache 'active))
+
+; kmem-cache-reset: reset active count to 0 (for testing)
+(define (kmem-cache-reset cache)
+  ((cache 'set-active!) 0))
+
+; ----------------------------------------------------------------
+; Cache registry — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-cache-registry: empty registry.
+(define (make-cache-registry)
+  (let ((caches '())
+        (next-id 0))
+    (letrec ((set-caches!   (lambda (v) (set! caches v) v))
+             (set-next-id!  (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) caches)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-caches!)   set-caches!)
+                       ((eq? msg 'set-next-id!)  set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global cache registry
+(define g-cache-registry (make-cache-registry))
+
+; kmem-cache-create: register a new kmem_cache, assign a unique id.
+; Returns the assigned id.
+(define (kmem-cache-create cache)
+  (let ((new-id (+ (g-cache-registry 'next-id) 1)))
+    ((g-cache-registry 'set-next-id!) new-id)
+    ((cache 'set-next-id!) new-id)
+    ((g-cache-registry 'set-caches!)
+     (cons cache (g-cache-registry 'list)))
+    new-id))
+
+; kmem-cache-destroy: remove a cache from the registry.
+; Returns #t if removed, #f if not found.
+(define (kmem-cache-destroy cache)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-cache-registry 'set-caches!)
+                             (cons-rev acc '()))
+                            ((g-cache-registry 'set-caches!) acc))
+                        found?)
+                       ((eq? (car rest) cache)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-cache-registry 'list) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; kmem-cache-find: find a cache by name.
+; Returns the cache or #f if not found.
+(define (kmem-cache-find name)
+  (let loop ((rest (g-cache-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (kmem-cache-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; kmem-cache-count: count of registered caches
+(define (kmem-cache-count)
+  (let loop ((rest (g-cache-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; Allocation / free
+; ----------------------------------------------------------------
+
+; kmem-cache-alloc: simulate allocation from a cache.
+; Returns a unique object id (next-id), increments active count.
+(define (kmem-cache-alloc cache)
+  ((cache 'inc-active!)))
+
+; kmem-cache-free: simulate deallocation from a cache.
+; Returns the new active count (clamped at 0).
+(define (kmem-cache-free cache)
+  (let ((current (cache 'active)))
+    (if (= current 0)
+        0
+        ((cache 'dec-active!)))))
