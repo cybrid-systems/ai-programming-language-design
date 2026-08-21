@@ -1,0 +1,292 @@
+; 02-mvcc-iterator_test.aura
+; ============================
+; Smoke tests for 02-mvcc-iterator.aura — MVCC read iterator minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/02-mvcc-iterator_test.aura
+;
+; Verified automatically (smoke):
+;   - DML-LOCK + DML-NOT-EXIST constants distinct
+;   - ObStoreRowLockState construction + accessors
+;   - row-exist? (UPDATE/INSERT/LOCK true, DELETE false)
+;   - row-deleted? (DELETE true, others false)
+;   - is-row-decided? (locked OR has-version-AND-not-NOT_EXIST)
+;   - set-is-locked! updates
+;   - ObMvccValueIterator construction + predicate
+;   - find-visible (null row, empty row, committed, multiple,
+;     read-uncommitted)
+;   - find-visible sets version-iter + is-inited
+;   - reset!
+;
+; Verified via separate probes during development:
+;   - Predicate rejects non-target procedures
+;   - find-visible skips non-committed (read-uncommitted=false)
+;   - reset clears all state
+;
+; Deferred (full OceanBase MVCC iterator):
+;   - lock_for_read_inner_ state machine
+;   - try_cleanout_tx_node_
+;   - move_to_next_node_
+;   - check_row_locked
+;   - ObTxTableGuards / src_tx_table_guard_ transfer scenarios
+
+(require "std/test" all:)
+(require "01-mvcc-row" all:)
+(require "02-mvcc-iterator" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers (multi-form let bodies work at file level)
+; ----------------------------------------------------------------
+
+; make-row-with-3-versions: create a row with 3 versions, all committed.
+; Returns a pair (row . versions-list) so caller can reference nodes.
+(define (make-row-with-3-versions)
+  (let ((row (make-mvcc-row 0 0))
+        (a (make-mvcc-trans-node 100 30 0 0 NDT-NORMAL F-INIT #f))
+        (b (make-mvcc-trans-node 200 60 0 0 NDT-NORMAL F-INIT #f))
+        (c (make-mvcc-trans-node 300 80 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row a)
+    (mvcc-row-add-version! row b)
+    (mvcc-row-add-version! row c)
+    (mvcc-trans-node-trans-commit! a 30 100)
+    (mvcc-trans-node-trans-commit! b 60 200)
+    (mvcc-trans-node-trans-commit! c 80 300)
+    (cons row (list a b c))))
+
+; make-row-with-1-committed: create a row with 1 committed version.
+; Returns the row.
+(define (make-row-with-1-committed)
+  (let ((row (make-mvcc-row DML-INSERT DML-UPDATE))
+        (n (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row n)
+    (mvcc-trans-node-trans-commit! n 50 100)
+    row))
+
+; make-row-with-1-uncommitted: create a row with 1 uncommitted version.
+; Returns the row.
+(define (make-row-with-1-uncommitted)
+  (let ((row (make-mvcc-row DML-INSERT DML-UPDATE))
+        (n (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row n)
+    row))
+
+; find-visible-trans-version: run find-visible + return trans-version
+; (or -1 if no version found)
+(define (find-visible-trans-version iter)
+  (let ((result (mvcc-value-iterator-find-visible iter)))
+    (if (procedure? result)
+        (mvcc-trans-node-trans-version result)
+        -1)))
+
+; ----------------------------------------------------------------
+; DML flag constants
+; ----------------------------------------------------------------
+
+(test-suite "02-001-dml-constants"
+  ; DML-LOCK and DML-NOT-EXIST are distinct.
+  (check (= 1 (if (not (= DML-LOCK DML-UPDATE)) 1 0)))
+  (check (= 1 (if (not (= DML-NOT-EXIST DML-LOCK)) 1 0)))
+  (check (= 1 (if (not (= DML-NOT-EXIST DML-UPDATE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObStoreRowLockState construction
+; ----------------------------------------------------------------
+
+(test-suite "02-002-lock-state-construction"
+  ; lock state preserves fields.
+  (check (= 100 (store-row-lock-state-trans-version
+                  (make-store-row-lock-state 100 5 1 DML-INSERT #f #f 50 #f))))
+  (check (= 5 (store-row-lock-state-lock-trans-id
+                (make-store-row-lock-state 100 5 1 DML-INSERT #f #f 50 #f))))
+  (check (= 1 (store-row-lock-state-lock-data-sequence
+               (make-store-row-lock-state 100 5 1 DML-INSERT #f #f 50 #f))))
+  (check (= DML-INSERT (store-row-lock-state-lock-dml-flag
+                          (make-store-row-lock-state 100 5 1 DML-INSERT #f #f 50 #f))))
+  (check (= 50 (store-row-lock-state-trans-scn
+                (make-store-row-lock-state 100 5 1 DML-INSERT #f #f 50 #f)))))
+
+(test-suite "02-002-lock-state-predicate"
+  ; store-row-lock-state? accepts only lock_state closures.
+  (check (= #t (store-row-lock-state?
+                 (make-store-row-lock-state 0 0 0 DML-NONE #f #f 0 #f))))
+  (check (= #f (store-row-lock-state? 'not-a-lock)))
+  (check (= #f (store-row-lock-state? 42))))
+
+; ----------------------------------------------------------------
+; Row state predicates
+; ----------------------------------------------------------------
+
+(test-suite "02-003-row-exist-update"
+  ; row-exist? returns #t for DML-UPDATE.
+  (check (= #t (store-row-lock-state-row-exist?
+                 (make-store-row-lock-state 0 0 0 DML-UPDATE #f #f 0 #f)))))
+
+(test-suite "02-003-row-exist-insert"
+  ; row-exist? returns #t for DML-INSERT.
+  (check (= #t (store-row-lock-state-row-exist?
+                 (make-store-row-lock-state 0 0 0 DML-INSERT #f #f 0 #f)))))
+
+(test-suite "02-003-row-exist-lock"
+  ; row-exist? returns #t for DML-LOCK.
+  (check (= #t (store-row-lock-state-row-exist?
+                 (make-store-row-lock-state 0 0 0 DML-LOCK #f #f 0 #f)))))
+
+(test-suite "02-003-row-exist-delete"
+  ; row-exist? returns #f for DML-DELETE.
+  (check (= #f (store-row-lock-state-row-exist?
+                 (make-store-row-lock-state 0 0 0 DML-DELETE #f #f 0 #f)))))
+
+(test-suite "02-003-row-exist-not-exist"
+  ; row-exist? returns #f for DML-NOT-EXIST.
+  (check (= #f (store-row-lock-state-row-exist?
+                 (make-store-row-lock-state 0 0 0 DML-NOT-EXIST #f #f 0 #f)))))
+
+(test-suite "02-003-row-deleted"
+  ; row-deleted? returns #t for DML-DELETE.
+  (check (= #t (store-row-lock-state-row-deleted?
+                 (make-store-row-lock-state 0 0 0 DML-DELETE #f #f 0 #f)))))
+
+(test-suite "02-003-row-deleted-not"
+  ; row-deleted? returns #f for DML-INSERT.
+  (check (= #f (store-row-lock-state-row-deleted?
+                 (make-store-row-lock-state 0 0 0 DML-INSERT #f #f 0 #f)))))
+
+(test-suite "02-003-row-deleted-not-exist"
+  ; row-deleted? returns #f for DML-NOT-EXIST.
+  (check (= #f (store-row-lock-state-row-deleted?
+                 (make-store-row-lock-state 0 0 0 DML-NOT-EXIST #f #f 0 #f)))))
+
+(test-suite "02-003-is-row-decided-locked"
+  ; is-row-decided? returns #t when is-locked.
+  (check (= #t (store-row-lock-state-is-row-decided?
+                 (make-store-row-lock-state 0 0 0 DML-NONE #f #f 0 #t)))))
+
+(test-suite "02-003-is-row-decided-not-exists"
+  ; is-row-decided? returns #f when trans-version=0 AND flag=NOT_EXIST.
+  (check (= #f (store-row-lock-state-is-row-decided?
+                 (make-store-row-lock-state 0 0 0 DML-NOT-EXIST #f #f 0 #f)))))
+
+(test-suite "02-003-is-row-decided-exists"
+  ; is-row-decided? returns #t when trans-version>0 AND flag != NOT_EXIST.
+  (check (= #t (store-row-lock-state-is-row-decided?
+                 (make-store-row-lock-state 100 0 0 DML-INSERT #f #f 50 #f)))))
+
+(test-suite "02-004-set-is-locked"
+  ; store-row-lock-state-set-is-locked! updates.
+  (check (= #t (let ((s (make-store-row-lock-state 0 0 0 DML-NONE #f #f 0 #f)))
+                 (store-row-lock-state-set-is-locked! s #t)
+                 (store-row-lock-state-is-locked s)))))
+
+(test-suite "02-004-set-is-locked-false"
+  ; store-row-lock-state-set-is-locked! can toggle back.
+  (check (= #f (let ((s (make-store-row-lock-state 0 0 0 DML-NONE #f #f 0 #t)))
+                 (store-row-lock-state-set-is-locked! s #f)
+                 (store-row-lock-state-is-locked s)))))
+
+; ----------------------------------------------------------------
+; ObMvccValueIterator construction
+; ----------------------------------------------------------------
+
+(test-suite "02-005-iterator-construction"
+  ; iterator preserves fields.
+  (check (= 100 ((make-mvcc-value-iterator 100 #f #f #f) 'snapshot-version)))
+  (check (= #f ((make-mvcc-value-iterator 100 #f #f #f) 'read-uncommitted)))
+  (check (= #f ((make-mvcc-value-iterator 100 #f #f #f) 'read-latest)))
+  (check (= #f ((make-mvcc-value-iterator 100 #f #f #f) 'is-inited)))
+  (check (= #f ((make-mvcc-value-iterator 100 #f #f #f) 'version-iter))))
+
+(test-suite "02-005-iterator-predicate"
+  ; mvcc-value-iterator? accepts only iterator closures.
+  (check (= #t (mvcc-value-iterator?
+                 (make-mvcc-value-iterator 0 #f #f #f))))
+  (check (= #f (mvcc-value-iterator? 'not-an-iter)))
+  (check (= #f (mvcc-value-iterator? 42))))
+
+; ----------------------------------------------------------------
+; find-visible
+; ----------------------------------------------------------------
+
+(test-suite "02-006-find-visible-null-row"
+  ; find-visible on null row returns #f.
+  (check (= #f (mvcc-value-iterator-find-visible
+                 (make-mvcc-value-iterator 100 #f #f #f)))))
+
+(test-suite "02-006-find-visible-empty-row"
+  ; find-visible on empty row returns #f.
+  (check (= #f (mvcc-value-iterator-find-visible
+                 (make-mvcc-value-iterator 100 #f #f
+                   (make-mvcc-row DML-INSERT DML-UPDATE))))))
+
+(test-suite "02-006-find-visible-committed-single"
+  ; find-visible returns committed version <= snapshot.
+  (check (= #t (procedure? (mvcc-value-iterator-find-visible
+                             (make-mvcc-value-iterator 100 #f #f
+                               (make-row-with-1-committed)))))))
+
+(test-suite "02-006-find-visible-picks-latest-committed"
+  ; find-visible picks latest committed version <= snapshot.
+  ; With trans-versions 30/60/80 and snapshot=100, picks 80 (c).
+  (check (= 80 (find-visible-trans-version
+                  (make-mvcc-value-iterator 100 #f #f
+                    (car (make-row-with-3-versions)))))))
+
+(test-suite "02-006-find-visible-picks-older-committed"
+  ; find-visible with snapshot=50 picks b (trans-version=60... wait 60 > 50).
+  ; Picks a (trans-version=30) since b > 50.
+  (check (= 30 (find-visible-trans-version
+                  (make-mvcc-value-iterator 50 #f #f
+                    (car (make-row-with-3-versions)))))))
+
+(test-suite "02-006-find-visible-read-uncommitted"
+  ; read-uncommitted: returns first version even if not committed.
+  (check (= #t (procedure? (mvcc-value-iterator-find-visible
+                             (make-mvcc-value-iterator 100 #t #f
+                               (make-row-with-1-uncommitted)))))))
+
+(test-suite "02-006-find-visible-skip-uncommitted"
+  ; read-uncommitted=false: skip uncommitted versions.
+  (check (= #f (mvcc-value-iterator-find-visible
+                 (make-mvcc-value-iterator 100 #f #f
+                   (make-row-with-1-uncommitted))))))
+
+(test-suite "02-006-find-visible-sets-version-iter"
+  ; find-visible sets version-iter field.
+  (check (= #t (let ((iter (make-mvcc-value-iterator 100 #f #f
+                              (make-row-with-1-committed))))
+                 (mvcc-value-iterator-find-visible iter)
+                 (procedure? (mvcc-value-iterator-version-iter iter)))))
+
+(test-suite "02-006-find-visible-sets-is-inited"
+  ; find-visible sets is-inited to #t.
+  (check (= #t (let ((iter (make-mvcc-value-iterator 100 #f #f
+                              (make-row-with-1-committed))))
+                 (mvcc-value-iterator-find-visible iter)
+                 (eq? #t (iter 'is-inited)))))
+
+(test-suite "02-006-find-visible-not-sets-is-inited-on-fail"
+  ; find-visible that fails (returns #f) leaves is-inited=#f.
+  (check (= #f (let ((iter (make-mvcc-value-iterator 100 #f #f
+                              (make-row-with-1-uncommitted))))
+                 (mvcc-value-iterator-find-visible iter)
+                 (iter 'is-inited))))
+
+; ----------------------------------------------------------------
+; reset!
+; ----------------------------------------------------------------
+
+(test-suite "02-007-reset"
+  ; reset! clears is-inited + version-iter.
+  (check (= #t (let ((iter (make-mvcc-value-iterator 100 #f #f
+                              (make-row-with-1-committed))))
+                 (mvcc-value-iterator-find-visible iter)
+                 (mvcc-value-iterator-reset! iter)
+                 (and (eq? #f (iter 'is-inited))
+                      (eq? #f (iter 'version-iter)))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

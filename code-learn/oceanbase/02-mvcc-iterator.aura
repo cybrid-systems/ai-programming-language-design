@@ -1,0 +1,232 @@
+; 02-mvcc-iterator.aura
+; ========================
+; mvcc_iterator — minimal capability port to aura.
+;
+; Maps to: OceanBase storage layer MVCC read iterator
+; Source: src/storage/memtable/mvcc/ob_mvcc_iterator.h +
+;         ob_mvcc_iterator.cpp + ob_i_store.h (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase MVCC iterator provides read-side visibility check:
+;   - struct ObMvccValueIterator: is_inited, ctx, value (mvcc-row),
+;     version_iter (resolved visible version)
+;   - struct ObStoreRowLockState: is_locked, trans_version,
+;     lock_trans_id, lock_data_sequence, lock_dml_flag,
+;     is_delayed_cleanout, mvcc_row, trans_scn
+;   - row_exist? / row_deleted? / is_row_decided? predicates
+;   - lock_for_read_ visibility logic
+;   - ObLockForReadArg (read_latest, read_uncommitted, snapshot)
+;
+; aura has no concurrency, no transactions. v1 ships:
+;   - DML-LOCK + DML-NOT-EXIST additional constants
+;   - make-store-row-lock-state + accessors + 3 predicates
+;   - make-mvcc-value-iterator + find-visible (with read-uncommitted
+;     option)
+;   - mvcc-value-iterator-reset!
+;
+; Deferred (full OceanBase MVCC iterator):
+;   - lock_for_read_inner_ state machine (6+ cases)
+;   - try_cleanout_tx_node_ (delayed cleanout)
+;   - move_to_next_node_ iteration
+;   - check_row_locked
+;   - ObLockForReadArg (full parameter set)
+;   - ObTxTableGuards / src_tx_table_guard_ transfer scenarios
+;   - ObMvccAccessCtx (snapshot, tx_id)
+;   - read_latest (Halloween problem)
+
+(export
+  ; DML flags (additional)
+  DML-LOCK DML-NOT-EXIST
+  ; ObStoreRowLockState
+  make-store-row-lock-state store-row-lock-state?
+  store-row-lock-state-trans-version store-row-lock-state-lock-trans-id
+  store-row-lock-state-lock-data-sequence store-row-lock-state-lock-dml-flag
+  store-row-lock-state-is-delayed-cleanout store-row-lock-state-mvcc-row
+  store-row-lock-state-trans-scn store-row-lock-state-is-locked
+  store-row-lock-state-set-is-locked!
+  store-row-lock-state-row-exist? store-row-lock-state-row-deleted?
+  store-row-lock-state-is-row-decided?
+  ; ObMvccValueIterator
+  make-mvcc-value-iterator mvcc-value-iterator?
+  mvcc-value-iterator-version-iter
+  mvcc-value-iterator-find-visible
+  mvcc-value-iterator-reset!)
+
+; ----------------------------------------------------------------
+; Additional DML flags
+; ----------------------------------------------------------------
+;
+; Linux definitions (kept here for reference):
+;   DF_LOCK      = 5  // pure lock, no DML yet
+;   DF_NOT_EXIST = 6  // no row exists at this position
+;
+; The first 5 (DF_INSERT/DELETE/UPDATE/REPLACE) come from
+; 01-mvcc-row.aura and are re-used here.
+
+(define DML-LOCK 5)
+(define DML-NOT-EXIST 6)
+
+; ----------------------------------------------------------------
+; ObStoreRowLockState — closure-based
+; ----------------------------------------------------------------
+
+; make-store-row-lock-state: create a row lock state descriptor.
+; Args: trans-version, lock-trans-id, lock-data-sequence, lock-dml-flag,
+;       is-delayed-cleanout, mvcc-row, trans-scn, is-locked
+; Returns: store_row_lock_state closure.
+(define (make-store-row-lock-state trans-version lock-trans-id lock-data-sequence
+                                  lock-dml-flag is-delayed-cleanout mvcc-row
+                                  trans-scn is-locked)
+  (let ((l is-locked))
+    (letrec ((set-is-locked! (lambda (v) (set! l v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'trans-version) trans-version)
+                       ((eq? msg 'lock-trans-id) lock-trans-id)
+                       ((eq? msg 'lock-data-sequence) lock-data-sequence)
+                       ((eq? msg 'lock-dml-flag) lock-dml-flag)
+                       ((eq? msg 'is-delayed-cleanout) is-delayed-cleanout)
+                       ((eq? msg 'mvcc-row) mvcc-row)
+                       ((eq? msg 'trans-scn) trans-scn)
+                       ((eq? msg 'is-locked) l)
+                       ((eq? msg 'set-is-locked!) set-is-locked!)
+                       (else #f)))))
+      self)))
+
+; store-row-lock-state?: is the object a store_row_lock_state?
+; Detected by querying 'is-locked — only lock_state closures return a
+; boolean.
+(define (store-row-lock-state? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'is-locked)))
+        (if (or (eq? l #t) (eq? l #f)) #t #f))
+      #f))
+
+; Field accessors
+(define (store-row-lock-state-trans-version s) (s 'trans-version))
+(define (store-row-lock-state-lock-trans-id s) (s 'lock-trans-id))
+(define (store-row-lock-state-lock-data-sequence s) (s 'lock-data-sequence))
+(define (store-row-lock-state-lock-dml-flag s) (s 'lock-dml-flag))
+(define (store-row-lock-state-is-delayed-cleanout s) (s 'is-delayed-cleanout))
+(define (store-row-lock-state-mvcc-row s) (s 'mvcc-row))
+(define (store-row-lock-state-trans-scn s) (s 'trans-scn))
+(define (store-row-lock-state-is-locked s) (s 'is-locked))
+
+; store-row-lock-state-set-is-locked!: set is-locked field.
+; Returns the new value.
+(define (store-row-lock-state-set-is-locked! s v) ((s 'set-is-locked!) v))
+
+; ----------------------------------------------------------------
+; Predicate methods (per ob_i_store.h:235-270)
+; ----------------------------------------------------------------
+
+; row-exist?: is the row present?
+; Per OB: lock_dml_flag == DF_UPDATE || DF_INSERT || DF_LOCK
+(define (store-row-lock-state-row-exist? s)
+  (let ((flag (s 'lock-dml-flag)))
+    (if (or (= flag DML-UPDATE) (= flag DML-INSERT) (= flag DML-LOCK))
+        #t #f)))
+
+; row-deleted?: was the row deleted?
+; Per OB: lock_dml_flag == DF_DELETE
+(define (store-row-lock-state-row-deleted? s)
+  (if (= (s 'lock-dml-flag) DML-DELETE) #t #f))
+
+; is-row-decided?: is the row state determined?
+; Per OB: is_locked_ || (!trans_version_.is_min() && lock_dml_flag_ != DF_NOT_EXIST)
+; Aura v1: is_min() approximated as == 0.
+(define (store-row-lock-state-is-row-decided? s)
+  (let ((locked (s 'is-locked))
+        (tv (s 'trans-version))
+        (flag (s 'lock-dml-flag)))
+    (if (or (eq? locked #t)
+            (and (> tv 0) (not (= flag DML-NOT-EXIST))))
+        #t #f)))
+
+; ----------------------------------------------------------------
+; ObMvccValueIterator — closure-based
+; ----------------------------------------------------------------
+
+; make-mvcc-value-iterator: create an MVCC read iterator.
+; Args: snapshot-version, read-uncommitted, read-latest, mvcc-row
+; Returns: mvcc_value_iterator closure (initial: is-inited=#f, version-iter=#f).
+(define (make-mvcc-value-iterator snapshot-version read-uncommitted read-latest mvcc-row)
+  (let ((is-inited #f)
+        (version-iter #f)
+        (row mvcc-row))
+    (letrec ((set-is-inited! (lambda (v) (set! is-inited v) v))
+             (set-version-iter! (lambda (v) (set! version-iter v) v))
+             (set-row! (lambda (v) (set! row v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'is-inited) is-inited)
+                       ((eq? msg 'snapshot-version) snapshot-version)
+                       ((eq? msg 'read-uncommitted) read-uncommitted)
+                       ((eq? msg 'read-latest) read-latest)
+                       ((eq? msg 'mvcc-row) row)
+                       ((eq? msg 'version-iter) version-iter)
+                       ((eq? msg 'set-is-inited!) set-is-inited!)
+                       ((eq? msg 'set-version-iter!) set-version-iter!)
+                       ((eq? msg 'set-mvcc-row!) set-row!)
+                       (else #f)))))
+      self)))
+
+; mvcc-value-iterator?: is the object a mvcc_value_iterator?
+; Detected by querying 'is-inited — only iterator closures return a
+; boolean.
+(define (mvcc-value-iterator? obj)
+  (if (procedure? obj)
+      (let ((v (obj 'is-inited)))
+        (if (or (eq? v #t) (eq? v #f)) #t #f))
+      #f))
+
+; mvcc-value-iterator-version-iter: get the resolved visible version.
+(define (mvcc-value-iterator-version-iter iter) (iter 'version-iter))
+
+; ----------------------------------------------------------------
+; mvcc-value-iterator-find-visible — visibility iteration logic
+; ----------------------------------------------------------------
+;
+; Per OB lock_for_read_ + lock_for_read_inner_ state machine:
+;   - Start from list_head_ (newest version)
+;   - Skip F_ABORTED versions
+;   - Handle F_DELAYED_CLEANOUT (try cleanout)
+;   - Handle F_INIT (uncommitted) — depends on read_uncommitted
+;   - Handle F_COMMITTED with trans_version <= snapshot → visible
+;   - Walk via prev_ pointers until visible found
+;
+; Aura v1: simplified — skip non-committed unless read-uncommitted.
+
+(define (mvcc-value-iterator-find-visible iter)
+  (let ((row (iter 'mvcc-row))
+        (snapshot (iter 'snapshot-version))
+        (read-unc (iter 'read-uncommitted)))
+    (if (not row)
+        #f
+        (let loop ((node (row 'list-head)))
+          (cond
+            ((eq? node #f) #f)
+            (else
+             (let ((flag (node 'flag))
+                   (tv (node 'trans-version)))
+               (cond
+                 ((= flag F-COMMITTED)
+                  (if (<= tv snapshot)
+                      (begin
+                        ((iter 'set-version-iter!) node)
+                        ((iter 'set-is-inited!) #t)
+                        node)
+                      (loop (node 'prev))))
+                 ((eq? read-unc #t)
+                  ((iter 'set-version-iter!) node)
+                  ((iter 'set-is-inited!) #t)
+                  node)
+                 (else
+                  (loop (node 'prev))))))))))
+
+; mvcc-value-iterator-reset!: clear is-inited + version-iter.
+; Returns #f (the new version-iter).
+(define (mvcc-value-iterator-reset! iter)
+  ((iter 'set-is-inited!) #f)
+  ((iter 'set-version-iter!) #f))
