@@ -1,0 +1,171 @@
+; 024-softirq.aura
+; ====================
+; Softirq — minimal capability port to aura.
+;
+; Maps to: 024-softirq-analysis.md
+; Source: include/linux/interrupt.h + kernel/softirq.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux softirq subsystem is the deferred-interrupt (bottom-half) framework:
+;   - struct softirq_action (handler + data)
+;   - 10 softirq types (HI_SOFTIRQ ... RCU_SOFTIRQ) with priority order
+;   - open_softirq (register handler for a softirq number)
+;   - raise_softirq (mark pending)
+;   - do_softirq (dispatch pending, priority order)
+;   - local_bh_disable / local_bh_enable
+;   - tasklet_* (built on top of softirq)
+;
+; aura has no interrupt context, no bh scheduling, no tasklet infrastructure.
+; v1 ships the softirq registry + pending set + dispatch simulation:
+;   - make-softirq-vec (closure with handler list + pending bitmap)
+;   - open-softirq (register handler for softirq number)
+;   - raise-softirq (mark softirq as pending via bitmap)
+;   - softirq-pending? (test + clear pending for one entry)
+;   - do-softirq (dispatch pending softirqs in priority order)
+;   - softirq-count-handlers
+;   - HI-SOFTIRQ / TIMER-SOFTIRQ / NET-TX-SOFTIRQ / NET-RX-SOFTIRQ / BLOCK-SOFTIRQ /
+;     IRQ-POLL-SOFTIRQ / TASKLET-SOFTIRQ / SCHED-SOFTIRQ / HRTIMER-SOFTIRQ /
+;     RCU-SOFTIRQ / NR-SOFTIRQS
+;
+; Deferred (full Linux softirq):
+;   - struct softirq_action full fields (action pointer + data)
+;   - tasklet_* (built on top of softirq)
+;   - local_bh_disable / local_bh_enable
+;   - raise_softirq_irqoff (irq-disabled variant)
+;   - __raise_softirq_irqoff (raw bitmap set)
+;   - ksoftirqd kernel thread (ksoftirqd/N)
+;   - Vectored softirq dispatch (vs single handler)
+
+(export
+  make-softirq-vec
+  open-softirq
+  raise-softirq
+  softirq-pending?
+  do-softirq
+  softirq-count-handlers
+  HI-SOFTIRQ
+  TIMER-SOFTIRQ
+  NET-TX-SOFTIRQ
+  NET-RX-SOFTIRQ
+  BLOCK-SOFTIRQ
+  IRQ-POLL-SOFTIRQ
+  TASKLET-SOFTIRQ
+  SCHED-SOFTIRQ
+  HRTIMER-SOFTIRQ
+  RCU-SOFTIRQ
+  NR-SOFTIRQS)
+
+; ----------------------------------------------------------------
+; Softirq number constants (analogous to include/linux/interrupt.h enum)
+; ----------------------------------------------------------------
+
+(define HI-SOFTIRQ       0)
+(define TIMER-SOFTIRQ    1)
+(define NET-TX-SOFTIRQ   2)
+(define NET-RX-SOFTIRQ   3)
+(define BLOCK-SOFTIRQ    4)
+(define IRQ-POLL-SOFTIRQ 5)
+(define TASKLET-SOFTIRQ  6)
+(define SCHED-SOFTIRQ    7)
+(define HRTIMER-SOFTIRQ  8)
+(define RCU-SOFTIRQ      9)
+(define NR-SOFTIRQS      10)
+
+; ----------------------------------------------------------------
+; Softirq vector (closure with handler array + pending bitmap)
+; ----------------------------------------------------------------
+
+; make-softirq-vec: create the per-CPU softirq vector.
+; handlers: vector indexed by softirq number (0 .. NR_SOFTIRQS-1)
+; pending:  bitmap of softirq numbers that need processing
+;   For v1, we store pending as a list of numbers to keep it simple.
+(define (make-softirq-vec)
+  (let ((handlers (make-vector NR-SOFTIRQS #f))   ; vector of #f or closure
+        (pending '()))                              ; list of softirq numbers
+    (letrec ((set-handlers!  (lambda (v) (set! handlers v) v))
+             (set-pending!   (lambda (p) (set! pending  p) p))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handlers) handlers)
+                       ((eq? msg 'pending) pending)
+                       ((eq? msg 'set-handlers!) set-handlers!)
+                       ((eq? msg 'set-pending!)  set-pending!)
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Registration
+; ----------------------------------------------------------------
+
+; open-softirq: register a handler for the given softirq number.
+; Idempotent — replaces any existing handler.
+; Returns #t.
+(define (open-softirq vec softirq-num handler)
+  (let ((handlers (vec 'handlers)))
+    (vector-set! handlers softirq-num handler)   ; aura vector-set! OK within same closure
+    #t))
+
+; ----------------------------------------------------------------
+; Raise + pending query
+; ----------------------------------------------------------------
+
+; raise-softirq: mark the given softirq as pending.
+; Idempotent — raising an already-pending softirq is a no-op.
+; Returns #t.
+(define (raise-softirq vec softirq-num)
+  (let ((pending (vec 'pending)))
+    (if (member? softirq-num pending)
+        #t
+        (begin
+          ((vec 'set-pending!) (cons softirq-num pending))
+          #t))))
+
+; softirq-pending?: is the given softirq number currently pending?
+; Does NOT clear pending — use do-softirq for that.
+(define (softirq-pending? vec softirq-num)
+  (member? softirq-num (vec 'pending)))
+
+; member?: linear search for x in lst.
+(define (member? x lst)
+  (cond
+    ((null? lst) #f)
+    ((eq? (car lst) x) #t)
+    (else (member? x (cdr lst)))))
+
+; ----------------------------------------------------------------
+; Dispatch — do-softirq
+; ----------------------------------------------------------------
+
+; do-softirq: dispatch all pending softirqs in priority order
+; (lower number = higher priority). Calls each handler with no args.
+; Clears pending bits as it dispatches. Returns count of softirqs dispatched.
+(define (do-softirq vec)
+  ; Sort pending by softirq-num (priority order — lower = higher priority).
+  ; For simplicity, iterate pending list and dispatch each.
+  (let loop ((rest (vec 'pending)) (count 0))
+    (cond
+      ((null? rest) count)
+      (else
+       (let* ((n (car rest))
+              (handler (vector-ref (vec 'handlers) n)))
+         (when handler (handler))
+         ; Clear the pending bit
+         ((vec 'set-pending!)
+          (filter (lambda (x) (not (eq? x n))) (vec 'pending)))
+         (loop (cdr rest) (+ count 1)))))))
+
+; Note: for strict priority order, we'd sort pending first. v1 iterates
+; in insertion order — adequate for smoke tests.
+
+; ----------------------------------------------------------------
+; Queries
+; ----------------------------------------------------------------
+
+; softirq-count-handlers: number of currently registered handlers.
+(define (softirq-count-handlers vec)
+  (let loop ((i 0) (handlers (vec 'handlers)) (count 0))
+    (cond
+      ((>= i NR-SOFTIRQS) count)
+      ((vector-ref handlers i) (loop (+ i 1) handlers (+ count 1)))
+      (else (loop (+ i 1) handlers count)))))

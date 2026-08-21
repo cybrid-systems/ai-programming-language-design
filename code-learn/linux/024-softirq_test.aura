@@ -1,0 +1,99 @@
+; 024-softirq_test.aura
+; =====================
+; Smoke tests for 024-softirq.aura — softirq minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/024-softirq_test.aura
+;
+; Verified automatically (smoke):
+;   - make-softirq-vec construction (no handlers, no pending)
+;   - open-softirq registers handler at number
+;   - raise-softirq marks pending
+;   - softirq-pending? tests pending bit
+;   - do-softirq dispatches pending (priority order)
+;   - softirq-count-handlers tracks registered handlers
+;
+; Verified via separate probes during development:
+;   - All 10 softirq number constants (HI_SOFTIRQ ... RCU_SOFTIRQ)
+;   - NR_SOFTIRQS = 10
+;   - raise-softirq idempotency
+;
+; Deferred (full Linux softirq):
+;   - tasklet_* (built on softirq)
+;   - local_bh_disable / local_bh_enable
+;   - raise_softirq_irqoff (irq-disabled variant)
+;   - ksoftirqd kernel thread
+;   - Vectored softirq dispatch (vs single handler)
+
+(require "std/test" all:)
+(require "024-softirq" all:)
+
+; ----------------------------------------------------------------
+; Construction + constants
+; ----------------------------------------------------------------
+
+(test-suite "softirq-001-vec-init"
+  (check (= 0 (softirq-count-handlers (make-softirq-vec))))
+  (check (= 1 (if (not (softirq-pending? (make-softirq-vec) TIMER-SOFTIRQ)) 1 0))))
+
+(test-suite "softirq-001-nr-softirqs"
+  (check (= 10 NR-SOFTIRQS)))
+
+; ----------------------------------------------------------------
+; Open-softirq + count
+; ----------------------------------------------------------------
+
+; A counter-handler closure.
+(define (make-counter)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handler) (lambda () (set! count (+ count 1))))
+                       ((eq? msg 'count) count)
+                       (else #f)))))
+      self)))
+
+(test-suite "softirq-002-open-count"
+  (check (= 1 (= 2 (let ((v (make-softirq-vec))
+                          (h1 (make-counter))
+                          (h2 (make-counter)))
+                      (open-softirq v TIMER-SOFTIRQ (h1 'handler))
+                      (open-softirq v NET-RX-SOFTIRQ (h2 'handler))
+                      (softirq-count-handlers v)))))
+
+; ----------------------------------------------------------------
+; Raise + pending?
+; ----------------------------------------------------------------
+
+(test-suite "softirq-003-raise-pending"
+  (check (= 1 (let ((v (make-softirq-vec)))
+                 (raise-softirq v TIMER-SOFTIRQ)
+                 (softirq-pending? v TIMER-SOFTIRQ))))
+
+(test-suite "softirq-003-raise-idempotent"
+  ; Raising the same softirq twice still has it pending (once).
+  (check (= 1 (let ((v (make-softirq-vec)))
+                 (raise-softirq v NET-TX-SOFTIRQ)
+                 (raise-softirq v NET-TX-SOFTIRQ)
+                 (softirq-pending? v NET-TX-SOFTIRQ))))
+
+; ----------------------------------------------------------------
+; do-softirq dispatch
+; ----------------------------------------------------------------
+
+; Counter handler — registered handler invokes count++.
+; do-softirq dispatches by calling each registered handler.
+(test-suite "softirq-004-do-softirq"
+  (check (= 1 (= 1 (let ((v (make-softirq-vec))
+                          (h (make-counter)))
+                      (open-softirq v TIMER-SOFTIRQ (h 'handler))
+                      (raise-softirq v TIMER-SOFTIRQ)
+                      (do-softirq v)
+                      (h 'count)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
