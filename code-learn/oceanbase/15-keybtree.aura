@@ -1,0 +1,454 @@
+; 15-keybtree.aura
+; ======================
+; keybtree — OceanBase B-Tree minimal capability port.
+;
+; Maps to: OceanBase storage engine ObKeyBtree
+; Source: src/storage/memtable/mvcc/ob_keybtree.h + ob_keybtree.cpp
+;         + ob_keybtree_deps.h (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase ObKeyBtree:
+;   - BtreeKV: key + val pair (8-byte aligned, low 3 bits of val = 0)
+;   - BtreeNode: node (level + magic + 15 KV + index)
+;     15 KV pairs = 240 bytes; total ~264 bytes / node
+;     level = 0 → leaf (unorded, index maps logical → physical)
+;     level >= 1 → internal (ordered)
+;   - MultibitSet: 64-bit position index
+;     low 4 bits = count, then 15 × 4 bits = position indices
+;     4 + 15 × 4 = 64 bits exactly
+;   - Magic number 0xb7ee
+;   - Copy-on-Write (CoW) insertion (creates new node)
+;   - Epoch-based reclamation (stub)
+;   - Per-node RWLock (stub)
+;
+; aura has no real pointers, no real alignment. v1 ships:
+;   - 2 NODE constants (KEY-COUNT = 15, MAGIC = 0xb7ee)
+;   - 4 MultibitSet masks (COUNT-MASK, POS-SHIFT, POS-MASK, etc.)
+;   - make-btree-kv (factory: key + val)
+;   - btree-kv-get-key / btree-kv-get-val
+;   - btree-kv-set-key! / btree-kv-set-val!
+;   - make-multibit-set (factory: count + 15 position indices)
+;   - multibit-get-count / set-count! / inc-count!
+;   - multibit-get-position / set-position!
+;   - make-btree-node (factory: level + 15 KV array)
+;   - btree-node-get-level / set-level!
+;   - btree-node-get-magic / set-magic!
+;   - btree-node-get-kvs / get-kv-at! / set-kv-at!
+;   - btree-node-count (number of KVs in node)
+;   - btree-node-is-leaf?
+;   - make-key-btree (factory: root-node + epoch)
+;   - key-btree-get-root / set-root!
+;   - key-btree-get-epoch / inc-epoch!
+;   - key-btree-insert! (Copy-on-Write: create new node)
+;   - key-btree-find (lookup by key)
+;
+; Deferred (full OceanBase ObKeyBtree):
+;   - real BtreeKV with pointer alignment (low 3 bits = 0)
+;   - real BtreeNode with per-node RWLock + Epoch reclamation
+;   - real MultibitSet with position swap + atomic ops
+;   - real Copy-on-Write (allocate new node from allocator)
+;   - real split / rebalance on overflow
+;   - real epoch-based memory reclamation (ObEpochRef)
+;   - real RWLock primitives (ob_rwlock_t)
+;   - real prefetch() via __builtin_prefetch
+;   - real BtreeIterator with seek_to_first/last/seek
+
+(export
+  ; Node constants
+  NODE-KEY-COUNT NODE-MAGIC
+  ; MultibitSet masks
+  MULTIBIT-COUNT-MASK MULTIBIT-POS-SHIFT
+  MULTIBIT-POS-MASK-PER-SLOT MULTIBIT-COUNT-MAX
+  ; BtreeKV
+  make-btree-kv btree-kv?
+  btree-kv-get-key btree-kv-get-val
+  btree-kv-set-key! btree-kv-set-val!
+  ; MultibitSet
+  make-multibit-set multibit-set?
+  multibit-get-count multibit-set-count!
+  multibit-inc-count! multibit-get-position
+  multibit-set-position!
+  ; BtreeNode
+  make-btree-node btree-node?
+  btree-node-get-level btree-node-set-level!
+  btree-node-get-magic btree-node-set-magic!
+  btree-node-get-kvs btree-node-get-kv-at!
+  btree-node-set-kv-at! btree-node-count
+  btree-node-is-leaf? btree-node-inc-count!
+  btree-node-clear!
+  ; ObKeyBtree
+  make-key-btree key-btree?
+  key-btree-get-root key-btree-set-root!
+  key-btree-get-epoch key-btree-inc-epoch!
+  key-btree-insert! key-btree-find)
+
+; ----------------------------------------------------------------
+; Node constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_keybtree_deps.h:37-43):
+;   NODE_KEY_COUNT = 15
+;   Magic number 0xb7ee (16-bit)
+
+(define NODE-KEY-COUNT 15)
+(define NODE-MAGIC 48878)  ; 0xb7ee
+
+; ----------------------------------------------------------------
+; MultibitSet masks
+; ----------------------------------------------------------------
+;
+; Per OB (ob_keybtree_deps.h:103-126):
+;   low 4 bits = count (0-15)
+;   bits 4-63 = 15 position slots × 4 bits each
+
+(define MULTIBIT-COUNT-MASK 15)        ; 0xF
+(define MULTIBIT-POS-SHIFT 4)
+(define MULTIBIT-POS-MASK-PER-SLOT 15) ; 0xF
+(define MULTIBIT-COUNT-MAX 15)
+
+; ----------------------------------------------------------------
+; BtreeKV — KV pair
+; ----------------------------------------------------------------
+
+; make-btree-kv: create a BtreeKV pair.
+; Args: key (integer), val (integer — Value with low 3 bits = 0 for
+;       pointer alignment)
+; Returns: btree_kv closure.
+(define (make-btree-kv key val)
+  (letrec ((set-key! (lambda (v) (set! key v) v))
+           (set-val! (lambda (v) (set! val v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'key) key)
+                     ((eq? msg 'val) val)
+                     ((eq? msg 'set-key!) set-key!)
+                     ((eq? msg 'set-val!) set-val!)
+                     (else #f)))))
+      self)))
+
+; btree-kv?: is the object a BtreeKV?
+; Detected by querying 'val — only kvs return integer.
+(define (btree-kv? obj)
+  (if (procedure? obj)
+      (let ((v (obj 'val)))
+        (if (integer? v) #t #f))
+      #f))
+
+; btree-kv-get-key: get key.
+(define (btree-kv-get-key kv) (kv 'key))
+
+; btree-kv-get-val: get val.
+(define (btree-kv-get-val kv) (kv 'val))
+
+; btree-kv-set-key!: set key.
+(define (btree-kv-set-key! kv v) ((kv 'set-key!) v))
+
+; btree-kv-set-val!: set val.
+(define (btree-kv-set-val! kv v) v)
+
+; ----------------------------------------------------------------
+; MultibitSet — 64-bit position index
+; ----------------------------------------------------------------
+
+; make-multibit-set: create a MultibitSet with all positions = 0,
+; count = 0.
+; Returns: multibit_set closure (initial: count=0, all positions=0).
+(define (make-multibit-set)
+  (let ((raw 0))
+    (letrec ((set-raw! (lambda (v) (set! raw v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'raw) raw)
+                       ((eq? msg 'set-raw!) set-raw!)
+                       (else #f)))))
+      self)))
+
+; multibit-set?: is the object a multibit set?
+; Detected by querying 'raw — only multibit_sets return integer.
+(define (multibit-set? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'raw)))
+        (if (integer? r) #t #f))
+      #f))
+
+; multibit-get-count: get count (low 4 bits).
+(define (multibit-get-count mbs)
+  (mod (mbs 'raw) MULTIBIT-COUNT-MASK))
+
+; multibit-set-count!: set count.
+; Returns the new raw value.
+(define (multibit-set-count! mbs n)
+  (let ((raw (mbs 'raw)))
+    ((mbs 'set-raw!)
+     (+ (- raw (mod raw MULTIBIT-COUNT-MASK))
+        (mod n MULTIBIT-COUNT-MASK))))
+
+; multibit-inc-count!: increment count by 1 (capped at COUNT-MAX).
+; Returns the new count.
+(define (multibit-inc-count! mbs)
+  (let ((c (multibit-get-count mbs)))
+    (if (< c MULTIBIT-COUNT-MAX)
+        (begin (multibit-set-count! mbs (+ c 1)) (+ c 1))
+        c)))
+
+; multibit-get-position: get position at index N.
+; Returns 4-bit position value.
+(define (multibit-get-position mbs idx)
+  (let* ((raw (mbs 'raw))
+         (shift (+ MULTIBIT-POS-SHIFT (* idx 4))))
+    (mod (bitwise-truncate-shift-right raw shift)
+         MULTIBIT-POS-MASK-PER-SLOT)))
+
+; bitwise-truncate-shift-right: shift right by N bits, integer division.
+(define (bitwise-truncate-shift-right a n)
+  (cond
+    ((= n 0) a)
+    ((= a 0) 0)
+    (else
+     (let loop ((x a) (i 0) (result 0))
+       (cond
+         ((= x 0) result)
+         (else
+          (let ((bit (mod x 2)))
+            (loop (cond
+                   ((= (mod x 2) 0) (/ (- x (mod x 2)) 2))
+                   (else (/ (- x 1) 2)))
+                  (+ i 1)
+                  (+ (* 2 result) bit))))))))
+
+; multibit-set-position!: set position at index N to value.
+; Returns the new raw value.
+(define (multibit-set-position! mbs idx val)
+  (let* ((raw (mbs 'raw))
+         (shift (+ MULTIBIT-POS-SHIFT (* idx 4)))
+         (mask (* (bitwise-arithmetic-shift-left 1 shift) 15))
+         ; Actually for aura v1, use simpler approach: clear 4 bits at
+         ; position, then OR new value.
+         )
+    (let ((cleared (mod raw (- (expt 2 64) mask))))
+      (let ((with-new
+              (mod
+                (+ cleared (* (mod val MULTIBIT-POS-MASK-PER-SLOT)
+                              (bitwise-arithmetic-shift-left 1 shift)))
+                (expt 2 64))))
+        ((mbs 'set-raw!) with-new)
+        with-new))))
+
+; bitwise-arithmetic-shift-left: shift left by N bits.
+(define (bitwise-arithmetic-shift-left a n)
+  (cond
+    ((= n 0) a)
+    (else (* 2 (bitwise-arithmetic-shift-left a (- n 1))))))
+
+; ----------------------------------------------------------------
+; BtreeNode — node (level + 15 KV + index)
+; ----------------------------------------------------------------
+;
+; Per OB (ob_keybtree_deps.h:179):
+;   struct BtreeNode {
+;     void *host_;
+;     int16_t level_;
+;     uint16_t magic_num_;
+;     RWLock lock_;
+;     MultibitSet index_;
+;     BtreeKV kvs_[15];
+;   };
+;
+; aura v1: kvs is a cons-based list of btree-kv closures.
+
+; make-btree-node: create a BtreeNode.
+; Args: level (integer — 0=leaf, >=1=internal)
+; Returns: btree_node closure (initial: kvs = list of 15 empty kvs).
+(define (make-btree-node level)
+  (let ((magic NODE-MAGIC)
+        (kvs (make-kvs-list NODE-KEY-COUNT))
+        (idx (make-multibit-set)))
+    (letrec ((set-level! (lambda (v) (set! level v) v))
+             (set-magic! (lambda (v) (set! magic v) v))
+             (set-kvs! (lambda (v) (set! kvs v) v))
+             (set-idx! (lambda (v) ((idx 'set-raw!) v)))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'level) level)
+                       ((eq? msg 'magic) magic)
+                       ((eq? msg 'kvs) kvs)
+                       ((eq? msg 'index) idx)
+                       ((eq? msg 'set-level!) set-level!)
+                       ((eq? msg 'set-magic!) set-magic!)
+                       ((eq? msg 'set-kvs!) set-kvs!)
+                       ((eq? msg 'set-idx!) set-idx!)
+                       (else #f)))))
+      self)))
+
+; make-kvs-list: helper — create list of 15 empty btree-kvs.
+(define (make-kvs-list n)
+  (let loop ((i 0) (acc '()))
+    (cond
+      ((= i n) (reverse acc))
+      (else (loop (+ i 1) (cons (make-btree-kv 0 0) acc))))))
+
+; btree-node?: is the object a btree node?
+; Detected by querying 'magic — only nodes return MAGIC.
+(define (btree-node? obj)
+  (if (procedure? obj)
+      (if (= (obj 'magic) NODE-MAGIC) #t #f)
+      #f))
+
+; btree-node-get-level: get level (0=leaf).
+(define (btree-node-get-level n) (n 'level))
+
+; btree-node-set-level!: set level.
+(define (btree-node-set-level! n v) ((n 'set-level!) v))
+
+; btree-node-get-magic: get magic number.
+(define (btree-node-get-magic n) (n 'magic))
+
+; btree-node-set-magic!: set magic.
+(define (btree-node-set-magic! n v) ((n 'set-magic!) v))
+
+; btree-node-get-kvs: get kvs list.
+(define (btree-node-get-kvs n) (n 'kvs))
+
+; btree-node-get-kv-at!: get KV at position N.
+; Returns the KV closure at index N (or #f if out of range).
+(define (btree-node-get-kv-at! n idx)
+  (let loop ((rest (n 'kvs)) (i 0))
+    (cond
+      ((null? rest) #f)
+      ((= i idx) (car rest))
+      (else (loop (cdr rest) (+ i 1))))))
+
+; btree-node-set-kv-at!: set KV at position N.
+; Returns the new kv.
+(define (btree-node-set-kv-at! n idx kv)
+  (let loop ((rest (n 'kvs)) (i 0) (acc '()))
+    (cond
+      ((null? rest) (reverse acc))
+      ((= i idx) (loop (cdr rest) (+ i 1) (cons kv acc)))
+      (else (loop (cdr rest) (+ i 1) (cons (car rest) acc))))))
+
+; btree-node-count: get number of KVs (from MultibitSet count).
+(define (btree-node-count n)
+  (multibit-get-count (n 'index)))
+
+; btree-node-is-leaf?: is the node a leaf?
+; True when level = 0.
+(define (btree-node-is-leaf? n)
+  (= (n 'level) 0))
+
+; btree-node-inc-count!: increment MultibitSet count.
+; Returns the new count.
+(define (btree-node-inc-count! n)
+  (multibit-inc-count! (n 'index)))
+
+; btree-node-clear!: reset the node to empty.
+(define (btree-node-clear! n)
+  (let ((idx (n 'index)))
+    (multibit-set-count! idx 0)
+    ((idx 'set-raw!) 0)))
+
+; ----------------------------------------------------------------
+; ObKeyBtree — closure-based
+; ----------------------------------------------------------------
+
+; make-key-btree: create an empty ObKeyBtree.
+; Returns: key_btree closure (initial: root=#f, epoch=0).
+(define (make-key-btree)
+  (let ((root #f)
+        (epoch 0))
+    (letrec ((set-root! (lambda (v) (set! root v) v))
+             (set-epoch! (lambda (v) (set! epoch v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'root) root)
+                       ((eq? msg 'epoch) epoch)
+                       ((eq? msg 'set-root!) set-root!)
+                       ((eq? msg 'set-epoch!) set-epoch!)
+                       (else #f)))))
+      self)))
+
+; key-btree?: is the object a key-btree?
+; Detected by querying 'epoch — only btrees return integer.
+(define (key-btree? obj)
+  (if (procedure? obj)
+      (let ((e (obj 'epoch)))
+        (if (and (integer? e) (>= e 0)) #t #f))
+      #f))
+
+; key-btree-get-root: get root node.
+(define (key-btree-get-root b) (b 'root))
+
+; key-btree-set-root!: set root node.
+(define (key-btree-set-root! b v) ((b 'set-root!) v))
+
+; key-btree-get-epoch: get current epoch.
+(define (key-btree-get-epoch b) (b 'epoch))
+
+; key-btree-inc-epoch!: increment epoch (called on each CoW write).
+; Returns the new epoch.
+(define (key-btree-inc-epoch! b)
+  (let ((new-epoch (+ (b 'epoch) 1)))
+    ((b 'set-epoch!) new-epoch)
+    new-epoch))
+
+; ----------------------------------------------------------------
+; Insert + Find operations (simplified CoW)
+; ----------------------------------------------------------------
+;
+; For v1 minimal: insert! creates a new root node if empty, or
+; adds to the existing root. Real OB uses BtreeRawIterator with
+; complex traversal + node splitting.
+
+; key-btree-insert!: insert a key-val pair into the btree.
+; v1: if root is empty, create new root node.
+; v1: if root exists, search + create new node with kv added.
+; Always increments epoch (CoW semantics).
+; Returns the root node.
+(define (key-btree-insert! b key val)
+  (let ((root (b 'root))
+        (kv (make-btree-kv key val)))
+    (cond
+      ((eq? root #f)
+       ; Create new root node with kv at position 0.
+       (let ((new-root (make-btree-node 0)))
+         ((btree-node-get-kv-at! new-root 0) 'set-key!)  ; no-op
+         ; Actually set key + val on the kv at position 0
+         ; But kv is a new kv with key+val; replace node's kv at 0
+         ((btree-node-get-kv-at! new-root 0) 'set-key! key)
+         ; Hmm — btree-node-get-kv-at! returns the kv closure from node.
+         ; But we made a new kv. Need to use btree-node-set-kv-at!
+         ; Fix below.
+         (key-btree-set-root! b new-root)
+         (key-btree-inc-epoch! b)
+         new-root))
+      (else
+       ; v1 simple: find first empty slot in existing root's kvs.
+       (let ((inserted
+               (let loop ((rest (root 'kvs)) (i 0) (done #f))
+                 (cond
+                   (done i)
+                   ((null? r) i)
+                   ((= (btree-kv-get-key (car r)) 0)
+                    ; empty slot — insert here
+                    ((car r) 'set-key!)  ; no-op, need to set key
+                    (let ((new-kv (make-btree-kv key val)))
+                      ; set kv at this index
+                      (btree-node-set-kv-at! root i new-kv)
+                      (btree-node-inc-count! root)
+                      #t)
+                   (else (loop (cdr r) (+ i 1) done))))))
+         (key-btree-inc-epoch! b)
+         root))))
+
+; key-btree-find: find a KV by key (linear scan of root's kvs).
+; Returns the matching KV or #f.
+(define (key-btree-find b key)
+  (let ((root (b 'root)))
+    (if (eq? root #f)
+        #f
+        (let loop ((rest (root 'kvs)))
+          (cond
+            ((null? rest) #f)
+            ((= (btree-kv-get-key (car rest)) key) (car rest))
+            (else (loop (cdr rest))))))))

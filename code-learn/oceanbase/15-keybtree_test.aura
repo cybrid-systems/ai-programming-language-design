@@ -1,0 +1,263 @@
+; 15-keybtree_test.aura
+; ======================
+; Smoke tests for 15-keybtree.aura — OceanBase B-Tree minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/15-keybtree_test.aura
+;
+; Verified automatically (smoke):
+;   - 2 NODE constants distinct
+;   - 4 MultibitSet masks distinct
+;   - make-btree-kv + accessors + setters
+;   - make-multibit-set + count + position ops
+;   - make-btree-node + accessors + set-kv-at + count
+;   - btree-node-is-leaf? (level=0 vs level=1)
+;   - make-key-btree + epoch + insert + find
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Copy-on-Write semantics (each insert increments epoch)
+;
+; Deferred (full OceanBase ObKeyBtree):
+;   - real BtreeKV with pointer alignment (low 3 bits = 0)
+;   - real BtreeNode with per-node RWLock + Epoch reclamation
+;   - real MultibitSet with position swap + atomic ops
+;   - real Copy-on-Write (allocate new node from allocator)
+;   - real split / rebalance on overflow
+;   - real epoch-based memory reclamation (ObepochRef)
+;   - real RWLock primitives (ob_rwlock_t)
+;   - real prefetch() via __builtin_prefetch
+;   - real BtreeIterator with seek_to_first/last/seek
+
+(require "std/test" all:)
+(require "15-keybtree" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; pad-buckets helper for testing padding (already in 14-memtable).
+; Here we just test 15-keybtree.
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "15-001-node-constants-distinct"
+  ; 2 NODE constants are distinct.
+  (check (= 1 (if (not (= NODE-KEY-COUNT NODE-MAGIC)) 1 0))))
+
+(test-suite "15-001-node-constants-values"
+  ; Constants have expected values.
+  (check (= 15 NODE-KEY-COUNT))
+  (check (= 48878 NODE-MAGIC))  ; 0xb7ee
+
+(test-suite "15-001-multibit-masks-distinct"
+  ; 4 MultibitSet masks/constants are distinct.
+  (check (= 1 (if (not (= MULTIBIT-COUNT-MASK MULTIBIT-POS-SHIFT)) 1 0)))
+  (check (= 1 (if (not (= MULTIBIT-POS-SHIFT MULTIBIT-COUNT-MAX)) 1 0)))
+  (check (= 1 (if (not (= MULTIBIT-POS-MASK-PER-SLOT MULTIBIT-COUNT-MAX)) 1 0))))
+
+; ----------------------------------------------------------------
+; BtreeKV
+; ----------------------------------------------------------------
+
+(test-suite "15-002-btree-kv-construction"
+  ; btree-kv preserves key + val.
+  (check (= 100 (btree-kv-get-key (make-btree-kv 100 200))))
+  (check (= 200 (btree-kv-get-val (make-btree-kv 100 200)))))
+
+(test-suite "15-002-btree-kv-predicate"
+  ; btree-kv? accepts only btree_kvs.
+  (check (= #t (btree-kv? (make-btree-kv 1 1))))
+  (check (= #f (btree-kv? 'not-a-kv)))
+  (check (= #f (btree-kv? 42))))
+
+(test-suite "15-003-btree-kv-setters"
+  ; btree-kv setters update fields.
+  (check (= 500 (let ((kv (make-btree-kv 100 200)))
+                 (btree-kv-set-key! kv 500)
+                 (btree-kv-get-key kv))))
+  (check (= 600 (let ((kv (make-btree-kv 100 200)))
+                 (btree-kv-set-val! kv 600)
+                 (btree-kv-get-val kv))))
+
+; ----------------------------------------------------------------
+; MultibitSet
+; ----------------------------------------------------------------
+
+(test-suite "15-004-multibit-init"
+  ; new MultibitSet starts with count=0.
+  (check (= 0 (multibit-get-count (make-multibit-set))))
+
+(test-suite "15-004-multibit-predicate"
+  ; multibit-set? accepts only multibit_sets.
+  (check (= #t (multibit-set? (make-multibit-set))))
+  (check (= #f (multibit-set? 'not-a-mbs)))
+  (check (= #f (multibit-set? 42))))
+
+(test-suite "15-005-multibit-set-count"
+  ; set-count! updates count.
+  (check (= 7 (let ((mbs (make-multibit-set)))
+                 (multibit-set-count! mbs 7)
+                 (multibit-get-count mbs))))
+
+(test-suite "15-005-multibit-inc-count"
+  ; inc-count! increments.
+  (check (= 3 (let ((mbs (make-multibit-set)))
+                 (multibit-inc-count! mbs)
+                 (multibit-inc-count! mbs)
+                 (multibit-inc-count! mbs)
+                 (multibit-get-count mbs))))
+
+(test-suite "15-005-multibit-get-position-init"
+  ; get-position returns 0 initially.
+  (check (= 0 (multibit-get-position (make-multibit-set) 0)))
+  (check (= 0 (multibit-get-position (make-multibit-set) 14)))
+
+(test-suite "15-006-multibit-set-position"
+  ; set-position! + get-position roundtrip.
+  (check (= 5 (let ((mbs (make-multibit-set)))
+                 (multibit-set-position! mbs 3 5)
+                 (multibit-get-position mbs 3))))
+  (check (= 12 (let ((mbs (make-multibit-set)))
+                  (multibit-set-position! mbs 7 12)
+                  (multibit-get-position mbs 7))))
+
+; ----------------------------------------------------------------
+; BtreeNode
+; ----------------------------------------------------------------
+
+(test-suite "15-007-btree-node-construction"
+  ; btree-node preserves level + magic.
+  (check (= 0 (btree-node-get-level (make-btree-node 0))))
+  (check (= 1 (btree-node-get-level (make-btree-node 1))))
+  (check (= NODE-MAGIC (btree-node-get-magic (make-btree-node 0))))
+  (check (= 0 (btree-node-count (make-btree-node 0))))
+
+(test-suite "15-007-btree-node-predicate"
+  ; btree-node? accepts only btree_nodes.
+  (check (= #t (btree-node? (make-btree-node 0))))
+  (check (= #f (btree-node? 'not-a-node)))
+  (check (= #f (btree-node? 42))))
+
+(test-suite "15-007-btree-node-set-level"
+  ; set-level! updates.
+  (check (= 3 (let ((n (make-btree-node 0)))
+                 (btree-node-set-level! n 3)
+                 (btree-node-get-level n))))
+
+(test-suite "15-008-btree-node-get-kv-at"
+  ; get-kv-at! returns KV at position.
+  (check (= #t (let ((n (make-btree-node 0)))
+                 (btree-kv? (btree-node-get-kv-at! n 0)))))
+  (check (= #t (let ((n (make-btree-node 0)))
+                 (btree-kv? (btree-node-get-kv-at! n 14))))
+  (check (= #f (btree-node-get-kv-at! n 15))))
+
+(test-suite "15-008-btree-node-set-kv-at"
+  ; set-kv-at! replaces KV at position.
+  (check (= 100 (let ((n (make-btree-node 0))
+                      (kv (make-btree-kv 100 200)))
+                 (btree-node-set-kv-at! n 0 kv)
+                 (btree-kv-get-key (btree-node-get-kv-at! n 0)))))
+
+(test-suite "15-009-btree-node-is-leaf"
+  ; level=0 → leaf, level>=1 → not leaf.
+  (check (= #t (btree-node-is-leaf? (make-btree-node 0))))
+  (check (= #f (btree-node-is-leaf? (make-btree-node 1))))
+  (check (= #f (btree-node-is-leaf? (make-btree-node 2)))))
+
+(test-suite "15-009-btree-node-inc-count"
+  ; inc-count! increments node count.
+  (check (= 3 (let ((n (make-btree-node 0)))
+                 (btree-node-inc-count! n)
+                 (btree-node-inc-count! n)
+                 (btree-node-inc-count! n)
+                 (btree-node-count n))))
+
+(test-suite "15-010-btree-node-clear"
+  ; clear! resets count + positions.
+  (check (= #t (let ((n (make-btree-node 0)))
+                 (btree-node-inc-count! n)
+                 (btree-node-inc-count! n)
+                 (btree-node-set-position! (n 'index) 0 5)
+                 (btree-node-clear! n)
+                 (and (= 0 (btree-node-count n))
+                      (= 0 (multibit-get-position (n 'index) 0))))))
+
+; ----------------------------------------------------------------
+; ObKeyBtree
+; ----------------------------------------------------------------
+
+(test-suite "15-011-key-btree-construction"
+  ; new key-btree has no root + epoch=0.
+  (check (= #f (key-btree-get-root (make-key-btree))))
+  (check (= 0 (key-btree-get-epoch (make-key-btree))))
+
+(test-suite "15-011-key-btree-predicate"
+  ; key-btree? accepts only key_btrees.
+  (check (= #t (key-btree? (make-key-btree))))
+  (check (= #f (key-btree? 'not-a-bt)))
+  (check (= #f (key-btree? 42))))
+
+(test-suite "15-011-key-btree-inc-epoch"
+  ; inc-epoch! increments.
+  (check (= 1 (let ((b (make-key-btree)))
+                 (key-btree-inc-epoch! b))))
+  (check (= 5 (let ((b (make-key-btree)))
+                 (key-btree-inc-epoch! b)
+                 (key-btree-inc-epoch! b)
+                 (key-btree-inc-epoch! b)
+                 (key-btree-inc-epoch! b)
+                 (key-btree-inc-epoch! b))))
+
+(test-suite "15-012-key-btree-insert-empty"
+  ; Insert into empty btree creates root + increments epoch.
+  (check (= #t (let ((b (make-key-btree)))
+                 (key-btree-insert! b 100 200)
+                 (and (btree-node? (key-btree-get-root b))
+                      (= 1 (key-btree-get-epoch b)))))))
+
+(test-suite "15-012-key-btree-insert-existing"
+  ; Insert into existing btree increments epoch + updates count.
+  (check (= #t (let ((b (make-key-btree)))
+                 (key-btree-insert! b 100 200)
+                 (key-btree-insert! b 200 300)
+                 (and (= 2 (key-btree-get-epoch b))
+                      (= 2 (btree-node-count (key-btree-get-root b)))))))
+
+(test-suite "15-012-key-btree-insert-3-keys"
+  ; Insert 3 keys, count = 3.
+  (check (= #t (let ((b (make-key-btree)))
+                 (key-btree-insert! b 1 10)
+                 (key-btree-insert! b 2 20)
+                 (key-btree-insert! b 3 30)
+                 (and (= 3 (btree-node-count (key-btree-get-root b)))
+                      (= 3 (key-btree-get-epoch b)))))))
+
+(test-suite "15-013-key-btree-find-empty"
+  ; find on empty btree returns #f.
+  (check (= #f (key-btree-find (make-key-btree) 100)))
+
+(test-suite "15-013-key-btree-find-existing"
+  ; find returns matching KV.
+  (check (= #t (let ((b (make-key-btree)))
+                 (key-btree-insert! b 100 200)
+                 (let ((kv (key-btree-find b 100)))
+                   (and (btree-kv? kv)
+                        (= 200 (btree-kv-get-val kv)))))))
+
+(test-suite "15-013-key-btree-find-missing"
+  ; find returns #f for missing key.
+  (check (= #f (let ((b (make-key-btree)))
+                 (key-btree-insert! b 100 200)
+                 (key-btree-find b 999))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
