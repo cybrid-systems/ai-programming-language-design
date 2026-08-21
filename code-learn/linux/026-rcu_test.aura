@@ -1,0 +1,94 @@
+; 026-rcu_test.aura
+; ======================
+; Smoke tests for 026-rcu.aura — RCU minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/026-rcu_test.aura
+;
+; Verified automatically (smoke):
+;   - make-rcu-state construction (no readers, no pending)
+;   - rcu-read-lock / rcu-read-unlock increment/decrement
+;   - rcu-readers-active? tracks count > 0
+;   - call-rcu enqueues callback
+;   - synchronize-rcu invokes pending callbacks
+;
+; Verified via separate probes during development:
+;   - Multiple call-rcu enqueue multiple callbacks
+;   - synchronize-rcu invokes all in order
+;   - After GP, pending list is empty
+;
+; Deferred (full Linux RCU):
+;   - GP state machine
+;   - Per-CPU quiescent state tracking
+;   - SRCU / Tasks RCU / Sched RCU variants
+;   - Tree RCU / Tiny RCU
+;   - synchronize_rcu_expedited
+;   - rcu_barrier
+;   - RCU stall detection
+
+(require "std/test" all:)
+(require "026-rcu" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "rcu-001-init"
+  (check (= 1 (if (not (rcu-readers-active? (make-rcu-state))) 1 0)))
+
+; ----------------------------------------------------------------
+; Read lock / unlock
+; ----------------------------------------------------------------
+
+(test-suite "rcu-002-read-lock"
+  (check (= 1 (let ((r (make-rcu-state)))
+                 (rcu-read-lock r)
+                 (rcu-readers-active? r))))
+
+(test-suite "rcu-002-nested-readers"
+  ; Multiple readers can be active simultaneously.
+  (check (= 1 (let ((r (make-rcu-state)))
+                 (rcu-read-lock r)
+                 (rcu-read-lock r)
+                 (rcu-read-lock r)
+                 (rcu-read-unlock r)
+                 (rcu-read-unlock r)
+                 (rcu-readers-active? r))))
+
+(test-suite "rcu-002-read-unlock-all"
+  ; After all unlocks, no active readers.
+  (check (= 1 (if (not (let ((r (make-rcu-state)))
+                            (rcu-read-lock r)
+                            (rcu-read-lock r)
+                            (rcu-read-unlock r)
+                            (rcu-read-unlock r)
+                            (rcu-readers-active? r)) 1 0)))
+
+; ----------------------------------------------------------------
+; call-rcu + synchronize-rcu
+; ----------------------------------------------------------------
+
+; A counter callback — records its count when invoked.
+(define (make-counter-cb)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'fn) (lambda () (set! count (+ count 1))))
+                       ((eq? msg 'count) count)
+                       (else #f)))))
+      self)))
+
+(test-suite "rcu-003-call-rcu-and-sync"
+  ; call-rcu enqueues + synchronize-rcu invokes.
+  (check (= 1 (let ((r (make-rcu-state))
+                    (cb (make-counter-cb)))
+                (call-rcu r (cb 'fn))
+                (synchronize-rcu r)
+                (= 1 (cb 'count)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

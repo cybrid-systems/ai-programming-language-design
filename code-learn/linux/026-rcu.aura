@@ -1,0 +1,146 @@
+; 026-rcu.aura
+; =================
+; RCU (Read-Copy-Update) — minimal capability port to aura.
+;
+; Maps to: 026-rcu-analysis.md
+; Source: include/linux/rcupdate.h + kernel/rcu/ (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux RCU is a sophisticated no-lock synchronization mechanism:
+;   - rcu_read_lock / rcu_read_unlock (reader critical section)
+;   - rcu_dereference / rcu_assign_pointer (pointer annotation + barriers)
+;   - synchronize_rcu / synchronize_rcu_expedited
+;   - call_rcu (defer callback until GP passes)
+;   - struct rcu_head (for callbacks)
+;   - GP state machine (IDLE → WAIT_GPS → ONOFF → INIT → WAIT_SCAN → SCANNING → DONE)
+;   - Per-CPU quiescent state tracking
+;   - SRCU, Tasks RCU, Sched RCU variants
+;   - Tree-RCU / Tiny-RCU
+;
+; aura has no concurrency, no memory barriers, no quiescent states.
+; v1 ships the read-locking + grace-period + call_rcu simulation:
+;   - make-rcu-state (closure with active-reader count + pending callbacks)
+;   - rcu-read-lock / rcu-read-unlock (incr/decr reader count)
+;   - rcu-readers-active? (is the count > 0?)
+;   - synchronize-rcu (simulate GP: drain readers + invoke pending callbacks)
+;   - call-rcu (enqueue callback for next GP)
+;   - rcu-dereference / rcu-assign-pointer (annotated pointer ops)
+;   - rcu-pointer-? predicate
+;
+; Deferred (full Linux RCU):
+;   - GP state machine (6+ states)
+;   - Per-CPU quiescent state tracking (dynticks)
+;   - SRCU (Sleepable RCU) variant
+;   - Tasks RCU / Sched RCU variants
+;   - Tree RCU / Tiny RCU implementations
+;   - RCU priority boosting
+;   - kfree_rcu (RCU-delayed kfree)
+;   - RCU stall detection
+;   - synchronize_rcu_expedited (IPI-based GP)
+;   - Call-rcu bypass list / lazy callbacks
+;   - rcu_barrier (wait for all queued callbacks)
+
+(export
+  make-rcu-state
+  rcu-read-lock
+  rcu-read-unlock
+  rcu-readers-active?
+  rcu-dereference
+  rcu-assign-pointer!
+  call-rcu
+  synchronize-rcu
+  rcu-pointer-?)
+
+; ----------------------------------------------------------------
+; RCU state (closure with active-reader count + pending callbacks)
+; ----------------------------------------------------------------
+
+; make-rcu-state: empty RCU state.
+; readers: count of currently-active read-lock holders
+; pending: list of callback closures awaiting GP
+(define (make-rcu-state)
+  (let ((readers 0)
+        (pending '()))
+    (letrec ((set-readers! (lambda (v) (set! readers v) v))
+             (set-pending!  (lambda (p) (set! pending  p) p))
+             (inc-readers!  (lambda () (set! readers (+ readers 1)) readers))
+             (dec-readers!  (lambda () (set! readers (- readers 1)) readers))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'readers) readers)
+                       ((eq? msg 'pending) pending)
+                       ((eq? msg 'set-readers!) set-readers!)
+                       ((eq? msg 'set-pending!)  set-pending!)
+                       ((eq? msg 'inc-readers!) inc-readers!)
+                       ((eq? msg 'dec-readers!) dec-readers!)
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Reader critical section
+; ----------------------------------------------------------------
+
+; rcu-read-lock: enter a read-side critical section.
+; Increments the active reader count. Returns the new count.
+(define (rcu-read-lock rcu)
+  ((rcu 'inc-readers!)))
+
+; rcu-read-unlock: exit a read-side critical section.
+; Decrements the active reader count. Returns the new count.
+(define (rcu-read-unlock rcu)
+  ((rcu 'dec-readers!)))
+
+; rcu-readers-active?: are there active readers (count > 0)?
+(define (rcu-readers-active? rcu)
+  (> (rcu 'readers) 0))
+
+; ----------------------------------------------------------------
+; Pointer ops (annotated — no real barrier in v1)
+; ----------------------------------------------------------------
+
+; rcu-dereference: annotated pointer load. In Linux adds smp_read_barrier_depends.
+; v1 just returns the pointer (closure-typed).
+(define (rcu-dereference rcu ptr) ptr)
+
+; rcu-assign-pointer!: annotated pointer store. In Linux adds smp_store_release.
+; v1 just stores the pointer (no actual barrier).
+(define (rcu-assign-pointer! rcu slot-ptr ptr)
+  (set! slot-ptr ptr))
+
+; rcu-pointer-?: is the pointer non-null? (analog of RCU_INIT_POINTER).
+; rcu-assign-pointer! takes a mutable slot — caller passes a closure wrapping it.
+; For v1 simplicity, rcu-pointer-? just checks the value is non-#f.
+(define (rcu-pointer-? ptr)
+  (if ptr #t #f))
+
+; ----------------------------------------------------------------
+; Deferred callbacks
+; ----------------------------------------------------------------
+
+; call-rcu: enqueue callback for invocation after next grace period.
+; Returns #t.
+(define (call-rcu rcu callback)
+  ((rcu 'set-pending!) (cons callback (rcu 'pending)))
+  #t)
+
+; ----------------------------------------------------------------
+; Grace period
+; ----------------------------------------------------------------
+
+; synchronize-rcu: wait for all current readers to exit, then invoke
+; all pending callbacks. Single-threaded simulation — no actual waiting.
+; v1: invoke all callbacks immediately (since aura has no concurrency).
+;
+; Returns count of callbacks invoked.
+(define (synchronize-rcu rcu)
+  ; In Linux, wait for all readers to finish their CS.
+  ; v1 single-threaded: no readers to wait for, just invoke callbacks.
+  (let ((pending (rcu 'pending)))
+    ((rcu 'set-pending!) '())
+    (let loop ((rest pending) (count 0))
+      (cond
+        ((null? rest) count)
+        (else
+         ((car rest))
+         (loop (cdr rest) (+ count 1)))))))
