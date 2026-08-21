@@ -1,0 +1,199 @@
+; 41-join-operators_test.aura
+; ======================
+; Smoke tests for 41-join-operators.aura — Join Operators minimal.
+
+(require "std/test" all:)
+(require "41-join-operators" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "41-001-join-type-distinct"
+  (check (= 1 (if (not (= JOIN-TYPE-NL JOIN-TYPE-HASH)) 1 0)))
+  (check (= 1 (if (not (= JOIN-TYPE-HASH JOIN-TYPE-MERGE)) 1 0)))
+  (check (= 1 (if (not (= JOIN-TYPE-NL JOIN-TYPE-MERGE)) 1 0))))
+
+(test-suite "41-001-inner-mode-distinct"
+  (check (= 1 (if (not (= INNER-MODE-SCAN
+                          INNER-MODE-INDEX-LOOKUP)) 1 0)))
+  (check (= 1 (if (not (= INNER-MODE-INDEX-LOOKUP
+                          INNER-MODE-MATERIALIZED)) 1 0)))
+  (check (= 1 (if (not (= INNER-MODE-MATERIALIZED
+                          INNER-MODE-EMPTY)) 1 0)))
+  (check (= 1 (if (not (= INNER-MODE-SCAN
+                          INNER-MODE-EMPTY)) 1 0))))
+
+(test-suite "41-001-join-status-distinct"
+  (check (= 1 (if (not (= JOIN-STATUS-OPEN
+                          JOIN-STATUS-READING)) 1 0)))
+  (check (= 1 (if (not (= JOIN-STATUS-READING
+                          JOIN-STATUS-END)) 1 0)))
+  (check (= 1 (if (not (= JOIN-STATUS-OPEN
+                          JOIN-STATUS-END)) 1 0))))
+
+; ----------------------------------------------------------------
+; HashTableEntry
+; ----------------------------------------------------------------
+
+(test-suite "41-002-entry-construction"
+  (check (= 42 (hash-table-entry-get-key
+                (make-hash-table-entry 42 7))))
+  (check (= 7 (hash-table-entry-get-row-idx
+               (make-hash-table-entry 42 7)))))
+
+(test-suite "41-002-entry-predicate"
+  (check (= #t (hash-table-entry? (make-hash-table-entry 0 0))))
+  (check (= #f (hash-table-entry? 'not-entry)))
+  (check (= #f (hash-table-entry? 42)))
+
+; ----------------------------------------------------------------
+; HashTable
+; ----------------------------------------------------------------
+
+(test-suite "41-003-ht-construction"
+  (check (= 16 (hash-table-get-bucket-count
+                (make-hash-table 16))))
+  (check (= 0 (hash-table-get-entry-count
+               (make-hash-table 16)))))
+
+(test-suite "41-003-ht-predicate"
+  (check (= #t (hash-table? (make-hash-table 1))))
+  (check (= #f (hash-table? 'not-ht)))
+  (check (= #f (hash-table? 42)))
+
+(test-suite "41-004-ht-put"
+  (check (= 1 (let ((ht (make-hash-table 16)))
+                 (hash-table-put! ht (make-hash-table-entry 42 7))
+                 (hash-table-get-entry-count ht))))
+  (check (= 3 (let ((ht (make-hash-table 16)))
+                 (hash-table-put! ht (make-hash-table-entry 42 7))
+                 (hash-table-put! ht (make-hash-table-entry 100 8))
+                 (hash-table-put! ht (make-hash-table-entry 200 9))
+                 (hash-table-get-entry-count ht))))
+
+(test-suite "41-004-ht-find"
+  (check (= #t (let ((ht (make-hash-table 16)))
+                 (hash-table-put! ht (make-hash-table-entry 42 7))
+                 (eq? 7 (hash-table-entry-get-row-idx
+                          (hash-table-find! ht 42))))))
+
+(test-suite "41-004-ht-find-missing"
+  (check (= #f (hash-table-find! (make-hash-table 16) 999)))
+
+; ----------------------------------------------------------------
+; RuntimeFilter
+; ----------------------------------------------------------------
+
+(test-suite "41-005-rf-construction"
+  (check (= 1 (runtime-filter-get-filter-id
+               (make-runtime-filter 1 1000))))
+  (check (= 1000 (runtime-filter-get-build-rows
+                   (make-runtime-filter 1 1000))))
+  (check (= #f (runtime-filter-is-built
+                 (make-runtime-filter 1 1000)))))
+
+(test-suite "41-005-rf-predicate"
+  (check (= #t (runtime-filter? (make-runtime-filter 0 0))))
+  (check (= #f (runtime-filter? 'not-rf)))
+  (check (= #f (runtime-filter? 42)))
+
+(test-suite "41-006-rf-set-built"
+  (check (= #t (let ((rf (make-runtime-filter 1 1000)))
+                 (runtime-filter-set-built! rf #t)
+                 (runtime-filter-is-built rf))))
+
+(test-suite "41-006-rf-might-contain"
+  ; might-contain? returns #t when built.
+  (check (= #t (let ((rf (make-runtime-filter 1 1000)))
+                 (runtime-filter-set-built! rf #t)
+                 (runtime-filter-might-contain? rf 42))))
+  ; Returns #f when not built.
+  (check (= #f (runtime-filter-might-contain?
+                 (make-runtime-filter 1 1000) 42)))
+
+; ----------------------------------------------------------------
+; NLJoinOp
+; ----------------------------------------------------------------
+
+(test-suite "41-007-nl-construction"
+  (check (= INNER-MODE-INDEX-LOOKUP
+             (nl-join-op-get-inner-mode
+               (make-nl-join-op INNER-MODE-INDEX-LOOKUP 1000 100))))
+  (check (= 1000 (nl-join-op-get-outer-rows
+                  (make-nl-join-op INNER-MODE-INDEX-LOOKUP 1000 100))))
+  (check (= 100 (nl-join-op-get-inner-rows
+                 (make-nl-join-op INNER-MODE-INDEX-LOOKUP 1000 100))))
+  (check (= 0 (nl-join-op-get-row-count
+               (make-nl-join-op INNER-MODE-INDEX-LOOKUP 1000 100)))))
+
+(test-suite "41-007-nl-predicate"
+  (check (= #t (nl-join-op?
+                 (make-nl-join-op INNER-MODE-SCAN 0 0))))
+  (check (= #f (nl-join-op? 'not-nl)))
+  (check (= #f (nl-join-op? 42)))
+
+(test-suite "41-008-nl-set-row-count"
+  (check (= 5000 (let ((op (make-nl-join-op INNER-MODE-INDEX-LOOKUP
+                         1000 100)))
+                   (nl-join-op-set-row-count! op 5000)
+                   (nl-join-op-get-row-count op))))
+
+(test-suite "41-008-nl-set-inner-mode"
+  (check (= INNER-MODE-MATERIALIZED
+             (let ((op (make-nl-join-op INNER-MODE-INDEX-LOOKUP
+                       1000 100)))
+               (nl-join-op-set-inner-mode! op INNER-MODE-MATERIALIZED)
+               (nl-join-op-get-inner-mode op))))
+
+; ----------------------------------------------------------------
+; HashJoinOp
+; ----------------------------------------------------------------
+
+(test-suite "41-009-hj-construction"
+  (check (= 1000 (hash-join-op-get-build-rows
+                  (make-hash-join-op 1000 10000))))
+  (check (= 10000 (hash-join-op-get-probe-rows
+                   (make-hash-join-op 1000 10000))))
+  (check (= #f (hash-join-op-is-built
+                 (make-hash-join-op 1000 10000)))))
+
+(test-suite "41-009-hj-predicate"
+  (check (= #t (hash-join-op? (make-hash-join-op 0 0))))
+  (check (= #f (hash-join-op? 'not-hj)))
+  (check (= #f (hash-join-op? 42)))
+
+(test-suite "41-010-hj-set-built"
+  (check (= #t (let ((op (make-hash-join-op 1000 10000)))
+                 (hash-join-op-set-built! op #t)
+                 (hash-join-op-is-built op))))
+
+(test-suite "41-010-hj-reset-probe"
+  (check (= #t (hash-join-op-reset-probe! (make-hash-join-op 0 0)))))
+
+; ----------------------------------------------------------------
+; MergeJoinOp
+; ----------------------------------------------------------------
+
+(test-suite "41-011-mj-construction"
+  (check (= 0 (merge-join-op-get-outer-cursor
+               (make-merge-join-op 0 0))))
+  (check (= 0 (merge-join-op-get-inner-cursor
+               (make-merge-join-op 0 0))))
+  (check (= #f (merge-join-op-is-match
+                 (make-merge-join-op 0 0)))))
+
+(test-suite "41-011-mj-predicate"
+  (check (= #t (merge-join-op? (make-merge-join-op 0 0))))
+  (check (= #f (merge-join-op? 'not-mj)))
+  (check (= #f (merge-join-op? 42)))
+
+(test-suite "41-012-mj-set-match"
+  (check (= #t (let ((op (make-merge-join-op 0 0)))
+                 (merge-join-op-set-match! op #t)
+                 (merge-join-op-is-match op))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

@@ -1,0 +1,406 @@
+; 41-join-operators.aura
+; ======================
+; join_operators — minimal capability port to aura.
+;
+; Maps to: OceanBase Join Operators (NL / Hash / Merge Join)
+; Source: src/sql/engine/join/ob_nested_loop_join_op.h
+;         + src/sql/engine/join/ob_hash_join_op.h
+;         + src/sql/engine/join/ob_merge_join_op.h
+;         + src/sql/engine/join/ob_join_op.h
+;         + src/sql/engine/join/ob_hash_table.h
+;         + src/sql/engine/join/ob_runtime_filter.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Join Operators:
+;   - 3 JOIN-TYPE constants: NL / HASH / MERGE
+;   - 4 INNER-MODE constants: SCAN / INDEX-LOOKUP /
+;     MATERIALIZED / EMPTY
+;   - 3 JOIN-STATUS constants: OPEN / READING / END
+;   - ObNLJoinOp: nested loop join with inner-mode
+;   - ObHashJoinOp: hash join with build + probe
+;   - ObMergeJoinOp: merge join with sort cursor
+;   - ObHashTable: build-side hash table
+;   - ObRuntimeFilter: bloom filter pushed to probe
+;   - ObJoinOp: unified join base
+;
+; aura v1 ships:
+;   - 3 JOIN-TYPE constants
+;   - 4 INNER-MODE constants
+;   - 3 JOIN-STATUS constants
+;   - make-hash-table-entry (factory: key + row-idx)
+;   - hash-table-entry accessors
+;   - make-hash-table (factory: empty buckets)
+;   - hash-table accessors + put! / find!
+;   - hash-table-get-bucket-count + get-entry-count
+;   - make-runtime-filter (factory: filter-id + build-rows)
+;   - runtime-filter accessors + set-built! + might-contain?
+;   - make-nl-join-op (factory: inner-mode + outer-rows +
+;     inner-rows)
+;   - nl-join-op accessors + set-row-count!
+;   - nl-join-op-set-inner-mode!
+;   - make-hash-join-op (factory: build-rows + probe-rows)
+;   - hash-join-op accessors + set-built! + reset-probe!
+;   - make-merge-join-op (factory: outer-cursor + inner-cursor)
+;   - merge-join-op accessors + set-match!
+;
+; Deferred (full OceanBase Join Operators):
+;   - real NL join with iterator + join_cond evaluation
+;   - real Hash join with full hash table + spill-to-disk
+;   - real Merge join with sort cursor + multi-way merge
+;   - real BNL (Block NL) with batch cache
+;   - real Grace Hash Join with partition spill
+;   - real Hybrid Hash with in-memory + spill
+;   - real Bloom Filter pushed as runtime filter
+;   - real PartitionWise parallel join
+;   - real Adaptive join selection at runtime
+;   - real join cond + filter evaluation
+;   - real vectorized join for columnar engine
+
+(export
+  ; JoinType constants
+  JOIN-TYPE-NL
+  JOIN-TYPE-HASH
+  JOIN-TYPE-MERGE
+  ; InnerMode constants
+  INNER-MODE-SCAN
+  INNER-MODE-INDEX-LOOKUP
+  INNER-MODE-MATERIALIZED
+  INNER-MODE-EMPTY
+  ; JoinStatus constants
+  JOIN-STATUS-OPEN
+  JOIN-STATUS-READING
+  JOIN-STATUS-END
+  ; HashTableEntry
+  make-hash-table-entry
+  hash-table-entry?
+  hash-table-entry-get-key
+  hash-table-entry-get-row-idx
+  ; HashTable
+  make-hash-table
+  hash-table?
+  hash-table-get-bucket-count
+  hash-table-get-entry-count
+  hash-table-put!
+  hash-table-find!
+  ; RuntimeFilter
+  make-runtime-filter
+  runtime-filter?
+  runtime-filter-get-filter-id
+  runtime-filter-get-build-rows
+  runtime-filter-is-built
+  runtime-filter-set-built!
+  runtime-filter-might-contain?
+  ; NLJoinOp
+  make-nl-join-op
+  nl-join-op?
+  nl-join-op-get-inner-mode
+  nl-join-op-get-outer-rows
+  nl-join-op-get-inner-rows
+  nl-join-op-get-row-count
+  nl-join-op-set-row-count!
+  nl-join-op-set-inner-mode!
+  ; HashJoinOp
+  make-hash-join-op
+  hash-join-op?
+  hash-join-op-get-build-rows
+  hash-join-op-get-probe-rows
+  hash-join-op-is-built
+  hash-join-op-set-built!
+  hash-join-op-reset-probe!
+  ; MergeJoinOp
+  make-merge-join-op
+  merge-join-op?
+  merge-join-op-get-outer-cursor
+  merge-join-op-get-inner-cursor
+  merge-join-op-is-match
+  merge-join-op-set-match!)
+
+; ----------------------------------------------------------------
+; JoinType constants
+; ----------------------------------------------------------------
+
+(define JOIN-TYPE-NL 0)
+(define JOIN-TYPE-HASH 1)
+(define JOIN-TYPE-MERGE 2)
+
+; ----------------------------------------------------------------
+; InnerMode constants (for NL inner access)
+; ----------------------------------------------------------------
+
+(define INNER-MODE-SCAN 0)
+(define INNER-MODE-INDEX-LOOKUP 1)
+(define INNER-MODE-MATERIALIZED 2)
+(define INNER-MODE-EMPTY 3)
+
+; ----------------------------------------------------------------
+; JoinStatus constants
+; ----------------------------------------------------------------
+
+(define JOIN-STATUS-OPEN 0)
+(define JOIN-STATUS-READING 1)
+(define JOIN-STATUS-END 2)
+
+; ----------------------------------------------------------------
+; ObHashTableEntry — closure-based
+; ----------------------------------------------------------------
+
+; make-hash-table-entry: create a hash table entry.
+; Args: key (integer), row-idx (integer)
+; Returns: hash_table_entry closure.
+(define (make-hash-table-entry key row-idx)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'key) key)
+                     ((eq? msg 'row-idx) row-idx)
+                     (else #f)))))
+      self))
+
+; hash-table-entry?: is the object a hash table entry?
+; Detected by querying 'row-idx — only entries return integer.
+(define (hash-table-entry? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'row-idx)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; hash-table-entry-get-key: get entry key.
+(define (hash-table-entry-get-key e) (e 'key))
+
+; hash-table-entry-get-row-idx: get entry row idx.
+(define (hash-table-entry-get-row-idx e) (e 'row-idx))
+
+; ----------------------------------------------------------------
+; ObHashTable — closure-based
+; ----------------------------------------------------------------
+
+; make-hash-table: create a hash table.
+; Args: bucket-count (integer)
+; Returns: hash_table closure (initial: empty buckets + entries).
+(define (make-hash-table bucket-count)
+  (let ((buckets (make-list bucket-count '()))
+        (entry-count 0))
+    (letrec ((set-buckets! (lambda (v) (set! buckets v) v))
+             (set-entry-count! (lambda (v) (set! entry-count v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'bucket-count) bucket-count)
+                       ((eq? msg 'buckets) buckets)
+                       ((eq? msg 'entry-count) entry-count)
+                       ((eq? msg 'set-buckets!) set-buckets!)
+                       ((eq? msg 'set-entry-count!) set-entry-count!)
+                       (else #f)))))
+      self)))
+
+; hash-table?: is the object a hash table?
+; Detected by querying 'bucket-count — only tables return integer.
+(define (hash-table? obj)
+  (if (procedure? obj)
+      (let ((b (obj 'bucket-count)))
+        (if (and (integer? b) (> b 0)) #t #f))
+      #f))
+
+; hash-table-get-bucket-count: get bucket count.
+(define (hash-table-get-bucket-count ht) (ht 'bucket-count))
+
+; hash-table-get-entry-count: get total entry count.
+(define (hash-table-get-entry-count ht) (ht 'entry-count))
+
+; hash-table-put!: insert entry.
+; v1: append to bucket 0 (simplified).
+; Returns the new entry count.
+(define (hash-table-put! ht entry)
+  (let ((existing (ht 'buckets)))
+    ((ht 'set-buckets!) (cons entry existing))
+    ((ht 'set-entry-count!) (+ (ht 'entry-count) 1))))
+
+; hash-table-find!: find entry by key.
+; Returns the matching entry or #f.
+(define (hash-table-find! ht key)
+  (let loop ((rest (ht 'buckets)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'key) key) (car rest))
+      (#t (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; ObRuntimeFilter — closure-based (bloom filter)
+; ----------------------------------------------------------------
+
+; make-runtime-filter: create a runtime filter.
+; Args: filter-id (integer), build-rows (integer)
+; Returns: runtime_filter closure (initial: built=#f).
+(define (make-runtime-filter filter-id build-rows)
+  (let ((built #f))
+    (letrec ((set-built! (lambda (v) (set! built v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'filter-id) filter-id)
+                       ((eq? msg 'build-rows) build-rows)
+                       ((eq? msg 'built) built)
+                       ((eq? msg 'set-built!) set-built!)
+                       (else #f)))))
+      self)))
+
+; runtime-filter?: is the object a runtime filter?
+; Detected by querying 'filter-id — only filters return integer.
+(define (runtime-filter? obj)
+  (if (procedure? obj)
+      (let ((f (obj 'filter-id)))
+        (if (and (integer? f) (>= f 0)) #t #f))
+      #f))
+
+; runtime-filter-get-filter-id: get filter id.
+(define (runtime-filter-get-filter-id rf) (rf 'filter-id))
+
+; runtime-filter-get-build-rows: get build rows.
+(define (runtime-filter-get-build-rows rf) (rf 'build-rows))
+
+; runtime-filter-is-built: is the filter built?
+(define (runtime-filter-is-built rf) (rf 'built))
+
+; runtime-filter-set-built!: set built flag.
+; Returns the new built.
+(define (runtime-filter-set-built! rf v) ((rf 'set-built!) v))
+
+; runtime-filter-might-contain?: might the filter contain this
+; key? v1: always returns #t unless filter not built (#f).
+(define (runtime-filter-might-contain? rf key)
+  (if (rf 'built) #t #f))
+
+; ----------------------------------------------------------------
+; ObNLJoinOp — closure-based
+; ----------------------------------------------------------------
+
+; make-nl-join-op: create a NL join op.
+; Args: inner-mode (integer), outer-rows (integer),
+;       inner-rows (integer)
+; Returns: nl_join_op closure (initial: row-count=0).
+(define (make-nl-join-op inner-mode outer-rows inner-rows)
+  (let ((row-count 0))
+    (letrec ((set-row-count! (lambda (v) (set! row-count v) v))
+             (set-inner-mode! (lambda (v) (set! inner-mode v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'inner-mode) inner-mode)
+                       ((eq? msg 'outer-rows) outer-rows)
+                       ((eq? msg 'inner-rows) inner-rows)
+                       ((eq? msg 'row-count) row-count)
+                       ((eq? msg 'set-row-count!) set-row-count!)
+                       ((eq? msg 'set-inner-mode!) set-inner-mode!)
+                       (else #f)))))
+      self)))
+
+; nl-join-op?: is the object a NL join op?
+; Detected by querying 'outer-rows — only ops return integer.
+(define (nl-join-op? obj)
+  (if (procedure? obj)
+      (let ((o (obj 'outer-rows)))
+        (if (and (integer? o) (>= o 0)) #t #f))
+      #f))
+
+; nl-join-op-get-inner-mode: get inner mode.
+(define (nl-join-op-get-inner-mode op) (op 'inner-mode))
+
+; nl-join-op-get-outer-rows: get outer rows.
+(define (nl-join-op-get-outer-rows op) (op 'outer-rows))
+
+; nl-join-op-get-inner-rows: get inner rows.
+(define (nl-join-op-get-inner-rows op) (op 'inner-rows))
+
+; nl-join-op-get-row-count: get row count.
+(define (nl-join-op-get-row-count op) (op 'row-count))
+
+; nl-join-op-set-row-count!: set row count.
+; Returns the new row count.
+(define (nl-join-op-set-row-count! op v) ((op 'set-row-count!) v))
+
+; nl-join-op-set-inner-mode!: set inner mode.
+; Returns the new mode.
+(define (nl-join-op-set-inner-mode! op v) ((op 'set-inner-mode!) v))
+
+; ----------------------------------------------------------------
+; ObHashJoinOp — closure-based
+; ----------------------------------------------------------------
+
+; make-hash-join-op: create a hash join op.
+; Args: build-rows (integer), probe-rows (integer)
+; Returns: hash_join_op closure (initial: built=#f).
+(define (make-hash-join-op build-rows probe-rows)
+  (let ((built #f))
+    (letrec ((set-built! (lambda (v) (set! built v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'build-rows) build-rows)
+                       ((eq? msg 'probe-rows) probe-rows)
+                       ((eq? msg 'built) built)
+                       ((eq? msg 'set-built!) set-built!)
+                       (else #f)))))
+      self)))
+
+; hash-join-op?: is the object a hash join op?
+; Detected by querying 'probe-rows — only ops return integer.
+(define (hash-join-op? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'probe-rows)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; hash-join-op-get-build-rows: get build rows.
+(define (hash-join-op-get-build-rows op) (op 'build-rows))
+
+; hash-join-op-get-probe-rows: get probe rows.
+(define (hash-join-op-get-probe-rows op) (op 'probe-rows))
+
+; hash-join-op-is-built: is the build phase done?
+(define (hash-join-op-is-built op) (op 'built))
+
+; hash-join-op-set-built!: set built flag.
+; Returns the new built.
+(define (hash-join-op-set-built! op v) ((op 'set-built!) v))
+
+; hash-join-op-reset-probe!: reset probe cursor (v1: no-op
+; stub).
+; Returns #t.
+(define (hash-join-op-reset-probe! op) #t)
+
+; ----------------------------------------------------------------
+; ObMergeJoinOp — closure-based
+; ----------------------------------------------------------------
+
+; make-merge-join-op: create a merge join op.
+; Args: outer-cursor (integer), inner-cursor (integer)
+; Returns: merge_join_op closure (initial: match=#f).
+(define (make-merge-join-op outer-cursor inner-cursor)
+  (let ((match #f))
+    (letrec ((set-match! (lambda (v) (set! match v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'outer-cursor) outer-cursor)
+                       ((eq? msg 'inner-cursor) inner-cursor)
+                       ((eq? msg 'match) match)
+                       ((eq? msg 'set-match!) set-match!)
+                       (else #f)))))
+      self)))
+
+; merge-join-op?: is the object a merge join op?
+; Detected by querying 'inner-cursor — only ops return integer.
+(define (merge-join-op? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'inner-cursor)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; merge-join-op-get-outer-cursor: get outer cursor.
+(define (merge-join-op-get-outer-cursor op) (op 'outer-cursor))
+
+; merge-join-op-get-inner-cursor: get inner cursor.
+(define (merge-join-op-get-inner-cursor op) (op 'inner-cursor))
+
+; merge-join-op-is-match: did cursors match?
+(define (merge-join-op-is-match op) (op 'match))
+
+; merge-join-op-set-match!: set match flag.
+; Returns the new match.
+(define (merge-join-op-set-match! op v) ((op 'set-match!) v))
