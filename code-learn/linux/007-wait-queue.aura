@@ -1,0 +1,168 @@
+; 007-wait-queue.aura
+; =========================
+; Wait queue — minimal capability port to aura.
+;
+; Maps to: 007-wait-queue-analysis.md
+; Source: include/linux/wait.h + kernel/sched/wait.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux wait queue integrates with the OS scheduler:
+;   - prepare_to_wait / finish_wait put current task to sleep
+;   - wake_up calls try_to_wake_up on each waiter
+;   - spinlock-protected queue ops
+;   - WQ_FLAG_EXCLUSIVE for selective wakeup
+;
+; aura has no scheduler, no spinlock primitives, no task_struct.
+; v1 ships the queue structure + entry lifecycle + wake-callback dispatch:
+;   - make-wait-queue-head (queue head)
+;   - make-wait-queue-entry (entry with optional func + private)
+;   - add-waiter / remove-waiter
+;   - wake-up (calls each entry's func with mode/flags/key)
+;   - wake-up-n (wake first N entries)
+;   - count-waiters / empty-wait-queue?
+;
+; Deferred (full Linux wait queue, separate issues):
+;   - prepare_to_wait / finish_wait (sleep integration)
+;   - Exclusive wakeup (WQ_FLAG_EXCLUSIVE)
+;   - wait_event macro family
+;   - wake_up_interruptible / wake_up_locked variants
+;   - Authoritative wakeups (autoremove_wake_function)
+;   - Polling (poll_table, poll_wait)
+
+(export
+  ; Queue head
+  make-wait-queue-head
+  empty-wait-queue?
+  count-waiters
+  ; Waiter entries
+  make-wait-queue-entry
+  wait-queue-entry-flags
+  wait-queue-entry-private
+  wait-queue-entry-func
+  ; Lifecycle
+  add-waiter
+  remove-waiter
+  ; Wake
+  wake-up
+  wake-up-n)
+
+; ----------------------------------------------------------------
+; Wait queue head (closure with linked list of entries)
+; ----------------------------------------------------------------
+
+(define (make-wait-queue-head)
+  (let ((entries '()))           ; list of entry closures
+    (letrec ((set-entries! (lambda (e) (set! entries e) e))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'entries) entries)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       ((eq? msg 'empty?) (null? entries))
+                       ((eq? msg 'size) (length entries))
+                       (else #f)))))
+      self)))
+
+; empty-wait-queue?: is the queue head empty?
+(define (empty-wait-queue? head)
+  (null? (head 'entries)))
+
+; count-waiters: number of entries currently in the queue.
+(define (count-waiters head)
+  (length (head 'entries)))
+
+; ----------------------------------------------------------------
+; Wait queue entry (closure with flags, private, func)
+; ----------------------------------------------------------------
+
+; Default wake function: no-op (returns 1 = "succeeded"). Caller can
+; override with set-func! to install a real callback.
+(define (default-wake-func entry mode flags key)
+  1)
+
+(define (make-wait-queue-entry)
+  (let ((flags 0)
+        (private #f)
+        (func default-wake-func))
+    (letrec ((set-flags!   (lambda (v) (set! flags v) v))
+             (set-private! (lambda (v) (set! private v) v))
+             (set-func!    (lambda (f) (set! func f) f))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'private) private)
+                       ((eq? msg 'func) func)
+                       ((eq? msg 'set-flags!) set-flags!)
+                       ((eq? msg 'set-private!) set-private!)
+                       ((eq? msg 'set-func!) set-func!)
+                       (else #f)))))
+      self)))
+
+; wait-queue-entry-flags: get the entry's flags.
+(define (wait-queue-entry-flags e) (e 'flags))
+
+; wait-queue-entry-private: get the entry's private data.
+(define (wait-queue-entry-private e) (e 'private))
+
+; wait-queue-entry-func: get the entry's wake func.
+(define (wait-queue-entry-func e) (e 'func))
+
+; ----------------------------------------------------------------
+; Lifecycle
+; ----------------------------------------------------------------
+
+; add-waiter: register an entry on the queue head.
+; Idempotent: returns #f if the entry is already on the queue.
+(define (add-waiter head entry)
+  (if (member-entry? entry (head 'entries))
+      #f
+      (begin
+        ((head 'set-entries!) (cons entry (head 'entries)))
+        #t)))
+
+; remove-waiter: unregister an entry from the queue head.
+; Returns #t on success, #f if not present.
+(define (remove-waiter head entry)
+  (if (member-entry? entry (head 'entries))
+      (begin
+        ((head 'set-entries!)
+         (filter (lambda (e) (not (eq? e entry))) (head 'entries)))
+        #t)
+      #f))
+
+; member-entry?: linear search for entry in list.
+(define (member-entry? entry lst)
+  (cond
+    ((null? lst) #f)
+    ((eq? (car lst) entry) #t)
+    (else (member-entry? entry (cdr lst)))))
+
+; ----------------------------------------------------------------
+; Wake — dispatch each entry's func with mode/flags/key
+; ----------------------------------------------------------------
+
+; wake-up: invoke each entry's wake func with the same mode/flags/key.
+; Returns the count of successfully-woken entries (those returning non-zero).
+; v1 does NOT remove woken entries (Linux's default wake function does;
+; callers must remove explicitly via remove-waiter).
+(define (wake-up head mode flags key)
+  (let loop ((rest (head 'entries)) (woken 0))
+    (if (null? rest)
+        woken
+        (let ((e (car rest)))
+          (let ((result ((e 'func) e mode flags key)))
+            (loop (cdr rest)
+                  (if (> result 0) (+ woken 1) woken)))))))
+
+; wake-up-n: wake at most n entries. Returns woken count.
+; Stops early after n successful wakes.
+(define (wake-up-n head n mode flags key)
+  (let loop ((rest (head 'entries)) (woken 0))
+    (cond
+      ((null? rest) woken)
+      ((>= woken n) woken)
+      (else
+       (let ((e (car rest)))
+         (let ((result ((e 'func) e mode flags key)))
+           (loop (cdr rest)
+                 (if (> result 0) (+ woken 1) woken))))))))

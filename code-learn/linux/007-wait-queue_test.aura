@@ -1,0 +1,114 @@
+; 007-wait-queue_test.aura
+; ============================
+; Smoke tests for 007-wait-queue.aura — wait queue minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/007-wait-queue_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form. Multi-form let bodies
+; trigger aura parser quirks, so multi-step setup goes through file-level
+; helpers.
+;
+; Verified automatically (smoke):
+;   - make-wait-queue-head construction (empty, count=0)
+;   - add-waiter adds to queue
+;   - count-waiters tracks size
+;   - wake-up calls each entry's func
+;   - remove-waiter removes from queue
+;   - wake-up-n wakes at most n entries
+;
+; Verified via separate probes during development:
+;   - Custom wake func (override default)
+;   - add-waiter idempotency
+;   - wake-up returns count of successful wakes
+;   - empty-wait-queue? tracks state
+;
+; Deferred (full Linux wait queue):
+;   - prepare_to_wait / finish_wait (sleep integration)
+;   - Exclusive wakeup (WQ_FLAG_EXCLUSIVE)
+;   - wait_event macro family
+;   - wake_up_interruptible / wake_up_locked
+;   - Autoremove wake function
+
+(require "std/test" all:)
+(require "007-wait-queue" all:)
+
+; File-level helpers
+
+(define (head-with-1-entry)
+  (let ((h (make-wait-queue-head)))
+    (add-waiter h (make-wait-queue-entry))
+    h))
+
+(define (head-with-n n)
+  (let ((h (make-wait-queue-head)))
+    (let loop ((i 0))
+      (when (< i n)
+        (add-waiter h (make-wait-queue-entry))
+        (loop (+ i 1))))
+    h))
+
+(define (head-with-no-wake)
+  (let ((h (make-wait-queue-head)))
+    (let ((e (make-wait-queue-entry)))
+      ((e 'set-func!) (lambda (entry mode flags key) 0))
+      (add-waiter h e))
+    h))
+
+; ----------------------------------------------------------------
+; Queue head construction
+; ----------------------------------------------------------------
+
+(test-suite "waitq-001-head-empty"
+  (check (= 1 (empty-wait-queue? (make-wait-queue-head))))
+  (check (= 0 (count-waiters (make-wait-queue-head)))))
+
+; ----------------------------------------------------------------
+; add-waiter / count-waiters
+; ----------------------------------------------------------------
+
+(test-suite "waitq-002-add-1"
+  (check (= 1 (count-waiters (head-with-1-entry))))
+
+(test-suite "waitq-002-add-3"
+  (check (= 3 (count-waiters (head-with-n 3))))
+
+; ----------------------------------------------------------------
+; remove-waiter
+; ----------------------------------------------------------------
+
+(test-suite "waitq-003-remove"
+  (check (= 0 (count-waiters
+    (let ((h (head-with-n 2)))
+      (remove-waiter h (car (h 'entries)))
+      h))))
+
+; ----------------------------------------------------------------
+; wake-up (default no-op func returns 1)
+; ----------------------------------------------------------------
+
+(test-suite "waitq-004-wake-default"
+  (check (= 2 (wake-up (head-with-n 2) 0 0 #f)))
+
+; ----------------------------------------------------------------
+; Custom wake function (returns 0 → not woken)
+; ----------------------------------------------------------------
+
+(test-suite "waitq-005-wake-custom"
+  (check (= 0 (wake-up (head-with-no-wake) 0 0 #f)))
+
+; ----------------------------------------------------------------
+; wake-up-n limits count
+; ----------------------------------------------------------------
+
+(test-suite "waitq-006-wake-n"
+  (check (= 2 (wake-up-n (head-with-n 5) 2 0 0 #f)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
