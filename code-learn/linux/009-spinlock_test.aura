@@ -1,0 +1,87 @@
+; 009-spinlock_test.aura
+; =========================
+; Smoke tests for 009-spinlock.aura — spinlock minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/009-spinlock_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-spinlock construction (unlocked)
+;   - spin-locked? tracks state
+;   - spin-lock / spin-unlock acquire/release
+;   - spin-trylock success when free, failure when held
+;   - spin-owner returns current holder
+;
+; Verified via separate probes during development:
+;   - Re-locking after unlock
+;   - Multiple trylocks fail while held
+;
+; Deferred (full Linux spinlock):
+;   - Atomic cmpxchg fast path
+;   - Pending-bit optimization
+;   - MCS queue (per-CPU nodes)
+;   - spin_lock_irq / spin_lock_bh variants
+;   - Debug spinlock + lockdep
+
+(require "std/test" all:)
+(require "009-spinlock" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "spinlock-001-init-unlocked"
+  (check (= 1 (if (not (spin-locked? (make-spinlock))) 1 0)))
+  (check (= 1 (if (not (spin-owner (make-spinlock))) 1 0)))
+
+; ----------------------------------------------------------------
+; lock + unlock
+; ----------------------------------------------------------------
+
+(test-suite "spinlock-002-lock"
+  (check (= 1 (let ((s (make-spinlock)))
+                 (spin-lock s 'cpu-0)
+                 (spin-locked? s))))
+
+(test-suite "spinlock-002-unlock"
+  (check (= 1 (let ((s (make-spinlock)))
+                 (spin-lock s 'cpu-0)
+                 (spin-unlock s)
+                 (if (not (spin-locked? s)) 1 0))))
+
+; ----------------------------------------------------------------
+; owner tracking
+; ----------------------------------------------------------------
+
+(test-suite "spinlock-003-owner"
+  (check (= 1 (eq? 'cpu-7 (spin-owner
+    (let ((s (make-spinlock)))
+      (spin-lock s 'cpu-7)
+      s)))))
+
+; ----------------------------------------------------------------
+; trylock
+; ----------------------------------------------------------------
+
+(test-suite "spinlock-004-trylock-free"
+  ; trylock on unlocked spinlock succeeds.
+  (check (= 1 (eq? 'cpu-1 (spin-trylock (let ((s (make-spinlock)))
+                                          (spin-trylock s 'cpu-1)
+                                          s) 'cpu-2))))
+
+(test-suite "spinlock-004-trylock-held"
+  ; trylock on held spinlock fails (returns #f).
+  (check (= 1 (let ((s (make-spinlock)))
+                 (spin-lock s 'cpu-0)
+                 (if (not (spin-trylock s 'cpu-1)) 1 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

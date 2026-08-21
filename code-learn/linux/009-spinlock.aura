@@ -1,0 +1,105 @@
+; 009-spinlock.aura
+; ====================
+; Spinlock — minimal capability port to aura.
+;
+; Maps to: 009-spinlock-analysis.md
+; Source: include/asm-generic/qspinlock.h + kernel/locking/qspinlock.c
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux spinlock on x86-64 is queued spinlock (qspinlock) with 3-tier
+; fast paths:
+;   - Fast path: lock cmpxchg (zero contention)
+;   - Pending bit: single waiter spins on locked byte
+;   - MCS queue: multi-waiter via per-CPU queue (avoids thundering herd)
+;
+; aura has no atomic ops, no per-CPU state, no scheduler.
+; v1 ships the data structure + acquire/release semantics (single-threaded):
+;   - make-spinlock
+;   - spin-lock / spin-unlock
+;   - spin-trylock (non-blocking acquire)
+;   - spin-locked?
+;   - spin-owner
+;
+; Deferred (full Linux spinlock, separate issues):
+;   - Atomic cmpxchg fast path
+;   - Pending-bit optimization
+;   - MCS queue (per-CPU nodes)
+;   - Debug spinlock (magic, owner_cpu)
+;   - spin_lock_irq / spin_unlock_irq (interrupt disabling)
+;   - spin_lock_bh / spin_unlock_bh (softirq disabling)
+;   - PREEMPT_RT sleep-locks variant
+;   - lockdep
+;
+; ## Design notes
+;
+; Linux's spinlock = busy-wait mutex (no scheduler involvement).
+; aura can't busy-wait meaningfully, so v1 simulates instant acquire/release
+; — same single-threaded story as mutex v1, just with different naming.
+
+(export
+  make-spinlock
+  spin-locked?
+  spin-lock
+  spin-unlock
+  spin-trylock
+  spin-owner)
+
+; ----------------------------------------------------------------
+; Spinlock (closure with owner field)
+; ----------------------------------------------------------------
+
+; Make a spinlock. owner=#f means unlocked.
+(define (make-spinlock)
+  (let ((owner #f))
+    (letrec ((set-owner! (lambda (v) (set! owner v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'owner) owner)
+                       ((eq? msg 'set-owner!) set-owner!)
+                       ((eq? msg 'locked?) (not (not owner)))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+; spin-locked?: is the spinlock currently held?
+(define (spin-locked? s)
+  (not (not (s 'owner))))
+
+; spin-owner: current owner value, or #f if unlocked.
+(define (spin-owner s)
+  (s 'owner))
+
+; ----------------------------------------------------------------
+; Acquire / release
+; ----------------------------------------------------------------
+
+; spin-lock: acquire the spinlock, setting caller as owner.
+; Single-threaded: instant. In a real OS, this would spin until acquired.
+; Caller passes an owner token (typically current CPU id or thread id).
+; Returns the owner token on success.
+(define (spin-lock s owner-token)
+  ((s 'set-owner!) owner-token)
+  owner-token)
+
+; spin-trylock: try to acquire without blocking/spinning.
+; Returns owner-token on success, #f if already held.
+(define (spin-trylock s owner-token)
+  (if (spin-locked? s)
+      #f
+      (begin
+        ((s 'set-owner!) owner-token)
+        owner-token)))
+
+; spin-unlock: release the spinlock.
+; Returns #t on success, #f if the spinlock was not held.
+(define (spin-unlock s)
+  (if (spin-locked? s)
+      (begin
+        ((s 'set-owner!) #f)
+        #t)
+      #f))
