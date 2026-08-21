@@ -1,0 +1,557 @@
+; 04-mvcc-callback.aura
+; ========================
+; mvcc_callback — minimal capability port to aura.
+;
+; Maps to: OceanBase transaction callback chain
+; Source: src/storage/memtable/mvcc/ob_mvcc.h + ob_mvcc_trans_ctx.h
+;         + ob_tx_callback_list.h + .cpp (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase transaction callback chain:
+;   - ObITransCallback (base class): need_submit_log, scn, epoch,
+;     prev/next pointers, hash_holder_linker
+;     6 virtual methods: before_append, log_submitted, log_sync_fail,
+;     trans_commit, trans_abort, elr_trans_preparing, elr_revoke
+;   - ObMvccRowCallback (subclass): references ObMvccTransNode +
+;     ObMemtableKey + seq_no; overrides trans_commit to mark node
+;     committed
+;   - ObTxCallbackList (circular doubly-linked list with sentry):
+;     head_ sentry, log_cursor_, length_, appended_, logged_,
+;     synced_, removed_, data_size_, sync_scn_
+;   - 4 latches: append_latch, log_latch, log_submitted_pending,
+;     iter_synced (concurrency control)
+;
+; aura has no virtual functions, no latches. v1 ships:
+;   - make-callback (ObITransCallback base) with 7 virtual method
+;     slots + 6 fields + state transitions
+;   - make-mvcc-row-callback (ObMvccRowCallback) — links callback
+;     to ObMvccTransNode + key + seq_no
+;   - make-callback-list (ObTxCallbackList) — circular doubly-linked
+;     list with sentry + counters
+;   - Operations: append-callback!, remove-callback!,
+;     walk-callbacks, find-by-tnode, advance-log-cursor!
+;
+; Deferred (full OceanBase callback chain):
+;   - real virtual function dispatch (C++ vtable)
+;   - 4 latch primitives (ObByteLock)
+;   - log_latch fill/flush coordination
+;   - concat_callbacks (merge multiple sub-lists)
+;   - fill_log (collect redo data for Paxos)
+;   - submit_log_succ / submit_log_fail
+;   - remove_callbacks_for_fast_commit / rollback_to
+;   - freeze_clock check_freeze_clock_order_
+;   - TxChecksum batch_checksum
+;   - log_submitted_pending latch ordering
+;   - iter_synced serialization
+
+(export
+  ; ObITransCallback base
+  make-callback callback?
+  callback-need-submit-log callback-set-need-submit-log!
+  callback-scn callback-set-scn!
+  callback-epoch callback-set-epoch!
+  callback-prev callback-set-prev!
+  callback-next callback-set-next!
+  callback-hash-holder-linker callback-set-hash-holder-linker!
+  callback-before-append-fn callback-set-before-append-fn!
+  callback-log-submitted-fn callback-set-log-submitted-fn!
+  callback-log-sync-fail-fn callback-set-log-sync-fail-fn!
+  callback-trans-commit-fn callback-set-trans-commit-fn!
+  callback-trans-abort-fn callback-set-trans-abort-fn!
+  callback-elr-preparing-fn callback-set-elr-preparing-fn!
+  callback-elr-revoke-fn callback-set-elr-revoke-fn!
+  callback-is-log-submitted?
+  ; Lifecycle (invoke virtual methods + state updates)
+  callback-before-append! callback-log-submitted!
+  callback-log-sync-fail! callback-trans-commit!
+  callback-trans-abort! callback-elr-preparing! callback-elr-revoke!
+  ; ObMvccRowCallback subclass
+  make-mvcc-row-callback mvcc-row-callback?
+  mvcc-row-callback-tnode mvcc-row-callback-set-tnode!
+  mvcc-row-callback-key mvcc-row-callback-set-key!
+  mvcc-row-callback-seq-no mvcc-row-callback-set-seq-no!
+  mvcc-row-callback-is-link mvcc-row-callback-set-is-link!
+  ; ObTxCallbackList
+  make-callback-list callback-list?
+  callback-list-head callback-list-log-cursor
+  callback-list-length callback-list-appended
+  callback-list-logged callback-list-synced callback-list-removed
+  callback-list-data-size callback-list-sync-scn
+  callback-list-append-callback! callback-list-remove-callback!
+  callback-list-walk-callbacks callback-list-find-by-tnode
+  callback-list-advance-log-cursor!
+  callback-list-set-sync-scn!
+  callback-list-reset!)
+
+; ----------------------------------------------------------------
+; ObITransCallback — base closure
+; ----------------------------------------------------------------
+;
+; Linux definitions (kept here for reference):
+;   struct {
+;     bool need_submit_log_ : 1;
+;   };
+;   share::SCN scn_;             // 0 = max = not submitted
+;   int64_t epoch_;
+;   ObITransCallback *prev_;     // older callback
+;   ObITransCallback *next_;     // newer callback
+;   ObTxCallbackHashHolderLinker hash_holder_linker_;
+;
+; 7 virtual methods (closure slots in v1):
+;   before_append, log_submitted, log_sync_fail,
+;   trans_commit, trans_abort,
+;   elr_trans_preparing, elr_trans_revoke
+;
+; aura v1: scn=0 means "not submitted" (max sentinel).
+; Non-zero scn means "submitted".
+
+; make-callback: create an ObITransCallback base.
+; Args: 7 virtual method slots (closures or #f).
+; Returns: callback closure.
+(define (make-callback before-append-fn log-submitted-fn log-sync-fail-fn
+                     trans-commit-fn trans-abort-fn
+                     elr-preparing-fn elr-revoke-fn)
+  (let ((need-submit-log #t)
+        (scn 0)
+        (epoch 0)
+        (prev #f)
+        (next #f)
+        (hash-holder-linker 0)
+        (baf before-append-fn)
+        (lsf log-submitted-fn)
+        (lsff log-sync-fail-fn)
+        (tcf trans-commit-fn)
+        (taf trans-abort-fn)
+        (epf elr-preparing-fn)
+        (erf elr-revoke-fn))
+    (letrec ((set-need-submit-log! (lambda (v) (set! need-submit-log v) v))
+             (set-scn! (lambda (v) (set! scn v) v))
+             (set-epoch! (lambda (v) (set! epoch v) v))
+             (set-prev! (lambda (v) (set! prev v) v))
+             (set-next! (lambda (v) (set! next v) v))
+             (set-hash! (lambda (v) (set! hash-holder-linker v) v))
+             (set-baf! (lambda (v) (set! baf v) v))
+             (set-lsf! (lambda (v) (set! lsf v) v))
+             (set-lsff! (lambda (v) (set! lsff v) v))
+             (set-tcf! (lambda (v) (set! tcf v) v))
+             (set-taf! (lambda (v) (set! taf v) v))
+             (set-epf! (lambda (v) (set! epf v) v))
+             (set-erf! (lambda (v) (set! erf v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'need-submit-log) need-submit-log)
+                       ((eq? msg 'scn) scn)
+                       ((eq? msg 'epoch) epoch)
+                       ((eq? msg 'prev) prev)
+                       ((eq? msg 'next) next)
+                       ((eq? msg 'hash-holder-linker) hash-holder-linker)
+                       ((eq? msg 'before-append-fn) baf)
+                       ((eq? msg 'log-submitted-fn) lsf)
+                       ((eq? msg 'log-sync-fail-fn) lsff)
+                       ((eq? msg 'trans-commit-fn) tcf)
+                       ((eq? msg 'trans-abort-fn) taf)
+                       ((eq? msg 'elr-preparing-fn) epf)
+                       ((eq? msg 'elr-revoke-fn) erf)
+                       ((eq? msg 'set-need-submit-log!) set-need-submit-log!)
+                       ((eq? msg 'set-scn!) set-scn!)
+                       ((eq? msg 'set-epoch!) set-epoch!)
+                       ((eq? msg 'set-prev!) set-prev!)
+                       ((eq? msg 'set-next!) set-next!)
+                       ((eq? msg 'set-hash!) set-hash!)
+                       ((eq? msg 'set-before-append-fn!) set-baf!)
+                       ((eq? msg 'set-log-submitted-fn!) set-lsf!)
+                       ((eq? msg 'set-log-sync-fail-fn!) set-lsff!)
+                       ((eq? msg 'set-trans-commit-fn!) set-tcf!)
+                       ((eq? msg 'set-trans-abort-fn!) set-taf!)
+                       ((eq? msg 'set-elr-preparing-fn!) set-epf!)
+                       ((eq? msg 'set-elr-revoke-fn!) set-erf!)
+                       (else #f)))))
+      self)))
+
+; callback?: is the object a callback?
+; Detected by querying 'hash-holder-linker — only callbacks return an
+; integer for hash_holder_linker.
+(define (callback? obj)
+  (if (procedure? obj)
+      (let ((h (obj 'hash-holder-linker)))
+        (if (integer? h) #t #f))
+      #f))
+
+; callback-need-submit-log: get need_submit_log_
+(define (callback-need-submit-log c) (c 'need-submit-log))
+
+; callback-scn: get scn_ (0 = not submitted, non-zero = submitted)
+(define (callback-scn c) (c 'scn))
+
+; callback-epoch: get epoch_
+(define (callback-epoch c) (c 'epoch))
+
+; callback-prev: get prev_ pointer
+(define (callback-prev c) (c 'prev))
+
+; callback-next: get next_ pointer
+(define (callback-next c) (c 'next))
+
+; callback-hash-holder-linker: get hash_holder_linker
+(define (callback-hash-holder-linker c) (c 'hash-holder-linker))
+
+; callback-set-need-submit-log!: set need_submit_log_
+(define (callback-set-need-submit-log! c v) ((c 'set-need-submit-log!) v))
+
+; callback-set-scn!: set scn_
+(define (callback-set-scn! c v) ((c 'set-scn!) v))
+
+; callback-set-epoch!: set epoch_
+(define (callback-set-epoch! c v) ((c 'set-epoch!) v))
+
+; callback-set-prev!: set prev_
+(define (callback-set-prev! c v) ((c 'set-prev!) v))
+
+; callback-set-next!: set next_
+(define (callback-set-next! c v) ((c 'set-next!) v))
+
+; callback-set-hash-holder-linker!: set hash_holder_linker
+(define (callback-set-hash-holder-linker! c v) ((c 'set-hash!) v))
+
+; ----------------------------------------------------------------
+; Virtual method accessors (get/set the closure slots)
+; ----------------------------------------------------------------
+
+(define (callback-before-append-fn c) (c 'before-append-fn))
+(define (callback-log-submitted-fn c) (c 'log-submitted-fn))
+(define (callback-log-sync-fail-fn c) (c 'log-sync-fail-fn))
+(define (callback-trans-commit-fn c) (c 'trans-commit-fn))
+(define (callback-trans-abort-fn c) (c 'trans-abort-fn))
+(define (callback-elr-preparing-fn c) (c 'elr-preparing-fn))
+(define (callback-elr-revoke-fn c) (c 'elr-revoke-fn))
+
+(define (callback-set-before-append-fn! c v) ((c 'set-before-append-fn!) v))
+(define (callback-set-log-submitted-fn! c v) ((c 'set-log-submitted-fn!) v))
+(define (callback-set-log-sync-fail-fn! c v) ((c 'set-log-sync-fail-fn!) v))
+(define (callback-set-trans-commit-fn! c v) ((c 'set-trans-commit-fn!) v))
+(define (callback-set-trans-abort-fn! c v) ((c 'set-trans-abort-fn!) v))
+(define (callback-set-elr-preparing-fn! c v) ((c 'set-elr-preparing-fn!) v))
+(define (callback-set-elr-revoke-fn! c v) ((c 'set-elr-revoke-fn!) v))
+
+; ----------------------------------------------------------------
+; Lifecycle methods (wrapper around virtual methods + state updates)
+; ----------------------------------------------------------------
+
+; callback-is-log-submitted?: has scn been set (non-zero)?
+(define (callback-is-log-submitted? c)
+  (if (= (c 'scn) 0) #f #t))
+
+; callback-before-append!: invoke before_append_fn.
+(define (callback-before-append! c)
+  (let ((fn (c 'before-append-fn)))
+    (if (procedure? fn) (fn c))))
+
+; callback-log-submitted!: invoke log_submitted_fn + update scn.
+; Returns the new scn.
+(define (callback-log-submitted! c new-scn)
+  ((c 'set-scn!) new-scn)
+  ((c 'set-need-submit-log!) #f)
+  (let ((fn (c 'log-submitted-fn)))
+    (if (procedure? fn) (fn c)))
+  new-scn)
+
+; callback-log-sync-fail!: invoke log_sync_fail_fn.
+(define (callback-log-sync-fail! c)
+  (let ((fn (c 'log-sync-fail-fn)))
+    (if (procedure? fn) (fn c))))
+
+; callback-trans-commit!: invoke trans_commit_fn.
+(define (callback-trans-commit! c)
+  (let ((fn (c 'trans-commit-fn)))
+    (if (procedure? fn) (fn c))))
+
+; callback-trans-abort!: invoke trans_abort_fn.
+(define (callback-trans-abort! c)
+  (let ((fn (c 'trans-abort-fn)))
+    (if (procedure? fn) (fn c))))
+
+; callback-elr-preparing!: invoke elr_preparing_fn.
+(define (callback-elr-preparing! c)
+  (let ((fn (c 'elr-preparing-fn)))
+    (if (procedure? fn) (fn c))))
+
+; callback-elr-revoke!: invoke elr_revoke_fn.
+(define (callback-elr-revoke! c)
+  (let ((fn (c 'elr-revoke-fn)))
+    (if (procedure? fn) (fn c))))
+
+; ----------------------------------------------------------------
+; ObMvccRowCallback — subclass linking ObMvccTransNode
+; ----------------------------------------------------------------
+;
+; Per OB (ob_mvcc_trans_ctx.h:426-536):
+;   - Inherits all ObITransCallback fields
+;   - Adds: ctx, key, tnode, memtable, seq_no, column_cnt,
+;     freeze_clock, is_link, not_calc_checksum,
+;     is_non_unique_local_index_cb
+;   - Overrides trans_commit to mark tnode as committed
+;
+; aura v1: standalone closure with all fields (no inheritance).
+; trans_commit! is overridden to call mvcc-trans-node-trans-commit!
+
+; make-mvcc-row-callback: create an ObMvccRowCallback.
+; Args: key (integer — fake row key), tnode (mvcc-trans-node or #f),
+;       seq_no (integer)
+; Returns: mvcc_row_callback closure.
+(define (make-mvcc-row-callback key tnode seq-no)
+  (let ((scn 0) (epoch 0) (prev #f) (next #f) (hash-holder-linker 0)
+        (need-submit-log #t)
+        (k key) (tn tnode) (sn seq-no) (is-link #f))
+    (letrec ((set-scn! (lambda (v) (set! scn v) v))
+             (set-epoch! (lambda (v) (set! epoch v) v))
+             (set-prev! (lambda (v) (set! prev v) v))
+             (set-next! (lambda (v) (set! next v) v))
+             (set-hash! (lambda (v) (set! hash-holder-linker v) v))
+             (set-need-submit-log! (lambda (v) (set! need-submit-log v) v))
+             (set-key! (lambda (v) (set! k v) v))
+             (set-tnode! (lambda (v) (set! tn v) v))
+             (set-seq-no! (lambda (v) (set! sn v) v))
+             (set-is-link! (lambda (v) (set! is-link v) v))
+             (set-scn-cb! (lambda (v) (set! scn v) v))  ; for trans-commit override
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'need-submit-log) need-submit-log)
+                       ((eq? msg 'scn) scn)
+                       ((eq? msg 'epoch) epoch)
+                       ((eq? msg 'prev) prev)
+                       ((eq? msg 'next) next)
+                       ((eq? msg 'hash-holder-linker) hash-holder-linker)
+                       ((eq? msg 'key) k)
+                       ((eq? msg 'tnode) tn)
+                       ((eq? msg 'seq-no) sn)
+                       ((eq? msg 'is-link) is-link)
+                       ((eq? msg 'set-scn!) set-scn!)
+                       ((eq? msg 'set-epoch!) set-epoch!)
+                       ((eq? msg 'set-prev!) set-prev!)
+                       ((eq? msg 'set-next!) set-next!)
+                       ((eq? msg 'set-hash!) set-hash!)
+                       ((eq? msg 'set-need-submit-log!) set-need-submit-log!)
+                       ((eq? msg 'set-key!) set-key!)
+                       ((eq? msg 'set-tnode!) set-tnode!)
+                       ((eq? msg 'set-seq-no!) set-seq-no!)
+                       ((eq? msg 'set-is-link!) set-is-link!)
+                       (else #f)))))
+      self)))
+
+; mvcc-row-callback?: is the object a mvcc_row_callback?
+; Detected by querying 'is-link — only mvcc_row_callbacks return a
+; boolean (for is_link bitfield).
+(define (mvcc-row-callback? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'is-link)))
+        (if (or (eq? l #t) (eq? l #f)) #t #f))
+      #f))
+
+; mvcc-row-callback-tnode: get linked trans_node
+(define (mvcc-row-callback-tnode c) (c 'tnode))
+
+; mvcc-row-callback-set-tnode!: set linked trans_node.
+; Returns the new tnode.
+(define (mvcc-row-callback-set-tnode! c v) ((c 'set-tnode!) v))
+
+; mvcc-row-callback-key: get key
+(define (mvcc-row-callback-key c) (c 'key))
+
+; mvcc-row-callback-set-key!: set key.
+; Returns the new key.
+(define (mvcc-row-callback-set-key! c v) ((c 'set-key!) v))
+
+; mvcc-row-callback-seq-no: get seq_no
+(define (mvcc-row-callback-seq-no c) (c 'seq-no))
+
+; mvcc-row-callback-set-seq-no!: set seq_no.
+; Returns the new seq_no.
+(define (mvcc-row-callback-set-seq-no! c v) ((c 'set-seq-no!) v))
+
+; mvcc-row-callback-is-link: get is_link flag
+(define (mvcc-row-callback-is-link c) (c 'is-link))
+
+; mvcc-row-callback-set-is-link!: set is_link flag.
+; Returns the new value.
+(define (mvcc-row-callback-set-is-link! c v) ((c 'set-is-link!) v))
+
+; ----------------------------------------------------------------
+; ObTxCallbackList — circular doubly-linked list with sentry
+; ----------------------------------------------------------------
+;
+; Per OB (ob_tx_callback_list.h:138-174):
+;   - head_: sentry ObITransCallback
+;   - log_cursor_: next callback to log
+;   - length_: current list length
+;   - 4 latches (concurrent control)
+;   - 4 cumulative counters: appended, logged, synced, removed
+;   - data_size, sync_scn, batch_checksum
+;
+; aura v1: sentry is a plain callback (head_). The real callbacks
+; form a circular doubly-linked list: head_ <-> cb1 <-> cb2 <-> ...
+; <-> head_. length_ tracks current size.
+
+; make-callback-list: create an empty ObTxCallbackList.
+; Returns: callback_list closure.
+(define (make-callback-list)
+  (let ((head (make-callback #f #f #f #f #f #f #f))
+        (log-cursor head)
+        (length 0)
+        (appended 0)
+        (logged 0)
+        (synced 0)
+        (removed 0)
+        (data-size 0)
+        (sync-scn 0))
+    ; Initialize sentry: prev = sentry, next = sentry (circular empty)
+    ((head 'set-prev!) head)
+    ((head 'set-next!) head)
+    (letrec ((set-log-cursor! (lambda (v) (set! log-cursor v) v))
+             (set-length! (lambda (v) (set! length v) v))
+             (set-appended! (lambda (v) (set! appended v) v))
+             (set-logged! (lambda (v) (set! logged v) v))
+             (set-synced! (lambda (v) (set! synced v) v))
+             (set-removed! (lambda (v) (set! removed v) v))
+             (set-data-size! (lambda (v) (set! data-size v) v))
+             (set-sync-scn! (lambda (v) (set! sync-scn v) v))
+             (inc-length! (lambda () (set! length (+ length 1)) length))
+             (inc-appended! (lambda () (set! appended (+ appended 1)) appended))
+             (inc-logged! (lambda () (set! logged (+ logged 1)) logged))
+             (inc-synced! (lambda () (set! synced (+ synced 1)) synced))
+             (inc-removed! (lambda () (set! removed (+ removed 1)) removed))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'head) head)
+                       ((eq? msg 'log-cursor) log-cursor)
+                       ((eq? msg 'length) length)
+                       ((eq? msg 'appended) appended)
+                       ((eq? msg 'logged) logged)
+                       ((eq? msg 'synced) synced)
+                       ((eq? msg 'removed) removed)
+                       ((eq? msg 'data-size) data-size)
+                       ((eq? msg 'sync-scn) sync-scn)
+                       ((eq? msg 'set-log-cursor!) set-log-cursor!)
+                       ((eq? msg 'set-length!) set-length!)
+                       ((eq? msg 'set-appended!) set-appended!)
+                       ((eq? msg 'set-logged!) set-logged!)
+                       ((eq? msg 'set-synced!) set-synced!)
+                       ((eq? msg 'set-removed!) set-removed!)
+                       ((eq? msg 'set-data-size!) set-data-size!)
+                       ((eq? msg 'set-sync-scn!) set-sync-scn!)
+                       ((eq? msg 'inc-length!) inc-length!)
+                       ((eq? msg 'inc-appended!) inc-appended!)
+                       ((eq? msg 'inc-logged!) inc-logged!)
+                       ((eq? msg 'inc-synced!) inc-synced!)
+                       ((eq? msg 'inc-removed!) inc-removed!)
+                       (else #f)))))
+      self)))
+
+; callback-list?: is the object a callback_list?
+; Detected by querying 'length — only callback_lists return integer.
+(define (callback-list? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'length)))
+        (if (and (integer? l) (>= l 0)) #t #f))
+      #f))
+
+; callback-list-head: get sentry callback
+(define (callback-list-head lst) (lst 'head))
+
+; callback-list-log-cursor: get log_cursor
+(define (callback-list-log-cursor lst) (lst 'log-cursor))
+
+; callback-list-length: get current length
+(define (callback-list-length lst) (lst 'length))
+
+; callback-list-appended: get total appended counter
+(define (callback-list-appended lst) (lst 'appended))
+
+; callback-list-logged: get total logged counter
+(define (callback-list-logged lst) (lst 'logged))
+
+; callback-list-synced: get total synced counter
+(define (callback-list-synced lst) (lst 'synced))
+
+; callback-list-removed: get total removed counter
+(define (callback-list-removed lst) (lst 'removed))
+
+; callback-list-data-size: get total data size
+(define (callback-list-data-size lst) (lst 'data-size))
+
+; callback-list-sync-scn: get sync_scn
+(define (callback-list-sync-scn lst) (lst 'sync-scn))
+
+; ----------------------------------------------------------------
+; callback-list operations
+; ----------------------------------------------------------------
+
+; callback-list-append-callback!: append a callback to the list tail.
+; Atomic in v1 (no latches). Inserts before head (circular).
+; Returns the new length.
+(define (callback-list-append-callback! lst cb)
+  (let ((head (lst 'head)))
+    ; tail is head.prev (last real callback before head)
+    (let ((tail (head 'prev)))
+      ; Insert cb between tail and head
+      ((tail 'set-next!) cb)
+      ((cb 'set-prev!) tail)
+      ((cb 'set-next!) head)
+      ((head 'set-prev!) cb))
+    ; Update counters
+    ((lst 'inc-length!))
+    ((lst 'inc-appended!))))
+
+; callback-list-remove-callback!: remove a callback from the list.
+; Returns #t if removed, #f if not found.
+(define (callback-list-remove-callback! lst cb)
+  (let ((prev (cb 'prev))
+        (next (cb 'next)))
+    ((prev 'set-next!) next)
+    ((next 'set-prev!) prev)
+    ((lst 'inc-removed!))
+    ((lst 'set-length!) (- (lst 'length) 1))))
+
+; callback-list-walk-callbacks: walk the list from head (skip sentry)
+; and apply a procedure to each real callback. Returns count walked.
+(define (callback-list-walk-callbacks lst proc)
+  (let ((head (lst 'head)))
+    (let loop ((node (head 'next)) (n 0))
+      (cond
+        ((eq? node head) n)
+        (else
+         (proc node)
+         (loop (node 'next) (+ n 1)))))))
+
+; callback-list-find-by-tnode: find a callback by linked tnode.
+; Walks the list looking for callbacks with matching tnode.
+; Returns the callback or #f if not found.
+(define (callback-list-find-by-tnode lst tnode)
+  (let ((head (lst 'head)))
+    (let loop ((node (head 'next)))
+      (cond
+        ((eq? node head) #f)
+        ((mvcc-row-callback? node)
+         (if (eq? (mvcc-row-callback-tnode node) tnode)
+             node
+             (loop (node 'next))))
+        (else (loop (node 'next)))))))
+
+; callback-list-advance-log-cursor!: move log_cursor to a callback.
+; Sets log_cursor to `cb`.
+(define (callback-list-advance-log-cursor! lst cb)
+  ((lst 'set-log-cursor!) cb))
+
+; callback-list-set-sync-scn!: set sync_scn.
+(define (callback-list-set-sync-scn! lst scn)
+  ((lst 'set-sync-scn!) scn))
+
+; callback-list-reset!: clear counters (not the actual callbacks).
+(define (callback-list-reset! lst)
+  ((lst 'set-length!) 0)
+  ((lst 'set-appended!) 0)
+  ((lst 'set-logged!) 0)
+  ((lst 'set-synced!) 0)
+  ((lst 'set-removed!) 0)
+  ((lst 'set-data-size!) 0)
+  ((lst 'set-sync-scn!) 0))

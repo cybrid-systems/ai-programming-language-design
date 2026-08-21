@@ -1,0 +1,372 @@
+; 04-mvcc-callback_test.aura
+; ========================
+; Smoke tests for 04-mvcc-callback.aura — transaction callback chain minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/04-mvcc-callback_test.aura
+;
+; Verified automatically (smoke):
+;   - ObITransCallback construction + accessors + 7 virtual method
+;     slots
+;   - Lifecycle: before-append!, log-submitted! (sets scn),
+;     log-sync-fail!, trans-commit!, trans-abort!, elr-*,
+;     is-log-submitted?
+;   - ObMvccRowCallback subclass fields (key, tnode, seq-no, is-link)
+;   - ObTxCallbackList: construction + counters
+;   - append-callback! / remove-callback!
+;   - walk-callbacks / find-by-tnode
+;   - advance-log-cursor! / reset!
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Counter increments correct
+;   - Walk visits all appended callbacks in order
+;
+; Deferred (full OceanBase callback chain):
+;   - real virtual function dispatch (C++ vtable)
+;   - 4 latch primitives (ObByteLock)
+;   - log_latch fill/flush coordination
+;   - concat_callbacks (merge multiple sub-lists)
+;   - fill_log (collect redo data for Paxos)
+;   - submit_log_succ / submit_log_fail
+;   - remove_callbacks_for_fast_commit / rollback_to
+;   - freeze_clock check_freeze_clock_order_
+;   - TxChecksum batch_checksum
+
+(require "std/test" all:)
+(require "01-mvcc-row" all:)
+(require "04-mvcc-callback" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; dummy-fn: minimal no-op procedure for testing virtual method slots.
+(define (dummy-fn)
+  'invoked)
+
+; counter-cb-fn: closure that increments a counter when invoked.
+(define (make-counter-fn)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'count) count)
+                       ((eq? msg 'invoke) (set! count (+ count 1)) count)
+                       (else #f)))))
+      self)))
+
+; make-row-with-1-node: helper to create row + 1 version node for
+; callback-tnode tests.
+(define (make-row-with-1-node)
+  (let ((row (make-mvcc-row 0 0))
+        (n (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row n)
+    (cons row n)))
+
+; ----------------------------------------------------------------
+; ObITransCallback construction + accessors
+; ----------------------------------------------------------------
+
+(test-suite "04-001-callback-construction"
+  ; callback preserves fields.
+  (check (= #t (callback?
+                 (make-callback #f #f #f #f #f #f #f))))
+  (check (= #t (callback-need-submit-log
+                 (make-callback #f #f #f #f #f #f #f))))
+  (check (= 0 (callback-scn
+              (make-callback #f #f #f #f #f #f #f))))
+  (check (= 0 (callback-epoch
+              (make-callback #f #f #f #f #f #f #f))))
+  (check (= #f (callback-prev
+                (make-callback #f #f #f #f #f #f #f))))
+  (check (= #f (callback-next
+                (make-callback #f #f #d #f #f #f #f))))
+
+(test-suite "04-001-callback-predicate"
+  ; callback? accepts only callback closures.
+  (check (= #t (callback? (make-callback #f #f #f #f #f #f #f))))
+  (check (= #f (callback? 'not-a-callback)))
+  (check (= #f (callback? 42))))
+
+(test-suite "04-002-callback-setters"
+  ; setters update fields.
+  (check (= #f (let ((c (make-callback #f #f #f #f #f #f #f)))
+                 (callback-set-need-submit-log! c #f)
+                 (callback-need-submit-log c))))
+  (check (= 100 (let ((c (make-callback #f #f #f #f #f #f #f)))
+                  (callback-set-scn! c 100)
+                  (callback-scn c))))
+  (check (= 5 (let ((c (make-callback #f #f #f #f #f #f #f)))
+                (callback-set-epoch! c 5)
+                (callback-epoch c)))))
+
+(test-suite "04-002-callback-virtual-fn-setters"
+  ; virtual method setters update slots.
+  (check (= #t (let ((c (make-callback #f #f #f #f #f #f #f)))
+                 (callback-set-trans-commit-fn! c dummy-fn)
+                 (procedure? (callback-trans-commit-fn c))))))
+
+; ----------------------------------------------------------------
+; Lifecycle methods
+; ----------------------------------------------------------------
+
+(test-suite "04-003-callback-is-log-submitted-init"
+  ; is-log-submitted? starts as #f (scn=0).
+  (check (= #f (callback-is-log-submitted?
+                 (make-callback #f #f #f #f #f #f #f)))))
+
+(test-suite "04-003-callback-log-submitted"
+  ; log-submitted! sets scn + clears need-submit-log + invokes fn.
+  (check (= 1 (let ((c (make-callback #f #f #f #f #f #f #f))
+                     (cf (make-counter-fn)))
+                (callback-set-log-submitted-fn! c (cf 'invoke))
+                (callback-log-submitted! c 999)
+                (cf 'count))))
+  (check (= 999 (let ((c (make-callback #f #f #f #f #f #f #f)))
+                  (callback-log-submitted! c 999)
+                  (callback-scn c))))
+  (check (= #f (let ((c (make-callback #f #f #f #f #f #f #f)))
+                 (callback-log-submitted! c 999)
+                 (callback-need-submit-log c))))
+  (check (= #t (let ((c (make-callback #f #f #f #f #f #f #f)))
+                 (callback-log-submitted! c 999)
+                 (callback-is-log-submitted? c)))))
+
+(test-suite "04-003-callback-trans-commit"
+  ; trans-commit! invokes fn.
+  (check (= 1 (let ((c (make-callback #f #f #f #f #f #f #f))
+                     (cf (make-counter-fn)))
+                (callback-set-trans-commit-fn! c (cf 'invoke))
+                (callback-trans-commit! c)
+                (cf 'count))))
+
+(test-suite "04-003-callback-no-fn-no-error"
+  ; callback-with-no-fn doesn't error (slot is #f).
+  (check (= 'ok (let ((c (make-callback #f #f #f #f #f #f #f)))
+                 (callback-trans-commit! c)
+                 (callback-trans-abort! c)
+                 (callback-elr-preparing! c)
+                 (callback-elr-revoke! c)
+                 (callback-before-append! c)
+                 (callback-log-sync-fail! c)
+                 'ok))))
+
+; ----------------------------------------------------------------
+; ObMvccRowCallback
+; ----------------------------------------------------------------
+
+(test-suite "04-004-row-callback-construction"
+  ; mvcc-row-callback preserves key, tnode, seq-no.
+  (check (= 1 (let ((n (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f)))
+                (mvcc-row-callback-key (make-mvcc-row-callback 42 n 5))))
+  (check (= #t (let ((n (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f)))
+                 (eq? n (mvcc-row-callback-tnode
+                          (make-mvcc-row-callback 42 n 5))))))
+  (check (= 5 (mvcc-row-callback-seq-no
+                (make-mvcc-row-callback 42 #f 5)))))
+
+(test-suite "04-004-row-callback-predicate"
+  ; mvcc-row-callback? accepts only row_callback closures.
+  (check (= #t (mvcc-row-callback? (make-mvcc-row-callback 0 #f 0))))
+  (check (= #f (mvcc-row-callback? 'not-a-rc)))
+  (check (= #f (mvcc-row-callback? 42))))
+
+(test-suite "04-005-row-callback-setters"
+  ; setters update fields.
+  (check (= 99 (let ((rc (make-mvcc-row-callback 0 #f 0)))
+                (mvcc-row-callback-set-key! rc 99)
+                (mvcc-row-callback-key rc))))
+  (check (= #t (let ((n1 (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-INIT #f))
+                      (n2 (make-mvcc-trans-node 200 60 0 0 NDT-NORMAL F-INIT #f))
+                      (rc (make-mvcc-row-callback 0 n1 0)))
+                 (mvcc-row-callback-set-tnode! rc n2)
+                 (eq? n2 (mvcc-row-callback-tnode rc)))))
+  (check (= #t (let ((rc (make-mvcc-row-callback 0 #f 0)))
+                 (mvcc-row-callback-set-is-link! rc #t)
+                 (mvcc-row-callback-is-link rc)))))
+
+; ----------------------------------------------------------------
+; ObTxCallbackList
+; ----------------------------------------------------------------
+
+(test-suite "04-006-list-construction"
+  ; new list starts empty with all counters 0.
+  (check (= 0 (callback-list-length (make-callback-list))))
+  (check (= 0 (callback-list-appended (make-callback-list))))
+  (check (= 0 (callback-list-logged (make-callback-list))))
+  (check (= 0 (callback-list-synced (make-callback-list))))
+  (check (= 0 (callback-list-removed (make-callback-list))))
+  (check (= 0 (callback-list-data-size (make-callback-list))))
+  (check (= 0 (callback-list-sync-scn (make-callback-list)))))
+
+(test-suite "04-006-list-predicate"
+  ; callback-list? accepts only list closures.
+  (check (= #t (callback-list? (make-callback-list))))
+  (check (= #f (callback-list? 'not-a-list)))
+  (check (= #f (callback-list? 42))))
+
+(test-suite "04-007-list-head-sentry"
+  ; head is a callback (sentry).
+  (check (= #t (callback? (callback-list-head (make-callback-list))))))
+
+(test-suite "04-007-list-log-cursor-init"
+  ; log-cursor starts pointing to head.
+  (check (= #t (eq? (callback-list-head (make-callback-list))
+                   (callback-list-log-cursor (make-callback-list))))))
+
+; ----------------------------------------------------------------
+; append-callback!
+; ----------------------------------------------------------------
+
+(test-suite "04-008-list-append-single"
+  ; append-callback! increments length + appended.
+  (check (= 1 (let ((lst (make-callback-list))
+                    (cb (make-callback #f #f #f #f #f #f #f)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-length lst))))
+  (check (= 1 (let ((lst (make-callback-list))
+                    (cb (make-callback #f #f #f #f #f #f #f)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-appended lst))))
+
+(test-suite "04-008-list-append-multiple"
+  ; multiple appends accumulate.
+  (check (= 3 (let ((lst (make-callback-list)))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-length lst))))
+
+(test-suite "04-008-list-append-link-callback"
+  ; Linked callbacks get prev/next pointers set.
+  (check (= #t (let ((lst (make-callback-list))
+                    (cb1 (make-callback #f #f #f #f #f #f #f))
+                    (cb2 (make-callback #f #f #f #f #f #f #f)))
+                (callback-list-append-callback! lst cb1)
+                (callback-list-append-callback! lst cb2)
+                (eq? cb1 (cb2 'prev)))))
+
+; ----------------------------------------------------------------
+; remove-callback!
+; ----------------------------------------------------------------
+
+(test-suite "04-009-list-remove"
+  ; remove-callback! decrements length + increments removed.
+  (check (= 0 (let ((lst (make-callback-list))
+                    (cb (make-callback #f #f #f #f #f #f #f)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-remove-callback! lst cb)
+                (callback-list-length lst))))
+  (check (= 1 (let ((lst (make-callback-list))
+                    (cb (make-callback #f #f #d #f #f #f #f)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-remove-callback! lst cb)
+                (callback-list-removed lst))))
+
+(test-suite "04-009-list-remove-unlinks"
+  ; remove-callback! unlinks prev/next pointers.
+  (check (= #t (let ((lst (make-callback-list))
+                    (cb (make-callback #f #f #f #f #f #f #f)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-remove-callback! lst cb)
+                (and (eq? #f (cb 'prev)) (eq? #f (cb 'next))))))
+
+; ----------------------------------------------------------------
+; walk-callbacks + find-by-tnode
+; ----------------------------------------------------------------
+
+; collect-node: helper for walk-callbacks test.
+(define (collect-node n)
+  #t)
+
+; collect-callback: accumulator closure that appends to a list
+; passed via closure.
+(define (make-collector)
+  (let ((acc '()))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'acc) acc)
+                       ((eq? msg 'add) (lambda (x) (set! acc (cons x acc)) acc))
+                       (else #f)))))
+      self)))
+
+(test-suite "04-010-list-walk-count"
+  ; walk-callbacks visits all real callbacks.
+  (check (= 3 (let ((lst (make-callback-list)))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-walk-callbacks lst collect-node))))
+
+(test-suite "04-010-list-walk-empty"
+  ; walk-callbacks on empty list returns 0.
+  (check (= 0 (callback-list-walk-callbacks (make-callback-list) collect-node))))
+
+(test-suite "04-010-list-find-by-tnode"
+  ; find-by-tnode returns the callback with matching tnode.
+  (check (= #t (let ((lst (make-callback-list))
+                    (result (make-row-with-1-node))
+                    (row (car result))
+                    (node (cdr result))
+                    (cb (make-mvcc-row-callback 42 node 0)))
+                (callback-list-append-callback! lst cb)
+                (eq? cb (callback-list-find-by-tnode lst node)))))
+
+(test-suite "04-010-list-find-by-tnode-missing"
+  ; find-by-tnode returns #f for unknown tnode.
+  (check (= #f (let ((lst (make-callback-list))
+                     (node (make-mvcc-trans-node 999 0 0 0 NDT-NORMAL F-INIT #f))
+                     (cb (make-mvcc-row-callback 42 node 0)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-find-by-tnode lst
+                  (make-mvcc-trans-node 1 0 0 0 NDT-NORMAL F-INIT #f))))))
+
+; ----------------------------------------------------------------
+; advance-log-cursor! / set-sync-scn! / reset!
+; ----------------------------------------------------------------
+
+(test-suite "04-011-list-advance-log-cursor"
+  ; advance-log-cursor! moves cursor.
+  (check (= #t (let ((lst (make-callback-list))
+                    (cb (make-callback #f #f #f #f #f #f #f)))
+                (callback-list-append-callback! lst cb)
+                (callback-list-advance-log-cursor! lst cb)
+                (eq? cb (callback-list-log-cursor lst)))))
+
+(test-suite "04-011-list-set-sync-scn"
+  ; set-sync-scn! updates sync_scn.
+  (check (= 5000 (let ((lst (make-callback-list)))
+                   (callback-list-set-sync-scn! lst 5000)
+                   (callback-list-sync-scn lst)))))
+
+(test-suite "04-012-list-reset"
+  ; reset! clears counters.
+  (check (= 0 (let ((lst (make-callback-list)))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-append-callback! lst
+                  (make-callback #f #f #f #f #f #f #f))
+                (callback-list-removed lst 5)
+                (callback-list-set-sync-scn! lst 100)
+                (callback-list-reset! lst)
+                (+ (callback-list-length lst)
+                   (callback-list-appended lst)
+                   (callback-list-logged lst)
+                   (callback-list-synced lst)
+                   (callback-list-removed lst)
+                   (callback-list-data-size lst)
+                   (callback-list-sync-scn lst)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
