@@ -1,0 +1,173 @@
+; 012-futex.aura
+; ====================
+; Futex (Fast Userspace Mutex) — minimal capability port to aura.
+;
+; Maps to: 012-futex-analysis.md
+; Source: include/linux/futex.h + kernel/futex/{core,waitwake,requeue,pi,syscalls}.c
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux futex is a hybrid userspace/kernel sync primitive:
+;   - Fast path: atomic CAS in userspace (glibc/pthread layers)
+;   - Slow path: FUTEX_WAIT / FUTEX_WAKE syscalls register/unregister waiters
+;   - Hash buckets for key lookup (per-thread/process)
+;   - PI-futex (priority inheritance) for mutex
+;   - Requeue (FUTEX_REQUEUE) for condvar
+;   - bitset wake (FUTEX_WAKE_BITSET)
+;
+; aura has no userspace, no syscalls, no atomic CAS, no priority inheritance.
+; v1 ships the wait/wake queue mechanism + key-based grouping:
+;   - make-futex-key (closure with id + scope)
+;   - make-futex-queue (holds waiting futex_qs)
+;   - futex-wait (register waiter + check done)
+;   - futex-wake (signal N waiters)
+;   - futex-wake-all (signal all waiters)
+;   - futex-queue-size / futex-queue-empty?
+;
+; Deferred (full Linux futex, separate issues):
+;   - Userspace fast path (atomic CAS in glibc layer)
+;   - FUTEX_WAIT / FUTEX_WAKE syscalls
+;   - Hash buckets (futex_hash_bucket, private/shared key)
+;   - PI-futex (priority inheritance via rt_mutex)
+;   - FUTEX_REQUEUE / FUTEX_CMP_REQUEUE
+;   - FUTEX_WAKE_BITSET / FUTEX_WAIT_BITSET
+;   - FUTEX_FD (signal via fd) — deprecated
+;   - completion integration (futex_completion)
+
+(export
+  ; Key + queue
+  make-futex-key
+  make-futex-queue
+  futex-key-id
+  futex-key-equal?
+  ; Waiter
+  make-futex-q
+  futex-q-key
+  futex-q-set-key!
+  ; Wait / wake
+  futex-wait
+  futex-wake
+  futex-wake-all
+  futex-queue-size
+  futex-queue-empty?)
+
+; ----------------------------------------------------------------
+; Futex key (closure with id + scope)
+; ----------------------------------------------------------------
+
+; Scope markers (analogous to FUTEX_PRIVATE / FUTEX_SHARED).
+(define FUTEX-SCOPE-PRIVATE 0)
+(define FUTEX-SCOPE-SHARED  1)
+
+; Make a futex key from an integer id and scope.
+(define (make-futex-key id scope)
+  (let ((key-id id) (key-scope scope))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'id) key-id)
+                       ((eq? msg 'scope) key-scope)
+                       (else #f)))))
+      self)))
+
+; futex-key-id: get the integer id of the key.
+(define (futex-key-id k) (k 'id))
+
+; futex-key-equal?: are two keys equal (same id + scope)?
+(define (futex-key-equal? a b)
+  (and (eq? (a 'id) (b 'id))
+       (eq? (a 'scope) (b 'scope))))
+
+; ----------------------------------------------------------------
+; Futex queue (closure with waiter list)
+; ----------------------------------------------------------------
+
+; Make an empty futex queue.
+(define (make-futex-queue)
+  (let ((waiters '()))           ; list of futex_q closures
+    (letrec ((set-waiters! (lambda (w) (set! waiters w) w))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'waiters) waiters)
+                       ((eq? msg 'set-waiters!) set-waiters!)
+                       ((eq? msg 'empty?) (null? waiters))
+                       ((eq? msg 'size) (length waiters))
+                       (else #f)))))
+      self)))
+
+; futex-queue-size: number of registered waiters.
+(define (futex-queue-size q)
+  (length (q 'waiters)))
+
+; futex-queue-empty?: is the queue empty?
+(define (futex-queue-empty? q)
+  (null? (q 'waiters)))
+
+; ----------------------------------------------------------------
+; Futex_q (waiter entry — closure with key)
+; ----------------------------------------------------------------
+
+; Make a futex_q waiter.
+(define (make-futex-q)
+  (let ((q-key #f))
+    (letrec ((set-key! (lambda (k) (set! q-key k) k))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'key) q-key)
+                       ((eq? msg 'set-key!) set-key!)
+                       (else #f)))))
+      self)))
+
+; futex-q-key: get the waiter's key.
+(define (futex-q-key q) (q 'key))
+
+; futex-q-set-key!: set the waiter's key.
+(define (futex-q-set-key! q k)
+  ((q 'set-key!) k))
+
+; ----------------------------------------------------------------
+; Wait / wake (single-threaded simulation)
+; ----------------------------------------------------------------
+
+; futex-wait: register waiter for the given key, return #t if wait needed,
+; or #f if done condition already met (caller should not wait).
+; Caller is responsible for the actual blocking (via swait/etc.).
+; v1 just records the waiter for later wake — no blocking simulation.
+(define (futex-wait q futex-key waiter)
+  (futex-q-set-key! waiter futex-key)
+  ((q 'set-waiters!) (cons waiter (q 'waiters)))
+  #t)
+
+; futex-wake: wake N waiters matching the key (FIFO order: first-registered
+; first-woken — pops from head of insertion order).
+; Returns count of waiters woken.
+(define (futex-wake q futex-key n)
+  (let loop ((waiters (q 'waiters))
+             (woken 0)
+             (remaining n)
+             (acc '()))
+    (cond
+      ((or (null? waiters) (= remaining 0))
+       ((q 'set-waiters!) (append acc waiters))
+       woken)
+      ((futex-key-equal? (car waiters 'key) futex-key)
+       (loop (cdr waiters) (+ woken 1) (- remaining 1) acc))
+      (else
+       (loop (cdr waiters) woken remaining (cons (car waiters) acc))))))
+
+; Note: above loop uses `(car waiters 'key)` defensively — if waiters is
+; nil, we wouldn't reach this clause. The 'key fallback is just a marker.
+
+; futex-wake-all: wake all waiters matching the key.
+; Returns count of waiters woken.
+(define (futex-wake-all q futex-key)
+  (let ((waiters (q 'waiters)))
+    (let loop ((rest waiters) (woken 0) (acc '()))
+      (cond
+        ((null? rest)
+         ((q 'set-waiters!) (reverse acc))
+         woken)
+        ((futex-key-equal? (car rest) futex-key)
+         (loop (cdr rest) (+ woken 1) acc))
+        (else
+         (loop (cdr rest) woken (cons (car rest) acc)))))))

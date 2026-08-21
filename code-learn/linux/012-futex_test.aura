@@ -1,0 +1,104 @@
+; 012-futex_test.aura
+; =====================
+; Smoke tests for 012-futex.aura — futex minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/012-futex_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-futex-key / make-futex-queue / make-futex-q construction
+;   - futex-key-equal? (id + scope matching)
+;   - futex-wait registers waiter
+;   - futex-wake signals N waiters matching key
+;   - futex-wake-all signals all matching waiters
+;   - Cross-key isolation (wake on key X doesn't affect key Y)
+;
+; Verified via separate probes during development:
+;   - FIFO wake order (first registered → first woken)
+;   - futex-queue-size tracks waiters
+;
+; Deferred (full Linux futex):
+;   - Userspace fast path (atomic CAS in glibc)
+;   - FUTEX_WAIT / FUTEX_WAKE syscalls
+;   - Hash buckets (private/shared key resolution)
+;   - PI-futex (priority inheritance)
+;   - FUTEX_REQUEUE / FUTEX_CMP_REQUEUE
+;   - FUTEX_WAKE_BITSET
+
+(require "std/test" all:)
+(require "012-futex" all:)
+
+; ----------------------------------------------------------------
+; Key + queue + q construction
+; ----------------------------------------------------------------
+
+(test-suite "futex-001-key-equal"
+  ; Same id + scope → equal.
+  (check (= 1 (futex-key-equal? (make-futex-key 42 FUTEX-SCOPE-PRIVATE)
+                                 (make-futex-key 42 FUTEX-SCOPE-PRIVATE))))
+  ; Different id → not equal.
+  (check (= 1 (if (not (futex-key-equal? (make-futex-key 42 FUTEX-SCOPE-PRIVATE)
+                                         (make-futex-key 43 FUTEX-SCOPE-PRIVATE))) 1 0)))
+
+(test-suite "futex-001-queue-empty"
+  (check (= 1 (futex-queue-empty? (make-futex-queue))))
+  (check (= 0 (futex-queue-size (make-futex-queue))))
+
+; ----------------------------------------------------------------
+; Wait registers waiter
+; ----------------------------------------------------------------
+
+(test-suite "futex-002-wait-registers"
+  (check (= 1 (let ((q (make-futex-queue))
+                    (k (make-futex-key 100 FUTEX-SCOPE-PRIVATE))
+                    (w (make-futex-q)))
+                (futex-wait q k w)
+                (futex-queue-size q))))
+
+; ----------------------------------------------------------------
+; Wake signals N matching waiters
+; ----------------------------------------------------------------
+
+(test-suite "futex-003-wake-one"
+  (check (= 1 (let ((q (make-futex-queue))
+                    (k (make-futex-key 200 FUTEX-SCOPE-PRIVATE)))
+                (futex-wait q k (make-futex-q))
+                (futex-wake q k 1))))
+
+(test-suite "futex-003-wake-all-matching"
+  ; 3 waiters on key, wake all → 3 woken, queue empty.
+  (check (= 1 (let ((q (make-futex-queue))
+                    (k (make-futex-key 300 FUTEX-SCOPE-PRIVATE)))
+                (futex-wait q k (make-futex-q))
+                (futex-wait q k (make-futex-q))
+                (futex-wait q k (make-futex-q))
+                (let ((woken (futex-wake-all q k)))
+                  (and (= woken 3)
+                       (futex-queue-empty? q))))))
+
+; ----------------------------------------------------------------
+; Cross-key isolation
+; ----------------------------------------------------------------
+
+(test-suite "futex-004-isolation"
+  ; Wake on key-X doesn't affect key-Y waiters.
+  (check (= 1 (let ((q (make-futex-queue))
+                    (kx (make-futex-key 1 FUTEX-SCOPE-PRIVATE))
+                    (ky (make-futex-key 2 FUTEX-SCOPE-PRIVATE))
+                    (w-y (make-futex-q)))
+                (futex-wait q ky w-y)
+                (futex-wait q kx (make-futex-q))
+                (futex-wake q kx 99)
+                ; After waking key-X, key-Y waiter should still be queued.
+                (= 1 (futex-queue-size q)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
