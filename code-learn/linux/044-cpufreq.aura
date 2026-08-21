@@ -1,0 +1,350 @@
+; 044-cpufreq.aura
+; =======================
+; cpufreq — minimal capability port to aura.
+;
+; Maps to: Linux kernel CPU frequency scaling subsystem
+; Source: drivers/cpufreq/ + include/linux/cpufreq.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux cpufreq dynamically scales CPU frequency for power/performance:
+;   - struct cpufreq_policy (governor, min/max/cur freq, related cpus)
+;   - struct cpufreq_governor (name, callbacks: target / target_index /
+;     limits)
+;   - struct cpufreq_driver (name, callbacks: verify / target / init /
+;     exit / bios_limit)
+;   - cpufreq_register_driver / cpufreq_unregister_driver
+;   - cpufreq_register_governor / cpufreq_unregister_governor
+;   - cpufreq_update_policy / cpufreq_set_policy
+;   - cpufreq_freq_transition_begin / end (notifier chain)
+;   - /sys/devices/system/cpu/cpu*/cpufreq/
+;   - Built-in governors: performance, powersave, ondemand,
+;     conservative, schedutil
+;
+; aura has no CPU, no frequency scaling. v1 ships:
+;   - make-cpufreq-policy (min-freq, max-freq, cur-freq, governor)
+;   - cpufreq-policy-set-cur-freq!
+;   - make-cpufreq-governor (name, target-fn)
+;   - make-cpufreq-driver (name)
+;   - cpufreq-register-driver / unregister / find / count
+;   - cpufreq-register-governor / unregister / find / count
+;   - cpufreq-policy? / cpufreq-governor? / cpufreq-driver? predicates
+;
+; Deferred (full Linux cpufreq):
+;   - real CPU frequency transitions (HW register writes)
+;   - cpufreq notifier chain (CPUFREQ_TRANSITION_NOTIFY)
+;   - cpufreq governer interaction with scheduler
+;   - ondemand / conservative load sampling
+;   - schedutil — scheduler-driven freq selection
+;   - intel_pstate / amd_pstate hardware drivers
+;   - thermal pressure on freq (cooling device integration)
+;   - boost / turbo frequencies
+;   - per-policy related_cpus / cpus mask
+
+(export
+  make-cpufreq-policy
+  cpufreq-policy?
+  cpufreq-policy-min-freq
+  cpufreq-policy-max-freq
+  cpufreq-policy-cur-freq
+  cpufreq-policy-governor
+  cpufreq-policy-set-cur-freq!
+  cpufreq-policy-set-min-freq!
+  cpufreq-policy-set-max-freq!
+  cpufreq-policy-set-governor!
+  make-cpufreq-governor
+  cpufreq-governor?
+  cpufreq-governor-name
+  cpufreq-governor-target-fn
+  make-cpufreq-driver
+  cpufreq-driver?
+  cpufreq-driver-name
+  cpufreq-register-driver
+  cpufreq-unregister-driver
+  cpufreq-find-driver
+  cpufreq-driver-count
+  cpufreq-register-governor
+  cpufreq-unregister-governor
+  cpufreq-find-governor
+  cpufreq-governor-count
+  ; Built-in governor symbols
+  'performance
+  'powersave
+  'ondemand
+  'conservative
+  'schedutil)
+
+; ----------------------------------------------------------------
+; cpufreq_policy — closure-based, mutable state via letrec setters
+; ----------------------------------------------------------------
+
+; make-cpufreq-policy: create a CPU frequency policy.
+; Args: min-freq (kHz), max-freq (kHz), cur-freq (kHz), governor (symbol)
+; Returns: cpufreq_policy closure.
+(define (make-cpufreq-policy min-freq max-freq cur-freq governor)
+  (letrec ((set-cur-freq!  (lambda (v) (set! cur-freq v) v))
+           (set-min-freq!  (lambda (v) (set! min-freq v) v))
+           (set-max-freq!  (lambda (v) (set! max-freq v) v))
+           (set-governor!  (lambda (v) (set! governor v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'min-freq) min-freq)
+                     ((eq? msg 'max-freq) max-freq)
+                     ((eq? msg 'cur-freq) cur-freq)
+                     ((eq? msg 'governor)  governor)
+                     ((eq? msg 'set-cur-freq!) set-cur-freq!)
+                     ((eq? msg 'set-min-freq!) set-min-freq!)
+                     ((eq? msg 'set-max-freq!) set-max-freq!)
+                     ((eq? msg 'set-governor!) set-governor!)
+                     (else #f)))))
+    self))
+
+; cpufreq-policy?: is the object a cpufreq_policy?
+; Detected by querying 'cur-freq — only cpufreq_policy closures
+; return a positive integer for cur-freq.
+(define (cpufreq-policy? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'cur-freq)))
+        (if (and (integer? c) (> c 0)) #t #f))
+      #f))
+
+; cpufreq-policy-min-freq: get min frequency (kHz)
+(define (cpufreq-policy-min-freq p) (p 'min-freq))
+
+; cpufreq-policy-max-freq: get max frequency (kHz)
+(define (cpufreq-policy-max-freq p) (p 'max-freq))
+
+; cpufreq-policy-cur-freq: get current frequency (kHz)
+(define (cpufreq-policy-cur-freq p) (p 'cur-freq))
+
+; cpufreq-policy-governor: get current governor symbol
+(define (cpufreq-policy-governor p) (p 'governor))
+
+; cpufreq-policy-set-cur-freq!: set current frequency.
+; Returns the new cur-freq.
+(define (cpufreq-policy-set-cur-freq! p new-freq)
+  ((p 'set-cur-freq!) new-freq))
+
+; cpufreq-policy-set-min-freq!: set min frequency.
+; Returns the new min-freq.
+(define (cpufreq-policy-set-min-freq! p new-freq)
+  ((p 'set-min-freq!) new-freq))
+
+; cpufreq-policy-set-max-freq!: set max frequency.
+; Returns the new max-freq.
+(define (cpufreq-policy-set-max-freq! p new-freq)
+  ((p 'set-max-freq!) new-freq))
+
+; cpufreq-policy-set-governor!: set governor symbol.
+; Returns the new governor.
+(define (cpufreq-policy-set-governor! p new-gov)
+  ((p 'set-governor!) new-gov))
+
+; ----------------------------------------------------------------
+; cpufreq_governor — closure-based
+; ----------------------------------------------------------------
+
+; make-cpufreq-governor: create a CPU frequency governor.
+; Args: name (symbol), target-fn (procedure: target frequency selector)
+; Returns: cpufreq_governor closure.
+(define (make-cpufreq-governor name target-fn)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'target-fn) target-fn)
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; cpufreq-governor?: is the object a cpufreq_governor?
+; Detected by querying 'target-fn — only cpufreq_governor closures
+; return a value satisfying procedure?.
+(define (cpufreq-governor? obj)
+  (if (procedure? obj)
+      (if (procedure? (obj 'target-fn)) #t #f)
+      #f))
+
+; cpufreq-governor-name: get governor name
+(define (cpufreq-governor-name g) (g 'name))
+
+; cpufreq-governor-target-fn: get governor target frequency selector
+(define (cpufreq-governor-target-fn g) (g 'target-fn))
+
+; ----------------------------------------------------------------
+; cpufreq_driver — closure-based
+; ----------------------------------------------------------------
+
+; make-cpufreq-driver: create a CPU frequency driver.
+; Args: name (symbol)
+; Returns: cpufreq_driver closure.
+(define (make-cpufreq-driver name)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; cpufreq-driver?: is the object a cpufreq_driver?
+; Detected by querying 'id — only cpufreq_driver closures return an
+; integer for id (initially 0).
+(define (cpufreq-driver? obj)
+  (if (procedure? obj)
+      (let ((i (obj 'id)))
+        (if (and (integer? i) (>= i 0)) #t #f))
+      #f))
+
+; cpufreq-driver-name: get driver name
+(define (cpufreq-driver-name d) (d 'name))
+
+; ----------------------------------------------------------------
+; Driver registry — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-driver-registry: empty driver registry.
+(define (make-driver-registry)
+  (let ((drivers '())
+        (next-id 0))
+    (letrec ((set-drivers!  (lambda (v) (set! drivers v) v))
+             (set-next-id! (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) drivers)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-drivers!)  set-drivers!)
+                       ((eq? msg 'set-next-id!) set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global driver registry
+(define g-driver-registry (make-driver-registry))
+
+; cpufreq-register-driver: register a driver, assign unique id.
+; Returns the assigned id.
+(define (cpufreq-register-driver drv)
+  (let ((new-id (+ (g-driver-registry 'next-id) 1)))
+    ((g-driver-registry 'set-next-id!) new-id)
+    ((drv 'set-id!) new-id)
+    ((g-driver-registry 'set-drivers!)
+     (cons drv (g-driver-registry 'list)))
+    new-id))
+
+; cpufreq-unregister-driver: remove a driver.
+; Returns #t if removed, #f if not found.
+(define (cpufreq-unregister-driver drv)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-driver-registry 'set-drivers!)
+                             (cons-rev acc '()))
+                            ((g-driver-registry 'set-drivers!) acc))
+                        found?)
+                       ((eq? (car rest) drv)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-driver-registry 'list) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; cpufreq-find-driver: find driver by name.
+; Returns driver or #f.
+(define (cpufreq-find-driver name)
+  (let loop ((rest (g-driver-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (cpufreq-driver-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; cpufreq-driver-count: count of registered drivers
+(define (cpufreq-driver-count)
+  (let loop ((rest (g-driver-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; Governor registry — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-governor-registry: empty governor registry.
+(define (make-governor-registry)
+  (let ((governors '())
+        (next-id 0))
+    (letrec ((set-governors! (lambda (v) (set! governors v) v))
+             (set-next-id!   (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) governors)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-governors!) set-governors!)
+                       ((eq? msg 'set-next-id!)   set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global governor registry
+(define g-governor-registry (make-governor-registry))
+
+; cpufreq-register-governor: register a governor, assign unique id.
+; Returns the assigned id.
+(define (cpufreq-register-governor gov)
+  (let ((new-id (+ (g-governor-registry 'next-id) 1)))
+    ((g-governor-registry 'set-next-id!) new-id)
+    ((gov 'set-id!) new-id)
+    ((g-governor-registry 'set-governors!)
+     (cons gov (g-governor-registry 'list)))
+    new-id))
+
+; cpufreq-unregister-governor: remove a governor.
+; Returns #t if removed, #f if not found.
+(define (cpufreq-unregister-governor gov)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-governor-registry 'set-governors!)
+                             (cons-rev-2 acc '()))
+                            ((g-governor-registry 'set-governors!) acc))
+                        found?)
+                       ((eq? (car rest) gov)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-governor-registry 'list) '())))
+
+; cons-rev-2: same as cons-rev (separate to avoid redefinition issues)
+(define (cons-rev-2 acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev-2 (cdr acc) (cons (car acc) rest))))
+
+; cpufreq-find-governor: find governor by name.
+; Returns governor or #f.
+(define (cpufreq-find-governor name)
+  (let loop ((rest (g-governor-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (cpufreq-governor-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; cpufreq-governor-count: count of registered governors
+(define (cpufreq-governor-count)
+  (let loop ((rest (g-governor-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))

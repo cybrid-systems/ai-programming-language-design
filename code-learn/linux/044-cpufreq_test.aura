@@ -1,0 +1,189 @@
+; 044-cpufreq_test.aura
+; ========================
+; Smoke tests for 044-cpufreq.aura — CPU frequency scaling minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/044-cpufreq_test.aura
+;
+; Verified automatically (smoke):
+;   - cpufreq_policy / cpufreq_governor / cpufreq_driver construction
+;   - cpufreq-policy? / cpufreq-governor? / cpufreq-driver? predicates
+;   - cpufreq-policy-set-cur-freq! / min-freq! / max-freq! / governor!
+;   - cpufreq-register-driver + find + unregister + count
+;   - cpufreq-register-governor + find + unregister + count
+;
+; Verified via separate probes during development:
+;   - Multiple drivers / governors coexist
+;   - find / unregister return #f for missing
+;
+; Deferred (full Linux cpufreq):
+;   - real CPU frequency transitions (HW register writes)
+;   - cpufreq notifier chain (CPUFREQ_TRANSITION_NOTIFY)
+;   - ondemand / conservative load sampling
+;   - schedutil — scheduler-driven freq selection
+;   - intel_pstate / amd_pstate hardware drivers
+;   - thermal pressure on freq (cooling device integration)
+;   - boost / turbo frequencies
+
+(require "std/test" all:)
+(require "044-cpufreq" all:)
+
+; ----------------------------------------------------------------
+; cpufreq_policy construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "cf-001-policy-construction"
+  ; cpufreq_policy preserves min/max/cur freq, governor.
+  (check (= 800000 (cpufreq-policy-min-freq
+                     (make-cpufreq-policy 800000 2400000 1200000 'ondemand))))
+  (check (= 2400000 (cpufreq-policy-max-freq
+                      (make-cpufreq-policy 800000 2400000 1200000 'ondemand))))
+  (check (= 1200000 (cpufreq-policy-cur-freq
+                      (make-cpufreq-policy 800000 2400000 1200000 'ondemand))))
+  (check (= 'ondemand (cpufreq-policy-governor
+                       (make-cpufreq-policy 800000 2400000 1200000 'ondemand)))))
+
+(test-suite "cf-001-policy-predicate"
+  ; cpufreq-policy? accepts only cpufreq_policy closures.
+  (check (= 1 (if (cpufreq-policy?
+                   (make-cpufreq-policy 800000 2400000 1200000 'performance))
+                 1 0)))
+  (check (= 1 (if (not (cpufreq-policy? 'not-a-policy)) 1 0)))
+  (check (= 1 (if (not (cpufreq-policy? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; cpufreq_policy setters
+; ----------------------------------------------------------------
+
+(test-suite "cf-002-policy-set-cur-freq"
+  ; cpufreq-policy-set-cur-freq! updates cur-freq.
+  (check (= 2000000 (let ((p (make-cpufreq-policy 800000 2400000 1200000 'ondemand)))
+                      (cpufreq-policy-set-cur-freq! p 2000000)
+                      (cpufreq-policy-cur-freq p)))))
+
+(test-suite "cf-002-policy-set-min-freq"
+  ; cpufreq-policy-set-min-freq! updates min-freq.
+  (check (= 1000000 (let ((p (make-cpufreq-policy 800000 2400000 1200000 'ondemand)))
+                      (cpufreq-policy-set-min-freq! p 1000000)
+                      (cpufreq-policy-min-freq p)))))
+
+(test-suite "cf-002-policy-set-max-freq"
+  ; cpufreq-policy-set-max-freq! updates max-freq.
+  (check (= 3200000 (let ((p (make-cpufreq-policy 800000 2400000 1200000 'ondemand)))
+                      (cpufreq-policy-set-max-freq! p 3200000)
+                      (cpufreq-policy-max-freq p)))))
+
+(test-suite "cf-002-policy-set-governor"
+  ; cpufreq-policy-set-governor! updates governor.
+  (check (= 'performance
+             (let ((p (make-cpufreq-policy 800000 2400000 1200000 'ondemand)))
+               (cpufreq-policy-set-governor! p 'performance)
+               (cpufreq-policy-governor p)))))
+
+; ----------------------------------------------------------------
+; cpufreq_governor construction + predicate
+; ----------------------------------------------------------------
+
+; noop-target: minimal target-fn for tests.
+(define (noop-target policy)
+  (cpufreq-policy-cur-freq policy))
+
+(test-suite "cf-003-governor-construction"
+  ; cpufreq_governor preserves name, target-fn.
+  (check (= 'ondemand (cpufreq-governor-name
+                       (make-cpufreq-governor 'ondemand noop-target))))
+  (check (= 1 (if (eq? noop-target
+                        (cpufreq-governor-target-fn
+                         (make-cpufreq-governor 'ondemand noop-target)))
+                  1 0))))
+
+(test-suite "cf-003-governor-predicate"
+  ; cpufreq-governor? accepts only cpufreq_governor closures.
+  (check (= 1 (if (cpufreq-governor?
+                   (make-cpufreq-governor 'unq-cf-003 noop-target))
+                 1 0)))
+  (check (= 1 (if (not (cpufreq-governor? 'not-a-gov)) 1 0)))
+  (check (= 1 (if (not (cpufreq-governor? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; cpufreq_driver construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "cf-004-driver-construction"
+  ; cpufreq_driver preserves name.
+  (check (= 'acpi-cpufreq (cpufreq-driver-name
+                           (make-cpufreq-driver 'acpi-cpufreq)))))
+
+(test-suite "cf-004-driver-predicate"
+  ; cpufreq-driver? accepts only cpufreq_driver closures.
+  (check (= 1 (if (cpufreq-driver? (make-cpufreq-driver 'unq-cf-004)) 1 0)))
+  (check (= 1 (if (not (cpufreq-driver? 'not-a-drv)) 1 0)))
+  (check (= 1 (if (not (cpufreq-driver? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Driver registry
+; ----------------------------------------------------------------
+
+(test-suite "cf-005-register-driver"
+  ; cpufreq-register-driver assigns sequential id.
+  (check (= 1 (cpufreq-register-driver
+               (make-cpufreq-driver 'unq-cf-005-reg)))))
+
+(test-suite "cf-005-find-driver"
+  ; cpufreq-find-driver returns the registered driver.
+  (check (= 1 (let ((d (make-cpufreq-driver 'unq-cf-005-find)))
+                (cpufreq-register-driver d)
+                (if (eq? d (cpufreq-find-driver 'unq-cf-005-find)) 1 0)))))
+
+(test-suite "cf-005-find-driver-missing"
+  ; cpufreq-find-driver returns #f for unknown name.
+  (check (= 1 (if (not (cpufreq-find-driver 'unq-cf-005-missing)) 1 0))))
+
+(test-suite "cf-005-unregister-driver"
+  ; cpufreq-unregister-driver removes + find returns #f.
+  (check (= 1 (let ((d (make-cpufreq-driver 'unq-cf-005-unreg)))
+                (cpufreq-register-driver d)
+                (cpufreq-unregister-driver d)
+                (if (not (cpufreq-find-driver 'unq-cf-005-unreg)) 1 0)))))
+
+(test-suite "cf-005-driver-count"
+  ; cpufreq-driver-count is positive after registrations.
+  (check (= 1 (> (cpufreq-driver-count) 0))))
+
+; ----------------------------------------------------------------
+; Governor registry
+; ----------------------------------------------------------------
+
+(test-suite "cf-006-register-governor"
+  ; cpufreq-register-governor assigns sequential id.
+  (check (= 1 (cpufreq-register-governor
+               (make-cpufreq-governor 'unq-cf-006-reg noop-target)))))
+
+(test-suite "cf-006-find-governor"
+  ; cpufreq-find-governor returns the registered governor.
+  (check (= 1 (let ((g (make-cpufreq-governor 'unq-cf-006-find noop-target)))
+                (cpufreq-register-governor g)
+                (if (eq? g (cpufreq-find-governor 'unq-cf-006-find)) 1 0)))))
+
+(test-suite "cf-006-find-governor-missing"
+  ; cpufreq-find-governor returns #f for unknown name.
+  (check (= 1 (if (not (cpufreq-find-governor 'unq-cf-006-missing)) 1 0))))
+
+(test-suite "cf-006-unregister-governor"
+  ; cpufreq-unregister-governor removes + find returns #f.
+  (check (= 1 (let ((g (make-cpufreq-governor 'unq-cf-006-unreg noop-target)))
+                (cpufreq-register-governor g)
+                (cpufreq-unregister-governor g)
+                (if (not (cpufreq-find-governor 'unq-cf-006-unreg)) 1 0)))))
+
+(test-suite "cf-006-governor-count"
+  ; cpufreq-governor-count is positive after registrations.
+  (check (= 1 (> (cpufreq-governor-count) 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
