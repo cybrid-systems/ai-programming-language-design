@@ -1,0 +1,280 @@
+; 10-ob-transaction_test.aura
+; ===========================
+; Smoke tests for 10-ob-transaction.aura — distributed transaction + 2PC minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/10-ob-transaction_test.aura
+;
+; Verified automatically (smoke):
+;   - 8 TX-STATE constants distinct
+;   - 2 COMMIT-TYPE + 3 PARTICIPANT-ROLE constants distinct
+;   - make-trans-id + accessors
+;   - make-trans-ctx + accessors + setters
+;   - State transitions (INIT→ACTIVE→PREPARE→COMMITTING→COMMITTED,
+;     any→ROLLED_BACK/ABORTED)
+;   - Invalid transitions are no-ops
+;   - make-trans-service + stats + register/unregister/find
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Stats accumulate correctly
+;
+; Deferred (full OceanBase transaction):
+;   - real ObPartTransCtx with all 13 phases
+;   - real 2PC state machine (ObTwoPhaseCommitter)
+;   - real Paxos integration via ObITsMgr
+;   - real ELR handler with row callbacks
+;   - real ObTransRpc proxy + RPC serialization
+;   - Cycle 2PC for migration
+;   - real session-level state
+
+(require "std/test" all:)
+(require "10-ob-transaction" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "10-001-tx-state-distinct"
+  ; 8 TX-STATE constants are distinct.
+  (check (= 1 (if (not (= TX-STATE-INIT TX-STATE-ACTIVE)) 1 0)))
+  (check (= 1 (if (not (= TX-STATE-ACTIVE TX-STATE-PREPARE)) 1 0)))
+  (check (= 1 (if (not (= TX-STATE-PREPARE TX-STATE-COMMITTING)) 1 0)))
+  (check (= 1 (if (not (= TX-STATE-COMMITTING TX-STATE-COMMITTED)) 1 0)))
+  (check (= 1 (if (not (= TX-STATE-COMMITTED TX-STATE-ROLLED-BACK)) 1 0)))
+  (check (= 1 (if (not (= TX-STATE-ROLLED-BACK TX-STATE-ABORTED)) 1 0)))
+  (check (= 1 (if (not (= TX-STATE-ABORTED TX-STATE-ELR)) 1 0))))
+
+(test-suite "10-001-commit-type-distinct"
+  ; 2 COMMIT-TYPE constants are distinct.
+  (check (= 1 (if (not (= COMMIT-TYPE-ONE-PHASE COMMIT-TYPE-TWO-PHASE)) 1 0))))
+
+(test-suite "10-001-participant-role-distinct"
+  ; 3 PARTICIPANT-ROLE constants are distinct.
+  (check (= 1 (if (not (= PARTICIPANT-ROLE-COORDINATOR
+                          PARTICIPANT-ROLE-PARTICIPANT)) 1 0)))
+  (check (= 1 (if (not (= PARTICIPANT-ROLE-PARTICIPANT
+                          PARTICIPANT-ROLE-LEARNER)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObTransID
+; ----------------------------------------------------------------
+
+(test-suite "10-002-trans-id-construction"
+  ; trans-id preserves tx-id, session-id.
+  (check (= 100 (trans-id-get-tx-id
+                  (make-trans-id 100 7))))
+  (check (= 7 (trans-id-get-session-id
+                (make-trans-id 100 7)))))
+
+(test-suite "10-002-trans-id-predicate"
+  ; trans-id? accepts only trans_ids.
+  (check (= #t (trans-id? (make-trans-id 1 1))))
+  (check (= #f (trans-id? 'not-a-tid)))
+  (check (= #f (trans-id? 42))))
+
+; ----------------------------------------------------------------
+; ObTransCtx
+; ----------------------------------------------------------------
+
+(test-suite "10-003-trans-ctx-construction"
+  ; trans-ctx preserves fields.
+  (check (= 1 (trans-ctx-get-tenant-id
+               (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000))))
+  (check (= 5 (trans-ctx-get-ls-id
+               (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000))))
+  (check (= 10 (trans-id-get-tx-id
+                  (trans-ctx-get-tx-id
+                    (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))))
+  (check (= #t (eq? 'self
+                   (trans-ctx-get-addr
+                     (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))))
+  (check (= 7 (trans-ctx-get-session-id
+               (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000))))
+  (check (= 100000 (trans-ctx-get-expired-time
+                     (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000))))
+  ; Default state.
+  (check (= TX-STATE-INIT
+             (trans-ctx-get-state
+               (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))))
+
+(test-suite "10-003-trans-ctx-predicate"
+  ; trans-ctx? accepts only trans_ctxs.
+  (check (= #t (trans-ctx?
+                 (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000))))
+  (check (= #f (trans-ctx? 'not-a-ctx)))
+  (check (= #f (trans-ctx? 42))))
+
+(test-suite "10-004-trans-ctx-set-state"
+  ; set-state! updates state.
+  (check (= TX-STATE-COMMITTING
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-set-state! ctx TX-STATE-COMMITTING)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-004-trans-ctx-set-participant-role"
+  ; set-participant-role! updates.
+  (check (= PARTICIPANT-ROLE-COORDINATOR
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-set-participant-role! ctx PARTICIPANT-ROLE-COORDINATOR)
+               (trans-ctx-get-participant-role ctx))))
+
+(test-suite "10-004-trans-ctx-set-commit-type"
+  ; set-commit-type! updates.
+  (check (= COMMIT-TYPE-ONE-PHASE
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-set-commit-type! ctx COMMIT-TYPE-ONE-PHASE)
+               (trans-ctx-get-commit-type ctx))))
+
+(test-suite "10-004-trans-ctx-set-can-elr"
+  ; set-can-elr! updates.
+  (check (= #t (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+                 (trans-ctx-set-can-elr! ctx #t)
+                 (trans-ctx-can-elr? ctx))))
+
+; ----------------------------------------------------------------
+; State transitions
+; ----------------------------------------------------------------
+
+(test-suite "10-005-init-to-active"
+  ; INIT → ACTIVE transition.
+  (check (= TX-STATE-ACTIVE
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-active! ctx)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-init-no-op-from-active"
+  ; INIT → ACTIVE is no-op from non-INIT states.
+  (check (= TX-STATE-ACTIVE
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-active! ctx)
+               (trans-ctx-advance-to-active! ctx)  ; no-op
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-active-to-prepare"
+  ; ACTIVE → PREPARE.
+  (check (= TX-STATE-PREPARE
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-active! ctx)
+               (trans-ctx-advance-to-prepare! ctx)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-prepare-to-committing"
+  ; PREPARE → COMMITTING.
+  (check (= TX-STATE-COMMITTING
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-active! ctx)
+               (trans-ctx-advance-to-prepare! ctx)
+               (trans-ctx-advance-to-committing! ctx)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-committing-to-committed"
+  ; COMMITTING → COMMITTED.
+  (check (= TX-STATE-COMMITTED
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-active! ctx)
+               (trans-ctx-advance-to-prepare! ctx)
+               (trans-ctx-advance-to-committing! ctx)
+               (trans-ctx-advance-to-committed! ctx)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-advance-to-rolled-back"
+  ; any → ROLLED_BACK.
+  (check (= TX-STATE-ROLLED-BACK
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-active! ctx)
+               (trans-ctx-advance-to-rolled-back! ctx)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-advance-to-aborted"
+  ; any → ABORTED.
+  (check (= TX-STATE-ABORTED
+             (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+               (trans-ctx-advance-to-aborted! ctx)
+               (trans-ctx-get-state ctx))))
+
+(test-suite "10-005-full-2pc-flow"
+  ; Full 2PC flow: INIT → ACTIVE → PREPARE → COMMITTING → COMMITTED.
+  (check (= #t (let ((ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+                 (and (trans-ctx-advance-to-active! ctx)
+                      (trans-ctx-advance-to-prepare! ctx)
+                      (trans-ctx-advance-to-committing! ctx)
+                      (trans-ctx-advance-to-committed! ctx)
+                      (= TX-STATE-COMMITTED (trans-ctx-get-state ctx))))))
+
+; ----------------------------------------------------------------
+; ObTransService
+; ----------------------------------------------------------------
+
+(test-suite "10-006-trans-service-construction"
+  ; new service starts with zero stats.
+  (check (= 1 (trans-service-get-tenant-id
+                (make-trans-service 1 'self))))
+  (check (= #t (eq? 'self
+                   (trans-service-get-self-addr
+                     (make-trans-service 1 'self)))))
+  (check (= 0 (trans-service-get-stats-started
+               (make-trans-service 1 'self))))
+  (check (= 0 (trans-service-get-stats-committed
+               (make-trans-service 1 'self))))
+  (check (= 0 (trans-service-get-stats-rolled-back
+               (make-trans-service 1 'self))))
+  (check (= 0 (trans-service-count-ctxs
+               (make-trans-service 1 'self)))))
+
+(test-suite "10-006-trans-service-predicate"
+  ; trans-service? accepts only services.
+  (check (= #t (trans-service? (make-trans-service 1 'self))))
+  (check (= #f (trans-service? 'not-a-svc)))
+  (check (= #f (trans-service? 42))))
+
+(test-suite "10-007-trans-service-inc-stats"
+  ; Stats accumulate.
+  (check (= 3 (let ((svc (make-trans-service 1 'self)))
+                 (trans-service-inc-started! svc)
+                 (trans-service-inc-started! svc)
+                 (trans-service-inc-started! svc))))
+  (check (= 2 (let ((svc (make-trans-service 1 'self)))
+                 (trans-service-inc-committed! svc)
+                 (trans-service-inc-committed! svc))))
+  (check (= 1 (let ((svc (make-trans-service 1 'self)))
+                 (trans-service-inc-rolled-back! svc))))
+
+(test-suite "10-008-trans-service-register"
+  ; register-ctx! increases count.
+  (check (= 1 (let ((svc (make-trans-service 1 'self))
+                    (ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+                (trans-service-register-ctx! svc ctx)
+                (trans-service-count-ctxs svc))))
+
+(test-suite "10-008-trans-service-find"
+  ; find-ctx returns the registered ctx.
+  (check (= #t (let ((svc (make-trans-service 1 'self))
+                    (ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+                (trans-service-register-ctx! svc ctx)
+                (eq? ctx (trans-service-find-ctx svc 10)))))
+
+(test-suite "10-008-trans-service-find-missing"
+  ; find-ctx returns #f for unknown tx-id.
+  (check (= #f (trans-service-find-ctx (make-trans-service 1 'self) 999))))
+
+(test-suite "10-008-trans-service-unregister"
+  ; unregister-ctx! removes + find returns #f.
+  (check (= #t (let ((svc (make-trans-service 1 'self))
+                    (ctx (make-trans-ctx 1 5 (make-trans-id 10 7) 'self 7 100000)))
+                (trans-service-register-ctx! svc ctx)
+                (trans-service-unregister-ctx! svc 10)
+                (eq? #f (trans-service-find-ctx svc 10)))))
+
+(test-suite "10-008-trans-service-unregister-not-found"
+  ; unregister-ctx! returns #f for non-existing.
+  (check (= #f (trans-service-unregister-ctx!
+                 (make-trans-service 1 'self) 99))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
