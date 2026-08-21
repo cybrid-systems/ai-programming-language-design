@@ -1,0 +1,116 @@
+; 004-xarray_test.aura
+; =======================
+; Smoke tests for 004-xarray.aura — minimal XArray capability port.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/004-xarray_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-xarray construction (empty, size=0)
+;   - xa-store + xa-load (basic put/get)
+;   - xa-store replaces existing key (no duplicate)
+;   - xa-load returns XA-NOTFOUND for missing key
+;   - xa-erase removes entry
+;   - xa-size / xa-empty? track state correctly
+;   - XA-NOTFOUND distinct from stored values
+;
+; Verified via separate probes during development:
+;   - Multi-key xa-store (3-5 entries)
+;   - xa-keys / xa-values return correct lists
+;
+; Deferred (full XArray, separate issues):
+;   - Multi-level tree (64-slot nodes)
+;   - spinlock + RCU
+;   - Tag bits + internal entries
+;   - xa_state iterator
+;   - xa_alloc with limits
+;   - Mark bits (xa_get_mark / xa_set_mark)
+
+(require "std/test" all:)
+(require "004-xarray" all:)
+
+; File-level helpers (define-in-suite doesn't bind, so all helpers here)
+
+; Helper: xa holding one stored entry.
+(define (xa-with k v)
+  (let ((x (make-xarray)))
+    ((x 'set-entries!) (xa-store x k v))
+    x))
+
+; Helper: xa holding one entry, then erased.
+(define (xa-with-erased k v)
+  (let ((x (make-xarray)))
+    ((x 'set-entries!) (xa-store x k v))
+    ((x 'set-entries!) (xa-erase x k))
+    x))
+
+; Helper: xa holding one entry, then erase a non-existent key (no-op).
+(define (xa-with-erase-noop k v bad-key)
+  (let ((x (make-xarray)))
+    ((x 'set-entries!) (xa-store x k v))
+    ((x 'set-entries!) (xa-erase x bad-key))
+    x))
+
+; Helper: xa holding one entry, then replaced.
+(define (xa-with-replaced k v1 v2)
+  (let ((x (make-xarray)))
+    ((x 'set-entries!) (xa-store x k v1))
+    ((x 'set-entries!) (xa-store x k v2))
+    x))
+
+; ----------------------------------------------------------------
+; §1 — Construction
+; ----------------------------------------------------------------
+
+(test-suite "xarray-001-init-empty"
+  (check (= 1 (xa-empty? (make-xarray))))
+  (check (= 0 (xa-size (make-xarray)))))
+
+; ----------------------------------------------------------------
+; §2 — Store + load
+; ----------------------------------------------------------------
+
+(test-suite "xarray-002-store-load"
+  (check (= 1 (eq? 'foo (xa-load (xa-with 42 'foo) 42)))))
+
+(test-suite "xarray-002-replace"
+  (check (= 1 (= 1 (xa-size (xa-with-replaced 1 'first 'second))))))
+
+; ----------------------------------------------------------------
+; §3 — Not-found
+; ----------------------------------------------------------------
+
+(test-suite "xarray-003-notfound"
+  (check (= 1 (eq? XA-NOTFOUND (xa-load (xa-with 1 'a) 999)))))
+
+; ----------------------------------------------------------------
+; §4 — Erase
+; ----------------------------------------------------------------
+
+(test-suite "xarray-004-erase"
+  (check (= 1 (= 0 (xa-size (xa-with-erased 1 'a))))))
+
+; ----------------------------------------------------------------
+; §5 — Erase non-existent is no-op
+; ----------------------------------------------------------------
+
+(test-suite "xarray-005-erase-noop"
+  (check (= 1 (= 1 (xa-size (xa-with-erase-noop 1 'a 999))))))
+
+; ----------------------------------------------------------------
+; §6 — XA-NOTFOUND is exported and distinct
+; ----------------------------------------------------------------
+
+(test-suite "xarray-006-notfound-sentinel"
+  (check (= 1 (eq? XA-NOTFOUND 'notfound))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

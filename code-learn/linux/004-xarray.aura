@@ -1,0 +1,108 @@
+; 004-xarray.aura
+; ====================
+; XArray — minimal capability port to aura.
+;
+; Maps to: 004-xarray-analysis.md
+; Source: include/linux/xarray.h + lib/xarray.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; The full Linux XArray is a multi-way radix tree with 64-slot nodes,
+; embedded spinlock + RCU, tag-bit encoding, lazy node creation, and a
+; xa_state iterator. aura has none of those primitives — only single-
+; threaded execution, no pointer bit-packing, and broken mutable
+; containers (#3235 crashes on hash-set! / hash-count etc.).
+;
+; v1 therefore ships a single-level sparse-array API surface backed by a
+; closure-based list-of-pairs storage. Captures the xa-store / xa-load /
+; xa-erase / xa-empty? / xa-size / xa-keys / xa-values API; skips
+; multi-level tree structure, locking, and tag bits.
+;
+; Deferred (separate issues — see commit notes):
+;   - Multi-level tree (64-slot nodes, lazy creation)
+;   - spinlock + RCU (xa_lock, xa_state lock/unlock)
+;   - Tag bits (xa_tag_pointer / xa_pointer_tag)
+;   - Internal entries (XA_RETRY_ENTRY, XA_ZERO_ENTRY)
+;   - xa_state iterator + batch ops (xa_for_each, xa_find)
+;   - xa_alloc with xa_limit
+;   - xa_get_mark / xa_set_mark
+;   - Performance: O(1) store via mutation (would require #3235 fix)
+
+(export
+  ; Construction
+  make-xarray
+  ; Predicates
+  xa-empty? xa-size
+  ; Core ops
+  xa-store xa-load xa-erase
+  ; Iteration
+  xa-keys xa-values
+  ; Sentinel
+  XA-NOTFOUND)
+
+; "Not found" sentinel (analogous to NULL lookup in Linux).
+(define XA-NOTFOUND 'notfound)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+; make-xarray: empty xarray. Each "xa" is a closure holding a list
+; of (index . value) pairs. Mutation goes through the set-entries!
+; setter (preserved via letrec to avoid #3235 parser bug).
+(define (make-xarray)
+  (let ((entries '()))
+    (letrec ((set-entries! (lambda (e) (set! entries e) e)))
+      (letrec ((self (lambda (msg)
+                  (cond
+                    ((eq? msg 'entries) entries)
+                    ((eq? msg 'set-entries!) set-entries!)
+                    ((eq? msg 'empty?) (null? entries))
+                    (else #f)))))
+        self))))
+
+; ----------------------------------------------------------------
+; Predicates + accessors
+; ----------------------------------------------------------------
+
+; xa-empty?: is the xarray empty?
+(define (xa-empty? xa)
+  (null? (xa 'entries)))
+
+; xa-size: number of stored entries.
+(define (xa-size xa)
+  (length (xa 'entries)))
+
+; xa-keys: list of stored indices.
+(define (xa-keys xa)
+  (map car (xa 'entries)))
+
+; xa-values: list of stored values.
+(define (xa-values xa)
+  (map cdr (xa 'entries)))
+
+; ----------------------------------------------------------------
+; Core ops
+; ----------------------------------------------------------------
+
+; xa-store: replace-or-insert value at index. Returns the new entries
+; list. Caller updates via (xa 'set-entries! new-list).
+;
+; Usage:
+;   ((xa 'set-entries!) (xa-store xa index value))
+(define (xa-store xa index value)
+  (let ((entries (xa 'entries)))
+    (cons (cons index value)
+          (filter (lambda (kv) (not (eq? (car kv) index))) entries))))
+
+; xa-load: retrieve value at index. Returns XA-NOTFOUND if absent.
+(define (xa-load xa index)
+  (let loop ((rest (xa 'entries)))
+    (cond
+      ((null? rest) XA-NOTFOUND)
+      ((eq? (caar rest) index) (cdar rest))
+      (else (loop (cdr rest))))))
+
+; xa-erase: remove entry at index. Returns the new entries list.
+(define (xa-erase xa index)
+  (filter (lambda (kv) (not (eq? (car kv) index))) (xa 'entries)))
