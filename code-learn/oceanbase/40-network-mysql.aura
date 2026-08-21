@@ -1,0 +1,382 @@
+; 40-network-mysql.aura
+; ======================
+; network_mysql — minimal capability port to aura.
+;
+; Maps to: OceanBase Network Service + MySQL Protocol
+; Source: src/observer/ob_srv_xlator.cpp
+;         + src/observer/mysql/obsm_handler.h
+;         + src/observer/mysql/obsm_conn_callback.h
+;         + src/observer/mysql/obmp_base.h
+;         + src/observer/mysql/obmp_connect.h
+;         + src/observer/mysql/obmp_query.h
+;         + src/observer/mysql/ob_mysql_result_set.h
+;         + src/observer/mysql/ob_mysql_request_manager.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Network Service + MySQL Protocol:
+;   - 3 connection phases: CONNECTED / AUTHING / QUERY
+;   - 11 MySQL commands: COM_QUERY / COM_STMT_PREPARE /
+;     COM_STMT_EXECUTE / COM_STMT_CLOSE / COM_STMT_FETCH /
+;     COM_STMT_RESET / COM_PING / COM_QUIT / COM_INIT_DB /
+;     COM_FIELD_LIST / COM_DEFAULT
+;   - ObSMHandler: connection lifecycle (on_connect /
+;     on_disconnect / on_close)
+;   - ObSrvMySQLXlator: command → processor dispatch
+;   - ObMPBase / ObMPConnect / ObMPQuery: MySQL processors
+;   - ObMySQLRequestManager: request lifecycle + audit
+;   - libeasy event-driven I/O (v1: abstract layer)
+;
+; aura v1 ships:
+;   - 3 CONN-PHASE constants
+;   - 11 MYSQL-CMD constants
+;   - 3 CONN-STATUS constants (OPEN, CLOSED, ERROR)
+;   - make-mysql-handler (factory: phase + status)
+;   - mysql-handler accessors + set-phase! / set-status!
+;   - mysql-handler-on-connect! / on-disconnect! / on-close!
+;   - make-mysql-xlator (factory: dispatch-table)
+;   - mysql-xlator-dispatch! (cmd → processor-name)
+;   - mysql-xlator-get-cmd-count
+;   - make-mp-processor (factory: name + cmd-type)
+;   - mp-processor accessors + set-executed!
+;   - make-mysql-request (factory: cmd + tenant-id + session-id)
+;   - mysql-request accessors + set-finished!
+;   - make-mysql-request-manager (factory: empty requests)
+;   - mysql-request-manager-get-request-count
+;   - mysql-request-manager-add-request!
+;   - mysql-request-manager-find-by-session-id
+;
+; Deferred (full OceanBase Network Service + MySQL Protocol):
+;   - real libeasy event-driven TCP framework
+;   - real MySQL handshake + auth (challenge, scramble)
+;   - real ObMPConnect / ObMPQuery with full SQL engine
+;     integration
+;   - real ObMPStmtPrepare / ObMPStmtExecute with parameter
+;     binding
+;   - real ObMySQLResultSet with column metadata + row encoding
+;   - real audit log integration
+;   - real SSL/TLS handshake
+;   - real session timeout + connection pool
+;   - real packet compression + multi-result
+;   - real charset negotiation + collation
+;   - real ObProxy integration + routing
+
+(export
+  ; ConnPhase constants
+  CONN-PHASE-CONNECTED
+  CONN-PHASE-AUTHING
+  CONN-PHASE-QUERY
+  ; ConnStatus constants
+  CONN-STATUS-OPEN
+  CONN-STATUS-CLOSED
+  CONN-STATUS-ERROR
+  ; MySQL command constants
+  MYSQL-CMD-COM-QUERY
+  MYSQL-CMD-COM-STMT-PREPARE
+  MYSQL-CMD-COM-STMT-EXECUTE
+  MYSQL-CMD-COM-STMT-CLOSE
+  MYSQL-CMD-COM-STMT-FETCH
+  MYSQL-CMD-COM-STMT-RESET
+  MYSQL-CMD-COM-PING
+  MYSQL-CMD-COM-QUIT
+  MYSQL-CMD-COM-INIT-DB
+  MYSQL-CMD-COM-FIELD-LIST
+  MYSQL-CMD-COM-DEFAULT
+  ; MySQLHandler
+  make-mysql-handler
+  mysql-handler?
+  mysql-handler-get-phase
+  mysql-handler-get-status
+  mysql-handler-set-phase!
+  mysql-handler-set-status!
+  mysql-handler-on-connect!
+  mysql-handler-on-disconnect!
+  mysql-handler-on-close!
+  ; MySQLXlator
+  make-mysql-xlator
+  mysql-xlator?
+  mysql-xlator-get-cmd-count
+  mysql-xlator-dispatch!
+  ; MpProcessor
+  make-mp-processor
+  mp-processor?
+  mp-processor-get-name
+  mp-processor-get-cmd-type
+  mp-processor-is-executed
+  mp-processor-set-executed!
+  ; MySQLRequest
+  make-mysql-request
+  mysql-request?
+  mysql-request-get-cmd
+  mysql-request-get-tenant-id
+  mysql-request-get-session-id
+  mysql-request-is-finished
+  mysql-request-set-finished!
+  ; MySQLRequestManager
+  make-mysql-request-manager
+  mysql-request-manager?
+  mysql-request-manager-get-request-count
+  mysql-request-manager-add-request!
+  mysql-request-manager-find-by-session-id)
+
+; ----------------------------------------------------------------
+; ConnPhase constants
+; ----------------------------------------------------------------
+
+(define CONN-PHASE-CONNECTED 0)
+(define CONN-PHASE-AUTHING 1)
+(define CONN-PHASE-QUERY 2)
+
+; ----------------------------------------------------------------
+; ConnStatus constants
+; ----------------------------------------------------------------
+
+(define CONN-STATUS-OPEN 0)
+(define CONN-STATUS-CLOSED 1)
+(define CONN-STATUS-ERROR 2)
+
+; ----------------------------------------------------------------
+; MySQL command constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_srv_xlator.cpp:186-262):
+;   COM_QUERY, COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_CLOSE,
+;   COM_STMT_FETCH, COM_STMT_RESET, COM_PING, COM_QUIT,
+;   COM_INIT_DB, COM_FIELD_LIST, COM_DEFAULT
+
+(define MYSQL-CMD-COM-QUERY 0)
+(define MYSQL-CMD-COM-STMT-PREPARE 1)
+(define MYSQL-CMD-COM-STMT-EXECUTE 2)
+(define MYSQL-CMD-COM-STMT-CLOSE 3)
+(define MYSQL-CMD-COM-STMT-FETCH 4)
+(define MYSQL-CMD-COM-STMT-RESET 5)
+(define MYSQL-CMD-COM-PING 6)
+(define MYSQL-CMD-COM-QUIT 7)
+(define MYSQL-CMD-COM-INIT-DB 8)
+(define MYSQL-CMD-COM-FIELD-LIST 9)
+(define MYSQL-CMD-COM-DEFAULT 10)
+
+; ----------------------------------------------------------------
+; ObSMHandler — closure-based (connection lifecycle)
+; ----------------------------------------------------------------
+
+; make-mysql-handler: create a MySQL socket handler.
+; Returns: mysql_handler closure (initial: phase=CONNECTED,
+;         status=OPEN).
+(define (make-mysql-handler)
+  (let ((phase CONN-PHASE-CONNECTED)
+        (status CONN-STATUS-OPEN))
+    (letrec ((set-phase! (lambda (v) (set! phase v) v))
+             (set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'phase) phase)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-phase!) set-phase!)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self)))
+
+; mysql-handler?: is the object a MySQL handler?
+; Detected by querying 'phase — only handlers return integer.
+(define (mysql-handler? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'phase)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; mysql-handler-get-phase: get connection phase.
+(define (mysql-handler-get-phase h) (h 'phase))
+
+; mysql-handler-get-status: get connection status.
+(define (mysql-handler-get-status h) (h 'status))
+
+; mysql-handler-set-phase!: set connection phase.
+; Returns the new phase.
+(define (mysql-handler-set-phase! h v) ((h 'set-phase!) v))
+
+; mysql-handler-set-status!: set connection status.
+; Returns the new status.
+(define (mysql-handler-set-status! h v) ((h 'set-status!) v))
+
+; mysql-handler-on-connect!: handle new connection.
+; v1: sets phase to AUTHING.
+(define (mysql-handler-on-connect! h)
+  ((h 'set-phase!) CONN-PHASE-AUTHING))
+
+; mysql-handler-on-disconnect!: handle disconnect.
+; v1: sets status to CLOSED.
+(define (mysql-handler-on-disconnect! h)
+  ((h 'set-status!) CONN-STATUS-CLOSED))
+
+; mysql-handler-on-close!: handle close.
+; v1: sets status to CLOSED.
+(define (mysql-handler-on-close! h)
+  ((h 'set-status!) CONN-STATUS-CLOSED))
+
+; ----------------------------------------------------------------
+; ObSrvMySQLXlator — closure-based (command dispatch)
+; ----------------------------------------------------------------
+
+; make-mysql-xlator: create a MySQL command translator.
+; Returns: mysql_xlator closure (initial: empty dispatch table).
+(define (make-mysql-xlator)
+  (let ((dispatch-table '()))
+    (letrec ((set-dispatch-table! (lambda (v) (set! dispatch-table v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'dispatch-table) dispatch-table)
+                       ((eq? msg 'set-dispatch-table!) set-dispatch-table!)
+                       (else #f)))))
+      self)))
+
+; mysql-xlator?: is the object a MySQL xlator?
+; Detected by querying 'dispatch-table — only xlators return a cons.
+(define (mysql-xlator? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'dispatch-table)) #t #f)
+      #f))
+
+; mysql-xlator-get-cmd-count: get dispatch table count.
+(define (mysql-xlator-get-cmd-count x)
+  (let loop ((rest (x 'dispatch-table)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; mysql-xlator-dispatch!: add cmd → processor mapping.
+; Returns the new count.
+(define (mysql-xlator-dispatch! x cmd processor-name)
+  (let ((existing (x 'dispatch-table)))
+    ((x 'set-dispatch-table!)
+      (cons (cons cmd processor-name) existing))))
+
+; ----------------------------------------------------------------
+; ObMPBase / ObMPConnect / ObMPQuery — closure-based
+; ----------------------------------------------------------------
+
+; make-mp-processor: create a MySQL processor.
+; Args: name (symbol), cmd-type (integer)
+; Returns: mp_processor closure (initial: executed=#f).
+(define (make-mp-processor name cmd-type)
+  (let ((executed #f))
+    (letrec ((set-executed! (lambda (v) (set! executed v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'cmd-type) cmd-type)
+                       ((eq? msg 'executed) executed)
+                       ((eq? msg 'set-executed!) set-executed!)
+                       (else #f)))))
+      self)))
+
+; mp-processor?: is the object a MySQL processor?
+; Detected by querying 'cmd-type — only processors return integer.
+(define (mp-processor? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'cmd-type)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; mp-processor-get-name: get processor name.
+(define (mp-processor-get-name p) (p 'name))
+
+; mp-processor-get-cmd-type: get cmd type.
+(define (mp-processor-get-cmd-type p) (p 'cmd-type))
+
+; mp-processor-is-executed: is the processor executed?
+(define (mp-processor-is-executed p) (p 'executed))
+
+; mp-processor-set-executed!: set executed flag.
+; Returns the new executed.
+(define (mp-processor-set-executed! p v) ((p 'set-executed!) v))
+
+; ----------------------------------------------------------------
+; ObMySQLRequest — closure-based
+; ----------------------------------------------------------------
+
+; make-mysql-request: create a MySQL request.
+; Args: cmd (integer), tenant-id (integer), session-id (integer)
+; Returns: mysql_request closure (initial: finished=#f).
+(define (make-mysql-request cmd tenant-id session-id)
+  (let ((finished #f))
+    (letrec ((set-finished! (lambda (v) (set! finished v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'cmd) cmd)
+                       ((eq? msg 'tenant-id) tenant-id)
+                       ((eq? msg 'session-id) session-id)
+                       ((eq? msg 'finished) finished)
+                       ((eq? msg 'set-finished!) set-finished!)
+                       (else #f)))))
+      self)))
+
+; mysql-request?: is the object a MySQL request?
+; Detected by querying 'session-id — only requests return integer.
+(define (mysql-request? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'session-id)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; mysql-request-get-cmd: get cmd.
+(define (mysql-request-get-cmd r) (r 'cmd))
+
+; mysql-request-get-tenant-id: get tenant id.
+(define (mysql-request-get-tenant-id r) (r 'tenant-id))
+
+; mysql-request-get-session-id: get session id.
+(define (mysql-request-get-session-id r) (r 'session-id))
+
+; mysql-request-is-finished: is the request finished?
+(define (mysql-request-is-finished r) (r 'finished))
+
+; mysql-request-set-finished!: set finished flag.
+; Returns the new finished.
+(define (mysql-request-set-finished! r v) ((r 'set-finished!) v))
+
+; ----------------------------------------------------------------
+; ObMySQLRequestManager — closure-based
+; ----------------------------------------------------------------
+
+; make-mysql-request-manager: create a request manager.
+; Returns: mysql_request_manager closure (initial: empty requests).
+(define (make-mysql-request-manager)
+  (let ((requests '()))
+    (letrec ((set-requests! (lambda (v) (set! requests v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'requests) requests)
+                       ((eq? msg 'set-requests!) set-requests!)
+                       (else #f)))))
+      self)))
+
+; mysql-request-manager?: is the object a request manager?
+; Detected by querying 'requests — only managers return a cons.
+(define (mysql-request-manager? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'requests)) #t #f)
+      #f))
+
+; mysql-request-manager-get-request-count: get request count.
+(define (mysql-request-manager-get-request-count mgr)
+  (let loop ((rest (mgr 'requests)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; mysql-request-manager-add-request!: add a request.
+; Returns the new count.
+(define (mysql-request-manager-add-request! mgr req)
+  (let ((existing (mgr 'requests)))
+    ((mgr 'set-requests!) (cons req existing))))
+
+; mysql-request-manager-find-by-session-id: find by session id.
+; Returns the request or #f.
+(define (mysql-request-manager-find-by-session-id mgr sid)
+  (let loop ((rest (mgr 'requests)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'session-id) sid) (car rest))
+      (#t (loop (cdr rest))))))

@@ -1,0 +1,215 @@
+; 40-network-mysql_test.aura
+; ======================
+; Smoke tests for 40-network-mysql.aura — Network Service + MySQL Protocol minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/40-network-mysql_test.aura
+
+(require "std/test" all:)
+(require "40-network-mysql" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "40-001-conn-phase-distinct"
+  (check (= 1 (if (not (= CONN-PHASE-CONNECTED CONN-PHASE-AUTHING)) 1 0)))
+  (check (= 1 (if (not (= CONN-PHASE-AUTHING CONN-PHASE-QUERY)) 1 0)))
+  (check (= 1 (if (not (= CONN-PHASE-CONNECTED CONN-PHASE-QUERY)) 1 0))))
+
+(test-suite "40-001-conn-status-distinct"
+  (check (= 1 (if (not (= CONN-STATUS-OPEN CONN-STATUS-CLOSED)) 1 0)))
+  (check (= 1 (if (not (= CONN-STATUS-CLOSED CONN-STATUS-ERROR)) 1 0)))
+  (check (= 1 (if (not (= CONN-STATUS-OPEN CONN-STATUS-ERROR)) 1 0))))
+
+(test-suite "40-001-mysql-cmd-distinct"
+  (check (= 1 (if (not (= MYSQL-CMD-COM-QUERY
+                          MYSQL-CMD-COM-STMT-PREPARE)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-STMT-PREPARE
+                          MYSQL-CMD-COM-STMT-EXECUTE)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-STMT-EXECUTE
+                          MYSQL-CMD-COM-STMT-CLOSE)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-STMT-CLOSE
+                          MYSQL-CMD-COM-STMT-FETCH)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-STMT-FETCH
+                          MYSQL-CMD-COM-STMT-RESET)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-STMT-RESET
+                          MYSQL-CMD-COM-PING)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-PING
+                          MYSQL-CMD-COM-QUIT)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-QUIT
+                          MYSQL-CMD-COM-INIT-DB)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-INIT-DB
+                          MYSQL-CMD-COM-FIELD-LIST)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-FIELD-LIST
+                          MYSQL-CMD-COM-DEFAULT)) 1 0)))
+  (check (= 1 (if (not (= MYSQL-CMD-COM-QUERY
+                          MYSQL-CMD-COM-DEFAULT)) 1 0))))
+
+; ----------------------------------------------------------------
+; MySQLHandler
+; ----------------------------------------------------------------
+
+(test-suite "40-002-handler-construction"
+  (check (= CONN-PHASE-CONNECTED
+             (mysql-handler-get-phase (make-mysql-handler))))
+  (check (= CONN-STATUS-OPEN
+             (mysql-handler-get-status (make-mysql-handler)))))
+
+(test-suite "40-002-handler-predicate"
+  (check (= #t (mysql-handler? (make-mysql-handler))))
+  (check (= #f (mysql-handler? 'not-handler)))
+  (check (= #f (mysql-handler? 42)))
+
+(test-suite "40-003-handler-on-connect"
+  ; on-connect! sets phase to AUTHING.
+  (check (= CONN-PHASE-AUTHING
+             (let ((h (make-mysql-handler)))
+               (mysql-handler-on-connect! h)
+               (mysql-handler-get-phase h))))
+
+(test-suite "40-003-handler-on-disconnect"
+  ; on-disconnect! sets status to CLOSED.
+  (check (= CONN-STATUS-CLOSED
+             (let ((h (make-mysql-handler)))
+               (mysql-handler-on-disconnect! h)
+               (mysql-handler-get-status h))))
+
+(test-suite "40-003-handler-on-close"
+  ; on-close! sets status to CLOSED.
+  (check (= CONN-STATUS-CLOSED
+             (let ((h (make-mysql-handler)))
+               (mysql-handler-on-close! h)
+               (mysql-handler-get-status h))))
+
+(test-suite "40-004-handler-set-phase"
+  (check (= CONN-PHASE-QUERY
+             (let ((h (make-mysql-handler)))
+               (mysql-handler-set-phase! h CONN-PHASE-QUERY)
+               (mysql-handler-get-phase h))))
+
+(test-suite "40-004-handler-set-status"
+  (check (= CONN-STATUS-ERROR
+             (let ((h (make-mysql-handler)))
+               (mysql-handler-set-status! h CONN-STATUS-ERROR)
+               (mysql-handler-get-status h))))
+
+; ----------------------------------------------------------------
+; MySQLXlator
+; ----------------------------------------------------------------
+
+(test-suite "40-005-xlator-construction"
+  (check (= 0 (mysql-xlator-get-cmd-count (make-mysql-xlator)))))
+
+(test-suite "40-005-xlator-predicate"
+  (check (= #t (mysql-xlator? (make-mysql-xlator))))
+  (check (= #f (mysql-xlator? 'not-xlator)))
+  (check (= #f (mysql-xlator? 42)))
+
+(test-suite "40-006-xlator-dispatch"
+  ; dispatch! adds cmd → processor-name.
+  (check (= 1 (let ((x (make-mysql-xlator)))
+                 (mysql-xlator-dispatch! x MYSQL-CMD-COM-QUERY
+                   'ObMPQuery)
+                 (mysql-xlator-get-cmd-count x))))
+  (check (= 3 (let ((x (make-mysql-xlator)))
+                 (mysql-xlator-dispatch! x MYSQL-CMD-COM-QUERY 'ObMPQuery)
+                 (mysql-xlator-dispatch! x MYSQL-CMD-COM-STMT-PREPARE
+                   'ObMPStmtPrepare)
+                 (mysql-xlator-dispatch! x MYSQL-CMD-COM-PING 'ObMPPing)
+                 (mysql-xlator-get-cmd-count x))))
+
+; ----------------------------------------------------------------
+; MpProcessor
+; ----------------------------------------------------------------
+
+(test-suite "40-007-mp-construction"
+  (check (= #t (eq? 'ObMPQuery
+                   (mp-processor-get-name
+                     (make-mp-processor 'ObMPQuery
+                       MYSQL-CMD-COM-QUERY)))))
+  (check (= MYSQL-CMD-COM-QUERY
+             (mp-processor-get-cmd-type
+               (make-mp-processor 'ObMPQuery MYSQL-CMD-COM-QUERY))))
+  (check (= #f (mp-processor-is-executed
+                 (make-mp-processor 'ObMPQuery MYSQL-CMD-COM-QUERY)))))
+
+(test-suite "40-007-mp-predicate"
+  (check (= #t (mp-processor?
+                 (make-mp-processor 'a MYSQL-CMD-COM-QUERY))))
+  (check (= #f (mp-processor? 'not-mp)))
+  (check (= #f (mp-processor? 42)))
+
+(test-suite "40-008-mp-set-executed"
+  ; set-executed! updates.
+  (check (= #t (let ((p (make-mp-processor 'ObMPQuery
+                       MYSQL-CMD-COM-QUERY)))
+                 (mp-processor-set-executed! p #t)
+                 (mp-processor-is-executed p))))
+
+; ----------------------------------------------------------------
+; MySQLRequest
+; ----------------------------------------------------------------
+
+(test-suite "40-009-req-construction"
+  (check (= MYSQL-CMD-COM-QUERY
+             (mysql-request-get-cmd
+               (make-mysql-request MYSQL-CMD-COM-QUERY 1004 42))))
+  (check (= 1004 (mysql-request-get-tenant-id
+                  (make-mysql-request MYSQL-CMD-COM-QUERY 1004 42))))
+  (check (= 42 (mysql-request-get-session-id
+                (make-mysql-request MYSQL-CMD-COM-QUERY 1004 42))))
+  (check (= #f (mysql-request-is-finished
+                 (make-mysql-request MYSQL-CMD-COM-QUERY 1004 42)))))
+
+(test-suite "40-009-req-predicate"
+  (check (= #t (mysql-request?
+                 (make-mysql-request MYSQL-CMD-COM-QUERY 0 0))))
+  (check (= #f (mysql-request? 'not-req)))
+  (check (= #f (mysql-request? 42)))
+
+(test-suite "40-010-req-set-finished"
+  (check (= #t (let ((r (make-mysql-request MYSQL-CMD-COM-QUERY 0 0)))
+                 (mysql-request-set-finished! r #t)
+                 (mysql-request-is-finished r))))
+
+; ----------------------------------------------------------------
+; MySQLRequestManager
+; ----------------------------------------------------------------
+
+(test-suite "40-011-mgr-construction"
+  (check (= 0 (mysql-request-manager-get-request-count
+               (make-mysql-request-manager)))))
+
+(test-suite "40-011-mgr-predicate"
+  (check (= #t (mysql-request-manager? (make-mysql-request-manager))))
+  (check (= #f (mysql-request-manager? 'not-mgr)))
+  (check (= #f (mysql-request-manager? 42)))
+
+(test-suite "40-012-mgr-add"
+  (check (= 1 (let ((m (make-mysql-request-manager)))
+                 (mysql-request-manager-add-request! m
+                   (make-mysql-request MYSQL-CMD-COM-QUERY 1004 42))
+                 (mysql-request-manager-get-request-count m))))
+
+(test-suite "40-012-mgr-find"
+  ; find-by-session-id returns matching request.
+  (check (= #t (let ((m (make-mysql-request-manager)))
+                 (mysql-request-manager-add-request! m
+                   (make-mysql-request MYSQL-CMD-COM-QUERY 1004 42))
+                 (eq? MYSQL-CMD-COM-QUERY
+                   (mysql-request-get-cmd
+                     (mysql-request-manager-find-by-session-id m 42)))))))
+
+(test-suite "40-012-mgr-find-missing"
+  ; find-by-session-id returns #f for unknown id.
+  (check (= #f (mysql-request-manager-find-by-session-id
+                 (make-mysql-request-manager) 999)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
