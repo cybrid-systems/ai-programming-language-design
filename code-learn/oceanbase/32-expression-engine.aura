@@ -1,0 +1,360 @@
+; 32-expression-engine.aura
+; ======================
+; expression_engine — minimal capability port to aura.
+;
+; Maps to: OceanBase Expression Engine
+; Source: src/sql/engine/expr/ob_expr.h
+;         + src/sql/engine/expr/ob_expr_operator.h
+;         + src/sql/engine/expr/ob_expr_operator_factory.h
+;         + src/sql/engine/expr/ob_expr_ctx.h
+;         + src/sql/engine/expr/ob_expr_eval.h
+;         + src/sql/resolver/expr/ob_raw_expr.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Expression Engine:
+;   - 3 layers: ObRawExpr (logical) / ObExprOperator (operator
+;     registration) / ObExpr (runtime POD)
+;   - 3 evaluation modes: eval() / eval_batch() / eval_vector()
+;   - ObExpr with function pointers (not C++ virtual functions)
+;   - ObExprOperator: operator registration with type derivation
+;   - 2 ResultType constants (BOOL / NUMBER)
+;   - 3 EvalMode constants (SINGLE / BATCH / VECTOR)
+;   - 10 ExprType constants (CONST / COLUMN / ARITHOP / FUN_CALL /
+;     etc.)
+;   - ObRawExpr: logical expression tree (parse-time)
+;   - ObExprCtx: evaluation context (input row, I/O, etc.)
+;
+; aura v1 ships:
+;   - 2 RESULT-TYPE constants (BOOL, NUMBER)
+;   - 3 EVAL-MODE constants (SINGLE, BATCH, VECTOR)
+;   - 10 EXPR-TYPE constants (CONST, COLUMN, ARITHOP, FUN_CALL,
+;     etc.)
+;   - make-raw-expr (factory: type + children)
+;   - raw-expr-get-type / get-children / get-child-count
+;   - raw-expr-set-children! / add-child!
+;   - make-expr-operator (factory: name + result-type + eval-mode)
+;   - expr-operator-get-name / get-result-type / get-eval-mode
+;   - make-expr (factory: op + result-type + max-length)
+;   - expr-get-op / get-result-type / get-max-length
+;   - expr-set-op! / set-result-type! / set-max-length!
+;   - make-expr-ctx (factory: input-row + batch-size)
+;   - expr-ctx-get-input-row / get-batch-size
+;   - expr-ctx-set-input-row! / set-batch-size!
+;   - make-expr-factory (operator registry)
+;   - expr-factory-register!
+;   - expr-factory-find-by-name
+;   - expr-factory-get-operator-count
+;
+; Deferred (full OceanBase Expression Engine):
+;   - real ObExpr with all 20+ fields (eval_func, batch_func,
+;     vector_func, etc.)
+;   - real ObExprOperator with type derivation
+;   - real ObRawExpr with 100+ expression types
+;   - real ObExprCtx with full execution context
+;   - real eval / eval_batch / eval_vector implementations
+;   - real expression code generation (cg_expr)
+;   - real expression optimization (constant folding, etc.)
+;   - real operator registration via factory pattern
+;   - real ENUM/SET type support (eval_enumset_func_)
+;   - real fixed-length data handling
+;   - real stack check for deep expression trees
+
+(export
+  ; ResultType constants
+  RESULT-TYPE-BOOL
+  RESULT-TYPE-NUMBER
+  ; EvalMode constants
+  EVAL-MODE-SINGLE
+  EVAL-MODE-BATCH
+  EVAL-MODE-VECTOR
+  ; ExprType constants
+  EXPR-TYPE-CONST
+  EXPR-TYPE-COLUMN
+  EXPR-TYPE-ARITHOP
+  EXPR-TYPE-FUN-CALL
+  EXPR-TYPE-CAST
+  EXPR-TYPE-CASE-WHEN
+  EXPR-TYPE-AGG-FUN
+  EXPR-TYPE-WIN-FUN
+  EXPR-TYPE-SUBQUERY
+  EXPR-TYPE-PSEUDO-COL
+  ; ObRawExpr
+  make-raw-expr raw-expr?
+  raw-expr-get-type
+  raw-expr-get-children
+  raw-expr-get-child-count
+  raw-expr-set-children!
+  raw-expr-add-child!
+  ; ObExprOperator
+  make-expr-operator
+  expr-operator-get-name
+  expr-operator-get-result-type
+  expr-operator-get-eval-mode
+  ; ObExpr
+  make-expr expr?
+  expr-get-op
+  expr-get-result-type
+  expr-get-max-length
+  expr-set-op!
+  expr-set-result-type!
+  expr-set-max-length!
+  ; ObExprCtx
+  make-expr-ctx expr-ctx?
+  expr-ctx-get-input-row
+  expr-ctx-get-batch-size
+  expr-ctx-set-input-row!
+  expr-ctx-set-batch-size!
+  ; ObExprFactory
+  make-expr-factory
+  expr-factory?
+  expr-factory-get-operator-count
+  expr-factory-register!
+  expr-factory-find-by-name)
+
+; ----------------------------------------------------------------
+; ResultType constants
+; ----------------------------------------------------------------
+
+(define RESULT-TYPE-BOOL 0)
+(define RESULT-TYPE-NUMBER 1)
+
+; ----------------------------------------------------------------
+; EvalMode constants
+; ----------------------------------------------------------------
+
+(define EVAL-MODE-SINGLE 0)
+(define EVAL-MODE-BATCH 1)
+(define EVAL-MODE-VECTOR 2)
+
+; ----------------------------------------------------------------
+; ExprType constants (subset of 100+)
+; ----------------------------------------------------------------
+;
+; Per OB (ob_expr.h ObExprOperatorType):
+;   CONST, COLUMN, ARITHOP, FUN_CALL, CAST, CASE_WHEN,
+;   AGG_FUN, WIN_FUN, SUBQUERY, PSEUDO_COL, ...
+
+(define EXPR-TYPE-CONST 0)
+(define EXPR-TYPE-COLUMN 1)
+(define EXPR-TYPE-ARITHOP 2)
+(define EXPR-TYPE-FUN-CALL 3)
+(define EXPR-TYPE-CAST 4)
+(define EXPR-TYPE-CASE-WHEN 5)
+(define EXPR-TYPE-AGG-FUN 6)
+(define EXPR-TYPE-WIN-FUN 7)
+(define EXPR-TYPE-SUBQUERY 8)
+(define EXPR-TYPE-PSEUDO-COL 9)
+
+; ----------------------------------------------------------------
+; ObRawExpr — closure-based (logical expression)
+; ----------------------------------------------------------------
+
+; make-raw-expr: create a logical raw expression.
+; Args: type (integer — EXPR-TYPE-*), children (cons list)
+; Returns: raw_expr closure.
+(define (make-raw-expr type children)
+  (letrec ((set-children! (lambda (v) (set! children v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'children) children)
+                     ((eq? msg 'set-children!) set-children!)
+                     (else #f)))))
+      self))
+
+; raw-expr?: is the object a raw expression?
+; Detected by querying 'type — only raw_exprs return integer.
+(define (raw-expr? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'type)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; raw-expr-get-type: get expression type.
+(define (raw-expr-get-type e) (e 'type))
+
+; raw-expr-get-children: get children list.
+(define (raw-expr-get-children e) (e 'children))
+
+; raw-expr-get-child-count: get number of children.
+(define (raw-expr-get-child-count e)
+  (let loop ((rest (e 'children)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; raw-expr-set-children!: set children list.
+; Returns the new list.
+(define (raw-expr-set-children! e v) ((e 'set-children!) v))
+
+; raw-expr-add-child!: add a child to the end of children.
+; Returns the new child count.
+(define (raw-expr-add-child! e child)
+  (let ((existing (e 'children)))
+    ((e 'set-children!) (append existing (list child)))))
+
+; ----------------------------------------------------------------
+; ObExprOperator — closure-based (operator registration)
+; ----------------------------------------------------------------
+
+; make-expr-operator: create an expression operator.
+; Args: name (symbol), result-type (integer), eval-mode (integer)
+; Returns: expr_operator closure.
+(define (make-expr-operator name result-type eval-mode)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'result-type) result-type)
+                     ((eq? msg 'eval-mode) eval-mode)
+                     (else #f)))))
+      self))
+
+; expr-operator-get-name: get operator name.
+(define (expr-operator-get-name op) (op 'name))
+
+; expr-operator-get-result-type: get result type.
+(define (expr-operator-get-result-type op) (op 'result-type))
+
+; expr-operator-get-eval-mode: get eval mode.
+(define (expr-operator-get-eval-mode op) (op 'eval-mode))
+
+; ----------------------------------------------------------------
+; ObExpr — closure-based (runtime POD)
+; ----------------------------------------------------------------
+
+; make-expr: create a runtime expression.
+; Args: op (expr_operator or #f), result-type (integer),
+;       max-length (integer)
+; Returns: expr closure.
+(define (make-expr op result-type max-length)
+  (letrec ((set-op! (lambda (v) (set! op v) v))
+           (set-result-type! (lambda (v) (set! result-type v) v))
+           (set-max-length! (lambda (v) (set! max-length v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'op) op)
+                     ((eq? msg 'result-type) result-type)
+                     ((eq? msg 'max-length) max-length)
+                     ((eq? msg 'set-op!) set-op!)
+                     ((eq? msg 'set-result-type!) set-result-type!)
+                     ((eq? msg 'set-max-length!) set-max-length!)
+                     (else #f)))))
+      self))
+
+; expr?: is the object an expression?
+; Detected by querying 'max-length — only exprs return integer.
+(define (expr? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'max-length)))
+        (if (and (integer? m) (>= m 0)) #t #f))
+      #f))
+
+; expr-get-op: get operator.
+(define (expr-get-op e) (e 'op))
+
+; expr-get-result-type: get result type.
+(define (expr-get-result-type e) (e 'result-type))
+
+; expr-get-max-length: get max length.
+(define (expr-get-max-length e) (e 'max-length))
+
+; expr-set-op!: set operator.
+; Returns the new operator.
+(define (expr-set-op! e v) ((e 'set-op!) v))
+
+; expr-set-result-type!: set result type.
+; Returns the new result type.
+(define (expr-set-result-type! e v) ((e 'set-result-type!) v))
+
+; expr-set-max-length!: set max length.
+; Returns the new max length.
+(define (expr-set-max-length! e v) ((e 'set-max-length!) v))
+
+; ----------------------------------------------------------------
+; ObExprCtx — closure-based (evaluation context)
+; ----------------------------------------------------------------
+
+; make-expr-ctx: create an expression evaluation context.
+; Args: input-row (integer — current row index),
+;       batch-size (integer)
+; Returns: expr_ctx closure.
+(define (make-expr-ctx input-row batch-size)
+  (letrec ((set-input-row! (lambda (v) (set! input-row v) v))
+           (set-batch-size! (lambda (v) (set! batch-size v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'input-row) input-row)
+                     ((eq? msg 'batch-size) batch-size)
+                     ((eq? msg 'set-input-row!) set-input-row!)
+                     ((eq? msg 'set-batch-size!) set-batch-size!)
+                     (else #f)))))
+      self))
+
+; expr-ctx?: is the object an expression context?
+; Detected by querying 'batch-size — only contexts return integer.
+(define (expr-ctx? obj)
+  (if (procedure? obj)
+      (let ((b (obj 'batch-size)))
+        (if (and (integer? b) (>= b 0)) #t #f))
+      #f))
+
+; expr-ctx-get-input-row: get input row.
+(define (expr-ctx-get-input-row ctx) (ctx 'input-row))
+
+; expr-ctx-get-batch-size: get batch size.
+(define (expr-ctx-get-batch-size ctx) (ctx 'batch-size))
+
+; expr-ctx-set-input-row!: set input row.
+; Returns the new row.
+(define (expr-ctx-set-input-row! ctx v) ((ctx 'set-input-row!) v))
+
+; expr-ctx-set-batch-size!: set batch size.
+; Returns the new batch size.
+(define (expr-ctx-set-batch-size! ctx v) ((ctx 'set-batch-size!) v))
+
+; ----------------------------------------------------------------
+; ObExprFactory — closure-based (operator registry)
+; ----------------------------------------------------------------
+
+; make-expr-factory: create an expression operator factory.
+; Returns: expr_factory closure (initial: empty operator list).
+(define (make-expr-factory)
+  (let ((operators '()))
+    (letrec ((set-operators! (lambda (v) (set! operators v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'operators) operators)
+                       ((eq? msg 'set-operators!) set-operators!)
+                       (else #f)))))
+      self))
+
+; expr-factory?: is the object an expression factory?
+; Detected by querying 'operators — only factories return a cons.
+(define (expr-factory? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'operators)) #t #f)
+      #f))
+
+; expr-factory-get-operator-count: get number of registered ops.
+(define (expr-factory-get-operator-count f)
+  (let loop ((rest (f 'operators)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; expr-factory-register!: register a new operator.
+; Returns the new count.
+(define (expr-factory-register! f op)
+  (let ((existing (f 'operators)))
+    ((f 'set-operators!) (cons op existing))))
+
+; expr-factory-find-by-name: find operator by name.
+; Returns the operator or #f.
+(define (expr-factory-find-by-name f name)
+  (let loop ((rest (f 'operators)))
+    (cond
+      ((null? rest) #f)
+      ((eq? ((car rest) 'name) name) (car rest))
+      (#t (loop (cdr rest))))))

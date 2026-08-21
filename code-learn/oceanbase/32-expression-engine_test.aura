@@ -1,0 +1,239 @@
+; 32-expression-engine_test.aura
+; ======================
+; Smoke tests for 32-expression-engine.aura — Expression Engine minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/32-expression-engine_test.aura
+;
+; Verified automatically (smoke):
+;   - 2 RESULT-TYPE + 3 EVAL-MODE + 10 EXPR-TYPE constants distinct
+;   - make-raw-expr + accessors + set-children + add-child
+;   - make-expr-operator + accessors
+;   - make-expr + accessors + setters
+;   - make-expr-ctx + accessors + setters
+;   - make-expr-factory + register + find-by-name + count
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Operator registration with find-by-name works
+;
+; Deferred (full OceanBase Expression Engine):
+;   - real ObExpr with all 20+ fields (eval_func, batch_func,
+;     vector_func, etc.)
+;   - real ObExprOperator with type derivation
+;   - real ObRawExpr with 100+ expression types
+;   - real ObExprCtx with full execution context
+;   - real eval / eval_batch / eval_vector implementations
+;   - real expression code generation (cg_expr)
+;   - real expression optimization (constant folding, etc.)
+;   - real operator registration via factory pattern
+;   - real ENUM/SET type support (eval_enumset_func_)
+;   - real fixed-length data handling
+;   - real stack check for deep expression trees
+
+(require "std/test" all:)
+(require "32-expression-engine" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "32-001-result-type-distinct"
+  ; 2 RESULT-TYPE constants are distinct.
+  (check (= 1 (if (not (= RESULT-TYPE-BOOL
+                          RESULT-TYPE-NUMBER)) 1 0))))
+
+(test-suite "32-001-eval-mode-distinct"
+  ; 3 EVAL-MODE constants are distinct.
+  (check (= 1 (if (not (= EVAL-MODE-SINGLE
+                          EVAL-MODE-BATCH)) 1 0)))
+  (check (= 1 (if (not (= EVAL-MODE-BATCH
+                          EVAL-MODE-VECTOR)) 1 0)))
+  (check (= 1 (if (not (= EVAL-MODE-SINGLE
+                          EVAL-MODE-VECTOR)) 1 0))))
+
+(test-suite "32-001-expr-type-distinct"
+  ; 10 EXPR-TYPE constants are distinct.
+  (check (= 1 (if (not (= EXPR-TYPE-CONST
+                          EXPR-TYPE-COLUMN)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-COLUMN
+                          EXPR-TYPE-ARITHOP)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-ARITHOP
+                          EXPR-TYPE-FUN-CALL)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-FUN-CALL
+                          EXPR-TYPE-CAST)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-CAST
+                          EXPR-TYPE-CASE-WHEN)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-CASE-WHEN
+                          EXPR-TYPE-AGG-FUN)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-AGG-FUN
+                          EXPR-TYPE-WIN-FUN)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-WIN-FUN
+                          EXPR-TYPE-SUBQUERY)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-SUBQUERY
+                          EXPR-TYPE-PSEUDO-COL)) 1 0)))
+  (check (= 1 (if (not (= EXPR-TYPE-CONST
+                          EXPR-TYPE-PSEUDO-COL)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObRawExpr
+; ----------------------------------------------------------------
+
+(test-suite "32-002-raw-expr-construction"
+  ; raw-expr preserves type + children.
+  (check (= EXPR-TYPE-ARITHOP
+             (raw-expr-get-type
+               (make-raw-expr EXPR-TYPE-ARITHOP '()))))
+
+(test-suite "32-002-raw-expr-predicate"
+  ; raw-expr? accepts only raw_exprs.
+  (check (= #t (raw-expr? (make-raw-expr EXPR-TYPE-CONST '()))))
+  (check (= #f (raw-expr? 'not-raw-expr)))
+  (check (= #f (raw-expr? 42)))
+
+(test-suite "32-003-raw-expr-children"
+  ; get-children + get-child-count work.
+  (check (= 0 (raw-expr-get-child-count
+               (make-raw-expr EXPR-TYPE-CONST '()))))
+  (check (= 2 (raw-expr-get-child-count
+               (make-raw-expr EXPR-TYPE-ARITHOP '(child1 child2)))))
+
+(test-suite "32-003-raw-expr-set-children"
+  ; set-children! updates.
+  (check (= 3 (let ((e (make-raw-expr EXPR-TYPE-CONST '())))
+                 (raw-expr-set-children! e '(a b c))
+                 (raw-expr-get-child-count e))))
+
+(test-suite "32-004-raw-expr-add-child"
+  ; add-child! appends to end.
+  (check (= 1 (let ((e (make-raw-expr EXPR-TYPE-CONST '())))
+                 (raw-expr-add-child! e 'new-child)
+                 (raw-expr-get-child-count e))))
+  (check (= 3 (let ((e (make-raw-expr EXPR-TYPE-CONST '(a b))))
+                 (raw-expr-add-child! e 'c)
+                 (raw-expr-get-child-count e))))
+
+; ----------------------------------------------------------------
+; ObExprOperator
+; ----------------------------------------------------------------
+
+(test-suite "32-005-op-construction"
+  ; expr-operator preserves fields.
+  (check (= #t (eq? 'add
+                   (expr-operator-get-name
+                     (make-expr-operator 'add RESULT-TYPE-NUMBER EVAL-MODE-SINGLE)))))
+  (check (= RESULT-TYPE-NUMBER
+             (expr-operator-get-result-type
+               (make-expr-operator 'add RESULT-TYPE-NUMBER EVAL-MODE-SINGLE))))
+  (check (= EVAL-MODE-SINGLE
+             (expr-operator-get-eval-mode
+               (make-expr-operator 'add RESULT-TYPE-NUMBER EVAL-MODE-SINGLE))))
+
+; ----------------------------------------------------------------
+; ObExpr
+; ----------------------------------------------------------------
+
+(test-suite "32-006-expr-construction"
+  ; expr preserves fields.
+  (check (= 128 (expr-get-max-length
+                 (make-expr #f RESULT-TYPE-NUMBER 128))))
+  (check (= RESULT-TYPE-NUMBER
+             (expr-get-result-type
+               (make-expr #f RESULT-TYPE-NUMBER 0))))
+
+(test-suite "32-006-expr-predicate"
+  ; expr? accepts only exprs.
+  (check (= #t (expr? (make-expr #f RESULT-TYPE-NUMBER 0))))
+  (check (= #f (expr? 'not-expr)))
+  (check (= #f (expr? 42)))
+
+(test-suite "32-007-expr-setters"
+  ; expr setters update fields.
+  (check (= 256 (let ((e (make-expr #f RESULT-TYPE-NUMBER 128)))
+                 (expr-set-max-length! e 256)
+                 (expr-get-max-length e))))
+  (check (= RESULT-TYPE-BOOL
+             (let ((e (make-expr #f RESULT-TYPE-NUMBER 0)))
+               (expr-set-result-type! e RESULT-TYPE-BOOL)
+               (expr-get-result-type e))))
+
+; ----------------------------------------------------------------
+; ObExprCtx
+; ----------------------------------------------------------------
+
+(test-suite "32-008-ctx-construction"
+  ; ctx preserves input-row + batch-size.
+  (check (= 0 (expr-ctx-get-input-row
+               (make-expr-ctx 0 1024))))
+  (check (= 1024 (expr-ctx-get-batch-size
+                  (make-expr-ctx 0 1024))))
+
+(test-suite "32-008-ctx-predicate"
+  ; expr-ctx? accepts only contexts.
+  (check (= #t (expr-ctx? (make-expr-ctx 0 0))))
+  (check (= #f (expr-ctx? 'not-ctx)))
+  (check (= #f (expr-ctx? 42)))
+
+(test-suite "32-009-ctx-setters"
+  ; ctx setters update fields.
+  (check (= 100 (let ((c (make-expr-ctx 0 0)))
+                 (expr-ctx-set-input-row! c 100)
+                 (expr-ctx-get-input-row c))))
+  (check (= 2048 (let ((c (make-expr-ctx 0 0)))
+                  (expr-ctx-set-batch-size! c 2048)
+                  (expr-ctx-get-batch-size c))))
+
+; ----------------------------------------------------------------
+; ObExprFactory
+; ----------------------------------------------------------------
+
+(test-suite "32-010-factory-construction"
+  ; factory starts empty.
+  (check (= 0 (expr-factory-get-operator-count
+               (make-expr-factory))))
+
+(test-suite "32-010-factory-predicate"
+  ; expr-factory? accepts only factories.
+  (check (= #t (expr-factory? (make-expr-factory))))
+  (check (= #f (expr-factory? 'not-factory)))
+  (check (= #f (expr-factory? 42)))
+
+(test-suite "32-011-factory-register"
+  ; register! increases count.
+  (check (= 1 (let ((f (make-expr-factory)))
+                 (expr-factory-register! f
+                   (make-expr-operator 'add RESULT-TYPE-NUMBER EVAL-MODE-SINGLE))
+                 (expr-factory-get-operator-count f))))
+
+(test-suite "32-011-factory-register-multiple"
+  ; Multiple registers accumulate.
+  (check (= 3 (let ((f (make-expr-factory)))
+                 (expr-factory-register! f
+                   (make-expr-operator 'add RESULT-TYPE-NUMBER EVAL-MODE-SINGLE))
+                 (expr-factory-register! f
+                   (make-expr-operator 'sub RESULT-TYPE-NUMBER EVAL-MODE-SINGLE))
+                 (expr-factory-register! f
+                   (make-expr-operator 'eq RESULT-TYPE-BOOL EVAL-MODE-BATCH))
+                 (expr-factory-get-operator-count f))))
+
+(test-suite "32-012-factory-find"
+  ; find-by-name returns the registered operator.
+  (check (= #t (let ((f (make-expr-factory)))
+                 (expr-factory-register! f
+                   (make-expr-operator 'add RESULT-TYPE-NUMBER EVAL-MODE-SINGLE))
+                 (eq? RESULT-TYPE-NUMBER
+                   (expr-operator-get-result-type
+                     (expr-factory-find-by-name f 'add))))))
+
+(test-suite "32-012-factory-find-missing"
+  ; find-by-name returns #f for unknown name.
+  (check (= #f (expr-factory-find-by-name
+                 (make-expr-factory) 'unknown)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
