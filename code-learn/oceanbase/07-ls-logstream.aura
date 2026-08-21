@@ -1,0 +1,313 @@
+; 07-ls-logstream.aura
+; ========================
+; ls_logstream — minimal capability port to aura.
+;
+; Maps to: OceanBase LogStream (ObLS) container architecture
+; Source: src/storage/ls/ob_ls.h + ob_ls.cpp
+;         + src/storage/ls/ob_ls_service.h (sub-services)
+;         + src/storage/ls/ob_freezer.h (Freezer)
+;         + src/storage/ls/ob_checkpoint_executor.h (CheckpointExecutor)
+;         + src/storage/ls/ob_tablet_service.h (TabletService)
+;         + src/storage/ls/ob_log_handler.h (LogHandler)
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase LogStream architecture:
+;   - ObLS: data replication + Paxos unit, manages a group of
+;     tablets
+;   - 9 sub-services (delegate pattern):
+;     TabletService, Freezer, CheckpointExecutor, DataCheckpoint,
+;     LogHandler, RoleChangeHandler, GCHandler, LSMigrationHandler,
+;     TransferHandler
+;   - 17 metadata fields: ls_id, replica_type, ls_state,
+;     migrate_status, tablet_count, weak_read_scn, need_rebuild,
+;     checkpoint_scn, checkpoint_lsn, rebuild_seq,
+;     tablet_change_checkpoint_scn, transfer_scn, tx_blocked,
+;     mv_major_merge_scn, mv_publish_scn, mv_safe_scn,
+;     required_data_disk_size
+;   - LS state machine: INVALID → CREATED → ONLINE → OFFLINE
+;   - LS role: LEADER / FOLLOWER / CANDIDATE (Paxos)
+;
+; aura has no Paxos, no online/offline, no replication. v1 ships:
+;   - 4 LS-STATE constants (INVALID, CREATED, ONLINE, OFFLINE)
+;   - 3 LS-ROLE constants (LEADER, FOLLOWER, CANDIDATE)
+;   - 3 REPLICA-TYPE constants (FULL, READONLY, LOGONLY)
+;   - make-ls (factory with ls-id + all 17 metadata fields)
+;   - LS metadata accessors (17 fields) + setters
+;   - LS state / role setters
+;   - LS lifecycle (init/start/stop/destroy — simulated)
+;   - add-tablet / remove-tablet (increments/decrements count)
+;
+; Deferred (full OceanBase LS):
+;   - real ObLS::init / start / stop / wait / destroy
+;   - actual sub-service initialization
+;   - Paxos leader election + role change
+;   - online() / offline() state transitions
+;   - replica_type transitions
+;   - logstream_freeze / tablet_freeze coordination
+;   - meta_rwlock_ read-write lock
+;   - tx_blocked propagation to TxService
+;   - MV SCN coordination (mv_publish / mv_safe / mv_major_merge)
+
+(export
+  ; LS state constants
+  LS-STATE-INVALID LS-STATE-CREATED LS-STATE-ONLINE LS-STATE-OFFLINE
+  ; LS role constants
+  LS-ROLE-LEADER LS-ROLE-FOLLOWER LS-ROLE-CANDIDATE
+  ; Replica type constants
+  REPLICA-TYPE-FULL REPLICA-TYPE-READONLY REPLICA-TYPE-LOGONLY
+  ; ObLS
+  make-ls ls?
+  ls-get-ls-id ls-get-replica-type ls-set-replica-type!
+  ls-get-ls-state ls-set-ls-state!
+  ls-get-migrate-status ls-set-migrate-status!
+  ls-get-tablet-count ls-inc-tablet-count! ls-dec-tablet-count!
+  ls-get-weak-read-scn ls-set-weak-read-scn!
+  ls-get-need-rebuild? ls-set-need-rebuild!
+  ls-get-checkpoint-scn ls-set-checkpoint-scn!
+  ls-get-checkpoint-lsn ls-set-checkpoint-lsn!
+  ls-get-rebuild-seq ls-set-rebuild-seq!
+  ls-get-tablet-change-checkpoint-scn
+  ls-set-tablet-change-checkpoint-scn!
+  ls-get-transfer-scn ls-set-transfer-scn!
+  ls-get-tx-blocked? ls-set-tx-blocked!
+  ls-get-mv-major-merge-scn ls-set-mv-major-merge-scn!
+  ls-get-mv-publish-scn ls-set-mv-publish-scn!
+  ls-get-mv-safe-scn ls-set-mv-safe-scn!
+  ls-get-required-data-disk-size ls-set-required-data-disk-size!
+  ; Lifecycle
+  ls-init! ls-start! ls-stop! ls-destroy!
+  ls-add-tablet! ls-remove-tablet!)
+
+; ----------------------------------------------------------------
+; LS state constants
+; ----------------------------------------------------------------
+;
+; Linux definitions (per ob_ls.h):
+;   ObLSState::LS_STATE_INVALID  = 0
+;   ObLSState::LS_STATE_CREATED  = 1
+;   ObLSState::LS_STATE_ONLINE   = 2
+;   ObLSState::LS_STATE_OFFLINE  = 3
+
+(define LS-STATE-INVALID 0)
+(define LS-STATE-CREATED 1)
+(define LS-STATE-ONLINE 2)
+(define LS-STATE-OFFLINE 3)
+
+; ----------------------------------------------------------------
+; LS role constants (Paxos)
+; ----------------------------------------------------------------
+
+(define LS-ROLE-LEADER 1)
+(define LS-ROLE-FOLLOWER 2)
+(define LS-ROLE-CANDIDATE 4)
+
+; ----------------------------------------------------------------
+; Replica type constants
+; ----------------------------------------------------------------
+
+(define REPLICA-TYPE-FULL 1)
+(define REPLICA-TYPE-READONLY 2)
+(define REPLICA-TYPE-LOGONLY 4)
+
+; ----------------------------------------------------------------
+; ObLS — closure-based
+; ----------------------------------------------------------------
+
+; make-ls: create an ObLS.
+; Args: ls-id (integer)
+; Returns: ls closure.
+(define (make-ls ls-id)
+  (let ((replica-type REPLICA-TYPE-FULL)
+        (ls-state LS-STATE-INVALID)
+        (migrate-status 0)
+        (tablet-count 0)
+        (weak-read-scn 0)
+        (need-rebuild #f)
+        (checkpoint-scn 0)
+        (checkpoint-lsn 0)
+        (rebuild-seq 0)
+        (tablet-change-checkpoint-scn 0)
+        (transfer-scn 0)
+        (tx-blocked #f)
+        (mv-major-merge-scn 0)
+        (mv-publish-scn 0)
+        (mv-safe-scn 0)
+        (required-data-disk-size 0))
+    (letrec ((set-replica-type! (lambda (v) (set! replica-type v) v))
+             (set-ls-state! (lambda (v) (set! ls-state v) v))
+             (set-migrate-status! (lambda (v) (set! migrate-status v) v))
+             (set-tablet-count! (lambda (v) (set! tablet-count v) v))
+             (inc-tablet-count! (lambda () (set! tablet-count (+ tablet-count 1)) tablet-count))
+             (dec-tablet-count! (lambda () (set! tablet-count (- tablet-count 1)) tablet-count))
+             (set-weak-read-scn! (lambda (v) (set! weak-read-scn v) v))
+             (set-need-rebuild! (lambda (v) (set! need-rebuild v) v))
+             (set-checkpoint-scn! (lambda (v) (set! checkpoint-scn v) v))
+             (set-checkpoint-lsn! (lambda (v) (set! checkpoint-lsn v) v))
+             (set-rebuild-seq! (lambda (v) (set! rebuild-seq v) v))
+             (set-tablet-change-checkpoint-scn!
+                (lambda (v) (set! tablet-change-checkpoint-scn v) v))
+             (set-transfer-scn! (lambda (v) (set! transfer-scn v) v))
+             (set-tx-blocked! (lambda (v) (set! tx-blocked v) v))
+             (set-mv-major-merge-scn! (lambda (v) (set! mv-major-merge-scn v) v))
+             (set-mv-publish-scn! (lambda (v) (set! mv-publish-scn v) v))
+             (set-mv-safe-scn! (lambda (v) (set! mv-safe-scn v) v))
+             (set-required-data-disk-size!
+                (lambda (v) (set! required-data-disk-size v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'ls-id) ls-id)
+                       ((eq? msg 'replica-type) replica-type)
+                       ((eq? msg 'ls-state) ls-state)
+                       ((eq? msg 'migrate-status) migrate-status)
+                       ((eq? msg 'tablet-count) tablet-count)
+                       ((eq? msg 'weak-read-scn) weak-read-scn)
+                       ((eq? msg 'need-rebuild) need-rebuild)
+                       ((eq? msg 'checkpoint-scn) checkpoint-scn)
+                       ((eq? msg 'checkpoint-lsn) checkpoint-lsn)
+                       ((eq? msg 'rebuild-seq) rebuild-seq)
+                       ((eq? msg 'tablet-change-checkpoint-scn) tablet-change-checkpoint-scn)
+                       ((eq? msg 'transfer-scn) transfer-scn)
+                       ((eq? msg 'tx-blocked) tx-blocked)
+                       ((eq? msg 'mv-major-merge-scn) mv-major-merge-scn)
+                       ((eq? msg 'mv-publish-scn) mv-publish-scn)
+                       ((eq? msg 'mv-safe-scn) mv-safe-scn)
+                       ((eq? msg 'required-data-disk-size) required-data-disk-size)
+                       ((eq? msg 'set-replica-type!) set-replica-type!)
+                       ((eq? msg 'set-ls-state!) set-ls-state!)
+                       ((eq? msg 'set-migrate-status!) set-migrate-status!)
+                       ((eq? msg 'set-tablet-count!) set-tablet-count!)
+                       ((eq? msg 'inc-tablet-count!) inc-tablet-count!)
+                       ((eq? msg 'dec-tablet-count!) dec-tablet-count!)
+                       ((eq? msg 'set-weak-read-scn!) set-weak-read-scn!)
+                       ((eq? msg 'set-need-rebuild!) set-need-rebuild!)
+                       ((eq? msg 'set-checkpoint-scn!) set-checkpoint-scn!)
+                       ((eq? msg 'set-checkpoint-lsn!) set-checkpoint-lsn!)
+                       ((eq? msg 'set-rebuild-seq!) set-rebuild-seq!)
+                       ((eq? msg 'set-tablet-change-checkpoint-scn!)
+                        set-tablet-change-checkpoint-scn!)
+                       ((eq? msg 'set-transfer-scn!) set-transfer-scn!)
+                       ((eq? msg 'set-tx-blocked!) set-tx-blocked!)
+                       ((eq? msg 'set-mv-major-merge-scn!) set-mv-major-merge-scn!)
+                       ((eq? msg 'set-mv-publish-scn!) set-mv-publish-scn!)
+                       ((eq? msg 'set-mv-safe-scn!) set-mv-safe-scn!)
+                       ((eq? msg 'set-required-data-disk-size!)
+                        set-required-data-disk-size!)
+                       (else #f)))))
+      self)))
+
+; ls?: is the object an ObLS?
+; Detected by querying 'tablet-count — only LS closures return an
+; integer.
+(define (ls? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'tablet-count)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; ----------------------------------------------------------------
+; Metadata accessors
+; ----------------------------------------------------------------
+
+(define (ls-get-ls-id ls) (ls 'ls-id))
+
+(define (ls-get-replica-type ls) (ls 'replica-type))
+(define (ls-set-replica-type! ls v) ((ls 'set-replica-type!) v))
+
+(define (ls-get-ls-state ls) (ls 'ls-state))
+(define (ls-set-ls-state! ls v) ((ls 'set-ls-state!) v))
+
+(define (ls-get-migrate-status ls) (ls 'migrate-status))
+(define (ls-set-migrate-status! ls v) ((ls 'set-migrate-status!) v))
+
+(define (ls-get-tablet-count ls) (ls 'tablet-count))
+(define (ls-inc-tablet-count! ls) ((ls 'inc-tablet-count!)))
+(define (ls-dec-tablet-count! ls) ((ls 'dec-tablet-count!)))
+
+(define (ls-get-weak-read-scn ls) (ls 'weak-read-scn))
+(define (ls-set-weak-read-scn! ls v) ((ls 'set-weak-read-scn!) v))
+
+(define (ls-get-need-rebuild? ls) (ls 'need-rebuild))
+(define (ls-set-need-rebuild! ls v) ((ls 'set-need-rebuild!) v))
+
+(define (ls-get-checkpoint-scn ls) (ls 'checkpoint-scn))
+(define (ls-set-checkpoint-scn! ls v) ((ls 'set-checkpoint-scn!) v))
+
+(define (ls-get-checkpoint-lsn ls) (ls 'checkpoint-lsn))
+(define (ls-set-checkpoint-lsn! ls v) ((ls 'set-checkpoint-lsn!) v))
+
+(define (ls-get-rebuild-seq ls) (ls 'rebuild-seq))
+(define (ls-set-rebuild-seq! ls v) ((ls 'set-rebuild-seq!) v))
+
+(define (ls-get-tablet-change-checkpoint-scn ls)
+  (ls 'tablet-change-checkpoint-scn))
+(define (ls-set-tablet-change-checkpoint-scn! ls v)
+  ((ls 'set-tablet-change-checkpoint-scn!) v))
+
+(define (ls-get-transfer-scn ls) (ls 'transfer-scn))
+(define (ls-set-transfer-scn! ls v) ((ls 'set-transfer-scn!) v))
+
+(define (ls-get-tx-blocked? ls) (ls 'tx-blocked))
+(define (ls-set-tx-blocked! ls v) ((ls 'set-tx-blocked!) v))
+
+(define (ls-get-mv-major-merge-scn ls) (ls 'mv-major-merge-scn))
+(define (ls-set-mv-major-merge-scn! ls v)
+  ((ls 'set-mv-major-merge-scn!) v))
+
+(define (ls-get-mv-publish-scn ls) (ls 'mv-publish-scn))
+(define (ls-set-mv-publish-scn! ls v)
+  ((ls 'set-mv-publish-scn!) v))
+
+(define (ls-get-mv-safe-scn ls) (ls 'mv-safe-scn))
+(define (ls-set-mv-safe-scn! ls v)
+  ((ls 'set-mv-safe-scn!) v))
+
+(define (ls-get-required-data-disk-size ls)
+  (ls 'required-data-disk-size))
+(define (ls-set-required-data-disk-size! ls v)
+  ((ls 'set-required-data-disk-size!) v))
+
+; ----------------------------------------------------------------
+; Lifecycle (simulated)
+; ----------------------------------------------------------------
+
+; ls-init!: initialize LS (INVALID → CREATED).
+; Returns the new state.
+(define (ls-init! ls)
+  (if (= (ls 'ls-state) LS-STATE-INVALID)
+      ((ls 'set-ls-state!) LS-STATE-CREATED)
+      (ls 'ls-state)))
+
+; ls-start!: start LS (CREATED → ONLINE).
+; Returns the new state.
+(define (ls-start! ls)
+  (if (= (ls 'ls-state) LS-STATE-CREATED)
+      ((ls 'set-ls-state!) LS-STATE-ONLINE)
+      (ls 'ls-state)))
+
+; ls-stop!: stop LS (ONLINE → OFFLINE).
+; Returns the new state.
+(define (ls-stop! ls)
+  (if (= (ls 'ls-state) LS-STATE-ONLINE)
+      ((ls 'set-ls-state!) LS-STATE-OFFLINE)
+      (ls 'ls-state)))
+
+; ls-destroy!: destroy LS (any → INVALID).
+; Returns the new state.
+(define (ls-destroy! ls)
+  ((ls 'set-ls-state!) LS-STATE-INVALID))
+
+; ----------------------------------------------------------------
+; Tablet management
+; ----------------------------------------------------------------
+
+; ls-add-tablet!: increment tablet-count.
+; Returns the new count.
+(define (ls-add-tablet! ls)
+  ((ls 'inc-tablet-count!)))
+
+; ls-remove-tablet!: decrement tablet-count.
+; Returns the new count.
+(define (ls-remove-tablet! ls)
+  ((ls 'dec-tablet-count!)))

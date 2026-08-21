@@ -1,0 +1,251 @@
+; 07-ls-logstream_test.aura
+; ============================
+; Smoke tests for 07-ls-logstream.aura — LogStream (ObLS) minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/07-ls-logstream_test.aura
+;
+; Verified automatically (smoke):
+;   - 4 LS-STATE constants distinct
+;   - 3 LS-ROLE + 3 REPLICA-TYPE constants distinct
+;   - make-ls construction + 17 metadata field defaults
+;   - Metadata setters update fields
+;   - ls-init! / ls-start! / ls-stop! / ls-destroy! lifecycle
+;   - ls-add-tablet! / ls-remove-tablet! count tracking
+;   - tx-blocked / need-rebuild predicates
+;
+; Verified via separate probes during development:
+;   - ls? rejects non-target procedures
+;   - Lifecycle transitions only valid state changes
+;
+; Deferred (full OceanBase LS):
+;   - real ObLS::init / start / stop / wait / destroy
+;   - actual sub-service initialization
+;   - Paxos leader election + role change
+;   - online() / offline() state transitions
+;   - replica_type transitions
+;   - logstream_freeze / tablet_freeze coordination
+;   - meta_rwlock_ read-write lock
+;   - tx_blocked propagation to TxService
+
+(require "std/test" all:)
+(require "07-ls-logstream" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "07-001-ls-state-distinct"
+  ; 4 LS-STATE constants are distinct.
+  (check (= 1 (if (not (= LS-STATE-INVALID LS-STATE-CREATED)) 1 0)))
+  (check (= 1 (if (not (= LS-STATE-CREATED LS-STATE-ONLINE)) 1 0)))
+  (check (= 1 (if (not (= LS-STATE-ONLINE LS-STATE-OFFLINE)) 1 0))))
+
+(test-suite "07-001-ls-role-distinct"
+  ; 3 LS-ROLE constants are distinct.
+  (check (= 1 (if (not (= LS-ROLE-LEADER LS-ROLE-FOLLOWER)) 1 0)))
+  (check (= 1 (if (not (= LS-ROLE-FOLLOWER LS-ROLE-CANDIDATE)) 1 0))))
+
+(test-suite "07-001-replica-type-distinct"
+  ; 3 REPLICA-TYPE constants are distinct.
+  (check (= 1 (if (not (= REPLICA-TYPE-FULL REPLICA-TYPE-READONLY)) 1 0)))
+  (check (= 1 (if (not (= REPLICA-TYPE-READONLY REPLICA-TYPE-LOGONLY)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObLS construction + defaults
+; ----------------------------------------------------------------
+
+(test-suite "07-002-ls-construction"
+  ; make-ls preserves ls-id.
+  (check (= 100 (ls-get-ls-id (make-ls 100))))
+  (check (= 200 (ls-get-ls-id (make-ls 200))))
+  ; All 17 metadata fields default.
+  (check (= REPLICA-TYPE-FULL (ls-get-replica-type (make-ls 1))))
+  (check (= LS-STATE-INVALID (ls-get-ls-state (make-ls 1))))
+  (check (= 0 (ls-get-migrate-status (make-ls 1))))
+  (check (= 0 (ls-get-tablet-count (make-ls 1))))
+  (check (= 0 (ls-get-weak-read-scn (make-ls 1))))
+  (check (= #f (ls-get-need-rebuild? (make-ls 1))))
+  (check (= 0 (ls-get-checkpoint-scn (make-ls 1))))
+  (check (= 0 (ls-get-checkpoint-lsn (make-ls 1))))
+  (check (= 0 (ls-get-rebuild-seq (make-ls 1))))
+  (check (= 0 (ls-get-tablet-change-checkpoint-scn (make-ls 1))))
+  (check (= 0 (ls-get-transfer-scn (make-ls 1))))
+  (check (= #f (ls-get-tx-blocked? (make-ls 1))))
+  (check (= 0 (ls-get-mv-major-merge-scn (make-ls 1))))
+  (check (= 0 (ls-get-mv-publish-scn (make-ls 1))))
+  (check (= 0 (ls-get-mv-safe-scn (make-ls 1))))
+  (check (= 0 (ls-get-required-data-disk-size (make-ls 1)))))
+
+(test-suite "07-002-ls-predicate"
+  ; ls? accepts only LS closures.
+  (check (= #t (ls? (make-ls 1))))
+  (check (= #f (ls? 'not-a-ls)))
+  (check (= #f (ls? 42))))
+
+; ----------------------------------------------------------------
+; Metadata setters
+; ----------------------------------------------------------------
+
+(test-suite "07-003-ls-set-replica-type"
+  ; set-replica-type! updates.
+  (check (= REPLICA-TYPE-READONLY
+             (let ((ls (make-ls 1)))
+               (ls-set-replica-type! ls REPLICA-TYPE-READONLY)
+               (ls-get-replica-type ls)))))
+
+(test-suite "07-003-ls-set-weak-read-scn"
+  ; set-weak-read-scn! updates.
+  (check (= 5000 (let ((ls (make-ls 1)))
+                   (ls-set-weak-read-scn! ls 5000)
+                   (ls-get-weak-read-scn ls)))))
+
+(test-suite "07-003-ls-set-checkpoint-scn"
+  ; set-checkpoint-scn! updates.
+  (check (= 8000 (let ((ls (make-ls 1)))
+                   (ls-set-checkpoint-scn! ls 8000)
+                   (ls-get-checkpoint-scn ls)))))
+
+(test-suite "07-003-ls-set-checkpoint-lsn"
+  ; set-checkpoint-lsn! updates.
+  (check (= 100 (let ((ls (make-ls 1)))
+                 (ls-set-checkpoint-lsn! ls 100)
+                 (ls-get-checkpoint-lsn ls)))))
+
+(test-suite "07-003-ls-set-rebuild-seq"
+  ; set-rebuild-seq! updates.
+  (check (= 42 (let ((ls (make-ls 1)))
+                 (ls-set-rebuild-seq! ls 42)
+                 (ls-get-rebuild-seq ls)))))
+
+(test-suite "07-003-ls-set-tablet-change-checkpoint-scn"
+  ; set-tablet-change-checkpoint-scn! updates.
+  (check (= 3000 (let ((ls (make-ls 1)))
+                   (ls-set-tablet-change-checkpoint-scn! ls 3000)
+                   (ls-get-tablet-change-checkpoint-scn ls)))))
+
+(test-suite "07-003-ls-set-transfer-scn"
+  ; set-transfer-scn! updates.
+  (check (= 200 (let ((ls (make-ls 1)))
+                 (ls-set-transfer-scn! ls 200)
+                 (ls-get-transfer-scn ls)))))
+
+(test-suite "07-003-ls-set-tx-blocked"
+  ; set-tx-blocked! updates.
+  (check (= #t (let ((ls (make-ls 1)))
+                 (ls-set-tx-blocked! ls #t)
+                 (ls-get-tx-blocked? ls))))
+
+(test-suite "07-003-ls-set-mv-major-merge-scn"
+  ; set-mv-major-merge-scn! updates.
+  (check (= 1500 (let ((ls (make-ls 1)))
+                   (ls-set-mv-major-merge-scn! ls 1500)
+                   (ls-get-mv-major-merge-scn ls)))))
+
+(test-suite "07-003-ls-set-mv-publish-scn"
+  ; set-mv-publish-scn! updates.
+  (check (= 2000 (let ((ls (make-ls 1)))
+                   (ls-set-mv-publish-scn! ls 2000)
+                   (ls-get-mv-publish-scn ls)))))
+
+(test-suite "07-003-ls-set-mv-safe-scn"
+  ; set-mv-safe-scn! updates.
+  (check (= 1800 (let ((ls (make-ls 1)))
+                   (ls-set-mv-safe-scn! ls 1800)
+                   (ls-get-mv-safe-scn ls)))))
+
+(test-suite "07-003-ls-set-required-data-disk-size"
+  ; set-required-data-disk-size! updates.
+  (check (= 1073741824 (let ((ls (make-ls 1)))
+                        (ls-set-required-data-disk-size! ls 1073741824)
+                        (ls-get-required-data-disk-size ls)))))
+
+(test-suite "07-003-ls-set-need-rebuild"
+  ; set-need-rebuild! updates.
+  (check (= #t (let ((ls (make-ls 1)))
+                 (ls-set-need-rebuild! ls #t)
+                 (ls-get-need-rebuild? ls))))
+
+; ----------------------------------------------------------------
+; Lifecycle
+; ----------------------------------------------------------------
+
+(test-suite "07-004-ls-init"
+  ; ls-init! transitions INVALID → CREATED.
+  (check (= LS-STATE-CREATED
+             (let ((ls (make-ls 1)))
+               (ls-init! ls)
+               (ls-get-ls-state ls)))))
+
+(test-suite "07-004-ls-init-no-op-from-other-states"
+  ; ls-init! from non-INVALID state is no-op.
+  (check (= LS-STATE-ONLINE
+             (let ((ls (make-ls 1)))
+               (ls-set-ls-state! ls LS-STATE-ONLINE)
+               (ls-init! ls)
+               (ls-get-ls-state ls))))
+
+(test-suite "07-004-ls-start"
+  ; ls-start! transitions CREATED → ONLINE.
+  (check (= LS-STATE-ONLINE
+             (let ((ls (make-ls 1)))
+               (ls-init! ls)
+               (ls-start! ls)
+               (ls-get-ls-state ls)))))
+
+(test-suite "07-004-ls-start-no-op-from-other-states"
+  ; ls-start! from non-CREATED state is no-op.
+  (check (= LS-STATE-INVALID
+             (let ((ls (make-ls 1)))
+               (ls-start! ls)
+               (ls-get-ls-state ls))))
+
+(test-suite "07-004-ls-stop"
+  ; ls-stop! transitions ONLINE → OFFLINE.
+  (check (= LS-STATE-OFFLINE
+             (let ((ls (make-ls 1)))
+               (ls-init! ls)
+               (ls-start! ls)
+               (ls-stop! ls)
+               (ls-get-ls-state ls)))))
+
+(test-suite "07-004-ls-destroy"
+  ; ls-destroy! transitions any → INVALID.
+  (check (= LS-STATE-INVALID
+             (let ((ls (make-ls 1)))
+               (ls-init! ls)
+               (ls-start! ls)
+               (ls-destroy! ls)
+               (ls-get-ls-state ls)))))
+
+; ----------------------------------------------------------------
+; Tablet count
+; ----------------------------------------------------------------
+
+(test-suite "07-005-ls-add-tablet"
+  ; ls-add-tablet! increments count.
+  (check (= 1 (let ((ls (make-ls 1)))
+                 (ls-add-tablet! ls))))
+
+(test-suite "07-005-ls-add-multiple"
+  ; Multiple adds accumulate.
+  (check (= 3 (let ((ls (make-ls 1)))
+                 (ls-add-tablet! ls)
+                 (ls-add-tablet! ls)
+                 (ls-add-tablet! ls))))
+
+(test-suite "07-005-ls-remove-tablet"
+  ; ls-remove-tablet! decrements.
+  (check (= 2 (let ((ls (make-ls 1)))
+                 (ls-add-tablet! ls)
+                 (ls-add-tablet! ls)
+                 (ls-add-tablet! ls)
+                 (ls-remove-tablet! ls))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
