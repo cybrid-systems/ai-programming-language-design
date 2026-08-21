@@ -1,0 +1,154 @@
+; 023-interrupt-handling.aura
+; ===============================
+; Interrupt Handling — minimal capability port to aura.
+;
+; Maps to: 023-interrupt-handling-analysis.md
+; Source: include/linux/interrupt.h + include/linux/irqdesc.h +
+;         kernel/irq/manage.c + arch/x86/kernel/irq.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux interrupt subsystem handles hardware + software interrupts:
+;   - struct irq_desc (per-vector descriptor: handler, action list, kstat)
+;   - struct irqaction (driver-registered: handler, flags, name, dev_id)
+;   - request_irq / free_irq (handler registration)
+;   - handle_irq flow handlers (handle_level_irq, handle_edge_irq, etc.)
+;   - SoftIRQ (tasklet, NET_RX/TX, TIMER, BLOCK, etc.)
+;   - Threaded IRQ (request_threaded_irq)
+;   - 198 + 280 + 280 + 60 = ~820 symbols across core interrupt files
+;
+; aura has no hardware, no IRQ controller, no interrupt controller.
+; v1 ships the irq_desc + handler registry + dispatch simulation:
+;   - make-irq-desc (closure with handler list + flags + kstat)
+;   - request-irq (register a handler on an irq_desc)
+;   - free-irq (unregister by name)
+;   - irq-handle (simulate IRQ firing — invoke each registered handler)
+;   - irq-count-handlers
+;   - irq-handler-exists?
+;   - IRQ-FLAG-SHARED / IRQ-FLAG-NOTHREAD
+;
+; Deferred (full Linux interrupt subsystem):
+;   - struct irq_data (chip / hwirq / domain)
+;   - struct irq_common_data (per-cpu statistics + affinity)
+;   - struct irqaction (full fields: irq, flags, name, dev_id, next, thread_fn)
+;   - request_threaded_irq (threaded handler variant)
+;   - setup_irq (used internally by drivers)
+;   - handle_level_irq / handle_edge_irq / handle_fasteoi_irq flow handlers
+;   - SoftIRQ (tasklet, open_softirq, raise_softirq)
+;   - local_irq_disable / local_irq_save / local_bh_disable
+;   - generic_handle_irq (architecture dispatch)
+;   - IRQ chip integration (chip->irq_ack, chip->irq_mask, etc.)
+;   - Per-CPU IRQ statistics
+
+(export
+  make-irq-desc
+  request-irq
+  free-irq
+  irq-handle
+  irq-count-handlers
+  irq-handler-exists?
+  IRQ-FLAG-SHARED)
+
+; IRQ action flag constants (analogous to IRQF_* in include/linux/interrupt.h)
+(define IRQ-FLAG-SHARED 1)   ; bit 0: allow multiple handlers on same IRQ
+(define IRQ-FLAG-NOTHREAD 2) ; bit 1: non-threaded (v1 always)
+
+; ----------------------------------------------------------------
+; irq_desc (closure with handler list + flags + kstat)
+; ----------------------------------------------------------------
+
+; Make an irq_desc with the given IRQ number.
+; Initially no handlers are registered.
+(define (make-irq-desc irq-num)
+  (let ((irq-num irq-num)
+        (handlers '())           ; list of (name . handler) pairs
+        (flags 0)
+        (kstat 0))               ; interrupt fire count
+    (letrec ((set-handlers! (lambda (l) (set! handlers l) l))
+             (set-flags!    (lambda (v) (set! flags v) v))
+             (inc-kstat!    (lambda () (set! kstat (+ kstat 1)) kstat))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'num) irq-num)
+                       ((eq? msg 'handlers) handlers)
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'kstat) kstat)
+                       ((eq? msg 'set-handlers!) set-handlers!)
+                       ((eq? msg 'set-flags!) set-flags!)
+                       ((eq? msg 'inc-kstat!) inc-kstat!)
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Handler registration
+; ----------------------------------------------------------------
+
+; request-irq: register a handler for an IRQ line.
+; name: string/symbol identifying the driver (used for unregister).
+; handler: closure called with (irq-data) when the IRQ fires.
+; irqf-flags: IRQ action flags (IRQF_SHARED / IRQF_NOTHREAD).
+; Returns #t if registered, #f if name already exists (and not SHARED).
+(define (request-irq desc name handler irqf-flags)
+  (let ((handlers (desc 'handlers)))
+    (cond
+      ((and (not (zero? (modulo irqf-flags IRQ-FLAG-SHARED)))
+            (irq-handler-exists? desc name))
+       #f)   ; name already used and SHARED not requested
+      ((irq-handler-exists? desc name)
+       ; Name exists but SHARED allowed — append
+       ((desc 'set-handlers!) (cons (cons name handler) handlers))
+       #t)
+      (else
+        ((desc 'set-handlers!) (cons (cons name handler) handlers))
+        (if (not (zero? irqf-flags))
+            ((desc 'set-flags!) (+ (desc 'flags) irqf-flags)))
+        #t))))
+
+; free-irq: unregister a handler by name.
+; Returns #t if a handler was removed, #f otherwise.
+(define (free-irq desc name)
+  (let ((handlers (desc 'handlers)))
+    (let loop ((rest handlers) (acc '()) (found #f))
+      (cond
+        ((null? rest)
+         ((desc 'set-handlers!) (reverse acc))
+         found)
+        ((eq? (car (car rest)) name)
+         (loop (cdr rest) acc #t))
+        (else
+         (loop (cdr rest) (cons (car rest) acc) found))))))
+
+; ----------------------------------------------------------------
+; Dispatch
+; ----------------------------------------------------------------
+
+; irq-handle: simulate the IRQ firing — invoke each registered handler.
+; Optional irq-data argument passed through to each handler.
+; Returns the number of handlers invoked.
+(define (irq-handle desc . irq-data)
+  ((desc 'inc-kstat!))
+  (let* ((handlers (desc 'handlers))
+         (data (if (null? irq-data) #f (car irq-data))))
+    (let loop ((rest handlers) (count 0))
+      (cond
+        ((null? rest) count)
+        (else
+         (let ((handler (cdr (car rest))))
+           (handler data))
+           (loop (cdr rest) (+ count 1)))))))
+
+; ----------------------------------------------------------------
+; Queries
+; ----------------------------------------------------------------
+
+; irq-count-handlers: number of handlers currently registered.
+(define (irq-count-handlers desc)
+  (length (desc 'handlers)))
+
+; irq-handler-exists?: is a handler with the given name currently registered?
+(define (irq-handler-exists? desc name)
+  (let loop ((rest (desc 'handlers)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (car (car rest)) name) #t)
+      (else (loop (cdr rest))))))

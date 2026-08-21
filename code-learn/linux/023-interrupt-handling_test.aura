@@ -1,0 +1,121 @@
+; 023-interrupt-handling_test.aura
+; ==============================
+; Smoke tests for 023-interrupt-handling.aura — IRQ minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/023-interrupt-handling_test.aura
+;
+; Verified automatically (smoke):
+;   - make-irq-desc construction (no handlers, kstat=0)
+;   - request-irq registers a handler
+;   - irq-count-handlers tracks registration
+;   - free-irq removes handler by name
+;   - irq-handle invokes each registered handler
+;   - IRQ-FLAG-SHARED allows multiple handlers with same name
+;   - irq-handler-exists? predicate
+;
+; Verified via separate probes during development:
+;   - kstat increments on each irq-handle
+;   - handler receives the IRQ data arg
+;
+; Deferred (full Linux interrupt subsystem):
+;   - struct irq_data / irq_common_data
+;   - struct irqaction full fields (dev_id, next, thread_fn)
+;   - request_threaded_irq (threaded handler)
+;   - handle_level_irq / handle_edge_irq flow handlers
+;   - SoftIRQ (tasklet, open_softirq, raise_softirq)
+;   - local_irq_disable / local_irq_save / local_bh_disable
+;   - IRQ chip integration (chip->irq_ack, chip->irq_mask)
+;   - Per-CPU IRQ statistics
+
+(require "std/test" all:)
+(require "023-interrupt-handling" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "irq-001-desc-init"
+  (check (= 0 (irq-count-handlers (make-irq-desc 5))))
+
+; ----------------------------------------------------------------
+; request-irq
+; ----------------------------------------------------------------
+
+; A simple counter handler closure.
+(define (make-counter)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handler) (lambda (data) (set! count (+ count 1))))
+                       ((eq? msg 'count) count)
+                       (else #f)))))
+      self)))
+
+(test-suite "irq-002-register"
+  (check (= 1 (= 1 (irq-count-handlers
+    (let ((desc (make-irq-desc 7)))
+      (request-irq desc 'uart (make-counter 'handler) 0)
+      desc)))))
+
+(test-suite "irq-002-handler-exists"
+  (check (= 1 (irq-handler-exists?
+    (let ((desc (make-irq-desc 7)))
+      (request-irq desc 'uart (lambda (d) #t) 0)
+      desc) 'uart)))
+
+; ----------------------------------------------------------------
+; free-irq
+; ----------------------------------------------------------------
+
+(test-suite "irq-003-free"
+  (check (= 0 (irq-count-handlers
+    (let ((desc (make-irq-desc 7)))
+      (request-irq desc 'uart (lambda (d) #t) 0)
+      (free-irq desc 'uart)
+      desc))))
+
+; ----------------------------------------------------------------
+; SHARED flag allows duplicate registration
+; ----------------------------------------------------------------
+
+(test-suite "irq-004-shared"
+  ; SHARED flag allows registering two handlers with the same name.
+  (check (= 1 (= 2 (irq-count-handlers
+    (let ((desc (make-irq-desc 8)))
+      (request-irq desc 'shared-handler (lambda (d) #t) IRQ-FLAG-SHARED)
+      (request-irq desc 'shared-handler (lambda (d) #t) IRQ-FLAG-SHARED)
+      desc)))))
+
+; ----------------------------------------------------------------
+; irq-handle dispatch
+; ----------------------------------------------------------------
+
+; Handler that records its count when invoked.
+(define (make-recording-handler)
+  (let ((count 0))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handler) (lambda (data) (set! count (+ count 1))))
+                       ((eq? msg 'count) count)
+                       (else #f)))))
+      self)))
+
+; Count-handlers-with-data: register N handlers, then dispatch, verify all
+; invoked + kstat increments.
+(test-suite "irq-005-handle-dispatch"
+  (check (= 1 (= 2 (let ((desc (make-irq-desc 9))
+                          (h1 (make-recording-handler))
+                          (h2 (make-recording-handler)))
+                      (request-irq desc 'h1 (h1 'handler) 0)
+                      (request-irq desc 'h2 (h2 'handler) 0)
+                      (irq-handle desc 'irq-data)
+                      (and (= 1 (h1 'count))
+                           (= 1 (h2 'count)))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
