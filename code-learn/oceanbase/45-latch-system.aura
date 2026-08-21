@@ -1,0 +1,424 @@
+; 45-latch-system.aura
+; ======================
+; latch + lock system — minimal capability port to aura.
+;
+; Maps to: OceanBase ObLatch + ObRWLock + ObSpinLock + ObFutex +
+;          ObMutex + ObBucketLock + ObLockGuard
+; Source: deps/oblib/src/lib/lock/ob_latch.h
+;         + deps/oblib/src/lib/lock/ob_spin_lock.h
+;         + deps/oblib/src/lib/lock/ob_rwlock.h
+;         + deps/oblib/src/lib/lock/ob_futex.h
+;         + deps/oblib/src/lib/lock/ob_mutex.h
+;         + deps/oblib/src/lib/lock/ob_bucket_lock.h
+;         + deps/oblib/src/lib/lock/ob_lock_guard.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Lock System:
+;   - 2 LATCH-MODE constants: READ / WRITE
+;   - 2 OB-MUTEX-STATE constants: UNLOCKED / LOCKED
+;   - 2 OB-FUTEX-STATE constants: WAITING / SIGNALED
+;   - 2 OB-BUCKET-MODE constants: SHARED / EXCLUSIVE
+;   - ObLatch: core RW lock with wait queue
+;   - ObSpinLock: mutex spin lock
+;   - ObRWLock: RW lock wrapper
+;   - ObFutex: Linux futex wrapper
+;   - ObBucketLock: hash bucket lock
+;   - ObMutex: mutex wrapper
+;   - ObLockGuard: RAII guard wrapper
+;
+; aura v1 ships:
+;   - 2 LATCH-MODE constants
+;   - 2 OB-MUTEX-STATE constants
+;   - 2 OB-FUTEX-STATE constants
+;   - 2 OB-BUCKET-MODE constants
+;   - make-ob-latch (factory: mode + address-id + waiters)
+;   - ob-latch accessors + set-mode!
+;   - make-ob-spin-lock (factory: locked + owner-thread)
+;   - ob-spin-lock accessors + set-locked!
+;   - make-ob-rwlock (factory: readers + writer-active + mode)
+;   - ob-rwlock accessors + set-readers! / set-writer-active!
+;   - make-ob-futex (factory: val + sys-waiters)
+;   - ob-futex accessors + set-val!
+;   - make-ob-bucket-lock (factory: bucket-id + bucket-count + mode)
+;   - ob-bucket-lock accessors + set-mode!
+;   - make-ob-mutex (factory: locked + owner)
+;   - ob-mutex accessors + set-locked!
+;   - make-ob-lock-guard (factory: lock + mode + active)
+;   - ob-lock-guard accessors + set-active!
+;
+; Deferred (full OceanBase Lock System):
+;   - real ObLatch with futex-based wait/wake + waiter list
+;   - real ObLatchMutex with pthread_mutex fallback
+;   - real ObSpinLock with __atomic_load/store + PAUSE
+;   - real SpinRWLock with bit-packed counter (readers / writer)
+;   - real ObSmallSpinLock (1-bit) + ObByteLock + ObPtrSpinLock
+;   - real ObFutex.wait/wake with FUTEX_WAIT_PRIVATE /
+;     FUTEX_WAKE_PRIVATE
+;   - real ObBucketLock with per-bucket counter
+;   - real ObDRWLock dummy for testing
+;   - real ObLockGuard RAII unlock-on-destruction
+;   - real OB\_EHT\_TRY\_LOCK macros (try_lock / try_rdlock / ...)
+;   - real thread-local cache alignment (CACHE_ALIGNED)
+;   - real order-preserving hash bucket lock array
+
+(export
+  ; LATCH-MODE constants
+  LATCH-MODE-READ
+  LATCH-MODE-WRITE
+  ; OB-MUTEX-STATE constants
+  OB-MUTEX-STATE-UNLOCKED
+  OB-MUTEX-STATE-LOCKED
+  ; OB-FUTEX-STATE constants
+  OB-FUTEX-STATE-WAITING
+  OB-FUTEX-STATE-SIGNALED
+  ; OB-BUCKET-MODE constants
+  OB-BUCKET-MODE-SHARED
+  OB-BUCKET-MODE-EXCLUSIVE
+  ; ObLatch
+  make-ob-latch
+  ob-latch?
+  ob-latch-get-mode
+  ob-latch-get-address-id
+  ob-latch-get-waiters
+  ob-latch-set-mode!
+  ; ObSpinLock
+  make-ob-spin-lock
+  ob-spin-lock?
+  ob-spin-lock-get-locked
+  ob-spin-lock-get-owner-thread
+  ob-spin-lock-set-locked!
+  ; ObRWLock
+  make-ob-rwlock
+  ob-rwlock?
+  ob-rwlock-get-readers
+  ob-rwlock-get-writer-active
+  ob-rwlock-get-mode
+  ob-rwlock-set-readers!
+  ob-rwlock-set-writer-active!
+  ; ObFutex
+  make-ob-futex
+  ob-futex?
+  ob-futex-get-val
+  ob-futex-get-sys-waiters
+  ob-futex-set-val!
+  ; ObBucketLock
+  make-ob-bucket-lock
+  ob-bucket-lock?
+  ob-bucket-lock-get-bucket-id
+  ob-bucket-lock-get-bucket-count
+  ob-bucket-lock-get-mode
+  ob-bucket-lock-set-mode!
+  ; ObMutex
+  make-ob-mutex
+  ob-mutex?
+  ob-mutex-get-locked
+  ob-mutex-get-owner
+  ob-mutex-set-locked!
+  ; ObLockGuard
+  make-ob-lock-guard
+  ob-lock-guard?
+  ob-lock-guard-get-lock
+  ob-lock-guard-get-mode
+  ob-lock-guard-get-active
+  ob-lock-guard-set-active!)
+
+; ----------------------------------------------------------------
+; LATCH-MODE constants
+; ----------------------------------------------------------------
+
+(define LATCH-MODE-READ 0)
+(define LATCH-MODE-WRITE 1)
+
+; ----------------------------------------------------------------
+; OB-MUTEX-STATE constants
+; ----------------------------------------------------------------
+
+(define OB-MUTEX-STATE-UNLOCKED 0)
+(define OB-MUTEX-STATE-LOCKED 1)
+
+; ----------------------------------------------------------------
+; OB-FUTEX-STATE constants
+; ----------------------------------------------------------------
+
+(define OB-FUTEX-STATE-WAITING 0)
+(define OB-FUTEX-STATE-SIGNALED 1)
+
+; ----------------------------------------------------------------
+; OB-BUCKET-MODE constants
+; ----------------------------------------------------------------
+
+(define OB-BUCKET-MODE-SHARED 0)
+(define OB-BUCKET-MODE-EXCLUSIVE 1)
+
+; ----------------------------------------------------------------
+; ObLatch — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-latch: create an ObLatch.
+; Args: mode (integer), address-id (integer), waiters (integer)
+; Returns: ob_latch closure (initial: mode mutable).
+(define (make-ob-latch mode address-id waiters)
+  (let ((set-mode! (lambda (v) (set! mode v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'mode) mode)
+                  ((eq? msg 'address-id) address-id)
+                  ((eq? msg 'waiters) waiters)
+                  ((eq? msg 'set-mode!) set-mode!)
+                  (else #f)))))
+    self))
+
+; ob-latch?: is the object an ObLatch?
+; Detected by querying 'waiters — only latches return integer.
+(define (ob-latch? obj)
+  (if (procedure? obj)
+      (let ((w (obj 'waiters)))
+        (if (and (integer? w) (>= w 0)) #t #f))
+      #f))
+
+; ob-latch-get-mode: get current mode.
+(define (ob-latch-get-mode l) (l 'mode))
+
+; ob-latch-get-address-id: get address identifier.
+(define (ob-latch-get-address-id l) (l 'address-id))
+
+; ob-latch-get-waiters: get waiter count.
+(define (ob-latch-get-waiters l) (l 'waiters))
+
+; ob-latch-set-mode!: set mode.
+; Returns the new mode.
+(define (ob-latch-set-mode! l v) ((l 'set-mode!) v))
+
+; ----------------------------------------------------------------
+; ObSpinLock — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-spin-lock: create an ObSpinLock.
+; Args: locked (boolean), owner-thread (integer)
+; Returns: ob_spin_lock closure (initial: locked mutable).
+(define (make-ob-spin-lock locked owner-thread)
+  (let ((set-locked! (lambda (v) (set! locked v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'locked) locked)
+                  ((eq? msg 'owner-thread) owner-thread)
+                  ((eq? msg 'set-locked!) set-locked!)
+                  (else #f)))))
+    self))
+
+; ob-spin-lock?: is the object an ObSpinLock?
+; Detected by querying 'owner-thread — only spin locks return int.
+(define (ob-spin-lock? obj)
+  (if (procedure? obj)
+      (let ((o (obj 'owner-thread)))
+        (if (and (integer? o) (>= o 0)) #t #f))
+      #f))
+
+; ob-spin-lock-get-locked: get locked flag.
+(define (ob-spin-lock-get-locked l) (l 'locked))
+
+; ob-spin-lock-get-owner-thread: get owner thread id.
+(define (ob-spin-lock-get-owner-thread l) (l 'owner-thread))
+
+; ob-spin-lock-set-locked!: set locked flag.
+; Returns the new flag.
+(define (ob-spin-lock-set-locked! l v) ((l 'set-locked!) v))
+
+; ----------------------------------------------------------------
+; ObRWLock — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-rwlock: create an ObRWLock.
+; Args: readers (integer), writer-active (boolean), mode (integer)
+; Returns: ob_rwlock closure (initial: readers + writer-active
+;          mutable).
+(define (make-ob-rwlock readers writer-active mode)
+  (let ((set-readers! (lambda (v) (set! readers v) v))
+        (set-wa! (lambda (v) (set! writer-active v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'readers) readers)
+                  ((eq? msg 'writer-active) writer-active)
+                  ((eq? msg 'mode) mode)
+                  ((eq? msg 'set-readers!) set-readers!)
+                  ((eq? msg 'set-writer-active!) set-wa!)
+                  (else #f)))))
+    self))
+
+; ob-rwlock?: is the object an ObRWLock?
+; Detected by querying 'readers — only RWLocks return integer.
+(define (ob-rwlock? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'readers)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; ob-rwlock-get-readers: get reader count.
+(define (ob-rwlock-get-readers l) (l 'readers))
+
+; ob-rwlock-get-writer-active: get writer active flag.
+(define (ob-rwlock-get-writer-active l) (l 'writer-active))
+
+; ob-rwlock-get-mode: get mode.
+(define (ob-rwlock-get-mode l) (l 'mode))
+
+; ob-rwlock-set-readers!: set reader count.
+; Returns the new count.
+(define (ob-rwlock-set-readers! l v) ((l 'set-readers!) v))
+
+; ob-rwlock-set-writer-active!: set writer active flag.
+; Returns the new flag.
+(define (ob-rwlock-set-writer-active! l v)
+  ((l 'set-writer-active!) v))
+
+; ----------------------------------------------------------------
+; ObFutex — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-futex: create an ObFutex.
+; Args: val (integer), sys-waiters (integer)
+; Returns: ob_futex closure (initial: val mutable).
+(define (make-ob-futex val sys-waiters)
+  (let ((set-val! (lambda (v) (set! val v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'val) val)
+                  ((eq? msg 'sys-waiters) sys-waiters)
+                  ((eq? msg 'set-val!) set-val!)
+                  (else #f)))))
+    self))
+
+; ob-futex?: is the object an ObFutex?
+; Detected by querying 'sys-waiters — only futexes return integer.
+(define (ob-futex? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'sys-waiters)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; ob-futex-get-val: get futex value.
+(define (ob-futex-get-val f) (f 'val))
+
+; ob-futex-get-sys-waiters: get sys waiters count.
+(define (ob-futex-get-sys-waiters f) (f 'sys-waiters))
+
+; ob-futex-set-val!: set futex value.
+; Returns the new value.
+(define (ob-futex-set-val! f v) ((f 'set-val!) v))
+
+; ----------------------------------------------------------------
+; ObBucketLock — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-bucket-lock: create an ObBucketLock.
+; Args: bucket-id (integer), bucket-count (integer), mode (integer)
+; Returns: ob_bucket_lock closure (initial: mode mutable).
+(define (make-ob-bucket-lock bucket-id bucket-count mode)
+  (let ((set-mode! (lambda (v) (set! mode v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'bucket-id) bucket-id)
+                  ((eq? msg 'bucket-count) bucket-count)
+                  ((eq? msg 'mode) mode)
+                  ((eq? msg 'set-mode!) set-mode!)
+                  (else #f)))))
+    self))
+
+; ob-bucket-lock?: is the object an ObBucketLock?
+; Detected by querying 'bucket-count — only locks return integer.
+(define (ob-bucket-lock? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'bucket-count)))
+        (if (and (integer? c) (> c 0)) #t #f))
+      #f))
+
+; ob-bucket-lock-get-bucket-id: get current bucket id.
+(define (ob-bucket-lock-get-bucket-id l) (l 'bucket-id))
+
+; ob-bucket-lock-get-bucket-count: get total bucket count.
+(define (ob-bucket-lock-get-bucket-count l) (l 'bucket-count))
+
+; ob-bucket-lock-get-mode: get current mode.
+(define (ob-bucket-lock-get-mode l) (l 'mode))
+
+; ob-bucket-lock-set-mode!: set mode.
+; Returns the new mode.
+(define (ob-bucket-lock-set-mode! l v) ((l 'set-mode!) v))
+
+; ----------------------------------------------------------------
+; ObMutex — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-mutex: create an ObMutex.
+; Args: locked (integer — 0/1), owner (integer — thread id)
+; Returns: ob_mutex closure (initial: locked mutable).
+(define (make-ob-mutex locked owner)
+  (let ((set-locked! (lambda (v) (set! locked v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'locked) locked)
+                  ((eq? msg 'owner) owner)
+                  ((eq? msg 'set-locked!) set-locked!)
+                  (else #f)))))
+    self))
+
+; ob-mutex?: is the object an ObMutex?
+; Detected by querying 'owner — only mutexes return integer.
+(define (ob-mutex? obj)
+  (if (procedure? obj)
+      (let ((o (obj 'owner)))
+        (if (and (integer? o) (>= o 0)) #t #f))
+      #f))
+
+; ob-mutex-get-locked: get locked flag (0/1).
+(define (ob-mutex-get-locked m) (m 'locked))
+
+; ob-mutex-get-owner: get owner thread id.
+(define (ob-mutex-get-owner m) (m 'owner))
+
+; ob-mutex-set-locked!: set locked flag.
+; Returns the new flag.
+(define (ob-mutex-set-locked! m v) ((m 'set-locked!) v))
+
+; ----------------------------------------------------------------
+; ObLockGuard — closure-based
+; ----------------------------------------------------------------
+
+; make-ob-lock-guard: create an ObLockGuard.
+; Args: lock (procedure — any lock closure), mode (integer),
+;       active (boolean)
+; Returns: ob_lock_guard closure (initial: active mutable).
+(define (make-ob-lock-guard lock mode active)
+  (let ((set-active! (lambda (v) (set! active v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'lock) lock)
+                  ((eq? msg 'mode) mode)
+                  ((eq? msg 'active) active)
+                  ((eq? msg 'set-active!) set-active!)
+                  (else #f)))))
+    self))
+
+; ob-lock-guard?: is the object an ObLockGuard?
+; Detected by querying 'mode — only guards return integer.
+(define (ob-lock-guard? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mode)))
+        (if (and (integer? m) (>= m 0)
+                 (<= m OB-BUCKET-MODE-EXCLUSIVE)) #t #f))
+      #f))
+
+; ob-lock-guard-get-lock: get underlying lock.
+(define (ob-lock-guard-get-lock g) (g 'lock))
+
+; ob-lock-guard-get-mode: get guard mode.
+(define (ob-lock-guard-get-mode g) (g 'mode))
+
+; ob-lock-guard-get-active: get active flag.
+(define (ob-lock-guard-get-active g) (g 'active))
+
+; ob-lock-guard-set-active!: set active flag.
+; Returns the new flag.
+(define (ob-lock-guard-set-active! g v) ((g 'set-active!) v))

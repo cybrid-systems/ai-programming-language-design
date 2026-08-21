@@ -1,0 +1,268 @@
+; 45-latch-system_test.aura
+; ======================
+; Smoke tests for 45-latch-system.aura — Latch + Lock system
+; minimal.
+
+(require "std/test" all:)
+(require "45-latch-system" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "45-001-latch-mode-distinct"
+  (check (= 1 (if (not (= LATCH-MODE-READ LATCH-MODE-WRITE)) 1 0))))
+
+(test-suite "45-001-mutex-state-distinct"
+  (check (= 1 (if (not (= OB-MUTEX-STATE-UNLOCKED
+                          OB-MUTEX-STATE-LOCKED)) 1 0))))
+
+(test-suite "45-001-futex-state-distinct"
+  (check (= 1 (if (not (= OB-FUTEX-STATE-WAITING
+                          OB-FUTEX-STATE-SIGNALED)) 1 0))))
+
+(test-suite "45-001-bucket-mode-distinct"
+  (check (= 1 (if (not (= OB-BUCKET-MODE-SHARED
+                          OB-BUCKET-MODE-EXCLUSIVE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObLatch
+; ----------------------------------------------------------------
+
+(test-suite "45-002-latch-construction"
+  (check (= LATCH-MODE-READ (ob-latch-get-mode
+                              (make-ob-latch LATCH-MODE-READ 1 0))))
+  (check (= LATCH-MODE-WRITE (ob-latch-get-mode
+                               (make-ob-latch LATCH-MODE-WRITE 1 0))))
+  (check (= 1 (ob-latch-get-address-id
+               (make-ob-latch LATCH-MODE-READ 1 0))))
+  (check (= 42 (ob-latch-get-address-id
+                (make-ob-latch LATCH-MODE-WRITE 42 5))))
+  (check (= 0 (ob-latch-get-waiters
+               (make-ob-latch LATCH-MODE-READ 1 0))))
+  (check (= 5 (ob-latch-get-waiters
+               (make-ob-latch LATCH-MODE-WRITE 42 5)))))
+
+(test-suite "45-002-latch-predicate"
+  (check (= #t (ob-latch?
+                 (make-ob-latch LATCH-MODE-READ 0 0))))
+  (check (= #f (ob-latch? 'not-latch)))
+  (check (= #f (ob-latch? 42))))
+
+(test-suite "45-002-latch-set-mode"
+  (check (= LATCH-MODE-WRITE
+            (ob-latch-get-mode
+              (ob-latch-set-mode!
+                (make-ob-latch LATCH-MODE-READ 1 0)
+                LATCH-MODE-WRITE))))
+  (check (= LATCH-MODE-READ
+            (ob-latch-get-mode
+              (ob-latch-set-mode!
+                (make-ob-latch LATCH-MODE-WRITE 1 0)
+                LATCH-MODE-READ)))))
+
+; ----------------------------------------------------------------
+; ObSpinLock
+; ----------------------------------------------------------------
+
+(test-suite "45-003-spinlock-construction"
+  (check (= OB-MUTEX-STATE-UNLOCKED
+            (ob-spin-lock-get-locked
+              (make-ob-spin-lock OB-MUTEX-STATE-UNLOCKED 0))))
+  (check (= OB-MUTEX-STATE-LOCKED
+            (ob-spin-lock-get-locked
+              (make-ob-spin-lock OB-MUTEX-STATE-LOCKED 7))))
+  (check (= 7 (ob-spin-lock-get-owner-thread
+               (make-ob-spin-lock OB-MUTEX-STATE-LOCKED 7)))))
+
+(test-suite "45-003-spinlock-predicate"
+  (check (= #t (ob-spin-lock?
+                 (make-ob-spin-lock OB-MUTEX-STATE-UNLOCKED 0))))
+  (check (= #f (ob-spin-lock? 'not-spin)))
+  (check (= #f (ob-spin-lock? 42))))
+
+(test-suite "45-003-spinlock-set-locked"
+  (check (= OB-MUTEX-STATE-LOCKED
+            (ob-spin-lock-get-locked
+              (ob-spin-lock-set-locked!
+                (make-ob-spin-lock OB-MUTEX-STATE-UNLOCKED 0)
+                OB-MUTEX-STATE-LOCKED))))
+  (check (= OB-MUTEX-STATE-UNLOCKED
+            (ob-spin-lock-get-locked
+              (ob-spin-lock-set-locked!
+                (make-ob-spin-lock OB-MUTEX-STATE-LOCKED 7)
+                OB-MUTEX-STATE-UNLOCKED)))))
+
+; ----------------------------------------------------------------
+; ObRWLock
+; ----------------------------------------------------------------
+
+(test-suite "45-004-rwlock-construction"
+  (check (= 0 (ob-rwlock-get-readers
+               (make-ob-rwlock 0 #f LATCH-MODE-READ))))
+  (check (= 3 (ob-rwlock-get-readers
+               (make-ob-rwlock 3 #f LATCH-MODE-READ))))
+  (check (= #f (ob-rwlock-get-writer-active
+                (make-ob-rwlock 0 #f LATCH-MODE-READ))))
+  (check (= #t (ob-rwlock-get-writer-active
+                (make-ob-rwlock 0 #t LATCH-MODE-WRITE))))
+  (check (= LATCH-MODE-WRITE
+            (ob-rwlock-get-mode
+              (make-ob-rwlock 0 #t LATCH-MODE-WRITE)))))
+
+(test-suite "45-004-rwlock-predicate"
+  (check (= #t (ob-rwlock?
+                 (make-ob-rwlock 0 #f LATCH-MODE-READ))))
+  (check (= #f (ob-rwlock? 'not-rwlock)))
+  (check (= #f (ob-rwlock? 42))))
+
+(test-suite "45-004-rwlock-set-readers"
+  (check (= 5 (ob-rwlock-get-readers
+                (ob-rwlock-set-readers!
+                  (make-ob-rwlock 0 #f LATCH-MODE-READ)
+                  5))))
+  (check (= 0 (ob-rwlock-get-readers
+                (ob-rwlock-set-readers!
+                  (make-ob-rwlock 5 #f LATCH-MODE-READ)
+                  0)))))
+
+(test-suite "45-004-rwlock-set-writer-active"
+  (check (= #t (ob-rwlock-get-writer-active
+                (ob-rwlock-set-writer-active!
+                  (make-ob-rwlock 0 #f LATCH-MODE-READ)
+                  #t))))
+  (check (= #f (ob-rwlock-get-writer-active
+                 (ob-rwlock-set-writer-active!
+                   (make-ob-rwlock 0 #t LATCH-MODE-WRITE)
+                   #f)))))
+
+; ----------------------------------------------------------------
+; ObFutex
+; ----------------------------------------------------------------
+
+(test-suite "45-005-futex-construction"
+  (check (= 0 (ob-futex-get-val
+               (make-ob-futex 0 0))))
+  (check (= 42 (ob-futex-get-val
+                (make-ob-futex 42 3))))
+  (check (= 0 (ob-futex-get-sys-waiters
+               (make-ob-futex 0 0))))
+  (check (= 3 (ob-futex-get-sys-waiters
+               (make-ob-futex 42 3)))))
+
+(test-suite "45-005-futex-predicate"
+  (check (= #t (ob-futex? (make-ob-futex 0 0))))
+  (check (= #f (ob-futex? 'not-futex)))
+  (check (= #f (ob-futex? 42))))
+
+(test-suite "45-005-futex-set-val"
+  (check (= 100 (ob-futex-get-val
+                  (ob-futex-set-val!
+                    (make-ob-futex 0 0) 100))))
+  (check (= 0 (ob-futex-get-val
+                (ob-futex-set-val!
+                  (make-ob-futex 100 3) 0)))))
+
+; ----------------------------------------------------------------
+; ObBucketLock
+; ----------------------------------------------------------------
+
+(test-suite "45-006-bucket-construction"
+  (check (= 5 (ob-bucket-lock-get-bucket-id
+               (make-ob-bucket-lock 5 64 OB-BUCKET-MODE-SHARED))))
+  (check (= 64 (ob-bucket-lock-get-bucket-count
+                 (make-ob-bucket-lock 5 64 OB-BUCKET-MODE-SHARED))))
+  (check (= OB-BUCKET-MODE-EXCLUSIVE
+            (ob-bucket-lock-get-mode
+              (make-ob-bucket-lock 5 64 OB-BUCKET-MODE-EXCLUSIVE)))))
+
+(test-suite "45-006-bucket-predicate"
+  (check (= #t (ob-bucket-lock?
+                 (make-ob-bucket-lock 0 1 OB-BUCKET-MODE-SHARED))))
+  (check (= #f (ob-bucket-lock? 'not-bucket)))
+  (check (= #f (ob-bucket-lock? 42))))
+
+(test-suite "45-006-bucket-set-mode"
+  (check (= OB-BUCKET-MODE-EXCLUSIVE
+            (ob-bucket-lock-get-mode
+              (ob-bucket-lock-set-mode!
+                (make-ob-bucket-lock 5 64 OB-BUCKET-MODE-SHARED)
+                OB-BUCKET-MODE-EXCLUSIVE))))
+  (check (= OB-BUCKET-MODE-SHARED
+            (ob-bucket-lock-get-mode
+              (ob-bucket-lock-set-mode!
+                (make-ob-bucket-lock 5 64 OB-BUCKET-MODE-EXCLUSIVE)
+                OB-BUCKET-MODE-SHARED)))))
+
+; ----------------------------------------------------------------
+; ObMutex
+; ----------------------------------------------------------------
+
+(test-suite "45-007-mutex-construction"
+  (check (= OB-MUTEX-STATE-UNLOCKED
+            (ob-mutex-get-locked
+              (make-ob-mutex OB-MUTEX-STATE-UNLOCKED 0))))
+  (check (= OB-MUTEX-STATE-LOCKED
+            (ob-mutex-get-locked
+              (make-ob-mutex OB-MUTEX-STATE-LOCKED 7))))
+  (check (= 7 (ob-mutex-get-owner
+               (make-ob-mutex OB-MUTEX-STATE-LOCKED 7)))))
+
+(test-suite "45-007-mutex-predicate"
+  (check (= #t (ob-mutex?
+                 (make-ob-mutex OB-MUTEX-STATE-UNLOCKED 0))))
+  (check (= #f (ob-mutex? 'not-mutex)))
+  (check (= #f (ob-mutex? 42))))
+
+(test-suite "45-007-mutex-set-locked"
+  (check (= OB-MUTEX-STATE-LOCKED
+            (ob-mutex-get-locked
+              (ob-mutex-set-locked!
+                (make-ob-mutex OB-MUTEX-STATE-UNLOCKED 0)
+                OB-MUTEX-STATE-LOCKED))))
+  (check (= OB-MUTEX-STATE-UNLOCKED
+            (ob-mutex-get-locked
+              (ob-mutex-set-locked!
+                (make-ob-mutex OB-MUTEX-STATE-LOCKED 7)
+                OB-MUTEX-STATE-UNLOCKED)))))
+
+; ----------------------------------------------------------------
+; ObLockGuard
+; ----------------------------------------------------------------
+
+(test-suite "45-008-guard-construction"
+  (check (= LATCH-MODE-WRITE
+            (ob-lock-guard-get-mode
+              (make-ob-lock-guard
+                (make-ob-latch LATCH-MODE-READ 1 0)
+                LATCH-MODE-WRITE #f))))
+  (check (= #f (ob-lock-guard-get-active
+                 (make-ob-lock-guard
+                   (make-ob-latch LATCH-MODE-READ 1 0)
+                   LATCH-MODE-WRITE #f))))
+  (check (= #t (ob-lock-guard-get-active
+                 (make-ob-lock-guard
+                   (make-ob-latch LATCH-MODE-READ 1 0)
+                   LATCH-MODE-READ #t)))))
+
+(test-suite "45-008-guard-predicate"
+  (check (= #t (ob-lock-guard?
+                 (make-ob-lock-guard
+                   (make-ob-latch LATCH-MODE-READ 1 0)
+                   LATCH-MODE-READ #f))))
+  (check (= #f (ob-lock-guard? 'not-guard)))
+  (check (= #f (ob-lock-guard? 42))))
+
+(test-suite "45-008-guard-set-active"
+  (check (= #t (ob-lock-guard-get-active
+                 (ob-lock-guard-set-active!
+                   (make-ob-lock-guard
+                     (make-ob-latch LATCH-MODE-READ 1 0)
+                     LATCH-MODE-READ #f)
+                   #t))))
+  (check (= #f (ob-lock-guard-get-active
+                 (ob-lock-guard-set-active!
+                   (make-ob-lock-guard
+                     (make-ob-latch LATCH-MODE-WRITE 1 0)
+                     LATCH-MODE-WRITE #t)
+                   #f)))))
