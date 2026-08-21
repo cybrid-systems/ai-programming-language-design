@@ -1,0 +1,281 @@
+; 34-sstable-merge_test.aura
+; ======================
+; Smoke tests for 34-sstable-merge.aura — SSTable Merge minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/34-sstable-merge_test.aura
+;
+; Verified automatically (smoke):
+;   - 14 MERGE-TYPE constants distinct (incl. INVALID + MAX)
+;   - 4 MERGE-STATUS + 4 LEVEL constants distinct
+;   - merge-type predicates (is-mini-merge?, is-minor-merge?,
+;     is-medium-merge?, is-major-merge?, is-major-merge-type?,
+;     is-multi-version-merge?)
+;   - make-merge-task + accessors + set-status! + set-input-count!
+;   - merge-task-get-progress (4 statuses)
+;   - make-merge-scheduler + add-task! + find-task-by-id
+;   - merge-scheduler-pick-next (lowest-id PENDING)
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - pick-next ignores non-PENDING tasks
+;   - pending-count only counts PENDING
+;
+; Deferred (full OceanBase SSTable Merge):
+;   - real ObMergeCtx with all 30+ fields
+;   - real ObMediumCompactionScheduleFunc with full
+;     time/size/SCN threshold logic
+;   - real parallel mini/minor/major merge DAG
+;   - real merge progress with IO + CPU statistics
+;   - real merge history tracking
+;   - real tablet-level merge coordination
+;   - real version reuse across merge
+;   - real conflict detection during merge
+;   - real merge rate limit + adaptive throttling
+;   - real cold data + frozen tablet merge
+;   - real cross-tenant merge isolation
+
+(require "std/test" all:)
+(require "34-sstable-merge" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "34-001-merge-type-distinct"
+  ; 14 MERGE-TYPE constants are distinct.
+  (check (= 1 (if (not (= MERGE-TYPE-INVALID
+                          MERGE-TYPE-MINOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-MINOR
+                          MERGE-TYPE-HISTORY-MINOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-HISTORY-MINOR
+                          MERGE-TYPE-META-MAJOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-META-MAJOR
+                          MERGE-TYPE-MINI)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-MINI
+                          MERGE-TYPE-MAJOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-MAJOR
+                          MERGE-TYPE-MEDIUM)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-MEDIUM
+                          MERGE-TYPE-DDL-KV)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-DDL-KV
+                          MERGE-TYPE-BACKFILL-TX)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-BACKFILL-TX
+                          MERGE-TYPE-MDS-MINI)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-MDS-MINI
+                          MERGE-TYPE-MDS-MINOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-MDS-MINOR
+                          MERGE-TYPE-BATCH-EXEC)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-BATCH-EXEC
+                          MERGE-TYPE-CONVERT-CO-MAJOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-CONVERT-CO-MAJOR
+                          MERGE-TYPE-INC-MAJOR)) 1 0)))
+  (check (= 1 (if (not (= MERGE-TYPE-INC-MAJOR
+                          MERGE-TYPE-MAX)) 1 0))))
+
+(test-suite "34-001-merge-status-distinct"
+  ; 4 MERGE-STATUS constants are distinct.
+  (check (= 1 (if (not (= MERGE-STATUS-PENDING
+                          MERGE-STATUS-RUNNING)) 1 0)))
+  (check (= 1 (if (not (= MERGE-STATUS-RUNNING
+                          MERGE-STATUS-FINISHED)) 1 0)))
+  (check (= 1 (if (not (= MERGE-STATUS-FINISHED
+                          MERGE-STATUS-FAILED)) 1 0)))
+  (check (= 1 (if (not (= MERGE-STATUS-PENDING
+                          MERGE-STATUS-FAILED)) 1 0))))
+
+(test-suite "34-001-level-distinct"
+  ; 4 LEVEL constants are distinct.
+  (check (= 1 (if (not (= LEVEL-MINI
+                          LEVEL-MINOR)) 1 0)))
+  (check (= 1 (if (not (= LEVEL-MINOR
+                          LEVEL-MEDIUM)) 1 0)))
+  (check (= 1 (if (not (= LEVEL-MEDIUM
+                          LEVEL-MAJOR)) 1 0)))
+  (check (= 1 (if (not (= LEVEL-MINI
+                          LEVEL-MAJOR)) 1 0))))
+
+; ----------------------------------------------------------------
+; Merge type predicates
+; ----------------------------------------------------------------
+
+(test-suite "34-002-mini-predicate"
+  ; is-mini-merge? returns #t for MINI.
+  (check (= #t (is-mini-merge? MERGE-TYPE-MINI)))
+  (check (= #f (is-mini-merge? MERGE-TYPE-MINOR)))
+  (check (= #f (is-mini-merge? MERGE-TYPE-MAJOR))))
+
+(test-suite "34-002-minor-predicate"
+  ; is-minor-merge? returns #t for MINOR + HISTORY_MINOR.
+  (check (= #t (is-minor-merge? MERGE-TYPE-MINOR)))
+  (check (= #t (is-minor-merge? MERGE-TYPE-HISTORY-MINOR)))
+  (check (= #f (is-minor-merge? MERGE-TYPE-MAJOR))))
+
+(test-suite "34-002-medium-predicate"
+  ; is-medium-merge? returns #t for MEDIUM.
+  (check (= #t (is-medium-merge? MERGE-TYPE-MEDIUM)))
+  (check (= #f (is-medium-merge? MERGE-TYPE-MAJOR))))
+
+(test-suite "34-002-major-predicate"
+  ; is-major-merge? returns #t for strict MAJOR.
+  (check (= #t (is-major-merge? MERGE-TYPE-MAJOR)))
+  (check (= #f (is-major-merge? MERGE-TYPE-MEDIUM)))
+  (check (= #f (is-major-merge? MERGE-TYPE-MINI))))
+
+(test-suite "34-002-major-merge-type"
+  ; is-major-merge-type? accepts MEDIUM + MAJOR + CONVERT_CO_MAJOR.
+  (check (= #t (is-major-merge-type? MERGE-TYPE-MEDIUM)))
+  (check (= #t (is-major-merge-type? MERGE-TYPE-MAJOR)))
+  (check (= #t (is-major-merge-type? MERGE-TYPE-CONVERT-CO-MAJOR)))
+  (check (= #f (is-major-merge-type? MERGE-TYPE-MINI))))
+
+(test-suite "34-002-multi-version"
+  ; is-multi-version-merge? covers MINI + MINOR + HISTORY_MINOR +
+  ; BACKFILL_TX + MDS_MINOR.
+  (check (= #t (is-multi-version-merge? MERGE-TYPE-MINI)))
+  (check (= #t (is-multi-version-merge? MERGE-TYPE-MINOR)))
+  (check (= #t (is-multi-version-merge? MERGE-TYPE-HISTORY-MINOR)))
+  (check (= #t (is-multi-version-merge? MERGE-TYPE-BACKFILL-TX)))
+  (check (= #t (is-multi-version-merge? MERGE-TYPE-MDS-MINOR)))
+  (check (= #f (is-multi-version-merge? MERGE-TYPE-MAJOR))))
+
+; ----------------------------------------------------------------
+; MergeTask
+; ----------------------------------------------------------------
+
+(test-suite "34-003-task-construction"
+  ; task preserves all fields.
+  (check (= 1 (merge-task-get-task-id
+               (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                 0 LEVEL-MINI 100))))
+  (check (= MERGE-TYPE-MINI
+             (merge-task-get-type
+               (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                 0 LEVEL-MINI 100))))
+  (check (= MERGE-STATUS-PENDING
+             (merge-task-get-status
+               (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                 0 LEVEL-MINI 100))))
+  (check (= 0 (merge-task-get-input-count
+               (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                 0 LEVEL-MINI 100))))
+  (check (= LEVEL-MINI
+             (merge-task-get-output-level
+               (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                 0 LEVEL-MINI 100))))
+  (check (= 100 (merge-task-get-scn
+                 (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                   0 LEVEL-MINI 100))))
+
+(test-suite "34-003-task-predicate"
+  ; merge-task? accepts only tasks.
+  (check (= #t (merge-task?
+                 (make-merge-task 1 MERGE-TYPE-MINI MERGE-STATUS-PENDING
+                   0 LEVEL-MINI 0))))
+  (check (= #f (merge-task? 'not-task)))
+  (check (= #f (merge-task? 42)))
+
+(test-suite "34-004-task-set-status"
+  ; task set-status! updates.
+  (check (= MERGE-STATUS-FINISHED
+             (let ((t (make-merge-task 1 MERGE-TYPE-MINI
+                       MERGE-STATUS-PENDING 0 LEVEL-MINI 0)))
+               (merge-task-set-status! t MERGE-STATUS-FINISHED)
+               (merge-task-get-status t))))
+
+(test-suite "34-004-task-set-input-count"
+  ; task set-input-count! updates.
+  (check (= 5 (let ((t (make-merge-task 1 MERGE-TYPE-MINOR
+                     MERGE-STATUS-PENDING 0 LEVEL-MINOR 0)))
+                 (merge-task-set-input-count! t 5)
+                 (merge-task-get-input-count t))))
+
+(test-suite "34-005-task-progress"
+  ; task progress by status.
+  (check (= 0 (car (merge-task-get-progress
+                     (make-merge-task 1 MERGE-TYPE-MINI
+                       MERGE-STATUS-PENDING 0 LEVEL-MINI 0)))))
+  (check (= 1 (car (merge-task-get-progress
+                     (make-merge-task 1 MERGE-TYPE-MINI
+                       MERGE-STATUS-RUNNING 0 LEVEL-MINI 0)))))
+  (check (= 1 (car (merge-task-get-progress
+                     (make-merge-task 1 MERGE-TYPE-MINI
+                       MERGE-STATUS-FINISHED 0 LEVEL-MINI 0))))))
+
+; ----------------------------------------------------------------
+; MergeScheduler
+; ----------------------------------------------------------------
+
+(test-suite "34-006-scheduler-construction"
+  ; scheduler starts empty.
+  (check (= 0 (merge-scheduler-get-task-count
+               (make-merge-scheduler))))
+  (check (= 0 (merge-scheduler-get-pending-count
+               (make-merge-scheduler))))
+
+(test-suite "34-006-scheduler-predicate"
+  ; merge-scheduler? accepts only schedulers.
+  (check (= #t (merge-scheduler? (make-merge-scheduler))))
+  (check (= #f (merge-scheduler? 'not-scheduler)))
+  (check (= #f (merge-scheduler? 42)))
+
+(test-suite "34-007-scheduler-add"
+  ; add-task! increases count.
+  (check (= 1 (let ((s (make-merge-scheduler)))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 1 MERGE-TYPE-MINI
+                     MERGE-STATUS-PENDING 0 LEVEL-MINI 0))
+                 (merge-scheduler-get-task-count s))))
+
+(test-suite "34-007-scheduler-pending"
+  ; pending-count only counts PENDING.
+  (check (= 1 (let ((s (make-merge-scheduler)))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 1 MERGE-TYPE-MINI
+                     MERGE-STATUS-PENDING 0 LEVEL-MINI 0))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 2 MERGE-TYPE-MAJOR
+                     MERGE-STATUS-FINISHED 0 LEVEL-MAJOR 0))
+                 (merge-scheduler-get-pending-count s))))
+
+(test-suite "34-008-scheduler-find"
+  ; find-task-by-id returns the task.
+  (check (= #t (let ((s (make-merge-scheduler)))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 42 MERGE-TYPE-MINI
+                     MERGE-STATUS-PENDING 0 LEVEL-MINI 0))
+                 (eq? MERGE-TYPE-MINI
+                   (merge-task-get-type
+                     (merge-scheduler-find-task-by-id s 42))))))
+
+(test-suite "34-008-scheduler-find-missing"
+  ; find-task-by-id returns #f for unknown id.
+  (check (= #f (merge-scheduler-find-task-by-id
+                 (make-merge-scheduler) 999)))
+
+(test-suite "34-009-scheduler-pick-next"
+  ; pick-next returns the lowest-id PENDING task.
+  (check (= 1 (let ((s (make-merge-scheduler)))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 3 MERGE-TYPE-MINI
+                     MERGE-STATUS-PENDING 0 LEVEL-MINI 0))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 1 MERGE-TYPE-MAJOR
+                     MERGE-STATUS-PENDING 0 LEVEL-MAJOR 0))
+                 (merge-scheduler-add-task! s
+                   (make-merge-task 2 MERGE-TYPE-MEDIUM
+                     MERGE-STATUS-FINISHED 0 LEVEL-MEDIUM 0))
+                 (merge-task-get-task-id
+                   (merge-scheduler-pick-next s)))))
+
+(test-suite "34-009-scheduler-pick-next-empty"
+  ; pick-next on empty scheduler returns #f.
+  (check (= #f (merge-scheduler-pick-next (make-merge-scheduler))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

@@ -1,0 +1,330 @@
+; 34-sstable-merge.aura
+; ======================
+; sstable_merge — minimal capability port to aura.
+;
+; Maps to: OceanBase SSTable Merge (Compaction) Strategy
+; Source: src/storage/compaction/ob_compaction_util.h
+;         + src/storage/compaction/ob_merge_ctx.h
+;         + src/storage/compaction/ob_medium_compaction.h
+;         + src/storage/ls/ob_ls_tablet_service.h
+;         + src/share/scn/ob_scn.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase SSTable Merge:
+;   - 13 MergeType constants (INVALID, MINOR, HISTORY_MINOR,
+;     META_MAJOR, MINI, MAJOR, MEDIUM, DDL_KV, BACKFILL_TX,
+;     MDS_MINI, MDS_MINOR, BATCH_EXEC, CONVERT_CO_MAJOR,
+;     INC_MAJOR, MERGE_TYPE_MAX)
+;   - 4 MergeStatus constants (PENDING, RUNNING, FINISHED, FAILED)
+;   - 4 CompactionLevel constants (LEVEL_MINI, LEVEL_MINOR,
+;     LEVEL_MEDIUM, LEVEL_MAJOR)
+;   - ObMergeType: enum-like helper predicates
+;   - ObMergeTask: task with type, status, input count,
+;     output level
+;   - ObMergeSchedule: merge scheduler
+;   - Compaction priority logic
+;
+; aura v1 ships:
+;   - 14 MERGE-TYPE constants (INVALID + 13 real types)
+;   - 4 MERGE-STATUS constants
+;   - 4 LEVEL constants (MINI, MINOR, MEDIUM, MAJOR)
+;   - merge-type? (per-type predicates)
+;   - make-merge-task (factory: id, type, status, input-count,
+;     output-level, scn)
+;   - merge-task accessors + set-status! + set-input-count!
+;   - merge-task-get-progress (computed: completed/total)
+;   - make-merge-scheduler (factory: task list)
+;   - merge-scheduler-get-task-count
+;   - merge-scheduler-add-task! + find-task-by-id
+;   - merge-scheduler-pick-next (lowest id PENDING task)
+;
+; Deferred (full OceanBase SSTable Merge):
+;   - real ObMergeCtx with all 30+ fields
+;   - real ObMediumCompactionScheduleFunc with full
+;     time/size/SCN threshold logic
+;   - real parallel mini/minor/major merge DAG
+;   - real merge progress with IO + CPU statistics
+;   - real merge history tracking
+;   - real tablet-level merge coordination
+;   - real version reuse across merge
+;   - real conflict detection during merge
+;   - real merge rate limit + adaptive throttling
+;   - real cold data + frozen tablet merge
+;   - real cross-tenant merge isolation
+
+(export
+  ; MergeType constants
+  MERGE-TYPE-INVALID
+  MERGE-TYPE-MINOR
+  MERGE-TYPE-HISTORY-MINOR
+  MERGE-TYPE-META-MAJOR
+  MERGE-TYPE-MINI
+  MERGE-TYPE-MAJOR
+  MERGE-TYPE-MEDIUM
+  MERGE-TYPE-DDL-KV
+  MERGE-TYPE-BACKFILL-TX
+  MERGE-TYPE-MDS-MINI
+  MERGE-TYPE-MDS-MINOR
+  MERGE-TYPE-BATCH-EXEC
+  MERGE-TYPE-CONVERT-CO-MAJOR
+  MERGE-TYPE-INC-MAJOR
+  MERGE-TYPE-MAX
+  ; MergeStatus constants
+  MERGE-STATUS-PENDING
+  MERGE-STATUS-RUNNING
+  MERGE-STATUS-FINISHED
+  MERGE-STATUS-FAILED
+  ; Level constants
+  LEVEL-MINI
+  LEVEL-MINOR
+  LEVEL-MEDIUM
+  LEVEL-MAJOR
+  ; Merge type predicates
+  is-mini-merge?
+  is-minor-merge?
+  is-medium-merge?
+  is-major-merge?
+  is-major-merge-type?
+  is-multi-version-merge?
+  ; Merge task
+  make-merge-task
+  merge-task?
+  merge-task-get-task-id
+  merge-task-get-type
+  merge-task-get-status
+  merge-task-get-input-count
+  merge-task-get-output-level
+  merge-task-get-scn
+  merge-task-set-status!
+  merge-task-set-input-count!
+  merge-task-get-progress
+  ; Merge scheduler
+  make-merge-scheduler
+  merge-scheduler?
+  merge-scheduler-get-task-count
+  merge-scheduler-get-pending-count
+  merge-scheduler-add-task!
+  merge-scheduler-find-task-by-id
+  merge-scheduler-pick-next)
+
+; ----------------------------------------------------------------
+; MergeType constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_compaction_util.h:20-43):
+;   INVALID_MERGE_TYPE, MINOR_MERGE, HISTORY_MINOR_MERGE,
+;   META_MAJOR_MERGE, MINI_MERGE, MAJOR_MERGE, MEDIUM_MERGE,
+;   DDL_KV_MERGE, BACKFILL_TX_MERGE, MDS_MINI_MERGE,
+;   MDS_MINOR_MERGE, BATCH_EXEC, CONVERT_CO_MAJOR_MERGE,
+;   INC_MAJOR_MERGE, MERGE_TYPE_MAX
+
+(define MERGE-TYPE-INVALID 0)
+(define MERGE-TYPE-MINOR 1)
+(define MERGE-TYPE-HISTORY-MINOR 2)
+(define MERGE-TYPE-META-MAJOR 3)
+(define MERGE-TYPE-MINI 4)
+(define MERGE-TYPE-MAJOR 5)
+(define MERGE-TYPE-MEDIUM 6)
+(define MERGE-TYPE-DDL-KV 7)
+(define MERGE-TYPE-BACKFILL-TX 8)
+(define MERGE-TYPE-MDS-MINI 9)
+(define MERGE-TYPE-MDS-MINOR 10)
+(define MERGE-TYPE-BATCH-EXEC 11)
+(define MERGE-TYPE-CONVERT-CO-MAJOR 12)
+(define MERGE-TYPE-INC-MAJOR 13)
+(define MERGE-TYPE-MAX 14)
+
+; ----------------------------------------------------------------
+; MergeStatus constants
+; ----------------------------------------------------------------
+
+(define MERGE-STATUS-PENDING 0)
+(define MERGE-STATUS-RUNNING 1)
+(define MERGE-STATUS-FINISHED 2)
+(define MERGE-STATUS-FAILED 3)
+
+; ----------------------------------------------------------------
+; Level constants
+; ----------------------------------------------------------------
+
+(define LEVEL-MINI 0)
+(define LEVEL-MINOR 1)
+(define LEVEL-MEDIUM 2)
+(define LEVEL-MAJOR 3)
+
+; ----------------------------------------------------------------
+; Merge type predicates
+; ----------------------------------------------------------------
+
+; is-mini-merge?: is this a MINI merge type?
+(define (is-mini-merge? t) (or (= t MERGE-TYPE-MINI) #f))
+
+; is-minor-merge?: is this a MINOR merge type (MINOR or HISTORY_MINOR)?
+(define (is-minor-merge? t)
+  (if (or (= t MERGE-TYPE-MINOR) (= t MERGE-TYPE-HISTORY-MINOR))
+    #t #f))
+
+; is-medium-merge?: is this a MEDIUM merge type?
+(define (is-medium-merge? t) (or (= t MERGE-TYPE-MEDIUM) #f))
+
+; is-major-merge?: is this a strict MAJOR merge type?
+(define (is-major-merge? t) (or (= t MERGE-TYPE-MAJOR) #f))
+
+; is-major-merge-type?: is this a major merge family
+; (MEDIUM + MAJOR + CONVERT_CO_MAJOR)?
+(define (is-major-merge-type? t)
+  (if (or (= t MERGE-TYPE-MEDIUM)
+          (= t MERGE-TYPE-MAJOR)
+          (= t MERGE-TYPE-CONVERT-CO-MAJOR))
+    #t #f))
+
+; is-multi-version-merge?: is this a multi-version merge
+; (MINI + MINOR + HISTORY_MINOR + BACKFILL_TX + MDS_MINOR)?
+(define (is-multi-version-merge? t)
+  (if (or (= t MERGE-TYPE-MINI)
+          (= t MERGE-TYPE-MINOR)
+          (= t MERGE-TYPE-HISTORY-MINOR)
+          (= t MERGE-TYPE-BACKFILL-TX)
+          (= t MERGE-TYPE-MDS-MINOR))
+    #t #f))
+
+; ----------------------------------------------------------------
+; ObMergeTask — closure-based
+; ----------------------------------------------------------------
+
+; make-merge-task: create a merge task.
+; Args: task-id (integer), type (integer), status (integer),
+;       input-count (integer), output-level (integer),
+;       scn (integer — commit SCN)
+; Returns: merge_task closure.
+(define (make-merge-task task-id type status input-count
+                          output-level scn)
+  (letrec ((set-status! (lambda (v) (set! status v) v))
+           (set-input-count! (lambda (v) (set! input-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'task-id) task-id)
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'status) status)
+                     ((eq? msg 'input-count) input-count)
+                     ((eq? msg 'output-level) output-level)
+                     ((eq? msg 'scn) scn)
+                     ((eq? msg 'set-status!) set-status!)
+                     ((eq? msg 'set-input-count!) set-input-count!)
+                     (else #f)))))
+      self))
+
+; merge-task?: is the object a merge task?
+; Detected by querying 'scn — only tasks return integer.
+(define (merge-task? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'scn)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; merge-task-get-task-id: get task id.
+(define (merge-task-get-task-id t) (t 'task-id))
+
+; merge-task-get-type: get merge type.
+(define (merge-task-get-type t) (t 'type))
+
+; merge-task-get-status: get status.
+(define (merge-task-get-status t) (t 'status))
+
+; merge-task-get-input-count: get input count.
+(define (merge-task-get-input-count t) (t 'input-count))
+
+; merge-task-get-output-level: get output level.
+(define (merge-task-get-output-level t) (t 'output-level))
+
+; merge-task-get-scn: get commit SCN.
+(define (merge-task-get-scn t) (t 'scn))
+
+; merge-task-set-status!: set status.
+; Returns the new status.
+(define (merge-task-set-status! t v) ((t 'set-status!) v))
+
+; merge-task-set-input-count!: set input count.
+; Returns the new count.
+(define (merge-task-set-input-count! t v) ((t 'set-input-count!) v))
+
+; merge-task-get-progress: get progress (v1: 0/1 if PENDING,
+;                                       1/2 if RUNNING, 1/1 if FINISHED).
+; Returns: pair (numerator denominator).
+(define (merge-task-get-progress t)
+  (let ((s (t 'status)))
+    (cond
+      ((= s MERGE-STATUS-PENDING) (cons 0 1))
+      ((= s MERGE-STATUS-RUNNING) (cons 1 2))
+      ((= s MERGE-STATUS-FINISHED) (cons 1 1))
+      ((= s MERGE-STATUS-FAILED) (cons 0 1))
+      (else (cons 0 1)))))
+
+; ----------------------------------------------------------------
+; ObMergeScheduler — closure-based
+; ----------------------------------------------------------------
+
+; make-merge-scheduler: create a merge scheduler.
+; Returns: merge_scheduler closure (initial: empty task list).
+(define (make-merge-scheduler)
+  (let ((tasks '()))
+    (letrec ((set-tasks! (lambda (v) (set! tasks v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tasks) tasks)
+                       ((eq? msg 'set-tasks!) set-tasks!)
+                       (else #f)))))
+      self))
+
+; merge-scheduler?: is the object a merge scheduler?
+; Detected by querying 'tasks — only schedulers return a cons.
+(define (merge-scheduler? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'tasks)) #t #f)
+      #f))
+
+; merge-scheduler-get-task-count: get task count.
+(define (merge-scheduler-get-task-count s)
+  (let loop ((rest (s 'tasks)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; merge-scheduler-get-pending-count: get PENDING task count.
+(define (merge-scheduler-get-pending-count s)
+  (let loop ((rest (s 'tasks)) (n 0))
+    (cond
+      ((null? rest) n)
+      ((= ((car rest) 'status) MERGE-STATUS-PENDING)
+       (loop (cdr rest) (+ n 1)))
+      (#t (loop (cdr rest) n)))))
+
+; merge-scheduler-add-task!: add a task.
+; Returns the new count.
+(define (merge-scheduler-add-task! s task)
+  (let ((existing (s 'tasks)))
+    ((s 'set-tasks!) (cons task existing))))
+
+; merge-scheduler-find-task-by-id: find task by id.
+; Returns the task or #f.
+(define (merge-scheduler-find-task-by-id s id)
+  (let loop ((rest (s 'tasks)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'task-id) id) (car rest))
+      (#t (loop (cdr rest))))))
+
+; merge-scheduler-pick-next: pick next PENDING task (lowest id).
+; Returns the task or #f.
+(define (merge-scheduler-pick-next s)
+  (let loop ((rest (s 'tasks)) (best #f))
+    (cond
+      ((null? rest) best)
+      ((= ((car rest) 'status) MERGE-STATUS-PENDING)
+       (if (or (not best)
+               (< ((car rest) 'task-id) (best 'task-id)))
+         (loop (cdr rest) (car rest))
+         (loop (cdr rest) best)))
+      (#t (loop (cdr rest) best)))))
