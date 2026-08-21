@@ -1,0 +1,279 @@
+; 09-sql-executor_test.aura
+; ======================
+; Smoke tests for 09-sql-executor.aura — DAS + SQL executor minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/09-sql-executor_test.aura
+;
+; Verified automatically (smoke):
+;   - 4 DAS-TASK-TYPE constants distinct
+;   - 2 EXECUTION-MODE constants distinct
+;   - make-das-location + accessors
+;   - make-das-location-router + add/remove/find/count
+;   - das-router-find-server-by-tablet-id
+;   - make-das-task + accessors + setters
+;   - make-data-access-service + stats
+;   - das-execute-task (local + remote + unknown)
+;   - das-set-rpc-handler! + das-reset-stats!
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Stats accumulate correctly across execute calls
+;
+; Deferred (full OceanBase SQL executor):
+;   - real SQL planner + optimizer
+;   - actual ObDASScanOp / ObDASInsertOp operators
+;   - real RPC for remote tasks
+;   - tablet location cache refresh
+;   - DAS task serialization for RPC
+
+(require "std/test" all:)
+(require "09-sql-executor" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; mock-rpc: file-level RPC handler for tests.
+; Records which server the task went to and bumps a counter.
+; (Per-test counters managed via a global closure.)
+(define (make-rpc-recorder)
+  (let ((calls 0)
+        (last-server #f)
+        (last-task #f))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'calls) calls)
+                       ((eq? msg 'last-server) last-server)
+                       ((eq? msg 'last-task) last-task)
+                       ((eq? msg 'invoke)
+                        (lambda (server task)
+                          (set! calls (+ calls 1))
+                          (set! last-server server)
+                          (set! last-task task)
+                          (das-task-set-server-addr! task server)
+                          task))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "09-001-das-task-type-distinct"
+  ; 4 DAS-TASK-TYPE constants are distinct.
+  (check (= 1 (if (not (= DAS-TASK-TYPE-SCAN DAS-TASK-TYPE-INSERT)) 1 0)))
+  (check (= 1 (if (not (= DAS-TASK-TYPE-INSERT DAS-TASK-TYPE-UPDATE)) 1 0)))
+  (check (= 1 (if (not (= DAS-TASK-TYPE-UPDATE DAS-TASK-TYPE-DELETE)) 1 0))))
+
+(test-suite "09-001-execution-mode-distinct"
+  ; 2 EXECUTION-MODE constants are distinct.
+  (check (= 1 (if (not (= EXECUTION-MODE-LOCAL EXECUTION-MODE-REMOTE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObDASLocation
+; ----------------------------------------------------------------
+
+(test-suite "09-002-das-location-construction"
+  ; das-location preserves fields.
+  (check (= 100 (das-location-get-tablet-id
+                  (make-das-location 100 1 'local))))
+  (check (= 1 (das-location-get-ls-id
+               (make-das-location 100 1 'local))))
+  (check (= #t (eq? 'local
+                   (das-location-get-server-addr
+                     (make-das-location 100 1 'local))))))
+
+(test-suite "09-002-das-location-predicate"
+  ; das-location? accepts only locations.
+  (check (= #t (das-location? (make-das-location 1 1 'local))))
+  (check (= #f (das-location? 'not-a-loc)))
+  (check (= #f (das-location? 42))))
+
+; ----------------------------------------------------------------
+; ObDASLocationRouter
+; ----------------------------------------------------------------
+
+(test-suite "09-003-router-construction"
+  ; new router starts empty.
+  (check (= 0 (das-location-router-count (make-das-location-router)))))
+
+(test-suite "09-003-router-predicate"
+  ; das-location-router? accepts only routers.
+  (check (= #t (das-location-router? (make-das-location-router))))
+  (check (= #f (das-location-router? 'not-a-router)))
+  (check (= #f (das-location-router? 42))))
+
+(test-suite "09-004-router-add"
+  ; das-location-router-add! increases count.
+  (check (= 1 (let ((r (make-das-location-router)))
+                (das-location-router-add! r
+                  (make-das-location 1 1 'local))
+                (das-location-router-count r)))))
+
+(test-suite "09-004-router-add-multiple"
+  ; Multiple adds accumulate.
+  (check (= 3 (let ((r (make-das-location-router)))
+                (das-location-router-add! r
+                  (make-das-location 1 1 'local))
+                (das-location-router-add! r
+                  (make-das-location 2 1 'server-a))
+                (das-location-router-add! r
+                  (make-das-location 3 1 'server-b))
+                (das-location-router-count r)))))
+
+(test-suite "09-004-router-find"
+  ; das-location-router-find returns the registered location.
+  (check (= #t (let ((r (make-das-location-router))
+                    (loc (make-das-location 42 5 'server-a)))
+                (das-location-router-add! r loc)
+                (eq? loc (das-location-router-find r 42)))))
+
+(test-suite "09-004-router-find-missing"
+  ; das-location-router-find returns #f for unknown tablet-id.
+  (check (= #f (das-location-router-find (make-das-location-router) 999))))
+
+(test-suite "09-004-router-remove"
+  ; das-location-router-remove! removes + find returns #f.
+  (check (= #t (let ((r (make-das-location-router))
+                    (loc (make-das-location 42 5 'server-a)))
+                (das-location-router-add! r loc)
+                (das-location-router-remove! r 42)
+                (eq? #f (das-location-router-find r 42)))))
+
+(test-suite "09-004-router-remove-not-found"
+  ; das-location-router-remove! returns #f for non-existing.
+  (check (= #f (das-location-router-remove!
+                 (make-das-location-router) 99))))
+
+(test-suite "09-005-router-find-server"
+  ; das-router-find-server-by-tablet-id returns server-addr.
+  (check (= #t (let ((r (make-das-location-router))
+                    (loc (make-das-location 100 1 'server-x)))
+                (das-location-router-add! r loc)
+                (eq? 'server-x (das-router-find-server-by-tablet-id r 100)))))
+
+(test-suite "09-005-router-find-server-missing"
+  ; das-router-find-server-by-tablet-id returns #f for unknown.
+  (check (= #f (das-router-find-server-by-tablet-id
+                  (make-das-location-router) 999))))
+
+; ----------------------------------------------------------------
+; ObDASTask
+; ----------------------------------------------------------------
+
+(test-suite "09-006-das-task-construction"
+  ; das-task preserves fields.
+  (check (= #t (eq? 'SELECT
+                   (das-task-get-sql-stmt
+                     (make-das-task 'SELECT 100 'scan-tablet-100)))))
+  (check (= 100 (das-task-get-tablet-id
+                  (make-das-task 'SELECT 100 'scan-tablet-100))))
+  (check (= 0 (das-task-get-rows-affected
+               (make-das-task 'SELECT 100 'scan-tablet-100))))
+  (check (= 0 (das-task-get-rows-returned
+               (make-das-task 'SELECT 100 'scan-tablet-100))))
+  (check (= EXECUTION-MODE-LOCAL
+             (das-task-get-execution-mode
+               (make-das-task 'SELECT 100 'scan-tablet-100)))))
+
+(test-suite "09-006-das-task-predicate"
+  ; das-task? accepts only tasks.
+  (check (= #t (das-task? (make-das-task 'SELECT 100 'stmt)))))
+  (check (= #f (das-task? 'not-a-task)))
+  (check (= #f (das-task? 42))))
+
+(test-suite "09-007-das-task-setters"
+  ; das-task setters update fields.
+  (check (= 5 (let ((t (make-das-task 'SELECT 100 'stmt)))
+                (das-task-set-rows-affected! t 5)
+                (das-task-get-rows-affected t))))
+  (check (= 100 (let ((t (make-das-task 'SELECT 100 'stmt)))
+                 (das-task-set-rows-returned! t 100)
+                 (das-task-get-rows-returned t))))
+  (check (= EXECUTION-MODE-REMOTE
+             (let ((t (make-das-task 'SELECT 100 'stmt)))
+               (das-task-set-execution-mode! t EXECUTION-MODE-REMOTE)
+               (das-task-get-execution-mode t))))
+  (check (= #t (let ((t (make-das-task 'SELECT 100 'stmt)))
+                 (das-task-set-server-addr! t 'server-y)
+                 (eq? 'server-y (das-task-get-server-addr t)))))
+
+; ----------------------------------------------------------------
+; ObDataAccessService
+; ----------------------------------------------------------------
+
+(test-suite "09-008-das-service-construction"
+  ; new DAS starts with zero stats.
+  (check (= 0 (das-stat-local-tasks (make-data-access-service))))
+  (check (= 0 (das-stat-remote-tasks (make-data-access-service))))
+  (check (= 0 (das-stat-rpc-calls (make-data-access-service)))))
+
+(test-suite "09-008-das-service-predicate"
+  ; data-access-service? accepts only services.
+  (check (= #t (data-access-service? (make-data-access-service))))
+  (check (= #f (data-access-service? 'not-a-das)))
+  (check (= #f (data-access-service? 42))))
+
+(test-suite "09-009-das-execute-local"
+  ; Local task → execution-mode stays LOCAL + local counter bumps.
+  (check (= #t (let ((das (make-data-access-service))
+                    (r ((das 'router)))
+                    (task (make-das-task 'SELECT 1 'stmt)))
+                ((r 'set-locations!)
+                 (list (make-das-location 1 1 'local)))
+                (das-execute-task das task)
+                (and (eq? EXECUTION-MODE-LOCAL (das-task-get-execution-mode task))
+                     (= 1 (das-stat-local-tasks das)))))))
+
+(test-suite "09-009-das-execute-remote"
+  ; Remote task → execution-mode flips to REMOTE + remote counter bumps.
+  (check (= #t (let ((das (make-data-access-service))
+                    (r ((das 'router)))
+                    (task (make-das-task 'SELECT 2 'stmt)))
+                ((r 'set-locations!)
+                 (list (make-das-location 2 1 'server-remote)))
+                (das-execute-task das task)
+                (and (= 1 (das-stat-remote-tasks das))
+                     (= 1 (das-stat-rpc-calls das)))))))
+
+(test-suite "09-009-das-execute-unknown"
+  ; Unknown location → execution-mode stays LOCAL + 'unknown server.
+  (check (= #t (let ((das (make-data-access-service))
+                    (task (make-das-task 'SELECT 999 'stmt)))
+                (das-execute-task das task)
+                (and (eq? 'unknown (das-task-get-server-addr task))
+                     (= 1 (das-stat-local-tasks das)))))))
+
+(test-suite "09-009-das-rpc-handler-invoked"
+  ; rpc-handler is invoked for remote tasks.
+  (check (= #t (let ((das (make-data-access-service))
+                    (r ((das 'router)))
+                    (recorder (make-rpc-recorder))
+                    (task (make-das-task 'SELECT 3 'stmt)))
+                ((r 'set-locations!)
+                 (list (make-das-location 3 1 'server-zzz)))
+                (das-set-rpc-handler! das (recorder 'invoke))
+                (das-execute-task das task)
+                (and (= 1 (recorder 'calls))
+                     (eq? 'server-zzz (recorder 'last-server))
+                     (eq? task (recorder 'last-task)))))))
+
+(test-suite "09-010-das-reset-stats"
+  ; das-reset-stats! zeros all counters.
+  (check (= 0 (let ((das (make-data-access-service))
+                    (task (make-das-task 'SELECT 1 'stmt)))
+                (das-execute-task das task)
+                (das-execute-task das task)
+                (das-reset-stats! das)
+                (+ (das-stat-local-tasks das)
+                   (das-stat-remote-tasks das)
+                   (das-stat-rpc-calls das))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

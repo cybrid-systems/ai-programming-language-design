@@ -1,0 +1,380 @@
+; 09-sql-executor.aura
+; ======================
+; sql_executor — minimal capability port to aura.
+;
+; Maps to: OceanBase SQL executor + DAS layer
+; Source: src/sql/engine/table/ob_table_scan_op.h
+;         + src/sql/das/ob_data_access_service.h + .cpp
+;         + src/sql/das/ob_das_location_router.h
+;         + src/sql/das/ob_das_scan_task.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase SQL execution flow:
+;   - 3-layer architecture: SQL → DAS → Storage
+;   - ObTableScanOp (SQL-side scan operator)
+;   - ObDASLocationRouter (tablet → LS + server)
+;   - ObDASScanTask / ObDASInsertTask / ObDASUpdateTask / ObDASDeleteTask
+;   - ObDataAccessService::execute_das_task (local vs remote routing)
+;   - do_local_das_task (direct storage call)
+;   - do_async_remote_das_task (RPC to remote)
+;
+; aura has no RPC, no SQL planner, no partition routing. v1 ships:
+;   - 4 DAS-TASK-TYPE constants (SCAN, INSERT, UPDATE, DELETE)
+;   - 2 EXECUTION-MODE constants (LOCAL, REMOTE)
+;   - make-das-location (factory: tablet-id + ls-id + server-addr)
+;   - das-location-get-tablet-id / ls-id / server-addr
+;   - make-das-task (factory: task-type + tablet-id + sql-stmt)
+;   - das-task-get-task-type / tablet-id / sql-stmt
+;   - das-task-set-result! (set rows-affected or rows-returned)
+;   - make-data-access-service (registry of locations)
+;   - das-execute-task (route based on location: local vs remote)
+;   - das-find-location (by tablet-id)
+;   - das-local-task-count / das-remote-task-count (stats)
+;   - das-set-rpc-handler! (mock handler for remote tasks)
+;   - ObTableScanOp-like wrapper
+;
+; Deferred (full OceanBase SQL executor):
+;   - real SQL planner + optimizer
+;   - actual ObDASScanOp / ObDASInsertOp operators
+;   - real RPC for remote tasks
+;   - tablet location cache refresh
+;   - DAS task serialization for RPC
+;   - PX parallel execution coordination
+;   - error handling + retry logic
+
+(export
+  ; DAS task type constants
+  DAS-TASK-TYPE-SCAN DAS-TASK-TYPE-INSERT
+  DAS-TASK-TYPE-UPDATE DAS-TASK-TYPE-DELETE
+  ; Execution mode constants
+  EXECUTION-MODE-LOCAL EXECUTION-MODE-REMOTE
+  ; ObDASLocation
+  make-das-location das-location?
+  das-location-get-tablet-id das-location-get-ls-id
+  das-location-get-server-addr
+  ; ObDASLocationRouter
+  make-das-location-router das-location-router?
+  das-location-router-add! das-location-router-remove!
+  das-location-router-find das-location-router-count
+  das-location-router-find-server
+  ; ObDASLocationRouter.find server addr lookup
+  das-router-find-server-by-tablet-id
+  ; ObDASTask
+  make-das-task das-task?
+  das-task-get-task-type das-task-get-tablet-id
+  das-task-get-sql-stmt das-task-get-rows-affected
+  das-task-get-rows-returned das-task-get-execution-mode
+  das-task-set-rows-affected! das-task-set-rows-returned!
+  das-task-set-execution-mode! das-task-set-server-addr!
+  ; ObDataAccessService
+  make-data-access-service data-access-service?
+  das-execute-task das-stat-local-tasks
+  das-stat-remote-tasks das-stat-rpc-calls
+  das-set-rpc-handler! das-reset-stats!)
+
+; ----------------------------------------------------------------
+; DAS task type constants
+; ----------------------------------------------------------------
+
+(define DAS-TASK-TYPE-SCAN 1)
+(define DAS-TASK-TYPE-INSERT 2)
+(define DAS-TASK-TYPE-UPDATE 4)
+(define DAS-TASK-TYPE-DELETE 8)
+
+; ----------------------------------------------------------------
+; Execution mode constants
+; ----------------------------------------------------------------
+
+(define EXECUTION-MODE-LOCAL 1)
+(define EXECUTION-MODE-REMOTE 2)
+
+; ----------------------------------------------------------------
+; ObDASLocation — closure-based
+; ----------------------------------------------------------------
+
+; make-das-location: create a DAS location.
+; Args: tablet-id (integer), ls-id (integer), server-addr (symbol —
+;       logical address identifier)
+; Returns: das_location closure.
+(define (make-das-location tablet-id ls-id server-addr)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tablet-id) tablet-id)
+                     ((eq? msg 'ls-id) ls-id)
+                     ((eq? msg 'server-addr) server-addr)
+                     (else #f)))))
+      self)))
+
+; das-location?: is the object a DAS location?
+; Detected by querying 'tablet-id — only locations return an integer.
+(define (das-location? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'tablet-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; das-location-get-tablet-id: get tablet id.
+(define (das-location-get-tablet-id loc) (loc 'tablet-id))
+
+; das-location-get-ls-id: get LS id.
+(define (das-location-get-ls-id loc) (loc 'ls-id))
+
+; das-location-get-server-addr: get server address.
+(define (das-location-get-server-addr loc) (loc 'server-addr))
+
+; ----------------------------------------------------------------
+; ObDASLocationRouter — closure-based registry
+; ----------------------------------------------------------------
+
+; make-das-location-router: create an empty location router.
+; Returns: location_router closure.
+(define (make-das-location-router)
+  (let ((locations '()))
+    (letrec ((set-locations! (lambda (v) (set! locations v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) locations)
+                       ((eq? msg 'set-locations!) set-locations!)
+                       (else #f)))))
+      self)))
+
+; das-location-router?: is the object a location router?
+; Detected by querying 'list — only routers return a list.
+(define (das-location-router? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'list)) #t #f)
+      #f))
+
+; das-location-router-add!: add a location to the router.
+; Returns the new count.
+(define (das-location-router-add! router loc)
+  (let ((old-list (router 'list)))
+    ((router 'set-locations!) (cons loc old-list))))
+
+; das-location-router-remove!: remove a location by tablet-id.
+; Returns #t if removed, #f if not found.
+(define (das-location-router-remove! router tablet-id)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((router 'set-locations!) (cons-rev acc '()))
+                            ((router 'set-locations!) acc))
+                        found?)
+                       ((= ((car rest) 'tablet-id) tablet-id)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (router 'list) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; das-location-router-find: find a location by tablet-id.
+; Returns the location or #f.
+(define (das-location-router-find router tablet-id)
+  (let loop ((rest (router 'list)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'tablet-id) tablet-id) (car rest))
+      (else (loop (cdr rest))))))
+
+; das-location-router-count: count of registered locations.
+(define (das-location-router-count router)
+  (let loop ((rest (router 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; das-router-find-server-by-tablet-id: shortcut for server-addr lookup.
+; Returns server-addr symbol or #f.
+(define (das-router-find-server-by-tablet-id router tablet-id)
+  (let ((loc (das-location-router-find router tablet-id)))
+    (if loc
+        (loc 'server-addr)
+        #f)))
+
+; ----------------------------------------------------------------
+; ObDASTask — closure-based
+; ----------------------------------------------------------------
+
+; make-das-task: create a DAS task.
+; Args: task-type (symbol), tablet-id (integer), sql-stmt (symbol)
+; Returns: das_task closure.
+(define (make-das-task task-type tablet-id sql-stmt)
+  (let ((rows-affected 0)
+        (rows-returned 0)
+        (execution-mode EXECUTION-MODE-LOCAL)
+        (server-addr 'local))
+    (letrec ((set-rows-affected! (lambda (v) (set! rows-affected v) v))
+             (set-rows-returned! (lambda (v) (set! rows-returned v) v))
+             (set-execution-mode! (lambda (v) (set! execution-mode v) v))
+             (set-server-addr! (lambda (v) (set! server-addr v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'task-type) task-type)
+                       ((eq? msg 'tablet-id) tablet-id)
+                       ((eq? msg 'sql-stmt) sql-stmt)
+                       ((eq? msg 'rows-affected) rows-affected)
+                       ((eq? msg 'rows-returned) rows-returned)
+                       ((eq? msg 'execution-mode) execution-mode)
+                       ((eq? msg 'server-addr) server-addr)
+                       ((eq? msg 'set-rows-affected!) set-rows-affected!)
+                       ((eq? msg 'set-rows-returned!) set-rows-returned!)
+                       ((eq? msg 'set-execution-mode!) set-execution-mode!)
+                       ((eq? msg 'set-server-addr!) set-server-addr!)
+                       (else #f)))))
+      self)))
+
+; das-task?: is the object a DAS task?
+; Detected by querying 'rows-affected — only tasks return an integer.
+(define (das-task? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'rows-affected)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; das-task-get-task-type: get task-type symbol.
+(define (das-task-get-task-type t) (t 'task-type))
+
+; das-task-get-tablet-id: get tablet id.
+(define (das-task-get-tablet-id t) (t 'tablet-id))
+
+; das-task-get-sql-stmt: get SQL statement (mock symbol).
+(define (das-task-get-sql-stmt t) (t 'sql-stmt))
+
+; das-task-get-rows-affected: get rows-affected.
+(define (das-task-get-rows-affected t) (t 'rows-affected))
+
+; das-task-get-rows-returned: get rows-returned (for SCAN tasks).
+(define (das-task-get-rows-returned t) (t 'rows-returned))
+
+; das-task-get-execution-mode: get execution-mode (LOCAL or REMOTE).
+(define (das-task-get-execution-mode t) (t 'execution-mode))
+
+; das-task-set-rows-affected!: set rows-affected.
+(define (das-task-set-rows-affected! t v)
+  ((t 'set-rows-affected!) v))
+
+; das-task-set-rows-returned!: set rows-returned.
+(define (das-task-set-rows-returned! t v)
+  ((t 'set-rows-returned!) v))
+
+; das-task-set-execution-mode!: set execution-mode.
+(define (das-task-set-execution-mode! t v)
+  ((t 'set-execution-mode!) v))
+
+; das-task-set-server-addr!: set server-addr (where task ran).
+(define (das-task-set-server-addr! t v)
+  ((t 'set-server-addr!) v))
+
+; ----------------------------------------------------------------
+; ObDataAccessService — closure-based
+; ----------------------------------------------------------------
+;
+; Per OB (ob_data_access_service.h):
+;   - execute_das_task: routes task to local or remote
+;   - do_local_das_task: direct storage call
+;   - do_async_remote_das_task: RPC to remote
+;
+; aura v1: simulate by checking location's server-addr vs 'local.
+; rpc-handler is a procedure (server-addr, task) → returns updated
+; task. Used when task is routed to non-local server.
+
+; make-data-access-service: create a DAS service.
+; Returns: data_access_service closure.
+(define (make-data-access-service)
+  (let ((router (make-das-location-router))
+        (stat-local-tasks 0)
+        (stat-remote-tasks 0)
+        (stat-rpc-calls 0)
+        (rpc-handler #f))
+    (letrec ((set-rpc-handler! (lambda (h) (set! rpc-handler h)))
+             (set-stat-local! (lambda (v) (set! stat-local-tasks v) v))
+             (set-stat-remote! (lambda (v) (set! stat-remote-tasks v) v))
+             (set-stat-rpc! (lambda (v) (set! stat-rpc-calls v) v))
+             (inc-stat-local! (lambda () (set! stat-local-tasks (+ stat-local-tasks 1)) stat-local-tasks))
+             (inc-stat-remote! (lambda () (set! stat-remote-tasks (+ stat-remote-tasks 1)) stat-remote-tasks))
+             (inc-stat-rpc! (lambda () (set! stat-rpc-calls (+ stat-rpc-calls 1)) stat-rpc-calls))
+             (reset-stats! (lambda ()
+                            (set! stat-local-tasks 0)
+                            (set! stat-remote-tasks 0)
+                            (set! stat-rpc-calls 0)))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'router) router)
+                       ((eq? msg 'stat-local-tasks) stat-local-tasks)
+                       ((eq? msg 'stat-remote-tasks) stat-remote-tasks)
+                       ((eq? msg 'stat-rpc-calls) stat-rpc-calls)
+                       ((eq? msg 'rpc-handler) rpc-handler)
+                       ((eq? msg 'set-rpc-handler!) set-rpc-handler!)
+                       ((eq? msg 'set-stat-local!) set-stat-local!)
+                       ((eq? msg 'set-stat-remote!) set-stat-remote!)
+                       ((eq? msg 'set-stat-rpc!) set-stat-rpc!)
+                       ((eq? msg 'inc-stat-local!) inc-stat-local!)
+                       ((eq? msg 'inc-stat-remote!) inc-stat-remote!)
+                       ((eq? msg 'inc-stat-rpc!) inc-stat-rpc!)
+                       ((eq? msg 'reset-stats!) reset-stats!)
+                       (else #f)))))
+      self)))
+
+; data-access-service?: is the object a data access service?
+; Detected by querying 'stat-local-tasks — only services return an integer.
+(define (data-access-service? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'stat-local-tasks)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; das-execute-task: route + execute a DAS task.
+; Locates the tablet's server. If local, increment local counter.
+; If remote, increment remote counter + invoke rpc-handler.
+; Returns the updated task.
+(define (das-execute-task das task)
+  (let ((router (das 'router))
+        (tablet-id (task 'tablet-id)))
+    (let ((loc (das-location-router-find router tablet-id)))
+      (cond
+        ((eq? loc #f)
+         ; Unknown location — treat as local with 'unknown server.
+         ((das 'inc-stat-local!))
+         ((task 'set-server-addr!) 'unknown)
+         task)
+        ((eq? (loc 'server-addr) 'local)
+         ; Local task — no RPC needed.
+         ((das 'inc-stat-local!))
+         ((task 'set-server-addr!) 'local)
+         task)
+        (else
+         ; Remote task — invoke rpc-handler if set.
+         ((das 'inc-stat-remote!))
+         ((das 'inc-stat-rpc!))
+         ((task 'set-server-addr!) (loc 'server-addr))
+         (let ((handler (das 'rpc-handler)))
+           (if (procedure? handler)
+               (handler (loc 'server-addr) task)
+               task)))))))
+
+; das-stat-local-tasks: get local-task counter.
+(define (das-stat-local-tasks das) (das 'stat-local-tasks))
+
+; das-stat-remote-tasks: get remote-task counter.
+(define (das-stat-remote-tasks das) (das 'stat-remote-tasks))
+
+; das-stat-rpc-calls: get RPC-call counter.
+(define (das-stat-rpc-calls das) (das 'stat-rpc-calls))
+
+; das-set-rpc-handler!: set the RPC handler procedure.
+(define (das-set-rpc-handler! das handler)
+  ((das 'set-rpc-handler!) handler))
+
+; das-reset-stats!: reset all counters to 0.
+(define (das-reset-stats! das)
+  ((das 'reset-stats!)))
