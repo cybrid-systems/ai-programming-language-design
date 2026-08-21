@@ -1,0 +1,411 @@
+; 19-partition-migration.aura
+; ======================
+; partition_migration — minimal capability port to aura.
+;
+; Maps to: OceanBase LS migration + partition transfer
+; Source: src/storage/high_availability/ob_ls_migration_handler.{h,cpp}
+;         + src/storage/high_availability/ob_ls_prepare_migration.h
+;         + src/storage/high_availability/ob_ls_migration.h
+;         + src/storage/high_availability/ob_ls_complete_migration.h
+;         + src/storage/high_availability/ob_transfer_handler.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase LS migration / partition transfer:
+;   - ObLSMigrationHandler: 8-state state machine
+;     (INIT → PREPARE_LS → WAIT_PREPARE_LS → BUILD_LS → WAIT_BUILD_LS
+;      → COMPLETE_LS → WAIT_COMPLETE_LS → FINISH)
+;   - 3 migration phases: prepare / build (migrate) / complete
+;   - 5 migration operations: ADD_REPLICA / REMOVE_REPLICA /
+;     MIGRATE / REPLACE / CONVERT
+;   - ObLSPrepareMigration: prepare-phase data
+;   - ObLSMigration: build-phase data (Tablet-level)
+;   - ObLSCompleteMigration: complete-phase data
+;   - Status enum + operations
+;
+; aura v1 ships:
+;   - 8 MIGRATION-STATUS constants (INIT, PREPARE-LS,
+;     WAIT-PREPARE-LS, BUILD-LS, WAIT-BUILD-LS, COMPLETE-LS,
+;     WAIT-COMPLETE-LS, FINISH)
+;   - 5 MIGRATION-OP constants (ADD-REPLICA, REMOVE-REPLICA,
+;     MIGRATE, REPLACE, CONVERT)
+;   - 3 MIGRATION-PHASE constants (PREPARE, BUILD, COMPLETE)
+;   - make-migration-handler (factory: ls-id + op)
+;   - migration-handler-get-ls-id / get-op / get-status
+;   - migration-handler-set-status! / advance!
+;   - migration-handler-advance-to-prepare! /
+;     build! / complete! / finish! (state transitions)
+;   - migration-handler-is-final? (state == FINISH)
+;   - make-prepare-migration (factory: src-ls-id + dst-ls-id)
+;   - prepare-migration-get-src / get-dst
+;   - make-migrate-migration (factory: tablet-id + src + dst)
+;   - migrate-migration-get-tablet-id / src / dst
+;   - make-complete-migration (factory: ls-id)
+;   - complete-migration-get-ls-id
+;   - make-migration-registry (factory: list of handlers)
+;   - migration-registry-add! / count / find-by-ls-id
+;   - migration-registry-remove! (cleanup after FINISH)
+;
+; Deferred (full OceanBase LS migration):
+;   - real ObLSMigrationHandler with DAG Net scheduler
+;   - real 8-state state machine with retry + failure handling
+;   - real ObLSPrepareMigration (full LS creation + sync)
+;   - real ObLSMigration (Tablet-level SSTable copy + log catch-up)
+;   - real ObLSCompleteMigration (role switch + Meta update)
+;   - real ObTransferHandler (Partition Transfer)
+;   - real ObLSRebuildCbImpl (replica rebuild)
+;   - real ObLSMemberListService (member list management)
+;   - real ObLSBlockTxService (transaction block during migration)
+;   - real RootServer / ObPartitionBalanceer (load balancer)
+;   - real __all_ls_migration_task inner table
+;   - real SCM (strongly consistent) check_before_do_task_()
+
+(export
+  ; Migration status constants
+  MIGRATION-STATUS-INIT
+  MIGRATION-STATUS-PREPARE-LS
+  MIGRATION-STATUS-WAIT-PREPARE-LS
+  MIGRATION-STATUS-BUILD-LS
+  MIGRATION-STATUS-WAIT-BUILD-LS
+  MIGRATION-STATUS-COMPLETE-LS
+  MIGRATION-STATUS-WAIT-COMPLETE-LS
+  MIGRATION-STATUS-FINISH
+  ; Migration op constants
+  MIGRATION-OP-ADD-REPLICA
+  MIGRATION-OP-REMOVE-REPLICA
+  MIGRATION-OP-MIGRATE
+  MIGRATION-OP-REPLACE
+  MIGRATION-OP-CONVERT
+  ; Migration phase constants
+  MIGRATION-PHASE-PREPARE
+  MIGRATION-PHASE-BUILD
+  MIGRATION-PHASE-COMPLETE
+  ; ObLSMigrationHandler
+  make-migration-handler migration-handler?
+  migration-handler-get-ls-id migration-handler-get-op
+  migration-handler-get-status migration-handler-set-status!
+  migration-handler-advance! migration-handler-is-final?
+  ; Phase transitions
+  migration-handler-advance-to-prepare!
+  migration-handler-advance-to-wait-prepare!
+  migration-handler-advance-to-build!
+  migration-handler-advance-to-wait-build!
+  migration-handler-advance-to-complete!
+  migration-handler-advance-to-wait-complete!
+  migration-handler-advance-to-finish!
+  ; ObLSPrepareMigration
+  make-prepare-migration prepare-migration?
+  prepare-migration-get-src-ls-id
+  prepare-migration-get-dst-ls-id
+  prepare-migration-set-src-ls-id!
+  ; ObLSMigration (build / migrate phase)
+  make-migrate-migration migrate-migration?
+  migrate-migration-get-tablet-id
+  migrate-migration-get-src-ls-id
+  migrate-migration-get-dst-ls-id
+  migrate-migration-set-tablet-id!
+  ; ObLSCompleteMigration
+  make-complete-migration complete-migration?
+  complete-migration-get-ls-id
+  ; MigrationRegistry
+  make-migration-registry migration-registry?
+  migration-registry-add! migration-registry-count
+  migration-registry-find-by-ls-id
+  migration-registry-remove!
+  migration-registry-get-by-status)
+
+; ----------------------------------------------------------------
+; Migration status constants (per ob_ls_migration_handler.h:30-57)
+; ----------------------------------------------------------------
+
+(define MIGRATION-STATUS-INIT 0)
+(define MIGRATION-STATUS-PREPARE-LS 1)
+(define MIGRATION-STATUS-WAIT-PREPARE-LS 2)
+(define MIGRATION-STATUS-BUILD-LS 3)
+(define MIGRATION-STATUS-WAIT-BUILD-LS 4)
+(define MIGRATION-STATUS-COMPLETE-LS 5)
+(define MIGRATION-STATUS-WAIT-COMPLETE-LS 6)
+(define MIGRATION-STATUS-FINISH 7)
+
+; ----------------------------------------------------------------
+; Migration operation constants
+; ----------------------------------------------------------------
+
+(define MIGRATION-OP-ADD-REPLICA 1)
+(define MIGRATION-OP-REMOVE-REPLICA 2)
+(define MIGRATION-OP-MIGRATE 3)
+(define MIGRATION-OP-REPLACE 4)
+(define MIGRATION-OP-CONVERT 5)
+
+; ----------------------------------------------------------------
+; Migration phase constants
+; ----------------------------------------------------------------
+
+(define MIGRATION-PHASE-PREPARE 1)
+(define MIGRATION-PHASE-BUILD 2)
+(define MIGRATION-PHASE-COMPLETE 3)
+
+; ----------------------------------------------------------------
+; ObLSMigrationHandler — closure-based
+; ----------------------------------------------------------------
+
+; make-migration-handler: create an LS migration handler.
+; Args: ls-id (integer), op (integer — MIGRATION-OP-*)
+; Returns: migration_handler closure (initial: status=INIT).
+(define (make-migration-handler ls-id op)
+  (let ((status MIGRATION-STATUS-INIT))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'ls-id) ls-id)
+                       ((eq? msg 'op) op)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self)))
+
+; migration-handler?: is the object a migration handler?
+; Detected by querying 'op — only handlers return integer.
+(define (migration-handler? obj)
+  (if (procedure? obj)
+      (let ((o (obj 'op)))
+        (if (and (integer? o) (>= o 1)) #t #f))
+      #f))
+
+; migration-handler-get-ls-id: get LS id.
+(define (migration-handler-get-ls-id h) (h 'ls-id))
+
+; migration-handler-get-op: get migration operation type.
+(define (migration-handler-get-op h) (h 'op))
+
+; migration-handler-get-status: get current status.
+(define (migration-handler-get-status h) (h 'status))
+
+; migration-handler-set-status!: set status directly.
+; Returns the new status.
+(define (migration-handler-set-status! h v)
+  ((h 'set-status!) v))
+
+; migration-handler-advance!: advance to next status in the natural
+; sequence. Returns the new status.
+(define (migration-handler-advance! h)
+  (let ((cur (h 'status)))
+    (cond
+      ((= cur MIGRATION-STATUS-INIT) (migration-handler-set-status! h MIGRATION-STATUS-PREPARE-LS))
+      ((= cur MIGRATION-STATUS-PREPARE-LS) (migration-handler-set-status! h MIGRATION-STATUS-WAIT-PREPARE-LS))
+      ((= cur MIGRATION-STATUS-WAIT-PREPARE-LS) (migration-handler-set-status! h MIGRATION-STATUS-BUILD-LS))
+      ((= cur MIGRATION-STATUS-BUILD-LS) (migration-handler-set-status! h MIGRATION-STATUS-WAIT-BUILD-LS))
+      ((= cur MIGRATION-STATUS-WAIT-BUILD-LS) (migration-handler-set-status! h MIGRATION-STATUS-COMPLETE-LS))
+      ((= cur MIGRATION-STATUS-COMPLETE-LS) (migration-handler-set-status! h MIGRATION-STATUS-WAIT-COMPLETE-LS))
+      ((= cur MIGRATION-STATUS-WAIT-COMPLETE-LS) (migration-handler-set-status! h MIGRATION-STATUS-FINISH))
+      (else (h 'status)))))
+
+; migration-handler-is-final?: has the handler reached the final
+; FINISH state?
+(define (migration-handler-is-final? h)
+  (= (h 'status) MIGRATION-STATUS-FINISH))
+
+; Specific state transition helpers
+(define (migration-handler-advance-to-prepare! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-PREPARE-LS))
+
+(define (migration-handler-advance-to-wait-prepare! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-WAIT-PREPARE-LS))
+
+(define (migration-handler-advance-to-build! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-BUILD-LS))
+
+(define (migration-handler-advance-to-wait-build! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-WAIT-BUILD-LS))
+
+(define (migration-handler-advance-to-complete! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-COMPLETE-LS))
+
+(define (migration-handler-advance-to-wait-complete! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-WAIT-COMPLETE-LS))
+
+(define (migration-handler-advance-to-finish! h)
+  (migration-handler-set-status! h MIGRATION-STATUS-FINISH))
+
+; ----------------------------------------------------------------
+; ObLSPrepareMigration — closure-based
+; ----------------------------------------------------------------
+
+; make-prepare-migration: create prepare-migration record.
+; Args: src-ls-id (integer — source LS),
+;       dst-ls-id (integer — destination LS)
+; Returns: prepare_migration closure.
+(define (make-prepare-migration src-ls-id dst-ls-id)
+  (letrec ((set-src! (lambda (v) (set! src-ls-id v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'src-ls-id) src-ls-id)
+                     ((eq? msg 'dst-ls-id) dst-ls-id)
+                     ((eq? msg 'set-src-ls-id!) set-src!)
+                     (else #f)))))
+      self)))
+
+; prepare-migration?: is the object a prepare migration?
+; Detected by querying 'src-ls-id — only migrations return integer.
+(define (prepare-migration? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'src-ls-id)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; prepare-migration-get-src-ls-id: get source LS id.
+(define (prepare-migration-get-src-ls-id pm) (pm 'src-ls-id))
+
+; prepare-migration-get-dst-ls-id: get destination LS id.
+(define (prepare-migration-get-dst-ls-id pm) (pm 'dst-ls-id))
+
+; prepare-migration-set-src-ls-id!: set source LS id.
+; Returns the new src-ls-id.
+(define (prepare-migration-set-src-ls-id! pm v)
+  ((pm 'set-src-ls-id!) v))
+
+; ----------------------------------------------------------------
+; ObLSMigration (build / migrate phase) — closure-based
+; ----------------------------------------------------------------
+
+; make-migrate-migration: create migrate-migration record.
+; Args: tablet-id (integer), src-ls-id (integer), dst-ls-id (integer)
+; Returns: migrate_migration closure.
+(define (make-migrate-migration tablet-id src-ls-id dst-ls-id)
+  (letrec ((set-tablet-id! (lambda (v) (set! tablet-id v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tablet-id) tablet-id)
+                     ((eq? msg 'src-ls-id) src-ls-id)
+                     ((eq? msg 'dst-ls-id) dst-ls-id)
+                     ((eq? msg 'set-tablet-id!) set-tablet-id!)
+                     (else #f)))))
+      self))
+
+; migrate-migration?: is the object a migrate migration?
+; Detected by querying 'tablet-id — only migrations return integer.
+(define (migrate-migration? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'tablet-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; migrate-migration-get-tablet-id: get tablet id.
+(define (migrate-migration-get-tablet-id mm) (mm 'tablet-id))
+
+; migrate-migration-get-src-ls-id: get source LS id.
+(define (migrate-migration-get-src-ls-id mm) (mm 'src-ls-id))
+
+; migrate-migration-get-dst-ls-id: get destination LS id.
+(define (migrate-migration-get-dst-ls-id mm) (mm 'dst-ls-id))
+
+; migrate-migration-set-tablet-id!: set tablet id.
+; Returns the new tablet id.
+(define (migrate-migration-set-tablet-id! mm v)
+  ((mm 'set-tablet-id!) v))
+
+; ----------------------------------------------------------------
+; ObLSCompleteMigration — closure-based
+; ----------------------------------------------------------------
+
+; make-complete-migration: create complete-migration record.
+; Args: ls-id (integer)
+; Returns: complete_migration closure.
+(define (make-complete-migration ls-id)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'ls-id) ls-id)
+                     (else #f)))))
+      self))
+
+; complete-migration?: is the object a complete migration?
+; Detected by querying 'ls-id — only completions return integer.
+(define (complete-migration? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'ls-id)))
+        (if (and (integer? l) (>= l 0)) #t #f))
+      #f))
+
+; complete-migration-get-ls-id: get LS id.
+(define (complete-migration-get-ls-id cm) (cm 'ls-id))
+
+; ----------------------------------------------------------------
+; MigrationRegistry — closure-based
+; ----------------------------------------------------------------
+
+; make-migration-registry: create a registry of migration handlers.
+; Returns: migration_registry closure (initial: empty).
+(define (make-migration-registry)
+  (let ((handlers '()))
+    (letrec ((set-handlers! (lambda (v) (set! handlers v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handlers) handlers)
+                       ((eq? msg 'set-handlers!) set-handlers!)
+                       (else #f)))))
+      self)))
+
+; migration-registry?: is the object a registry?
+; Detected by querying 'handlers — only registries return a list.
+(define (migration-registry? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'handlers)) #t #f)
+      #f))
+
+; migration-registry-add!: add a handler.
+; Returns the new count.
+(define (migration-registry-add! reg handler)
+  (let ((existing (reg 'handlers)))
+    ((reg 'set-handlers!) (cons handler existing))))
+
+; migration-registry-count: count of registered handlers.
+(define (migration-registry-count reg)
+  (let loop ((rest (reg 'handlers)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; migration-registry-find-by-ls-id: find handler by LS id.
+; Returns the handler or #f.
+(define (migration-registry-find-by-ls-id reg ls-id)
+  (let loop ((rest (reg 'handlers)))
+    (cond
+      ((null? rest) #f)
+      ((= (migration-handler-get-ls-id (car rest)) ls-id) (car rest))
+      (else (loop (cdr rest))))))
+
+; migration-registry-remove!: remove handler by LS id.
+; Returns #t if removed, #f if not found.
+(define (migration-registry-remove! reg ls-id)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((reg 'set-handlers!) (cons-mig-rev acc '()))
+                            ((reg 'set-handlers!) acc))
+                        found?)
+                       ((= (migration-handler-get-ls-id (car rest)) ls-id)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (reg 'handlers) '())))
+
+; cons-mig-rev: helper — (cons-mig-rev acc rest) = (append (reverse acc) rest)
+(define (cons-mig-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-mig-rev (cdr acc) (cons (car acc) rest))))
+
+; migration-registry-get-by-status: find all handlers with given status.
+; Returns a list of matching handlers.
+(define (migration-registry-get-by-status reg status)
+  (let loop ((rest (reg 'handlers)) (acc '()))
+    (cond
+      ((null? rest) acc)
+      ((= (migration-handler-get-status (car rest)) status)
+       (loop (cdr rest) (cons (car rest) acc)))
+      (else
+       (loop (cdr rest) acc)))))

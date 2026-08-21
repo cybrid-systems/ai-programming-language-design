@@ -1,0 +1,296 @@
+; 19-partition-migration_test.aura
+; ======================
+; Smoke tests for 19-partition-migration.aura — LS migration + transfer minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/19-partition-migration_test.aura
+;
+; Verified automatically (smoke):
+;   - 8 MIGRATION-STATUS constants distinct
+;   - 5 MIGRATION-OP + 3 MIGRATION-PHASE constants distinct
+;   - make-migration-handler + accessors + setters
+;   - advance! walks through the 8-state sequence
+;   - is-final? predicate
+;   - prepare-migration / migrate-migration / complete-migration
+;   - migration-registry + add/find/remove/get-by-status
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - State machine transitions correct
+;
+; Deferred (full OceanBase LS migration):
+;   - real ObLSMigrationHandler with DAG Net scheduler
+;   - real 8-state state machine with retry + failure handling
+;   - real ObLSPrepareMigration (full LS creation + sync)
+;   - real ObLSMigration (Tablet-level SSTable copy + log catch-up)
+;   - real ObLSCompleteMigration (role switch + Meta update)
+;   - real ObTransferHandler (Partition Transfer)
+;   - real ObLSRebuildCbImpl (replica rebuild)
+;   - real ObLSMemberListService (member list management)
+;   - real ObLSBlockTxService (transaction block during migration)
+;   - real RootServer / ObPartitionBalanceer (load balancer)
+;   - real __all_ls_migration_task inner table
+;   - real SCM (strongly consistent) check_before_do_task_()
+
+(require "std/test" all:)
+(require "19-partition-migration" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "19-001-migration-status-distinct"
+  ; 8 MIGRATION-STATUS constants are distinct.
+  (check (= 1 (if (not (= MIGRATION-STATUS-INIT
+                          MIGRATION-STATUS-PREPARE-LS)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-STATUS-PREPARE-LS
+                          MIGRATION-STATUS-WAIT-PREPARE-LS)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-STATUS-WAIT-PREPARE-LS
+                          MIGRATION-STATUS-BUILD-LS)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-STATUS-BUILD-LS
+                          MIGRATION-STATUS-WAIT-BUILD-LS)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-STATUS-WAIT-BUILD-LS
+                          MIGRATION-STATUS-COMPLETE-LS)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-STATUS-COMPLETE-LS
+                          MIGRATION-STATUS-WAIT-COMPLETE-LS)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-STATUS-WAIT-COMPLETE-LS
+                          MIGRATION-STATUS-FINISH)) 1 0))))
+
+(test-suite "19-001-migration-op-distinct"
+  ; 5 MIGRATION-OP constants are distinct.
+  (check (= 1 (if (not (= MIGRATION-OP-ADD-REPLICA
+                          MIGRATION-OP-REMOVE-REPLICA)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-OP-REMOVE-REPLICA
+                          MIGRATION-OP-MIGRATE)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-OP-MIGRATE
+                          MIGRATION-OP-REPLACE)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-OP-REPLACE
+                          MIGRATION-OP-CONVERT)) 1 0))))
+
+(test-suite "19-001-migration-phase-distinct"
+  ; 3 MIGRATION-PHASE constants are distinct.
+  (check (= 1 (if (not (= MIGRATION-PHASE-PREPARE
+                          MIGRATION-PHASE-BUILD)) 1 0)))
+  (check (= 1 (if (not (= MIGRATION-PHASE-BUILD
+                          MIGRATION-PHASE-COMPLETE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObLSMigrationHandler
+; ----------------------------------------------------------------
+
+(test-suite "19-002-migration-handler-construction"
+  ; handler preserves ls-id + op.
+  (check (= 100 (migration-handler-get-ls-id
+                  (make-migration-handler 100 MIGRATION-OP-MIGRATE))))
+  (check (= MIGRATION-OP-MIGRATE
+             (migration-handler-get-op
+               (make-migration-handler 100 MIGRATION-OP-MIGRATE))))
+  (check (= MIGRATION-STATUS-INIT
+             (migration-handler-get-status
+               (make-migration-handler 100 MIGRATION-OP-MIGRATE))))
+
+(test-suite "19-002-migration-handler-predicate"
+  ; migration-handler? accepts only handlers.
+  (check (= #t (migration-handler?
+                 (make-migration-handler 1 MIGRATION-OP-MIGRATE))))
+  (check (= #f (migration-handler? 'not-a-handler)))
+  (check (= #f (migration-handler? 42)))
+
+(test-suite "19-003-migration-handler-set-status"
+  ; set-status! updates.
+  (check (= MIGRATION-STATUS-BUILD-LS
+             (let ((h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+               (migration-handler-set-status! h MIGRATION-STATUS-BUILD-LS)
+               (migration-handler-get-status h))))
+
+(test-suite "19-003-migration-handler-advance"
+  ; advance! walks through the 8-state sequence.
+  (check (= #t (let ((h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+                 (and (= MIGRATION-STATUS-PREPARE-LS
+                       (migration-handler-advance! h))
+                      (= MIGRATION-STATUS-WAIT-PREPARE-LS
+                       (migration-handler-advance! h))
+                      (= MIGRATION-STATUS-BUILD-LS
+                       (migration-handler-advance! h))
+                      (= MIGRATION-STATUS-WAIT-BUILD-LS
+                       (migration-handler-advance! h))
+                      (= MIGRATION-STATUS-COMPLETE-LS
+                       (migration-handler-advance! h))
+                      (= MIGRATION-STATUS-WAIT-COMPLETE-LS
+                       (migration-handler-advance! h))
+                      (= MIGRATION-STATUS-FINISH
+                       (migration-handler-advance! h))))))
+
+(test-suite "19-003-migration-handler-is-final"
+  ; is-final? true only when FINISH.
+  (check (= #f (migration-handler-is-final?
+                 (make-migration-handler 1 MIGRATION-OP-MIGRATE))))
+  (check (= #t (let ((h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+                 (migration-handler-advance-to-finish! h)
+                 (migration-handler-is-final? h))))
+
+; ----------------------------------------------------------------
+; Specific state transition helpers
+; ----------------------------------------------------------------
+
+(test-suite "19-004-migration-handler-advance-to-prepare"
+  ; advance-to-prepare! sets PREPARE-LS.
+  (check (= MIGRATION-STATUS-PREPARE-LS
+             (let ((h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+               (migration-handler-advance-to-prepare! h)
+               (migration-handler-get-status h)))))
+
+(test-suite "19-004-migration-handler-advance-to-build"
+  ; advance-to-build! sets BUILD-LS.
+  (check (= MIGRATION-STATUS-BUILD-LS
+             (let ((h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+               (migration-handler-advance-to-build! h)
+               (migration-handler-get-status h)))))
+
+(test-suite "19-004-migration-handler-advance-to-complete"
+  ; advance-to-complete! sets COMPLETE-LS.
+  (check (= MIGRATION-STATUS-COMPLETE-LS
+             (let ((h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+               (migration-handler-advance-to-complete! h)
+               (migration-handler-get-status h)))))
+
+; ----------------------------------------------------------------
+; ObLSPrepareMigration
+; ----------------------------------------------------------------
+
+(test-suite "19-005-prepare-migration-construction"
+  ; prepare-migration preserves src + dst LS ids.
+  (check (= 100 (prepare-migration-get-src-ls-id
+                  (make-prepare-migration 100 200))))
+  (check (= 200 (prepare-migration-get-dst-ls-id
+                  (make-prepare-migration 100 200)))))
+
+(test-suite "19-005-prepare-migration-predicate"
+  ; prepare-migration? accepts only migrations.
+  (check (= #t (prepare-migration? (make-prepare-migration 1 2))))
+  (check (= #f (prepare-migration? 'not-pm)))
+  (check (= #f (prepare-migration? 42)))
+
+(test-suite "19-005-prepare-migration-set-src"
+  ; set-src-ls-id! updates.
+  (check (= 999 (let ((pm (make-prepare-migration 1 2)))
+                 (prepare-migration-set-src-ls-id! pm 999)
+                 (prepare-migration-get-src-ls-id pm))))
+
+; ----------------------------------------------------------------
+; ObLSMigration (migrate phase)
+; ----------------------------------------------------------------
+
+(test-suite "19-006-migrate-migration-construction"
+  ; migrate-migration preserves tablet-id + src + dst.
+  (check (= 50 (migrate-migration-get-tablet-id
+                 (make-migrate-migration 50 100 200))))
+  (check (= 100 (migrate-migration-get-src-ls-id
+                  (make-migrate-migration 50 100 200))))
+  (check (= 200 (migrate-migration-get-dst-ls-id
+                  (make-migrate-migration 50 100 200)))))
+
+(test-suite "19-006-migrate-migration-predicate"
+  ; migrate-migration? accepts only migrations.
+  (check (= #t (migrate-migration? (make-migrate-migration 1 2 3))))
+  (check (= #f (migrate-migration? 'not-mm)))
+  (check (= #f (migrate-migration? 42)))
+
+(test-suite "19-006-migrate-migration-set-tablet-id"
+  ; set-tablet-id! updates.
+  (check (= 777 (let ((mm (make-migrate-migration 1 2 3)))
+                 (migrate-migration-set-tablet-id! mm 777)
+                 (migrate-migration-get-tablet-id mm))))
+
+; ----------------------------------------------------------------
+; ObLSCompleteMigration
+; ----------------------------------------------------------------
+
+(test-suite "19-007-complete-migration-construction"
+  ; complete-migration preserves ls-id.
+  (check (= 500 (complete-migration-get-ls-id
+                  (make-complete-migration 500))))
+
+(test-suite "19-007-complete-migration-predicate"
+  ; complete-migration? accepts only completions.
+  (check (= #t (complete-migration? (make-complete-migration 1))))
+  (check (= #f (complete-migration? 'not-cm)))
+  (check (= #f (complete-migration? 42)))
+
+; ----------------------------------------------------------------
+; MigrationRegistry
+; ----------------------------------------------------------------
+
+(test-suite "19-008-registry-construction"
+  ; new registry starts empty.
+  (check (= 0 (migration-registry-count (make-migration-registry))))
+
+(test-suite "19-008-registry-predicate"
+  ; migration-registry? accepts only registries.
+  (check (= #t (migration-registry? (make-migration-registry))))
+  (check (= #f (migration-registry? 'not-a-reg)))
+  (check (= #f (migration-registry? 42)))
+
+(test-suite "19-009-registry-add"
+  ; add! increases count.
+  (check (= 1 (let ((r (make-migration-registry))
+                    (h (make-migration-handler 1 MIGRATION-OP-MIGRATE)))
+                (migration-registry-add! r h)
+                (migration-registry-count r))))
+
+(test-suite "19-009-registry-add-multiple"
+  ; Multiple adds accumulate.
+  (check (= 3 (let ((r (make-migration-registry)))
+                (migration-registry-add! r
+                  (make-migration-handler 1 MIGRATION-OP-MIGRATE))
+                (migration-registry-add! r
+                  (make-migration-handler 2 MIGRATION-OP-ADD-REPLICA))
+                (migration-registry-add! r
+                  (make-migration-handler 3 MIGRATION-OP-REMOVE-REPLICA))
+                (migration-registry-count r))))
+
+(test-suite "19-010-registry-find-by-ls-id"
+  ; find-by-ls-id returns the handler.
+  (check (= #t (let ((r (make-migration-registry))
+                    (h (make-migration-handler 42 MIGRATION-OP-MIGRATE)))
+                (migration-registry-add! r h)
+                (eq? h (migration-registry-find-by-ls-id r 42)))))
+
+(test-suite "19-010-registry-find-missing"
+  ; find-by-ls-id returns #f for unknown LS id.
+  (check (= #f (migration-registry-find-by-ls-id
+                 (make-migration-registry) 99)))
+
+(test-suite "19-011-registry-remove"
+  ; remove! removes + find returns #f.
+  (check (= #t (let ((r (make-migration-registry))
+                    (h (make-migration-handler 42 MIGRATION-OP-MIGRATE)))
+                (migration-registry-add! r h)
+                (migration-registry-remove! r 42)
+                (eq? #f (migration-registry-find-by-ls-id r 42)))))
+
+(test-suite "19-011-registry-remove-not-found"
+  ; remove! returns #f for non-existing.
+  (check (= #f (migration-registry-remove!
+                 (make-migration-registry) 99)))
+
+(test-suite "19-012-registry-get-by-status"
+  ; get-by-status returns matching handlers.
+  (check (= #t (let ((r (make-migration-registry))
+                    (h1 (make-migration-handler 1 MIGRATION-OP-MIGRATE))
+                    (h2 (make-migration-handler 2 MIGRATION-OP-ADD-REPLICA))
+                    (h3 (make-migration-handler 3 MIGRATION-OP-REMOVE-REPLICA)))
+                (migration-registry-add! r h1)
+                (migration-registry-add! r h2)
+                (migration-registry-add! r h3)
+                (migration-handler-set-status! h2 MIGRATION-STATUS-BUILD-LS)
+                ; Only h2 is in BUILD-LS state.
+                (= 1 (length (migration-registry-get-by-status r MIGRATION-STATUS-BUILD-LS))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
