@@ -1,0 +1,258 @@
+; 16-mvcc-hash-index.aura
+; ======================
+; mvcc_hash_index — HISTORICAL (REMOVED in OB 5.0.2.0).
+;
+; Maps to: OceanBase MemTable Hash Index (HISTORICAL)
+; Source: src/storage/memtable/mvcc/ob_mvcc_hash_index.{h,cpp}
+;         + src/storage/memtable/mvcc/ob_mvcc_hash_node.h
+;         + src/storage/memtable/mvcc/ob_multi_version_iterator.{h,cpp}
+;         (OceanBase 5.0.2.0)
+;
+; ## ARCHITECTURAL REMOVAL NOTE (OB 5.0.2.0)
+;
+; Per analysis file 16-mvcc-hash-index-deep-dive-source-analysis-v2.md:
+;   "ObMvccHashIndex class is REMOVED in OB 5.0.2.0
+;    ob_memtable.cpp line 164-165 sets FALSE_IT(use_hash_index) as
+;    dead code, only constructs ObMvccEngineWithoutHashIndex.
+;    MemTable-level hash index has been architecturally removed.
+;    Hash index functionality is now ONLY at the SSTable level.
+;    This document is based on earlier OB versions (containing
+;    ObMvccHashIndex with three index implementations).
+;    In 5.0.2.0 this is only historical context — actual architecture
+;    uses ObKeyBTree single index (ObMvccEngineWithoutHashIndex)."
+;
+; This aura port documents the REMOVED API for historical learning
+; purposes. The OB 5.0.2.0 actual code uses only ObKeyBTree (see
+; 15-keybtree.aura for the live implementation).
+;
+; ## Scope (v1 — HISTORICAL port)
+;
+; ObMvccHashIndex (REMOVED in 5.0.2.0):
+;   - ObMvccHashIndex: hash-bucket-based index over ObMvccTransNode
+;   - ObMvccHashNode: rowkey + ObMvccRow pointer
+;   - Operations: init / reset / destroy / get / scan
+;   - MVCC integration: mvcc_write / commit / abort / lock / unlock
+;   - 3 indexes historically: ObMvccHashIndex / ObKeyBtree / ObClusterIndex
+;
+; aura v1 ships:
+;   - make-hash-rowkey (factory: hash + serialized bytes)
+;   - hash-rowkey-get-hash / get-bytes
+;   - make-mvcc-hash-node (factory: rowkey + mvcc-row pointer)
+;   - mvcc-hash-node-get-rowkey / get-mvcc-row
+;   - mvcc-hash-node-set-rowkey! / set-mvcc-row!
+;   - make-mvcc-hash-index (factory: bucket count + nodes list)
+;   - mvcc-hash-index-get-bucket-count / set-bucket-count!
+;   - mvcc-hash-index-insert! / get! / remove!
+;   - mvcc-hash-index-count (number of nodes)
+;   - mvcc-hash-index? predicate
+;   - "ARCHITECTURAL REMOVAL" comment marker
+;
+; Note: This API mirrors the historical pre-5.0.2.0 interface but
+; does NOT match the current 5.0.2.0 production code. For current
+; MemTable index, use 15-keybtree.aura instead.
+;
+; Deferred (full historical ObMvccHashIndex):
+;   - real ObMvccHashIndex with init/reset/destroy lifecycle
+;   - real ObHashNodeAllocator (node memory pool)
+;   - real get() with snapshot_version + check_exist
+;   - real scan() with range iteration
+;   - real mvcc_write() with 6-case state machine
+;   - real lock() / unlock() with per-row latch
+;   - real commit() / abort() with version chain
+;   - real try_cleanout_tx_node / try_cleanout_mvcc_row
+;   - real ObMultiVersionIterator with snapshot + filter
+
+(export
+  ; "ARCHITECTURAL REMOVAL" marker
+  ARCHITECTURAL-REMOVAL-VERSION
+  ARCHITECTURAL-REMOVAL-CLASS
+  ; ObMvccHashRowkey
+  make-hash-rowkey hash-rowkey?
+  hash-rowkey-get-hash hash-rowkey-get-bytes
+  hash-rowkey-set-bytes!
+  ; ObMvccHashNode
+  make-mvcc-hash-node mvcc-hash-node?
+  mvcc-hash-node-get-rowkey mvcc-hash-node-get-mvcc-row
+  mvcc-hash-node-set-rowkey! mvcc-hash-node-set-mvcc-row!
+  ; ObMvccHashIndex
+  make-mvcc-hash-index mvcc-hash-index?
+  mvcc-hash-index-get-bucket-count mvcc-hash-index-set-bucket-count!
+  mvcc-hash-index-insert! mvcc-hash-index-get!
+  mvcc-hash-index-remove! mvcc-hash-index-count
+  ; Integration markers (pointing to live impl)
+  use-keybtree-instead)
+
+; ----------------------------------------------------------------
+; Architectural removal marker constants
+; ----------------------------------------------------------------
+;
+; These constants document that this API was REMOVED in OB 5.0.2.0.
+
+(define ARCHITECTURAL-REMOVAL-VERSION "5.0.2.0")
+(define ARCHITECTURAL-REMOVAL-CLASS "ObMvccHashIndex")
+
+; use-keybtree-instead: marker pointing to 15-keybtree.aura (live impl).
+(define use-keybtree-instead "see 15-keybtree.aura")
+
+; ----------------------------------------------------------------
+; ObMvccHashRowkey — closure-based
+; ----------------------------------------------------------------
+
+; make-hash-rowkey: create a hash rowkey.
+; Args: hash (integer — rowkey hash), bytes (any — serialized rowkey)
+; Returns: hash_rowkey closure.
+(define (make-hash-rowkey hash bytes)
+  (letrec ((set-bytes! (lambda (v) (set! bytes v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'hash) hash)
+                     ((eq? msg 'bytes) bytes)
+                     ((eq? msg 'set-bytes!) set-bytes!)
+                     (else #f)))))
+      self)))
+
+; hash-rowkey?: is the object a hash rowkey?
+; Detected by querying 'hash — only rowkeys return integer.
+(define (hash-rowkey? obj)
+  (if (procedure? obj)
+      (let ((h (obj 'hash)))
+        (if (and (integer? h) (>= h 0)) #t #f))
+      #f))
+
+; hash-rowkey-get-hash: get hash.
+(define (hash-rowkey-get-hash rk) (rk 'hash))
+
+; hash-rowkey-get-bytes: get serialized bytes.
+(define (hash-rowkey-get-bytes rk) (rk 'bytes))
+
+; hash-rowkey-set-bytes!: set serialized bytes.
+(define (hash-rowkey-set-bytes! rk v) ((rk 'set-bytes!) v))
+
+; ----------------------------------------------------------------
+; ObMvccHashNode — closure-based
+; ----------------------------------------------------------------
+
+; make-mvcc-hash-node: create an ObMvccHashNode.
+; Args: rowkey (hash_rowkey or any), mvcc-row (any — ObMvccRow pointer)
+; Returns: mvcc_hash_node closure.
+(define (make-mvcc-hash-node rowkey mvcc-row)
+  (letrec ((set-rowkey! (lambda (v) (set! rowkey v) v))
+           (set-mvcc-row! (lambda (v) (set! mvcc-row v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'rowkey) rowkey)
+                     ((eq? msg 'mvcc-row) mvcc-row)
+                     ((eq? msg 'set-rowkey!) set-rowkey!)
+                     ((eq? msg 'set-mvcc-row!) set-mvcc-row!)
+                     (else #f)))))
+      self)))
+
+; mvcc-hash-node?: is the object a mvcc-hash node?
+; Detected by querying 'mvcc-row — only nodes return 'mvcc-row message.
+(define (mvcc-hash-node? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'mvcc-row)))
+        (if (or (procedure? r) (symbol? r) (integer? r)
+                (eq? r #f) (eq? r #t)) #t #f))
+      #f))
+
+; mvcc-hash-node-get-rowkey: get rowkey.
+(define (mvcc-hash-node-get-rowkey n) (n 'rowkey))
+
+; mvcc-hash-node-get-mvcc-row: get mvcc-row pointer.
+(define (mvcc-hash-node-get-mvcc-row n) (n 'mvcc-row))
+
+; mvcc-hash-node-set-rowkey!: set rowkey.
+(define (mvcc-hash-node-set-rowkey! n v) ((n 'set-rowkey!) v))
+
+; mvcc-hash-node-set-mvcc-row!: set mvcc-row.
+(define (mvcc-hash-node-set-mvcc-row! n v) ((n 'set-mvcc-row!) v))
+
+; ----------------------------------------------------------------
+; ObMvccHashIndex — closure-based (HISTORICAL)
+; ----------------------------------------------------------------
+;
+; v1 minimal: a list of hash nodes with bucket-count tracking.
+; Bucket index = hash mod bucket-count.
+
+; make-mvcc-hash-index: create an empty ObMvccHashIndex.
+; Args: bucket-count (integer — default 128)
+; Returns: mvcc_hash_index closure.
+(define (make-mvcc-hash-index bucket-count)
+  (let ((bucket-cnt bucket-count)
+        (nodes '()))
+    (letrec ((set-bucket-cnt! (lambda (v) (set! bucket-cnt v) v))
+             (set-nodes! (lambda (v) (set! nodes v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'bucket-count) bucket-cnt)
+                       ((eq? msg 'nodes) nodes)
+                       ((eq? msg 'set-bucket-count!) set-bucket-cnt!)
+                       ((eq? msg 'set-nodes!) set-nodes!)
+                       (else #f)))))
+      self)))
+
+; mvcc-hash-index?: is the object an mvcc-hash index?
+; Detected by querying 'bucket-count — only indexes return integer.
+(define (mvcc-hash-index? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'bucket-count)))
+        (if (and (integer? c) (> c 0)) #t #f))
+      #f))
+
+; mvcc-hash-index-get-bucket-count: get bucket count.
+(define (mvcc-hash-index-get-bucket-count idx) (idx 'bucket-count))
+
+; mvcc-hash-index-set-bucket-count!: set bucket count.
+(define (mvcc-hash-index-set-bucket-count! idx v)
+  ((idx 'set-bucket-count!) v))
+
+; mvcc-hash-index-insert!: insert a node.
+; v1: prepends to nodes list. (Real OB uses hash bucket placement.)
+; Returns the new count of nodes.
+(define (mvcc-hash-index-insert! idx node)
+  (let ((nodes (idx 'nodes)))
+    ((idx 'set-nodes!) (cons node nodes))))
+
+; mvcc-hash-index-get!: get a node by rowkey hash.
+; v1: linear search by hash.
+; Returns the node or #f.
+(define (mvcc-hash-index-get! idx hash)
+  (let loop ((rest (idx 'nodes)))
+    (cond
+      ((null? rest) #f)
+      ((= (hash-rowkey-get-hash (mvcc-hash-node-get-rowkey (car rest))) hash)
+       (car rest))
+      (else (loop (cdr rest))))))
+
+; mvcc-hash-index-remove!: remove a node by rowkey hash.
+; Returns #t if removed, #f if not found.
+(define (mvcc-hash-index-remove! idx hash)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((idx 'set-nodes!) (cons-rev-3 acc '()))
+                            ((idx 'set-nodes!) acc))
+                        found?)
+                       ((= (hash-rowkey-get-hash
+                            (mvcc-hash-node-get-rowkey (car rest))) hash)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (idx 'nodes) '())))
+
+; cons-rev-3: helper — (cons-rev-3 acc rest) = (append (reverse acc) rest)
+(define (cons-rev-3 acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev-3 (cdr acc) (cons (car acc) rest))))
+
+; mvcc-hash-index-count: count of nodes.
+(define (mvcc-hash-index-count idx)
+  (let loop ((rest (idx 'nodes)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))

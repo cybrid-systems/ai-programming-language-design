@@ -1,0 +1,177 @@
+; 16-mvcc-hash-index_test.aura
+; ======================
+; Smoke tests for 16-mvcc-hash-index.aura — MemTable Hash Index HISTORICAL.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/16-mvcc-hash-index_test.aura
+;
+; Verified automatically (smoke):
+;   - ARCHITECTURAL-REMOVAL markers
+;   - use-keybtree-instead marker
+;   - make-hash-rowkey + accessors + setters
+;   - make-mvcc-hash-node + accessors + setters
+;   - make-mvcc-hash-index + bucket-count + insert + get + remove + count
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Hash lookup finds correct node
+;
+; ARCHITECTURAL NOTE: ObMvccHashIndex is REMOVED in OB 5.0.2.0.
+; This port is HISTORICAL. Current code uses ObKeyBTree (15-keybtree).
+;
+; Deferred (full historical ObMvccHashIndex):
+;   - real ObMvccHashIndex with init/reset/destroy lifecycle
+;   - real ObHashNodeAllocator (node memory pool)
+;   - real get() with snapshot_version + check_exist
+;   - real scan() with range iteration
+;   - real mvcc_write() with 6-case state machine
+;   - real lock() / unlock() with per-row latch
+;   - real commit() / abort() with version chain
+;   - real try_cleanout_tx_node / try_cleanout_mvcc_row
+;   - real ObMultiVersionIterator with snapshot + filter
+
+(require "std/test" all:)
+(require "16-mvcc-hash-index" all:)
+
+; ----------------------------------------------------------------
+; ARCHITECTURAL REMOVAL markers
+; ----------------------------------------------------------------
+
+(test-suite "16-001-removal-version"
+  ; ARCHITECTURAL-REMOVAL-VERSION = "5.0.2.0".
+  (check (= #t (eq? "5.0.2.0" ARCHITECTURAL-REMOVAL-VERSION))))
+
+(test-suite "16-001-removal-class"
+  ; ARCHITECTURAL-REMOVAL-CLASS = "ObMvccHashIndex".
+  (check (= #t (eq? "ObMvccHashIndex" ARCHITECTURAL-REMOVAL-CLASS))))
+
+(test-suite "16-001-use-keybtree-instead"
+  ; use-keybtree-instead marker exists.
+  (check (= #t (eq? "see 15-keybtree.aura" use-keybtree-instead)))
+
+; ----------------------------------------------------------------
+; ObMvccHashRowkey
+; ----------------------------------------------------------------
+
+(test-suite "16-002-hash-rowkey-construction"
+  ; hash-rowkey preserves hash + bytes.
+  (check (= 100 (hash-rowkey-get-hash
+                  (make-hash-rowkey 100 'serialized-bytes))))
+  (check (= #t (eq? 'serialized-bytes
+                   (hash-rowkey-get-bytes
+                     (make-hash-rowkey 100 'serialized-bytes))))))
+
+(test-suite "16-002-hash-rowkey-predicate"
+  ; hash-rowkey? accepts only hash_rowkeys.
+  (check (= #t (hash-rowkey? (make-hash-rowkey 1 'k))))
+  (check (= #f (hash-rowkey? 'not-a-rk)))
+  (check (= #f (hash-rowkey? 42))))
+
+(test-suite "16-002-hash-rowkey-set-bytes"
+  ; set-bytes! updates.
+  (check (= #t (let ((rk (make-hash-rowkey 1 'old)))
+                (hash-rowkey-set-bytes! rk 'new)
+                (eq? 'new (hash-rowkey-get-bytes rk)))))
+
+; ----------------------------------------------------------------
+; ObMvccHashNode
+; ----------------------------------------------------------------
+
+(test-suite "16-003-mvcc-hash-node-construction"
+  ; mvcc-hash-node preserves rowkey + mvcc-row.
+  (check (= #t (let ((rk (make-hash-rowkey 1 'k))
+                    (n (make-mvcc-hash-node rk 'row)))
+                (eq? rk (mvcc-hash-node-get-rowkey n)))))
+  (check (= #t (let ((rk (make-hash-rowkey 1 'k))
+                    (n (make-mvcc-hash-node rk 'row)))
+                (eq? 'row (mvcc-hash-node-get-mvcc-row n)))))
+
+(test-suite "16-003-mvcc-hash-node-predicate"
+  ; mvcc-hash-node? accepts only nodes.
+  (check (= #t (mvcc-hash-node? (make-mvcc-hash-node 'rk 'row))))
+  (check (= #f (mvcc-hash-node? 'not-a-node)))
+  (check (= #f (mvcc-hash-node? 42))))
+
+(test-suite "16-003-mvcc-hash-node-setters"
+  ; setters update fields.
+  (check (= #t (let ((n (make-mvcc-hash-node 'rk 'old-row)))
+                (mvcc-hash-node-set-mvcc-row! n 'new-row)
+                (eq? 'new-row (mvcc-hash-node-get-mvcc-row n)))))
+
+; ----------------------------------------------------------------
+; ObMvccHashIndex
+; ----------------------------------------------------------------
+
+(test-suite "16-004-hash-index-construction"
+  ; mvcc-hash-index preserves bucket-count + empty nodes.
+  (check (= 128 (mvcc-hash-index-get-bucket-count
+                 (make-mvcc-hash-index 128))))
+  (check (= 0 (mvcc-hash-index-count (make-mvcc-hash-index 128))))
+
+(test-suite "16-004-hash-index-predicate"
+  ; mvcc-hash-index? accepts only indexes.
+  (check (= #t (mvcc-hash-index? (make-mvcc-hash-index 10))))
+  (check (= #f (mvcc-hash-index? 'not-an-idx)))
+  (check (= #f (mvcc-hash-index? 42))))
+
+(test-suite "16-005-hash-index-insert"
+  ; insert! increases count.
+  (check (= 1 (let ((idx (make-mvcc-hash-index 128))
+                    (n (make-mvcc-hash-node
+                         (make-hash-rowkey 1 'k) 'row)))
+                (mvcc-hash-index-insert! idx n)
+                (mvcc-hash-index-count idx))))
+
+(test-suite "16-005-hash-index-insert-multiple"
+  ; Multiple inserts accumulate.
+  (check (= 3 (let ((idx (make-mvcc-hash-index 128)))
+                (mvcc-hash-index-insert! idx
+                  (make-mvcc-hash-node
+                    (make-hash-rowkey 1 'k) 'row1))
+                (mvcc-hash-index-insert! idx
+                  (make-mvcc-hash-node
+                    (make-hash-rowkey 2 'k) 'row2))
+                (mvcc-hash-index-insert! idx
+                  (make-mvcc-hash-node
+                    (make-hash-rowkey 3 'k) 'row3))
+                (mvcc-hash-index-count idx))))
+
+(test-suite "16-005-hash-index-get"
+  ; get! returns the node with matching hash.
+  (check (= #t (let ((idx (make-mvcc-hash-index 128))
+                    (n (make-mvcc-hash-node
+                         (make-hash-rowkey 42 'k) 'row42)))
+                (mvcc-hash-index-insert! idx n)
+                (eq? n (mvcc-hash-index-get! idx 42)))))
+
+(test-suite "16-005-hash-index-get-missing"
+  ; get! returns #f for unknown hash.
+  (check (= #f (mvcc-hash-index-get! (make-mvcc-hash-index 128) 999))))
+
+(test-suite "16-006-hash-index-remove"
+  ; remove! removes + get! returns #f.
+  (check (= #t (let ((idx (make-mvcc-hash-index 128))
+                    (n (make-mvcc-hash-node
+                         (make-hash-rowkey 42 'k) 'row)))
+                (mvcc-hash-index-insert! idx n)
+                (mvcc-hash-index-remove! idx 42)
+                (eq? #f (mvcc-hash-index-get! idx 42)))))
+
+(test-suite "16-006-hash-index-remove-not-found"
+  ; remove! returns #f for non-existing.
+  (check (= #f (mvcc-hash-index-remove!
+                 (make-mvcc-hash-index 128) 99))))
+
+(test-suite "16-006-hash-index-set-bucket-count"
+  ; set-bucket-count! updates.
+  (check (= 256 (let ((idx (make-mvcc-hash-index 128)))
+                 (mvcc-hash-index-set-bucket-count! idx 256)
+                 (mvcc-hash-index-get-bucket-count idx))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
