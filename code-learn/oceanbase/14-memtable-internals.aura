@@ -1,0 +1,426 @@
+; 14-memtable-internals.aura
+; ===========================
+; memtable_internals — minimal capability port to aura.
+;
+; Maps to: OceanBase Memtable internals (Hash index + Key + Data)
+; Source: src/storage/memtable/ob_mt_hash.h
+;         + src/storage/memtable/ob_memtable_key.h
+;         + src/storage/memtable/ob_memtable_data.h
+;         + src/storage/memtable/ob_memtable.h
+;         + src/storage/memtable/ob_memtable_ctx_obj_pool.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Memtable internals:
+;   - ObHashNode (linked-list base: next_ + hash_)
+;   - ObMtHashNode (extends hash node: key_ + value_)
+;   - ObMtHash (lock-free extendable hash, lazy bucket filling,
+;     128 initial buckets, 0xFFFFFFFFFFFFFFFF tail sentinel)
+;   - ObMemtableKey (key encoding: table_id_ + hash_ + serialized
+;     bytes)
+;   - ObMemtableData (row data: tx_node_ + rowkey_buf_ +
+;     stored_row_)
+;   - Bucket genealogy (unfilled buckets tracking)
+;   - Hash operations: insert, get, contains?, remove
+;
+; aura has no real pointers, no real key encoding. v1 ships:
+;   - 1 HASH-SIZE constant (INIT-HASH-SIZE = 128)
+;   - 1 TAIL-SENTINEL constant (0xFFFFFFFFFFFFFFFF)
+;   - make-hash-node (factory: hash + next)
+;   - hash-node-get-hash / hash-node-get-next / hash-node-set-next!
+;   - make-mt-hash-node (factory: key + value + hash + next)
+;   - mt-hash-node-get-key / mt-hash-node-get-value
+;   - make-mt-key (factory: table-id + hash + key-bytes)
+;   - mt-key-get-table-id / mt-key-get-hash / mt-key-get-key-bytes
+;   - mt-key-set-hash! / mt-key-set-key-bytes!
+;   - make-mt-data (factory: tx-node + rowkey-buf + stored-row)
+;   - mt-data-get-tx-node / mt-data-get-rowkey-buf
+;   - mt-data-get-stored-row
+;   - mt-data-set-tx-node!
+;   - make-mt-hash (factory: bucket-count + allocator)
+;   - mt-hash-get-size (current bucket count)
+;   - mt-hash-insert! (insert a mt-hash-node into a bucket)
+;   - mt-hash-get-bucket-nodes (get list of nodes in a bucket)
+;   - mt-hash-find-in-bucket (linear search within bucket)
+;   - mt-hash-bucket-filled? (predicate)
+;   - mt-hash-get-bucket (compute bucket from hash)
+;
+; Deferred (full OceanBase Memtable internals):
+;   - real ObMtHash lock-free insert / delete / get with CAS
+;   - real ObMtHash resize (lazy double-bucket on collision)
+;   - real ObMtArray bucket allocation
+;   - real ObMemtableKey serialization (ObMemtableKeyHeader)
+;   - real ObMemtableData allocator / buffer pool
+;   - real ObMemtableCtxObjPool (object pool cache)
+;   - real ObHashNode atomic next_ manipulation
+
+(export
+  ; Hash constants
+  HASH-INIT-SIZE TAIL-SENTINEL
+  ; ObHashNode
+  make-hash-node hash-node?
+  hash-node-get-hash hash-node-get-next
+  hash-node-set-next!
+  ; ObMtHashNode
+  make-mt-hash-node mt-hash-node?
+  mt-hash-node-get-key mt-hash-node-get-value
+  ; ObMemtableKey
+  make-mt-key mt-key?
+  mt-key-get-table-id mt-key-get-hash
+  mt-key-get-key-bytes mt-key-set-hash!
+  mt-key-set-key-bytes!
+  ; ObMemtableData
+  make-mt-data mt-data?
+  mt-data-get-tx-node mt-data-get-rowkey-buf
+  mt-data-get-stored-row mt-data-set-tx-node!
+  ; ObMtHash
+  make-mt-hash mt-hash?
+  mt-hash-get-size mt-hash-set-size!
+  mt-hash-insert!
+  mt-hash-get-bucket
+  mt-hash-get-bucket-nodes
+  mt-hash-find-in-bucket
+  mt-hash-bucket-filled?
+  mt-hash-set-bucket-filled!)
+
+; ----------------------------------------------------------------
+; Hash constants (per ob_mt_hash.h)
+; ----------------------------------------------------------------
+;
+; Per OB:
+;   INIT_HASH_SIZE = 128
+;   TAIL_SENTINEL_HASH = 0xFFFFFFFFFFFFFFFF
+
+(define HASH-INIT-SIZE 128)
+(define TAIL-SENTINEL 18446744073709551615)  ; 0xFFFFFFFFFFFFFFFF
+
+; ----------------------------------------------------------------
+; ObHashNode — closure-based linked-list base node
+; ----------------------------------------------------------------
+
+; make-hash-node: create a hash node.
+; Args: hash (integer — hash value with flags), next (hash_node or #f)
+; Returns: hash_node closure.
+(define (make-hash-node hash next)
+  (letrec ((set-next! (lambda (v) (set! next v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'hash) hash)
+                     ((eq? msg 'next) next)
+                     ((eq? msg 'set-next!) set-next!)
+                     (else #f)))))
+      self)))
+
+; hash-node?: is the object a hash node?
+; Detected by querying 'hash — only hash_nodes return an integer.
+(define (hash-node? obj)
+  (if (procedure? obj)
+      (let ((h (obj 'hash)))
+        (if (integer? h) #t #f))
+      #f))
+
+; hash-node-get-hash: get hash value.
+(define (hash-node-get-hash n) (n 'hash))
+
+; hash-node-get-next: get next pointer.
+(define (hash-node-get-next n) (n 'next))
+
+; hash-node-set-next!: set next pointer.
+(define (hash-node-set-next! n v) ((n 'set-next!) v))
+
+; ----------------------------------------------------------------
+; ObMtHashNode — extends hash node with key + value
+; ----------------------------------------------------------------
+
+; make-mt-hash-node: create a Memtable hash node.
+; Args: key (mt_key or any), value (any — typically ObMvccRow),
+;       hash (integer), next (hash_node or #f)
+; Returns: mt_hash_node closure.
+(define (make-mt-hash-node key value hash next)
+  (letrec ((set-next! (lambda (v) (set! next v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'hash) hash)
+                     ((eq? msg 'next) next)
+                     ((eq? msg 'key) key)
+                     ((eq? msg 'value) value)
+                     ((eq? msg 'set-next!) set-next!)
+                     (else #f)))))
+      self)))
+
+; mt-hash-node?: is the object a Memtable hash node?
+; Detected by querying 'value — only mt_hash_nodes return value.
+; (Note: 'hash is also integer, but we use 'value for distinction
+; since regular hash nodes don't have key/value.)
+(define (mt-hash-node? obj)
+  (if (procedure? obj)
+      (let ((v (obj 'value)))
+        (if (procedure? v)
+            #t
+            (if (symbol? v)
+                #t
+                (if (integer? v)
+                    #t
+                    (if (eq? v #f)
+                        #t
+                        (if (eq? v #t) #t #f)))))))
+      #f))
+
+; mt-hash-node-get-key: get key.
+(define (mt-hash-node-get-key n) (n 'key))
+
+; mt-hash-node-get-value: get value.
+(define (mt-hash-node-get-value n) (n 'value))
+
+; ----------------------------------------------------------------
+; ObMemtableKey — closure-based key encoding
+; ----------------------------------------------------------------
+;
+; Per OB (ob_memtable_key.h):
+;   Key encoding: table_id (8B) + hash (8B) + serialized bytes
+;   (ObMemtableKeyHeader + ObRowkeyWrapper)
+
+; make-mt-key: create a Memtable key.
+; Args: table-id (integer), hash (integer — key hash),
+;       key-bytes (any — serialized key payload)
+; Returns: mt_key closure.
+(define (make-mt-key table-id hash key-bytes)
+  (letrec ((set-hash! (lambda (v) (set! hash v) v))
+           (set-key-bytes! (lambda (v) (set! key-bytes v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'table-id) table-id)
+                     ((eq? msg 'hash) hash)
+                     ((eq? msg 'key-bytes) key-bytes)
+                     ((eq? msg 'set-hash!) set-hash!)
+                     ((eq? msg 'set-key-bytes!) set-key-bytes!)
+                     (else #f)))))
+      self)))
+
+; mt-key?: is the object a Memtable key?
+; Detected by querying 'table-id — only keys return integer.
+(define (mt-key? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'table-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; mt-key-get-table-id: get table id.
+(define (mt-key-get-table-id k) (k 'table-id))
+
+; mt-key-get-hash: get key hash.
+(define (mt-key-get-hash k) (k 'hash))
+
+; mt-key-get-key-bytes: get serialized key bytes.
+(define (mt-key-get-key-bytes k) (k 'key-bytes))
+
+; mt-key-set-hash!: set key hash.
+(define (mt-key-set-hash! k v) ((k 'set-hash!) v))
+
+; mt-key-set-key-bytes!: set key bytes.
+(define (mt-key-set-key-bytes! k v) ((k 'set-key-bytes!) v))
+
+; ----------------------------------------------------------------
+; ObMemtableData — closure-based row data
+; ----------------------------------------------------------------
+;
+; Per OB (ob_memtable_data.h):
+;   Data wrapper: tx_node_ + rowkey_buf_ + stored_row_
+
+; make-mt-data: create a Memtable data wrapper.
+; Args: tx-node (any — mvcc trans node), rowkey-buf (any),
+;       stored-row (any)
+; Returns: mt_data closure.
+(define (make-mt-data tx-node rowkey-buf stored-row)
+  (letrec ((set-tx-node! (lambda (v) (set! tx-node v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tx-node) tx-node)
+                     ((eq? msg 'rowkey-buf) rowkey-buf)
+                     ((eq? msg 'stored-row) stored-row)
+                     ((eq? msg 'set-tx-node!) set-tx-node!)
+                     (else #f)))))
+      self))
+
+; mt-data?: is the object a Memtable data wrapper?
+; Detected by querying 'rowkey-buf — only mt_data returns integer.
+(define (mt-data? obj)
+  (if (procedure? obj)
+      (let ((b (obj 'rowkey-buf)))
+        (if (integer? b) #t #f))
+      #f))
+
+; mt-data-get-tx-node: get mvcc trans node.
+(define (mt-data-get-tx-node d) (d 'tx-node))
+
+; mt-data-get-rowkey-buf: get rowkey buffer.
+(define (mt-data-get-rowkey-buf d) (d 'rowkey-buf))
+
+; mt-data-get-stored-row: get stored row payload.
+(define (mt-data-get-stored-row d) (d 'stored-row))
+
+; mt-data-set-tx-node!: set mvcc trans node.
+(define (mt-data-set-tx-node! d v) ((d 'set-tx-node!) v))
+
+; ----------------------------------------------------------------
+; ObMtHash — closure-based hash table
+; ----------------------------------------------------------------
+;
+; Per OB (ob_mt_hash.h):
+;   - arr_: ObMtArray<ObHashNode*> (128 buckets initially)
+;   - arr_size_: current bucket count
+;   - lazy bucket filling via genealogy
+;   - 0xFFFFFFFFFFFFFFFF tail sentinel
+;
+; aura v1: simplified to cons-based bucket list. Each bucket holds
+; a linked list of hash nodes. Bucket index = hash mod size.
+
+; bucket pair structure (file-level):
+; (filled? . node-list)
+; We store as cons pairs.
+
+; make-mt-hash: create an empty Memtable hash table.
+; Args: initial-size (integer — default 128)
+; Returns: mt_hash closure.
+(define (make-mt-hash initial-size)
+  (let ((size initial-size)
+        (buckets '())  ; list of buckets (each a hash_node or #f)
+        (filled-count 0))
+    (letrec ((set-size! (lambda (v) (set! size v) v))
+             (set-buckets! (lambda (v) (set! buckets v) v))
+             (set-filled-count! (lambda (v) (set! filled-count v) v))
+             (inc-filled-count! (lambda () (set! filled-count (+ filled-count 1)) filled-count))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'size) size)
+                       ((eq? msg 'buckets) buckets)
+                       ((eq? msg 'filled-count) filled-count)
+                       ((eq? msg 'set-size!) set-size!)
+                       ((eq? msg 'set-buckets!) set-buckets!)
+                       ((eq? msg 'set-filled-count!) set-filled-count!)
+                       ((eq? msg 'inc-filled-count) inc-filled-count!)
+                       (else #f)))))
+      self)))
+
+; mt-hash?: is the object an MtHash?
+; Detected by querying 'filled-count — only mt_hashes return integer.
+(define (mt-hash? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'filled-count)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; mt-hash-get-size: get current bucket count.
+(define (mt-hash-get-size h) (h 'size))
+
+; mt-hash-set-size!: set bucket count.
+(define (mt-hash-set-size! h v) ((h 'set-size!) v))
+
+; mt-hash-get-bucket: compute bucket index from hash.
+; Returns integer in [0, size).
+(define (mt-hash-get-bucket h hash)
+  (mod hash (mt-hash-get-size h)))
+
+; mt-hash-get-bucket-nodes: get the head node of a bucket at index.
+; Returns the bucket's hash_node or #f.
+; For v1: we use cons list of buckets.
+(define (mt-hash-get-bucket-nodes h bucket-idx)
+  (let loop ((rest (h 'buckets))
+             (idx bucket-idx))
+    (cond
+      ((null? rest) #f)
+      ((= idx 0) (car rest))
+      (else (loop (cdr rest) (- idx 1))))))
+
+; pad-buckets: helper — pad a bucket list to `size` entries with #f.
+; Returns the padded list.
+(define (pad-buckets buckets size)
+  (let loop ((rest buckets) (acc '()) (i 0))
+    (cond
+      ((null? rest)
+       (cond
+         ((= i size) (reverse acc))
+         (else (loop '() (cons #f acc) (+ i 1)))))
+      ((= i size) (reverse acc))
+      (else (loop (cdr rest) (cons (car rest) acc) (+ i 1))))))
+
+; mt-hash-set-bucket!: set the head node of a bucket at index.
+(define (mt-hash-set-bucket! h bucket-idx node)
+  (let ((old (h 'buckets))
+        (size (h 'size))
+        (padded (pad-buckets old size)))
+    (set-bucket-at! padded bucket-idx node size)
+    ((h 'set-buckets!) (set-bucket-at! padded bucket-idx node size))))
+
+; set-bucket-at!: helper — replace item at idx in list, return new list.
+; If list shorter than size+1, pad with #f.
+(define (set-bucket-at! lst idx new-val size)
+  (let ((filled (pad-buckets lst (+ size 1))))
+    ; (already padded to size+1 to safely replace at idx in [0, size])
+    (let loop ((rest filled) (acc '()) (i 0))
+      (cond
+        ((= i idx)
+         (append (reverse acc) (cons new-val rest)))
+        ((null? rest) (append (reverse acc) (list #f)))
+        (else (loop (cdr rest) (cons (car rest) acc) (+ i 1)))))))
+
+; list-replace: helper — replace item at idx in list.
+(define (list-replace lst idx new-val)
+  (let loop ((rest lst) (i 0) (acc '()))
+    (cond
+      ((null? rest)
+       (if (= i idx)
+           (cons new-val acc)
+           (append (reverse acc) rest)))
+      ((= i idx)
+       (append (reverse acc) (cons new-val rest)))
+      (else (loop (cdr rest) (+ i 1) (cons (car rest) acc))))))
+
+; mt-hash-insert!: insert a node into the hash table.
+; If bucket was empty, increment filled-count.
+; Returns #t on success.
+(define (mt-hash-insert! h node)
+  (let ((hash (node 'hash))
+        (size (h 'size)))
+    (let ((bucket-idx (mt-hash-get-bucket h hash)))
+      (let ((current-head (mt-hash-get-bucket-nodes h bucket-idx)))
+        (cond
+          ((eq? current-head #f)
+           ; Empty bucket — set as head + count as filled.
+           (mt-hash-set-bucket! h bucket-idx node)
+           ((h 'inc-filled-count))
+           #t)
+          (else
+           ; Bucket has nodes — insert at head.
+           ((node 'set-next!) current-head)
+           (mt-hash-set-bucket! h bucket-idx node)
+           #t))))))
+
+; mt-hash-find-in-bucket: linear search for a node by hash + value.
+; Returns the node or #f.
+; For v1, we compare hash only (simulating key matching).
+(define (mt-hash-find-in-bucket h bucket-idx target-hash)
+  (let ((head (mt-hash-get-bucket-nodes h bucket-idx)))
+    (let loop ((node head))
+      (cond
+        ((eq? node #f) #f)
+        ((= (node 'hash) target-hash) node)
+        (else (loop (node 'next))))))
+
+; mt-hash-bucket-filled?: is a bucket filled?
+; In v1: returns #t if bucket has at least one node.
+(define (mt-hash-bucket-filled? h bucket-idx)
+  (if (eq? (mt-hash-get-bucket-nodes h bucket-idx) #f)
+      #f
+      #t))
+
+; mt-hash-set-bucket-filled!: mark bucket as filled (v1: simply
+; set head to a node if not already filled).
+(define (mt-hash-set-bucket-filled! h bucket-idx node)
+  (let ((current (mt-hash-get-bucket-nodes h bucket-idx)))
+    (if (eq? current #f)
+        (begin
+          (mt-hash-set-bucket! h bucket-idx node)
+          ((h 'inc-filled-count)))
+        #t)))
