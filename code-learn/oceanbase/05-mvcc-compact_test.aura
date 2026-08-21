@@ -1,0 +1,230 @@
+; 05-mvcc-compact_test.aura
+; ======================
+; Smoke tests for 05-mvcc-compact.aura — compaction / GC minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/05-mvcc-compact_test.aura
+;
+; Verified automatically (smoke):
+;   - Compact threshold constants distinct + positive
+;   - need-compact? (for-read vs for-replay)
+;   - construct-compact-node (inherits save's fields + type=NDT-COMPACT)
+;   - unlink-trans-node (decrements count, prev/next rewire)
+;   - Compact stats accessors + setters
+;   - row-compact-in-cooldown? (true within 3s of last compact)
+;   - mark-compacted! (reset stats + set latest-compact-node)
+;
+; Verified via separate probes during development:
+;   - Predicates work correctly
+;   - Chain updates after unlink
+;
+; Deferred (full OceanBase compaction):
+;   - actual row_compact chain walk + multi-node merge
+;   - real NDT_COMPACT payload (full-column ObDatumRow assembly)
+;   - row Compactor class + allocators
+;   - real 3-second cooldown via ObTimeUtility
+;   - snapshot_version_barrier bit setting
+;   - freeze_clock check_freeze_clock_order_
+
+(require "std/test" all:)
+(require "01-mvcc-row" all:)
+(require "05-mvcc-compact" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; make-row-with-3-versions: create row with 3 versions.
+(define (make-row-with-3-versions)
+  (let ((row (make-mvcc-row 0 0))
+        (a (make-mvcc-trans-node 100 30 0 0 NDT-NORMAL F-INIT #f))
+        (b (make-mvcc-trans-node 200 60 0 0 NDT-NORMAL F-INIT #f))
+        (c (make-mvcc-trans-node 300 80 0 0 NDT-NORMAL F-INIT #f)))
+    (mvcc-row-add-version! row a)
+    (mvcc-row-add-version! row b)
+    (mvcc-row-add-version! row c)
+    row))
+
+; ----------------------------------------------------------------
+; Threshold constants
+; ----------------------------------------------------------------
+
+(test-suite "05-001-thresholds-distinct"
+  ; Threshold constants are distinct.
+  (check (= 1 (if (not (= NORMAL-COMPACT-THRESHOLD FOR-REPLAY-COMPACT-THRESHOLD)) 1 0))))
+
+(test-suite "05-001-thresholds-positive"
+  ; All thresholds are positive integers.
+  (check (= 1 (if (> NORMAL-COMPACT-THRESHOLD 0) 1 0)))
+  (check (= 1 (if (> FOR-REPLAY-COMPACT-THRESHOLD 0) 1 0)))
+  (check (= 1 (if (> WEAK-READ-COMPACT-COOLDOWN-MS 0) 1 0))))
+
+; ----------------------------------------------------------------
+; need-compact?
+; ----------------------------------------------------------------
+
+(test-suite "05-002-need-compact-for-replay"
+  ; for-replay returns #t when total-trans-node-cnt >= threshold.
+  (check (= #t (need-compact?
+                 (make-row-with-3-versions)
+                 #f #t)))
+  (check (= #f (need-compact?
+                 (make-mvcc-row 0 0)
+                 #f #t))))
+
+(test-suite "05-002-need-compact-for-read"
+  ; for-read returns #t when update_since_compact >= NORMAL-COMPACT-THRESHOLD.
+  (check (= #f (let ((row (make-mvcc-row 0 0)))
+                 (row-set-update-since-compact! row 0)
+                 (need-compact? row #t #f))))
+  (check (= #t (let ((row (make-mvcc-row 0 0)))
+                 (row-set-update-since-compact! row NORMAL-COMPACT-THRESHOLD)
+                 (need-compact? row #t #f))))
+  (check (= #t (let ((row (make-mvcc-row 0 0)))
+                 (row-set-update-since-compact! row (+ NORMAL-COMPACT-THRESHOLD 1))
+                 (need-compact? row #t #f)))))
+
+; ----------------------------------------------------------------
+; construct-compact-node
+; ----------------------------------------------------------------
+
+(test-suite "05-003-construct-compact-type"
+  ; construct-compact-node creates NDT-COMPACT node.
+  (check (= #t (let ((save (make-mvcc-trans-node 100 50 0 5 NDT-NORMAL F-INIT 'payload))
+                      (compact (construct-compact-node save 1000)))
+                 (= NDT-COMPACT (mvcc-trans-node-type compact)))))
+
+(test-suite "05-003-construct-compact-inherits-tx-id"
+  ; construct-compact-node inherits save's tx_id.
+  (check (= 100 (let ((save (make-mvcc-trans-node 100 50 0 5 NDT-NORMAL F-INIT 'payload))
+                        (compact (construct-compact-node save 1000)))
+                    (mvcc-trans-node-tx-id compact))))
+
+(test-suite "05-003-construct-compact-inherits-trans-version"
+  ; construct-compact-node inherits save's trans-version.
+  (check (= 50 (let ((save (make-mvcc-trans-node 100 50 0 5 NDT-NORMAL F-INIT 'payload))
+                      (compact (construct-compact-node save 1000)))
+                  (mvcc-trans-node-trans-version compact))))
+
+(test-suite "05-003-construct-compact-inherits-scn"
+  ; construct-compact-node inherits save's scn.
+  (check (= 200 (let ((save (make-mvcc-trans-node 100 50 200 5 NDT-NORMAL F-INIT 'p))
+                        (compact (construct-compact-node save 1000)))
+                    (mvcc-trans-node-scn compact))))
+
+(test-suite "05-003-construct-compact-inherits-seq"
+  ; construct-compact-node inherits save's seq.
+  (check (= 5 (let ((save (make-mvcc-trans-node 100 50 0 5 NDT-NORMAL F-INIT 'p))
+                    (compact (construct-compact-node save 1000)))
+                (mvcc-trans-node-seq compact))))
+
+(test-suite "05-003-construct-compact-inherits-flag"
+  ; construct-compact-node inherits save's flag.
+  (check (= F-COMMITTED (let ((save (make-mvcc-trans-node 100 50 0 0 NDT-NORMAL F-COMMITTED 'p))
+                                (compact (construct-compact-node save 1000)))
+                            (mvcc-trans-node-flag compact))))
+
+; ----------------------------------------------------------------
+; unlink-trans-node
+; ----------------------------------------------------------------
+
+(test-suite "05-004-unlink-decrements-count"
+  ; unlink-trans-node decrements total-trans-node-cnt.
+  (check (= 1 (let ((row (make-row-with-3-versions))
+                    (oldest (mvcc-trans-node-prev
+                              (mvcc-trans-node-prev
+                                (mvcc-row-list-head row)))))
+                 (let ((before-count (mvcc-row-total-trans-node-cnt row)))
+                   (unlink-trans-node row oldest)
+                   (= before-count (+ (mvcc-row-total-trans-node-cnt row) 1))))))
+
+(test-suite "05-004-unlink-clears-prev-next"
+  ; unlink-trans-node clears node's prev/next pointers.
+  (check (= #t (let ((row (make-row-with-3-versions))
+                    (oldest (mvcc-trans-node-prev
+                              (mvcc-trans-node-prev
+                                (mvcc-row-list-head row)))))
+                 (unlink-trans-node row oldest)
+                 (and (eq? #f (oldest 'prev))
+                      (eq? #f (oldest 'next))))))
+
+(test-suite "05-004-unlink-not-in-chain"
+  ; unlink-trans-node on unlinked node returns #f.
+  (check (= #f (unlink-trans-node (make-mvcc-row 0 0)
+                                  (make-mvcc-trans-node 1 0 0 0 NDT-NORMAL F-INIT #f)))))
+
+; ----------------------------------------------------------------
+; Compact stats accessors
+; ----------------------------------------------------------------
+
+(test-suite "05-005-stats-init"
+  ; New row stats are 0.
+  (check (= 0 (row-update-since-compact (make-mvcc-row 0 0))))
+  (check (= 0 (row-latest-compact-ts (make-mvcc-row 0 0))))
+  (check (= 0 (row-last-compact-cnt (make-mvcc-row 0 0))))
+
+(test-suite "05-005-stats-setters"
+  ; Setters update fields.
+  (check (= 7 (let ((row (make-mvcc-row 0 0)))
+                (row-set-update-since-compact! row 7)
+                (row-update-since-compact row))))
+  (check (= 5000 (let ((row (make-mvcc-row 0 0)))
+                  (row-set-latest-compact-ts! row 5000)
+                  (row-latest-compact-ts row))))
+  (check (= 10 (let ((row (make-mvcc-row 0 0)))
+                 (row-set-last-compact-cnt! row 10)
+                 (row-last-compact-cnt row))))
+
+; ----------------------------------------------------------------
+; row-compact-in-cooldown?
+; ----------------------------------------------------------------
+
+(test-suite "05-006-cooldown-no-prior"
+  ; Without prior compact, cooldown check returns #f.
+  (check (= #f (row-compact-in-cooldown? (make-mvcc-row 0 0) 1000000))))
+
+(test-suite "05-006-cooldown-within-3s"
+  ; Within 3 seconds of last compact → cooldown #t.
+  (check (= #t (let ((row (make-mvcc-row 0 0)))
+                 (row-set-latest-compact-ts! row 1000000)
+                 (row-compact-in-cooldown? row 1000001))))
+
+(test-suite "05-006-cooldown-after-3s"
+  ; After 3 seconds → cooldown #f.
+  (check (= #f (let ((row (make-mvcc-row 0 0)))
+                 (row-set-latest-compact-ts! row 1000000)
+                 (row-compact-in-cooldown? row (+ 1000000 WEAK-READ-COMPACT-COOLDOWN-MS)))))
+
+; ----------------------------------------------------------------
+; mark-compacted!
+; ----------------------------------------------------------------
+
+(test-suite "05-007-mark-compacted-resets-stats"
+  ; mark-compacted! resets update_since_compact to 0.
+  (check (= 0 (let ((row (make-mvcc-row 0 0))
+                    (compact-node (make-mvcc-trans-node 1 0 0 0 NDT-COMPACT F-INIT #f)))
+                (row-set-update-since-compact! row 5)
+                (mark-compacted! row compact-node 3 1000)
+                (row-update-since-compact row))))
+
+(test-suite "05-007-mark-compacted-sets-ts"
+  ; mark-compacted! sets latest_compact_ts.
+  (check (= 9999 (let ((row (make-mvcc-row 0 0))
+                      (compact-node (make-mvcc-trans-node 1 0 0 0 NDT-COMPACT F-INIT #f)))
+                  (mark-compacted! row compact-node 3 9999)
+                  (row-latest-compact-ts row))))
+
+(test-suite "05-007-mark-compacted-sets-cnt"
+  ; mark-compacted! sets last_compact_cnt.
+  (check (= 7 (let ((row (make-mvcc-row 0 0))
+                    (compact-node (make-mvcc-trans-node 1 0 0 0 NDT-COMPACT F-INIT #f)))
+                (mark-compacted! row compact-node 7 1000)
+                (row-last-compact-cnt row))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

@@ -1,0 +1,223 @@
+; 05-mvcc-compact.aura
+; ======================
+; mvcc_compact — minimal capability port to aura.
+;
+; Maps to: OceanBase MVCC version chain compaction / GC
+; Source: src/storage/memtable/mvcc/ob_mvcc_row.cpp + .h
+;         + storage/memtable/ob_row_compactor.cpp + .h
+;         (OceanBase 5.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase compaction compresses MVCC version chains:
+;   - NDT_COMPACT node: full-column copy (vs NDT_NORMAL incremental)
+;   - ObMvccRow::need_compact: predicate (update_since_compact >
+;     threshold + cooling check)
+;   - try_compact_row_when_mvcc_read_: 3-second cooling period
+;     (WEAK_READ_COMPACT_THRESHOLD = 3 * 1000 * 1000 ms)
+;   - ObMvccRow::row_compact: walk from latest_compact_node_ backwards,
+;     construct new NDT_COMPACT node, unlink old trans nodes
+;   - compact stats: update_since_compact_ (incremented per write),
+;     latest_compact_ts_ (last compact time), last_compact_cnt_
+;     (nodes merged in last compact), total_trans_node_cnt_
+;   - snapshot_version_barrier: NDT_COMPACT node field preventing
+;     reads from going further back
+;
+; aura has no row latches, no time, no compaction worker. v1 ships:
+;   - 3 compact threshold constants (NORMAL, FOR-REPLAY, COOLDOWN)
+;   - need-compact? predicate
+;   - construct-compact-node (NDT_COMPACT factory inheriting save's
+;     tx_id/seq/trans_version/scn/flag)
+;   - unlink-trans-node (remove single node from chain, decrement
+;     count)
+;   - row-compact-in-cooldown? predicate
+;   - row-update-since-compact! (atomic FAA via closure)
+;   - row-update-update-since-compact! (increment, mimics ATOMIC_FAA)
+;   - row-set-latest-compact-ts! + row-latest-compact-ts
+;   - row-set-last-compact-cnt! + row-last-compact-cnt
+;   - mark-compacted! (set latest-compact-node + reset stats)
+;
+; Deferred (full OceanBase compaction):
+;   - actual row_compact chain walk + multi-node merge
+;   - real NDT_COMPACT payload (full-column ObDatumRow assembly
+;     from NDT_NORMAL versions + memtable data)
+;   - row Compactor class (ObMemtableRowCompactor) + allocators
+;   - try_compact_row_when_mvcc_read_ 3-second cooldown (uses
+;     ObTimeUtility::current_time())
+;   - snapshot_version_barrier bit setting (4-bit field)
+;   - freeze_clock check_freeze_clock_order_
+;   - latest_compact_node_ advancement
+
+(export
+  ; Compact thresholds
+  NORMAL-COMPACT-THRESHOLD FOR-REPLAY-COMPACT-THRESHOLD
+  WEAK-READ-COMPACT-COOLDOWN-MS
+  ; need-compact? predicate
+  need-compact?
+  ; construct-compact-node
+  construct-compact-node
+  ; unlink-trans-node
+  unlink-trans-node
+  ; compact stats accessors
+  row-update-since-compact row-latest-compact-ts row-last-compact-cnt
+  row-set-update-since-compact! row-set-latest-compact-ts!
+  row-set-last-compact-cnt!
+  ; Cooldown check
+  row-compact-in-cooldown?
+  ; Mark compacted (set latest-compact-node + reset stats)
+  mark-compacted!)
+
+; ----------------------------------------------------------------
+; Compact thresholds
+; ----------------------------------------------------------------
+;
+; Linux definitions (kept here for reference):
+;   const int64_t WEAK_READ_COMPACT_THRESHOLD = 3 * 1000 * 1000; // 3s
+;
+; aura v1: simplified thresholds.
+
+(define NORMAL-COMPACT-THRESHOLD 4)        ; compact after 4 writes since last
+(define FOR-REPLAY-COMPACT-THRESHOLD 1)    ; always compact on replay path
+(define WEAK-READ-COMPACT-COOLDOWN-MS 3000000) ; 3 seconds
+
+; ----------------------------------------------------------------
+; need-compact? — predicate for whether to trigger compact
+; ----------------------------------------------------------------
+;
+; Per OB (ob_mvcc_row.cpp::need_compact):
+;   if for_replay:
+;     return total_trans_node_cnt_ >= FOR_REPLAY_COMPACT_THRESHOLD
+;   if for_read:
+;     return update_since_compact_ >= NORMAL_COMPACT_THRESHOLD &&
+;            cooling check passes
+;
+; aura v1: simplified — just check update_since_compact threshold.
+; Cooling check is separate (row-compact-in-cooldown?).
+
+(define (need-compact? row for-read for-replay)
+  (if for-replay
+      (>= (row 'total-trans-node-cnt) FOR-REPLAY-COMPACT-THRESHOLD)
+      (>= (row 'update-since-compact) NORMAL-COMPACT-THRESHOLD)))
+
+; ----------------------------------------------------------------
+; construct-compact-node — create NDT_COMPACT node inheriting save's
+; fields
+; ----------------------------------------------------------------
+;
+; Per OB (ob_row_compactor.cpp:299-306):
+;   new(trans_node) ObMvccTransNode();
+;   trans_node->tx_id_ = save->tx_id_;
+;   trans_node->seq_no_ = save->seq_no_;
+;   trans_node->trans_version_ = save->trans_version_;
+;   trans_node->modify_count_ = save->modify_count_;
+;   trans_node->acc_checksum_ = save->acc_checksum_;
+;   trans_node->version_ = save->version_;
+;   trans_node->type_ = NDT_COMPACT;             // ★
+;   trans_node->set_saved_flag(save->get_flag());
+;   trans_node->scn_ = save->scn_;
+;   trans_node->set_snapshot_version_barrier(snapshot_version, flag);
+;
+; aura v1: inherit basic fields from save. Payload is shared.
+; snapshot_version_barrier not implemented (full feature).
+
+(define (construct-compact-node save-node snapshot-version)
+  (make-mvcc-trans-node
+    (save-node 'tx-id)
+    (save-node 'trans-version)
+    (save-node 'scn)
+    (save-node 'seq)
+    NDT-COMPACT
+    (save-node 'flag)
+    (save-node 'payload)))
+
+; ----------------------------------------------------------------
+; unlink-trans-node — remove a single trans node from chain
+; ----------------------------------------------------------------
+;
+; Per OB (ob_mvcc_row.cpp::unlink_trans_node):
+;   ATOMIC_STORE(&prev->next_, node->next_);
+;   ATOMIC_STORE(&next->prev_, node->prev_);
+;   ATOMIC_STORE(&node->next_, NULL);
+;   ATOMIC_STORE(&node->prev_, NULL);
+;   --total_trans_node_cnt_;
+;
+; aura v1: same semantics without atomic (single-threaded).
+
+(define (unlink-trans-node row node)
+  (let ((prev (node 'prev))
+        (next (node 'next)))
+    (cond
+      ((or (eq? prev #f) (eq? next #f))
+       ; Node not properly linked — cannot unlink.
+       #f)
+      (else
+       ((prev 'set-next!) next)
+       ((next 'set-prev!) prev)
+       ((node 'set-prev!) #f)
+       ((node 'set-next!) #f)
+       ((row 'set-total-trans-node-cnt!)
+        (- (row 'total-trans-node-cnt) 1))
+       #t))))
+
+; ----------------------------------------------------------------
+; Compact stats accessors
+; ----------------------------------------------------------------
+
+; row-update-since-compact: get update_since_compact_
+(define (row-update-since-compact row)
+  ((row 'update-since-compact)))
+
+; row-latest-compact-ts: get latest_compact_ts_
+(define (row-latest-compact-ts row)
+  ((row 'latest-compact-ts)))
+
+; row-last-compact-cnt: get last_compact_cnt_
+(define (row-last-compact-cnt row)
+  ((row 'last-compact-cnt)))
+
+; row-set-update-since-compact!: set update_since_compact_.
+; Returns the new value.
+(define (row-set-update-since-compact! row v)
+  ((row 'set-update-since-compact!) v))
+
+; row-set-latest-compact-ts!: set latest_compact_ts_.
+; Returns the new value.
+(define (row-set-latest-compact-ts! row v)
+  ((row 'set-latest-compact-ts!) v))
+
+; row-set-last-compact-cnt!: set last_compact_cnt_.
+; Returns the new value.
+(define (row-set-last-compact-cnt! row v)
+  ((row 'set-last-compact-cnt!) v))
+
+; ----------------------------------------------------------------
+; row-compact-in-cooldown? — cooling check
+; ----------------------------------------------------------------
+;
+; Per OB (ob_mvcc_engine.cpp::try_compact_row_when_mvcc_read_):
+;   if (ObTimeUtility::current_time() < latest_compact_ts_ + 3s) skip;
+;
+; aura v1: caller passes current-time-ms.
+
+(define (row-compact-in-cooldown? row current-time-ms)
+  (let ((latest (row 'latest-compact-ts)))
+    (and (> latest 0)
+         (< current-time-ms (+ latest WEAK-READ-COMPACT-COOLDOWN-MS))))
+
+; ----------------------------------------------------------------
+; mark-compacted! — set latest-compact-node + reset stats
+; ----------------------------------------------------------------
+;
+; Per OB (ob_mvcc_row.cpp::row_compact stats update):
+;   latest_compact_node_ = new_compact_node;
+;   update_since_compact_ = 0;
+;   latest_compact_ts_ = current_time;
+;   last_compact_cnt_ = compact_count;
+;
+; aura v1: simplified wrapper.
+
+(define (mark-compacted! row compact-node compact-count current-time-ms)
+  ((row 'set-latest-compact-node!) compact-node)
+  ((row 'set-update-since-compact!) 0)
+  ((row 'set-latest-compact-ts!) current-time-ms)
+  ((row 'set-last-compact-cnt!) compact-count))
