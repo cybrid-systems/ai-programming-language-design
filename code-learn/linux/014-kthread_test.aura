@@ -1,0 +1,102 @@
+; 014-kthread_test.aura
+; =====================
+; Smoke tests for 014-kthread.aura — kthread minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/014-kthread_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-kthread construction (flags=0, no data, no name, no result, not started)
+;   - kthread-data accessors
+;   - kthread-should-stop? initially #f
+;   - kthread-stop sets SHOULD_STOP flag (should-stop? → #t)
+;   - kthread-should-park? initially #f
+;   - kthread-park sets + kthread-unpark clears
+;   - kthread-set-result! / kthread-result round-trip
+;   - kthread-full-name / kthread-set-full-name!
+;
+; Verified via separate probes during development:
+;   - stop is idempotent (can call multiple times)
+;   - should-park? and should-stop? are independent
+;
+; Deferred (full Linux kthread):
+;   - kthreadd (PID 2) lifecycle management
+;   - struct task_struct integration
+;   - kthread_worker (kworker) integration with workqueue
+;   - CPU affinity / NUMA binding
+;   - set_child_tid pointer trick
+;   - KTHREAD_IS_PER_CPU
+;   - kthread_create_info full creation API
+
+(require "std/test" all:)
+(require "014-kthread" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "kthread-001-init"
+  (check (= 1 (let ((t (make-kthread (lambda () 0))))
+                 (and (not (kthread-should-stop? t))
+                      (not (kthread-should-park? t))
+                      (not (kthread-started? t))))))
+
+; ----------------------------------------------------------------
+; Data accessors
+; ----------------------------------------------------------------
+
+(test-suite "kthread-002-data"
+  (check (= 1 (eq? 'my-data (kthread-data
+    (let ((t (make-kthread (lambda () 0)))
+      (kthread-set-data! t 'my-data)
+      t)))))
+
+; ----------------------------------------------------------------
+; Stop flag
+; ----------------------------------------------------------------
+
+(test-suite "kthread-003-should-stop"
+  (check (= 1 (let ((t (make-kthread (lambda () 0))))
+                 (kthread-stop t)
+                 (if (kthread-should-stop? t) 1 0))))
+
+; ----------------------------------------------------------------
+; Park / unpark
+; ----------------------------------------------------------------
+
+(test-suite "kthread-004-park"
+  (check (= 1 (let ((t (make-kthread (lambda () 0))))
+                 (kthread-park t)
+                 (if (kthread-should-park? t) 1 0))))
+
+(test-suite "kthread-004-unpark"
+  (check (= 1 (let ((t (make-kthread (lambda () 0))))
+                 (kthread-park t)
+                 (kthread-unpark t)
+                 (if (not (kthread-should-park? t)) 1 0))))
+
+; ----------------------------------------------------------------
+; Result + full name
+; ----------------------------------------------------------------
+
+(test-suite "kthread-005-result"
+  (check (= 42 (let ((t (make-kthread (lambda () 0))))
+                 (kthread-set-result! t 42)
+                 (kthread-result t))))
+
+(test-suite "kthread-006-full-name"
+  (check (= 1 (eq? 'kworker/0:0 (kthread-full-name
+    (let ((t (make-kthread (lambda () 0))))
+      (kthread-set-full-name! t 'kworker/0:0)
+      t)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

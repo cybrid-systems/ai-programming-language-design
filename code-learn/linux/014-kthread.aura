@@ -1,0 +1,139 @@
+; 014-kthread.aura
+; =====================
+; Kthread (kernel thread) — minimal capability port to aura.
+;
+; Maps to: 014-kthread-analysis.md
+; Source: kernel/kthread.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux kthread integrates with scheduler + kthreadd (PID 2):
+;   - struct kthread with 12+ fields (flags, cpu, node, started, result, etc.)
+;   - kthreadd manages create/destroy lifecycle
+;   - SHOULD_STOP / SHOULD_PARK flag coordination
+;   - completion integration (exited, parked)
+;   - Affinity / NUMA node binding
+;   - Full task_struct integration
+;
+; aura has no scheduler, no kthreadd, no task_struct.
+; v1 ships the kthread struct + lifecycle flag tracking (single-threaded):
+;   - make-kthread (closure with threadfn, data, flags, completion)
+;   - kthread-data / kthread-set-data!
+;   - kthread-should-stop? / kthread-stop signal
+;   - kthread-should-park? / kthread-park signal / kthread-unpark
+;   - kthread-set-result!
+;   - kthread-started?
+;   - kthread-full-name / kthread-set-full-name!
+;
+; Deferred (full Linux kthread, separate issues):
+;   - kthreadd thread (PID 2) lifecycle management
+;   - struct task_struct integration
+;   - kthread_worker (kworker) integration with workqueue
+;   - CPU affinity / NUMA node binding
+;   - set_child_tid pointer trick for zero-overhead kthread lookup
+;   - KTHREAD_IS_PER_CPU (per-cpu kthread variant)
+;   - kthread_create_info + kthread_create() full creation API
+;   - kthread_should_die vs SHOULD_STOP distinction
+
+(export
+  make-kthread
+  kthread-data
+  kthread-set-data!
+  kthread-should-stop?
+  kthread-stop
+  kthread-should-park?
+  kthread-park
+  kthread-unpark
+  kthread-set-result!
+  kthread-result
+  kthread-started?
+  kthread-full-name
+  kthread-set-full-name!)
+
+; Flag bit positions (analogous to Linux kthread.h)
+(define KTHREAD-SHOULD-STOP  1)   ; bit 0
+(define KTHREAD-SHOULD-PARK  2)   ; bit 1
+(define KTHREAD-IS-PER-CPU   4)   ; bit 2 (unused in v1)
+
+; ----------------------------------------------------------------
+; Kthread (closure with flags + state)
+; ----------------------------------------------------------------
+
+; Make a kthread. threadfn is the thread function (called when started).
+; v1 simulates a single-threaded invocation; "thread" never spawns.
+(define (make-kthread threadfn)
+  (let ((data #f)
+        (flags 0)
+        (result -1)               ; default return value
+        (started? #f)
+        (full-name #f))
+    (letrec ((set-data!      (lambda (v) (set! data v) v))
+             (set-flags!     (lambda (v) (set! flags v) v))
+             (set-result!    (lambda (v) (set! result v) v))
+             (set-started?!  (lambda (v) (set! started? v) v))
+             (set-full-name! (lambda (v) (set! full-name v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'threadfn) threadfn)
+                       ((eq? msg 'data) data)
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'result) result)
+                       ((eq? msg 'started?) started?)
+                       ((eq? msg 'full-name) full-name)
+                       ((eq? msg 'set-data!) set-data!)
+                       ((eq? msg 'set-flags!) set-flags!)
+                       ((eq? msg 'set-result!) set-result!)
+                       ((eq? msg 'set-started?!) set-started?!)
+                       ((eq? msg 'set-full-name!) set-full-name!)
+                       ((eq? msg 'should-stop?) (not (zero? (modulo flags KTHREAD-SHOULD-STOP))))
+                       ((eq? msg 'should-park?) (not (zero? (modulo flags KTHREAD-SHOULD-PARK))))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+; kthread-data: get the data pointer passed to threadfn.
+(define (kthread-data t) (t 'data))
+
+; kthread-set-data!: set the data pointer.
+(define (kthread-set-data! t v) ((t 'set-data!) v))
+
+; kthread-full-name: get the thread's display name.
+(define (kthread-full-name t) (t 'full-name))
+
+; kthread-set-full-name!: set the thread's display name.
+(define (kthread-set-full-name! t n) ((t 'set-full-name!) n))
+
+; kthread-result: get the thread's stored result.
+(define (kthread-result t) (t 'result))
+
+; kthread-set-result!: set the thread's stored result.
+(define (kthread-set-result! t v) ((t 'set-result!) v))
+
+; kthread-started?: has the thread started?
+(define (kthread-started? t) (t 'started?))
+
+; ----------------------------------------------------------------
+; Flag signals
+; ----------------------------------------------------------------
+
+; kthread-should-stop?: did kthread_stop() request this thread to exit?
+(define (kthread-should-stop? t) (t 'should-stop?))
+
+; kthread-stop: signal the thread to stop (sets SHOULD_STOP flag).
+; Idempotent.
+(define (kthread-stop t)
+  ((t 'set-flags!) (+ (t 'flags) KTHREAD-SHOULD-STOP)))
+
+; kthread-should-park?: did kthread_park() request this thread to sleep?
+(define (kthread-should-park? t) (t 'should-park?))
+
+; kthread-park: signal the thread to park (sets SHOULD_PARK flag).
+(define (kthread-park t)
+  ((t 'set-flags!) (+ (t 'flags) KTHREAD-SHOULD-PARK)))
+
+; kthread-unpark: clear the SHOULD_PARK flag (thread resumes).
+(define (kthread-unpark t)
+  ((t 'set-flags!) (- (t 'flags) KTHREAD-SHOULD-PARK)))
