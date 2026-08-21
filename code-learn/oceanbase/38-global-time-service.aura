@@ -1,0 +1,384 @@
+; 38-global-time-service.aura
+; ======================
+; global_time_service — minimal capability port to aura.
+;
+; Maps to: OceanBase Global Time Service (GTS)
+; Source: src/storage/gt/ob_gts_service.h
+;         + src/storage/gt/ob_gts_paxos.h
+;         + src/storage/gt/ob_gts_rpc.h
+;         + src/storage/gt/ob_gts_task_queue.h
+;         + src/share/ob_gts_define.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase GTS:
+;   - 3 GTS-ROLE constants: LEADER / FOLLOWER / CANDIDATE
+;   - 4 GTS-STATUS constants: INIT / RUNNING / SUSPEND / STOP
+;   - 2 TS-TYPE constants: MONOTONIC / PHYSICAL
+;   - ObGtsTask: task with mono_ts + physical_ts + tenant_id
+;   - ObGtsTaskQueue: batch queue
+;   - ObGtsLocalCache: local cache with last_mono + last_physical
+;   - ObGtsPaxosMember: paxos replica
+;   - ObGtsService: gts service (role + status + leader addr)
+;
+; aura v1 ships:
+;   - 3 GTS-ROLE constants
+;   - 4 GTS-STATUS constants
+;   - 2 TS-TYPE constants
+;   - make-gts-task (factory: mono + physical + tenant-id)
+;   - gts-task accessors + set-mono!
+;   - make-gts-task-queue (factory: empty)
+;   - gts-task-queue-get-count + add! + drain!
+;   - make-gts-local-cache (factory: last-mono + last-physical)
+;   - gts-local-cache accessors + set-last-mono!
+;   - make-gts-paxos-member (factory: addr + role + priority)
+;   - gts-paxos-member accessors + set-role!
+;   - make-gts-service (factory: role + status + leader-addr +
+;     local-cache + queue + paxos-members)
+;   - gts-service accessors + set-role! / set-status!
+;   - gts-service-get-paxos-member-count
+;   - gts-service-get-quorum (compute: floor(N/2) + 1)
+;
+; Deferred (full OceanBase GTS):
+;   - real ObGtsService with Paxos log + batch alloc
+;   - real HLC (Hybrid Logical Clock) algorithm
+;   - real Paxos prepare/accept/learn RPC
+;   - real __all_core_table meta integration
+;   - real GTS failover + leader election
+;   - real GTS local cache with batch refresh
+;   - real GTS task queue with back-pressure
+;   - real GTS monitor + metrics
+;   - real NTP sync + clock drift detection
+;   - real multi-cluster GTS failover
+;   - real GTS rate limit (max ts per second)
+
+(export
+  ; GtsRole constants
+  GTS-ROLE-LEADER
+  GTS-ROLE-FOLLOWER
+  GTS-ROLE-CANDIDATE
+  ; GtsStatus constants
+  GTS-STATUS-INIT
+  GTS-STATUS-RUNNING
+  GTS-STATUS-SUSPEND
+  GTS-STATUS-STOP
+  ; TsType constants
+  TS-TYPE-MONOTONIC
+  TS-TYPE-PHYSICAL
+  ; GtsTask
+  make-gts-task
+  gts-task?
+  gts-task-get-mono-ts
+  gts-task-get-physical-ts
+  gts-task-get-tenant-id
+  gts-task-set-mono!
+  ; GtsTaskQueue
+  make-gts-task-queue
+  gts-task-queue?
+  gts-task-queue-get-count
+  gts-task-queue-add!
+  gts-task-queue-drain!
+  ; GtsLocalCache
+  make-gts-local-cache
+  gts-local-cache?
+  gts-local-cache-get-last-mono
+  gts-local-cache-get-last-physical
+  gts-local-cache-set-last-mono!
+  gts-local-cache-set-last-physical!
+  ; GtsPaxosMember
+  make-gts-paxos-member
+  gts-paxos-member?
+  gts-paxos-member-get-addr
+  gts-paxos-member-get-role
+  gts-paxos-member-get-priority
+  gts-paxos-member-set-role!
+  ; GtsService
+  make-gts-service
+  gts-service?
+  gts-service-get-role
+  gts-service-get-status
+  gts-service-get-leader-addr
+  gts-service-get-local-cache
+  gts-service-get-task-queue
+  gts-service-get-paxos-members
+  gts-service-set-role!
+  gts-service-set-status!
+  gts-service-set-leader-addr!
+  gts-service-add-paxos-member!
+  gts-service-get-paxos-member-count
+  gts-service-get-quorum)
+
+; ----------------------------------------------------------------
+; GtsRole constants
+; ----------------------------------------------------------------
+
+(define GTS-ROLE-LEADER 0)
+(define GTS-ROLE-FOLLOWER 1)
+(define GTS-ROLE-CANDIDATE 2)
+
+; ----------------------------------------------------------------
+; GtsStatus constants
+; ----------------------------------------------------------------
+
+(define GTS-STATUS-INIT 0)
+(define GTS-STATUS-RUNNING 1)
+(define GTS-STATUS-SUSPEND 2)
+(define GTS-STATUS-STOP 3)
+
+; ----------------------------------------------------------------
+; TsType constants
+; ----------------------------------------------------------------
+
+(define TS-TYPE-MONOTONIC 0)
+(define TS-TYPE-PHYSICAL 1)
+
+; ----------------------------------------------------------------
+; ObGtsTask — closure-based
+; ----------------------------------------------------------------
+
+; make-gts-task: create a GTS task.
+; Args: mono-ts (integer), physical-ts (integer), tenant-id (integer)
+; Returns: gts_task closure.
+(define (make-gts-task mono-ts physical-ts tenant-id)
+  (letrec ((set-mono! (lambda (v) (set! mono-ts v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'mono-ts) mono-ts)
+                     ((eq? msg 'physical-ts) physical-ts)
+                     ((eq? msg 'tenant-id) tenant-id)
+                     ((eq? msg 'set-mono!) set-mono!)
+                     (else #f)))))
+      self))
+
+; gts-task?: is the object a GTS task?
+; Detected by querying 'mono-ts — only tasks return integer.
+(define (gts-task? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mono-ts)))
+        (if (and (integer? m) (>= m 0)) #t #f))
+      #f))
+
+; gts-task-get-mono-ts: get monotonic timestamp.
+(define (gts-task-get-mono-ts t) (t 'mono-ts))
+
+; gts-task-get-physical-ts: get physical timestamp.
+(define (gts-task-get-physical-ts t) (t 'physical-ts))
+
+; gts-task-get-tenant-id: get tenant id.
+(define (gts-task-get-tenant-id t) (t 'tenant-id))
+
+; gts-task-set-mono!: set monotonic timestamp.
+; Returns the new mono-ts.
+(define (gts-task-set-mono! t v) ((t 'set-mono!) v))
+
+; ----------------------------------------------------------------
+; ObGtsTaskQueue — closure-based
+; ----------------------------------------------------------------
+
+; make-gts-task-queue: create a GTS task queue.
+; Returns: gts_task_queue closure (initial: empty).
+(define (make-gts-task-queue)
+  (let ((tasks '()))
+    (letrec ((set-tasks! (lambda (v) (set! tasks v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tasks) tasks)
+                       ((eq? msg 'set-tasks!) set-tasks!)
+                       (else #f)))))
+      self)))
+
+; gts-task-queue?: is the object a GTS task queue?
+; Detected by querying 'tasks — only queues return a cons.
+(define (gts-task-queue? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'tasks)) #t #f)
+      #f))
+
+; gts-task-queue-get-count: get task count.
+(define (gts-task-queue-get-count q)
+  (let loop ((rest (q 'tasks)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; gts-task-queue-add!: add a task.
+; Returns the new count.
+(define (gts-task-queue-add! q task)
+  (let ((existing (q 'tasks)))
+    ((q 'set-tasks!) (cons task existing))))
+
+; gts-task-queue-drain!: drain all tasks (return + clear).
+; Returns the drained task list.
+(define (gts-task-queue-drain! q)
+  (let ((drained (q 'tasks)))
+    ((q 'set-tasks!) '())
+    drained))
+
+; ----------------------------------------------------------------
+; ObGtsLocalCache — closure-based
+; ----------------------------------------------------------------
+
+; make-gts-local-cache: create a GTS local cache.
+; Args: last-mono (integer), last-physical (integer)
+; Returns: gts_local_cache closure.
+(define (make-gts-local-cache last-mono last-physical)
+  (letrec ((set-last-mono! (lambda (v) (set! last-mono v) v))
+           (set-last-physical! (lambda (v) (set! last-physical v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'last-mono) last-mono)
+                     ((eq? msg 'last-physical) last-physical)
+                     ((eq? msg 'set-last-mono!) set-last-mono!)
+                     ((eq? msg 'set-last-physical!) set-last-physical!)
+                     (else #f)))))
+      self))
+
+; gts-local-cache?: is the object a GTS local cache?
+; Detected by querying 'last-mono — only caches return integer.
+(define (gts-local-cache? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'last-mono)))
+        (if (and (integer? m) (>= m 0)) #t #f))
+      #f))
+
+; gts-local-cache-get-last-mono: get last mono.
+(define (gts-local-cache-get-last-mono c) (c 'last-mono))
+
+; gts-local-cache-get-last-physical: get last physical.
+(define (gts-local-cache-get-last-physical c) (c 'last-physical))
+
+; gts-local-cache-set-last-mono!: set last mono.
+; Returns the new mono.
+(define (gts-local-cache-set-last-mono! c v) ((c 'set-last-mono!) v))
+
+; gts-local-cache-set-last-physical!: set last physical.
+; Returns the new physical.
+(define (gts-local-cache-set-last-physical! c v)
+  ((c 'set-last-physical!) v))
+
+; ----------------------------------------------------------------
+; ObGtsPaxosMember — closure-based
+; ----------------------------------------------------------------
+
+; make-gts-paxos-member: create a GTS paxos member.
+; Args: addr (symbol), role (integer), priority (integer)
+; Returns: gts_paxos_member closure.
+(define (make-gts-paxos-member addr role priority)
+  (letrec ((set-role! (lambda (v) (set! role v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'addr) addr)
+                     ((eq? msg 'role) role)
+                     ((eq? msg 'priority) priority)
+                     ((eq? msg 'set-role!) set-role!)
+                     (else #f)))))
+      self))
+
+; gts-paxos-member?: is the object a GTS paxos member?
+; Detected by querying 'priority — only members return integer.
+(define (gts-paxos-member? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'priority)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; gts-paxos-member-get-addr: get address.
+(define (gts-paxos-member-get-addr m) (m 'addr))
+
+; gts-paxos-member-get-role: get role.
+(define (gts-paxos-member-get-role m) (m 'role))
+
+; gts-paxos-member-get-priority: get priority.
+(define (gts-paxos-member-get-priority m) (m 'priority))
+
+; gts-paxos-member-set-role!: set role.
+; Returns the new role.
+(define (gts-paxos-member-set-role! m v) ((m 'set-role!) v))
+
+; ----------------------------------------------------------------
+; ObGtsService — closure-based (unified)
+; ----------------------------------------------------------------
+
+; make-gts-service: create a GTS service.
+; Args: role (integer), status (integer), leader-addr (symbol),
+;       local-cache (gts_local_cache),
+;       task-queue (gts_task_queue)
+; Returns: gts_service closure (initial: empty paxos-members).
+(define (make-gts-service role status leader-addr local-cache task-queue)
+  (let ((paxos-members '()))
+    (letrec ((set-role! (lambda (v) (set! role v) v))
+             (set-status! (lambda (v) (set! status v) v))
+             (set-leader-addr! (lambda (v) (set! leader-addr v) v))
+             (set-paxos-members! (lambda (v) (set! paxos-members v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'role) role)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'leader-addr) leader-addr)
+                       ((eq? msg 'local-cache) local-cache)
+                       ((eq? msg 'task-queue) task-queue)
+                       ((eq? msg 'paxos-members) paxos-members)
+                       ((eq? msg 'set-role!) set-role!)
+                       ((eq? msg 'set-status!) set-status!)
+                       ((eq? msg 'set-leader-addr!) set-leader-addr!)
+                       ((eq? msg 'set-paxos-members!) set-paxos-members!)
+                       (else #f)))))
+      self)))
+
+; gts-service?: is the object a GTS service?
+; Detected by querying 'role — only services return integer.
+(define (gts-service? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'role)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; gts-service-get-role: get role.
+(define (gts-service-get-role svc) (svc 'role))
+
+; gts-service-get-status: get status.
+(define (gts-service-get-status svc) (svc 'status))
+
+; gts-service-get-leader-addr: get leader addr.
+(define (gts-service-get-leader-addr svc) (svc 'leader-addr))
+
+; gts-service-get-local-cache: get local cache.
+(define (gts-service-get-local-cache svc) (svc 'local-cache))
+
+; gts-service-get-task-queue: get task queue.
+(define (gts-service-get-task-queue svc) (svc 'task-queue))
+
+; gts-service-get-paxos-members: get paxos members.
+(define (gts-service-get-paxos-members svc) (svc 'paxos-members))
+
+; gts-service-set-role!: set role.
+; Returns the new role.
+(define (gts-service-set-role! svc v) ((svc 'set-role!) v))
+
+; gts-service-set-status!: set status.
+; Returns the new status.
+(define (gts-service-set-status! svc v) ((svc 'set-status!) v))
+
+; gts-service-set-leader-addr!: set leader addr.
+; Returns the new addr.
+(define (gts-service-set-leader-addr! svc v) ((svc 'set-leader-addr!) v))
+
+; gts-service-add-paxos-member!: add paxos member.
+; Returns the new count.
+(define (gts-service-add-paxos-member! svc member)
+  (let ((existing (svc 'paxos-members)))
+    ((svc 'set-paxos-members!) (cons member existing))))
+
+; gts-service-get-paxos-member-count: get paxos member count.
+(define (gts-service-get-paxos-member-count svc)
+  (let loop ((rest (svc 'paxos-members)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; gts-service-get-quorum: get quorum size (floor(N/2) + 1).
+; v1: returns count/2 + 1 (integer division).
+(define (gts-service-get-quorum svc)
+  (let ((n (gts-service-get-paxos-member-count svc)))
+    (+ (quotient n 2) 1)))

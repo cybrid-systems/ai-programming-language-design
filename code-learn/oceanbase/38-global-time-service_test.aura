@@ -1,0 +1,223 @@
+; 38-global-time-service_test.aura
+; ======================
+; Smoke tests for 38-global-time-service.aura — GTS minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/38-global-time-service_test.aura
+
+(require "std/test" all:)
+(require "38-global-time-service" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "38-001-gts-role-distinct"
+  (check (= 1 (if (not (= GTS-ROLE-LEADER GTS-ROLE-FOLLOWER)) 1 0)))
+  (check (= 1 (if (not (= GTS-ROLE-FOLLOWER GTS-ROLE-CANDIDATE)) 1 0)))
+  (check (= 1 (if (not (= GTS-ROLE-LEADER GTS-ROLE-CANDIDATE)) 1 0))))
+
+(test-suite "38-001-gts-status-distinct"
+  (check (= 1 (if (not (= GTS-STATUS-INIT GTS-STATUS-RUNNING)) 1 0)))
+  (check (= 1 (if (not (= GTS-STATUS-RUNNING GTS-STATUS-SUSPEND)) 1 0)))
+  (check (= 1 (if (not (= GTS-STATUS-SUSPEND GTS-STATUS-STOP)) 1 0)))
+  (check (= 1 (if (not (= GTS-STATUS-INIT GTS-STATUS-STOP)) 1 0))))
+
+(test-suite "38-001-ts-type-distinct"
+  (check (= 1 (if (not (= TS-TYPE-MONOTONIC TS-TYPE-PHYSICAL)) 1 0))))
+
+; ----------------------------------------------------------------
+; GtsTask
+; ----------------------------------------------------------------
+
+(test-suite "38-002-task-construction"
+  (check (= 1000 (gts-task-get-mono-ts
+                  (make-gts-task 1000 1234567890 1004))))
+  (check (= 1234567890 (gts-task-get-physical-ts
+                         (make-gts-task 1000 1234567890 1004))))
+  (check (= 1004 (gts-task-get-tenant-id
+                  (make-gts-task 1000 1234567890 1004)))))
+
+(test-suite "38-002-task-predicate"
+  (check (= #t (gts-task? (make-gts-task 0 0 0))))
+  (check (= #f (gts-task? 'not-task)))
+  (check (= #f (gts-task? 42)))
+
+(test-suite "38-003-task-set-mono"
+  (check (= 2000 (let ((t (make-gts-task 1000 0 1004)))
+                   (gts-task-set-mono! t 2000)
+                   (gts-task-get-mono-ts t))))
+
+; ----------------------------------------------------------------
+; GtsTaskQueue
+; ----------------------------------------------------------------
+
+(test-suite "38-004-queue-construction"
+  (check (= 0 (gts-task-queue-get-count (make-gts-task-queue)))))
+
+(test-suite "38-004-queue-predicate"
+  (check (= #t (gts-task-queue? (make-gts-task-queue))))
+  (check (= #f (gts-task-queue? 'not-queue)))
+  (check (= #f (gts-task-queue? 42)))
+
+(test-suite "38-005-queue-add"
+  (check (= 1 (let ((q (make-gts-task-queue)))
+                 (gts-task-queue-add! q (make-gts-task 1 0 1004))
+                 (gts-task-queue-get-count q))))
+  (check (= 3 (let ((q (make-gts-task-queue)))
+                 (gts-task-queue-add! q (make-gts-task 1 0 1004))
+                 (gts-task-queue-add! q (make-gts-task 2 0 1004))
+                 (gts-task-queue-add! q (make-gts-task 3 0 1004))
+                 (gts-task-queue-get-count q))))
+
+(test-suite "38-005-queue-drain"
+  (check (= '() (let ((q (make-gts-task-queue)))
+                  (gts-task-queue-add! q (make-gts-task 1 0 1004))
+                  (gts-task-queue-drain! q)
+                  (gts-task-queue-get-count q))))
+
+; ----------------------------------------------------------------
+; GtsLocalCache
+; ----------------------------------------------------------------
+
+(test-suite "38-006-cache-construction"
+  (check (= 1000 (gts-local-cache-get-last-mono
+                  (make-gts-local-cache 1000 1234567890))))
+  (check (= 1234567890 (gts-local-cache-get-last-physical
+                         (make-gts-local-cache 1000 1234567890)))))
+
+(test-suite "38-006-cache-predicate"
+  (check (= #t (gts-local-cache? (make-gts-local-cache 0 0))))
+  (check (= #f (gts-local-cache? 'not-cache)))
+  (check (= #f (gts-local-cache? 42)))
+
+(test-suite "38-007-cache-set-last-mono"
+  (check (= 2000 (let ((c (make-gts-local-cache 1000 0)))
+                   (gts-local-cache-set-last-mono! c 2000)
+                   (gts-local-cache-get-last-mono c))))
+
+(test-suite "38-007-cache-set-last-physical"
+  (check (= 2000000000 (let ((c (make-gts-local-cache 0 0)))
+                         (gts-local-cache-set-last-physical! c 2000000000)
+                         (gts-local-cache-get-last-physical c))))
+
+; ----------------------------------------------------------------
+; GtsPaxosMember
+; ----------------------------------------------------------------
+
+(test-suite "38-008-member-construction"
+  (check (= #t (eq? 'gts-1
+                   (gts-paxos-member-get-addr
+                     (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1)))))
+  (check (= GTS-ROLE-LEADER
+             (gts-paxos-member-get-role
+               (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1))))
+  (check (= 1 (gts-paxos-member-get-priority
+               (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1)))))
+
+(test-suite "38-008-member-predicate"
+  (check (= #t (gts-paxos-member?
+                 (make-gts-paxos-member 'a GTS-ROLE-LEADER 0))))
+  (check (= #f (gts-paxos-member? 'not-member)))
+  (check (= #f (gts-paxos-member? 42)))
+
+(test-suite "38-009-member-set-role"
+  (check (= GTS-ROLE-FOLLOWER
+             (let ((m (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1)))
+               (gts-paxos-member-set-role! m GTS-ROLE-FOLLOWER)
+               (gts-paxos-member-get-role m))))
+
+; ----------------------------------------------------------------
+; GtsService
+; ----------------------------------------------------------------
+
+(test-suite "38-010-svc-construction"
+  (check (= GTS-ROLE-LEADER
+             (gts-service-get-role
+               (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                 'gts-1
+                 (make-gts-local-cache 0 0)
+                 (make-gts-task-queue)))))
+  (check (= GTS-STATUS-RUNNING
+             (gts-service-get-status
+               (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                 'gts-1
+                 (make-gts-local-cache 0 0)
+                 (make-gts-task-queue))))))
+
+(test-suite "38-010-svc-predicate"
+  (check (= #t (gts-service?
+                 (make-gts-service GTS-ROLE-FOLLOWER GTS-STATUS-RUNNING
+                   'gts-1
+                   (make-gts-local-cache 0 0)
+                   (make-gts-task-queue))))
+  (check (= #f (gts-service? 'not-svc)))
+  (check (= #f (gts-service? 42)))
+
+(test-suite "38-011-svc-set-role"
+  (check (= GTS-ROLE-FOLLOWER
+             (let ((s (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                       'gts-1
+                       (make-gts-local-cache 0 0)
+                       (make-gts-task-queue)))
+               (gts-service-set-role! s GTS-ROLE-FOLLOWER)
+               (gts-service-get-role s))))
+
+(test-suite "38-011-svc-add-member"
+  (check (= 1 (let ((s (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                       'gts-1
+                       (make-gts-local-cache 0 0)
+                       (make-gts-task-queue)))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1))
+                 (gts-service-get-paxos-member-count s))))
+
+(test-suite "38-012-svc-add-members"
+  (check (= 3 (let ((s (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                       'gts-1
+                       (make-gts-local-cache 0 0)
+                       (make-gts-task-queue)))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-2 GTS-ROLE-FOLLOWER 2))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-3 GTS-ROLE-FOLLOWER 3))
+                 (gts-service-get-paxos-member-count s))))
+
+(test-suite "38-012-svc-quorum"
+  ; get-quorum = floor(N/2) + 1.
+  (check (= 2 (let ((s (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                       'gts-1
+                       (make-gts-local-cache 0 0)
+                       (make-gts-task-queue)))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-2 GTS-ROLE-FOLLOWER 2))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-3 GTS-ROLE-FOLLOWER 3))
+                 (gts-service-get-quorum s))))
+  (check (= 3 (let ((s (make-gts-service GTS-ROLE-LEADER GTS-STATUS-RUNNING
+                       'gts-1
+                       (make-gts-local-cache 0 0)
+                       (make-gts-task-queue)))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-1 GTS-ROLE-LEADER 1))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-2 GTS-ROLE-FOLLOWER 2))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-3 GTS-ROLE-FOLLOWER 3))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-4 GTS-ROLE-FOLLOWER 4))
+                 (gts-service-add-paxos-member! s
+                   (make-gts-paxos-member 'gts-5 GTS-ROLE-FOLLOWER 5))
+                 (gts-service-get-quorum s))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
