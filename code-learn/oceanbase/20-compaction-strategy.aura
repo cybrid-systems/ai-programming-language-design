@@ -1,0 +1,445 @@
+; 20-compaction-strategy.aura
+; ======================
+; compaction_strategy — minimal capability port to aura.
+;
+; Maps to: OceanBase Compaction (Minor Freeze / Major Freeze /
+;          History Merge)
+; Source: src/storage/blocksstable/ob_sstable_type.h
+;         + src/storage/memtable/ob_memtable.{h,cpp}
+;         + src/storage/ob_partition_service.cpp (minor_freeze)
+;         + src/storage/blocksstable/ob_sstable_writer.cpp
+;         + src/storage/compaction/ob_partition_merge.h
+;         + src/storage/compaction/ob_schedule_dag.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Compaction:
+;   - 3 SSTable types: NORMAL / COMPACTED / COLUMNAR
+;   - 3 compaction types: MINOR_FREEZE / MAJOR_FREEZE /
+;     HISTORY_MERGE
+;   - Minor Freeze: MemTable → SSTable (trigger: memory or time
+;     threshold)
+;   - Major Freeze: full cluster SSTable merge + column-store
+;     conversion
+;   - History Merge: historical SSTable merge (clean up invalidated
+;     data)
+;   - ObMemtable::need_freeze: trigger check
+;   - ObPartitionService::minor_freeze: 5-step flow
+;   - ObSSTableWriter::write_sstable: dump to SSTable
+;   - Tablet's SSTable list (minor + history + major)
+;
+; aura v1 ships:
+;   - 3 SST-TYPE constants (NORMAL, COMPACTED, COLUMNAR)
+;   - 3 COMPACTION-TYPE constants (MINOR-FREEZE, MAJOR-FREEZE,
+;     HISTORY-MERGE)
+;   - 3 COMPACTION-STATUS constants (PENDING, RUNNING, DONE,
+;     FAILED)
+;   - make-sstable (factory: type + size + row-count)
+;   - sstable-get-type / get-size / get-row-count
+;   - sstable-set-type! / set-row-count!
+;   - make-compaction-task (factory: type + tablet-id +
+;     trigger-reason)
+;   - compaction-task-get-type / get-tablet-id / get-trigger
+;   - compaction-task-get-status / set-status!
+;   - make-tablet (factory: tablet-id + memtable + sstables)
+;   - tablet-get-id / get-memtable / get-sstables
+;   - tablet-set-memtable!
+;   - tablet-add-sstable! / remove-sstable!
+;   - tablet-get-sstable-count
+;   - make-memtable (factory: tablet-id + mem-used + row-count)
+;   - memtable-get-mem-used / set-mem-used!
+;   - memtable-get-row-count / set-row-count!
+;   - memtable-need-freeze? (memory threshold check)
+;   - make-sstable-writer (factory: memtable + compress-type)
+;   - sstable-writer-write! (dump memtable to sstable)
+;   - sstable-writer-get-sstables-written
+;
+; Deferred (full OceanBase Compaction):
+;   - real ObMemtable::need_freeze with time threshold
+;   - real ObPartitionService::minor_freeze with 5-step flow
+;   - real ObSSTableWriter with micro_block / macro_block headers
+;   - real compaction DAG scheduler (ObDagScheduler)
+;   - real ObPartitionMerge with 4-phase merge
+;   - real history merge with TTL / delete handling
+;   - real major freeze (cluster-wide + column-store conversion)
+;   - real IO rate control (ObIOManager)
+;   - real statistics + monitoring (ObCompactionStat)
+
+(export
+  ; SSTable type constants
+  SST-TYPE-NORMAL SST-TYPE-COMPACTED SST-TYPE-COLUMNAR
+  ; Compaction type constants
+  COMPACTION-TYPE-MINOR-FREEZE
+  COMPACTION-TYPE-MAJOR-FREEZE
+  COMPACTION-TYPE-HISTORY-MERGE
+  ; Compaction status constants
+  COMPACTION-STATUS-PENDING
+  COMPACTION-STATUS-RUNNING
+  COMPACTION-STATUS-DONE
+  COMPACTION-STATUS-FAILED
+  ; Compressor type constants (re-used from 08-ob-sstable)
+  COMPRESSOR-TYPE-NONE
+  COMPRESSOR-TYPE-ZSTD
+  ; SSTable
+  make-sstable sstable?
+  sstable-get-type sstable-get-size
+  sstable-get-row-count
+  sstable-set-type! sstable-set-size! sstable-set-row-count!
+  ; CompactionTask
+  make-compaction-task compaction-task?
+  compaction-task-get-type compaction-task-get-tablet-id
+  compaction-task-get-trigger compaction-task-get-status
+  compaction-task-set-status!
+  ; Memtable
+  make-memtable memtable?
+  memtable-get-tablet-id memtable-get-mem-used
+  memtable-set-mem-used!
+  memtable-get-row-count memtable-set-row-count!
+  memtable-need-freeze?
+  ; Tablet
+  make-tablet tablet?
+  tablet-get-id tablet-get-memtable tablet-set-memtable!
+  tablet-get-sstables tablet-get-sstable-count
+  tablet-add-sstable! tablet-remove-sstable!
+  ; SSTableWriter
+  make-sstable-writer sstable-writer?
+  sstable-writer-write! sstable-writer-get-sstables-written
+  sstable-writer-reset-stats!)
+  ; (memtable-freeze-memory-threshold kept internal — not exported)
+
+; ----------------------------------------------------------------
+; SSTable type constants (per ob_sstable_type.h:50)
+; ----------------------------------------------------------------
+;
+; Per OB:
+;   SST_TYPE_NORMAL     = MemTable flush
+;   SST_TYPE_COMPACTED  = Compaction output
+;   SST_TYPE_COLUMNAR   = Major Freeze output (column-store)
+
+(define SST-TYPE-NORMAL 1)
+(define SST-TYPE-COMPACTED 2)
+(define SST-TYPE-COLUMNAR 4)
+
+; ----------------------------------------------------------------
+; Default freeze thresholds (defined early to avoid forward-ref bug)
+; ----------------------------------------------------------------
+;
+; Per OB (ob_memtable.cpp:200):
+;   freeze_threshold_ = 256 MB (default)
+;   freeze_time_threshold_ = 2 minutes (default)
+;
+; Note: defined before memtable-need-freeze? to avoid
+; 'unbound variable' parse error.
+
+(define memtable-freeze-memory-threshold 268435456)  ; 256 MB
+
+; ----------------------------------------------------------------
+; Compaction type constants
+; ----------------------------------------------------------------
+
+(define COMPACTION-TYPE-MINOR-FREEZE 1)
+(define COMPACTION-TYPE-MAJOR-FREEZE 2)
+(define COMPACTION-TYPE-HISTORY-MERGE 4)
+
+; ----------------------------------------------------------------
+; Compaction status constants
+; ----------------------------------------------------------------
+
+(define COMPACTION-STATUS-PENDING 0)
+(define COMPACTION-STATUS-RUNNING 1)
+(define COMPACTION-STATUS-DONE 2)
+(define COMPACTION-STATUS-FAILED 3)
+
+; ----------------------------------------------------------------
+; Compressor type constants (re-used from 08-ob-sstable)
+; ----------------------------------------------------------------
+
+(define COMPRESSOR-TYPE-NONE 0)
+(define COMPRESSOR-TYPE-ZSTD 3)
+
+; ----------------------------------------------------------------
+; SSTable — closure-based
+; ----------------------------------------------------------------
+
+; make-sstable: create an SSTable.
+; Args: type (integer — SST-TYPE-*), size (integer — bytes),
+;       row-count (integer)
+; Returns: sstable closure.
+(define (make-sstable type size row-count)
+  (letrec ((set-type! (lambda (v) (set! type v) v))
+           (set-size! (lambda (v) (set! size v) v))
+           (set-row-count! (lambda (v) (set! row-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'size) size)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'set-type!) set-type!)
+                     ((eq? msg 'set-size!) set-size!)
+                     ((eq? msg 'set-row-count!) set-row-count!)
+                     (else #f)))))
+      self))
+
+; sstable?: is the object an SSTable?
+; Detected by querying 'size — only sstables return integer.
+(define (sstable? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'size)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; sstable-get-type: get SSTable type.
+(define (sstable-get-type s) (s 'type))
+
+; sstable-get-size: get SSTable size in bytes.
+(define (sstable-get-size s) (s 'size))
+
+; sstable-get-row-count: get row count.
+(define (sstable-get-row-count s) (s 'row-count))
+
+; sstable-set-type!: set SSTable type.
+; Returns the new type.
+(define (sstable-set-type! s v) ((s 'set-type!) v))
+
+; sstable-set-size!: set SSTable size.
+; Returns the new size.
+(define (sstable-set-size! s v) ((s 'set-size!) v))
+
+; sstable-set-row-count!: set row count.
+; Returns the new row count.
+(define (sstable-set-row-count! s v) ((s 'set-row-count!) v))
+
+; ----------------------------------------------------------------
+; CompactionTask — closure-based
+; ----------------------------------------------------------------
+
+; make-compaction-task: create a compaction task.
+; Args: type (integer — COMPACTION-TYPE-*),
+;       tablet-id (integer), trigger (integer — trigger reason)
+; Returns: compaction_task closure (initial: status=PENDING).
+(define (make-compaction-task type tablet-id trigger)
+  (let ((status COMPACTION-STATUS-PENDING))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'type) type)
+                       ((eq? msg 'tablet-id) tablet-id)
+                       ((eq? msg 'trigger) trigger)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self)))
+
+; compaction-task?: is the object a compaction task?
+; Detected by querying 'trigger — only tasks return integer.
+(define (compaction-task? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'trigger)))
+        (if (integer? t) #t #f))
+      #f))
+
+; compaction-task-get-type: get compaction type.
+(define (compaction-task-get-type t) (t 'type))
+
+; compaction-task-get-tablet-id: get tablet id.
+(define (compaction-task-get-tablet-id t) (t 'tablet-id))
+
+; compaction-task-get-trigger: get trigger reason.
+(define (compaction-task-get-trigger t) (t 'trigger))
+
+; compaction-task-get-status: get status.
+(define (compaction-task-get-status t) (t 'status))
+
+; compaction-task-set-status!: set status.
+; Returns the new status.
+(define (compaction-task-set-status! t v)
+  ((t 'set-status!) v))
+
+; ----------------------------------------------------------------
+; Memtable — closure-based
+; ----------------------------------------------------------------
+
+; make-memtable: create a memtable.
+; Args: tablet-id (integer), mem-used (integer — bytes used),
+;       row-count (integer)
+; Returns: memtable closure.
+(define (make-memtable tablet-id mem-used row-count)
+  (letrec ((set-mem-used! (lambda (v) (set! mem-used v) v))
+           (set-row-count! (lambda (v) (set! row-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tablet-id) tablet-id)
+                     ((eq? msg 'mem-used) mem-used)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'set-mem-used!) set-mem-used!)
+                     ((eq? msg 'set-row-count!) set-row-count!)
+                     (else #f)))))
+      self))
+
+; memtable?: is the object a memtable?
+; Detected by querying 'mem-used — only memtables return integer.
+(define (memtable? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mem-used)))
+        (if (and (integer? m) (>= m 0)) #t #f))
+      #f))
+
+; memtable-get-tablet-id: get tablet id.
+(define (memtable-get-tablet-id m) (m 'tablet-id))
+
+; memtable-get-mem-used: get memory used in bytes.
+(define (memtable-get-mem-used m) (m 'mem-used))
+
+; memtable-set-mem-used!: set memory used.
+; Returns the new mem-used.
+(define (memtable-set-mem-used! m v) ((m 'set-mem-used!) v))
+
+; memtable-get-row-count: get row count.
+(define (memtable-get-row-count m) (m 'row-count))
+
+; memtable-set-row-count!: set row count.
+; Returns the new row count.
+(define (memtable-set-row-count! m v) ((m 'set-row-count!) v))
+
+; memtable-need-freeze?: does the memtable need freeze?
+; True when mem-used >= threshold.
+(define (memtable-need-freeze? m)
+  (>= (m 'mem-used) memtable-freeze-memory-threshold))
+
+; ----------------------------------------------------------------
+; Tablet — closure-based
+; ----------------------------------------------------------------
+
+; make-tablet: create a tablet.
+; Args: tablet-id (integer), memtable (memtable or #f),
+;       sstables (list of sstables — initially empty)
+; Returns: tablet closure.
+(define (make-tablet tablet-id memtable sstables)
+  (letrec ((set-memtable! (lambda (v) (set! memtable v) v))
+           (set-sstables! (lambda (v) (set! sstables v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tablet-id) tablet-id)
+                     ((eq? msg 'memtable) memtable)
+                     ((eq? msg 'sstables) sstables)
+                     ((eq? msg 'set-memtable!) set-memtable!)
+                     ((eq? msg 'set-sstables!) set-sstables!)
+                     (else #f)))))
+      self))
+
+; tablet?: is the object a tablet?
+; Detected by querying 'tablet-id — only tablets return integer.
+(define (tablet? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'tablet-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; tablet-get-id: get tablet id.
+(define (tablet-get-id t) (t 'tablet-id))
+
+; tablet-get-memtable: get active memtable.
+(define (tablet-get-memtable t) (t 'memtable))
+
+; tablet-set-memtable!: set active memtable.
+(define (tablet-set-memtable! t v) ((t 'set-memtable!) v))
+
+; tablet-get-sstables: get sstables list.
+(define (tablet-get-sstables t) (t 'sstables))
+
+; tablet-get-sstable-count: count sstables.
+(define (tablet-get-sstable-count t)
+  (let loop ((rest (t 'sstables)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; tablet-add-sstable!: add an SSTable to the tablet.
+; Returns the new count.
+(define (tablet-add-sstable! t s)
+  ((t 'set-sstables!) (cons s (t 'sstables))))
+
+; tablet-remove-sstable!: remove an SSTable by index.
+; Returns the new count.
+(define (tablet-remove-sstable! t idx)
+  (let loop ((rest (t 'sstables)) (i 0) (acc '()))
+    (cond
+      ((null? rest) (reverse acc))
+      ((= i idx) (loop (cdr rest) (+ i 1) acc))
+      (else (loop (cdr rest) (+ i 1) (cons (car rest) acc))))))
+
+; ----------------------------------------------------------------
+; SSTableWriter — closure-based
+; ----------------------------------------------------------------
+;
+; Per OB (ob_sstable_writer.cpp:80):
+;   1. Scan all rows from memtable (sort by PK)
+;   2. Split into micro_blocks (~64KB, ~256 rows per block)
+;   3. Write macro_block_header (compress + encrypt metadata)
+;   4. Write blocks sequentially to disk
+;   5. Free memtable memory
+;
+; aura v1: simulated — converts memtable → sstable with stats.
+
+; make-sstable-writer: create an SSTable writer.
+; Args: memtable (memtable), compress-type (integer)
+; Returns: sstable_writer closure (initial: stats=0).
+(define (make-sstable-writer memtable compress-type)
+  (let ((written 0)
+        (total-rows 0)
+        (total-bytes 0))
+    (letrec ((set-written! (lambda (v) (set! written v) v))
+             (set-total-rows! (lambda (v) (set! total-rows v) v))
+             (set-total-bytes! (lambda (v) (set! total-bytes v) v))
+             (inc-written! (lambda () (set! written (+ written 1)) written))
+             (add-rows! (lambda (n) (set! total-rows (+ total-rows n)) total-rows))
+             (add-bytes! (lambda (n) (set! total-bytes (+ total-bytes n)) total-bytes))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'memtable) memtable)
+                       ((eq? msg 'compress-type) compress-type)
+                       ((eq? msg 'written) written)
+                       ((eq? msg 'total-rows) total-rows)
+                       ((eq? msg 'total-bytes) total-bytes)
+                       ((eq? msg 'set-written!) set-written!)
+                       ((eq? msg 'set-total-rows!) set-total-rows!)
+                       ((eq? msg 'set-total-bytes!) set-total-bytes!)
+                       ((eq? msg 'inc-written!) inc-written!)
+                       ((eq? msg 'add-rows!) add-rows!)
+                       ((eq? msg 'add-bytes!) add-bytes!)
+                       (else #f)))))
+      self)))
+
+; sstable-writer?: is the object an SSTable writer?
+; Detected by querying 'compress-type — only writers return integer.
+(define (sstable-writer? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'compress-type)))
+        (if (or (= c 0) (= c 1) (= c 2) (= c 3)) #t #f))
+      #f))
+
+; sstable-writer-write!: write memtable to a new SSTable.
+; Returns the new SSTable (or #f if memtable is empty).
+(define (sstable-writer-write! w)
+  (let ((mt (w 'memtable)))
+    (if (eq? mt #f)
+        #f
+        (let ((rows (memtable-get-row-count mt))
+              (size 1024))  ; v1: fixed size for simplicity
+          (let ((new-sst (make-sstable SST-TYPE-NORMAL size rows)))
+            ((w 'inc-written!))
+            ((w 'add-rows!) rows)
+            ((w 'add-bytes!) size)
+            ; Free memtable memory (v1: reset to 0)
+            (memtable-set-mem-used! mt 0)
+            new-sst)))))
+
+; sstable-writer-get-sstables-written: get number of SSTables written.
+(define (sstable-writer-get-sstables-written w) (w 'written))
+
+; sstable-writer-reset-stats!: reset all stats to 0.
+(define (sstable-writer-reset-stats! w)
+  ((w 'set-written!) 0)
+  ((w 'set-total-rows!) 0)
+  ((w 'set-total-bytes!) 0))
