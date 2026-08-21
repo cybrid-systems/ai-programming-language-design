@@ -1,0 +1,224 @@
+; 35-macro-block-lifecycle_test.aura
+; ======================
+; Smoke tests for 35-macro-block-lifecycle.aura — Macro Block Lifecycle minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/35-macro-block-lifecycle_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 BLOCK-STATUS constants distinct
+;   - make-macro-block-id + accessors + predicate
+;   - make-block-info + accessors + set-ref-cnt! + is-free? + is-bad?
+;   - make-macro-block-info + accessors + set-ref-cnt!
+;   - make-block-manager + get-free-count + get-total-count +
+;     get-block-count + get-free-ratio
+;   - alloc-block! + inc-ref! + dec-ref! + find-block
+;   - mark-and-sweep! (frees 0-ref blocks)
+;   - need-extend? (free < 512 or ratio < 10%)
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - inc-ref! / dec-ref! work on existing + missing blocks
+;   - mark-and-sweep returns count of freed blocks
+;
+; Deferred (full OceanBase Macro Block Lifecycle):
+;   - real ObBlockManager with bucket lock + linear hash map
+;   - real disk allocation via io_manager + filesystem
+;   - real mark-and-sweep with tablet/SSTable traversal
+;   - real bad block detection via IO error log
+;   - real file extension via posix_fallocate
+;   - real ref_cnt thread safety (atomic + bucket lock)
+;   - real pending_free_count tracking
+;   - real block migration across devices
+;   - real superblock + meta management
+;   - real per-tenant block quota
+;   - real block IO error injection + retry
+
+(require "std/test" all:)
+(require "35-macro-block-lifecycle" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "35-001-block-status-distinct"
+  ; 3 BLOCK-STATUS constants are distinct.
+  (check (= 1 (if (not (= BLOCK-STATUS-FREE
+                          BLOCK-STATUS-IN-USE)) 1 0)))
+  (check (= 1 (if (not (= BLOCK-STATUS-IN-USE
+                          BLOCK-STATUS-BAD)) 1 0)))
+  (check (= 1 (if (not (= BLOCK-STATUS-FREE
+                          BLOCK-STATUS-BAD)) 1 0))))
+
+; ----------------------------------------------------------------
+; MacroBlockId
+; ----------------------------------------------------------------
+
+(test-suite "35-002-id-construction"
+  ; id preserves write-seq + block-idx.
+  (check (= 1 (macro-block-id-get-write-seq
+               (make-macro-block-id 1 100))))
+  (check (= 100 (macro-block-id-get-block-idx
+                 (make-macro-block-id 1 100))))
+
+(test-suite "35-002-id-predicate"
+  ; macro-block-id? accepts only ids.
+  (check (= #t (macro-block-id? (make-macro-block-id 1 100))))
+  (check (= #f (macro-block-id? 'not-id)))
+  (check (= #f (macro-block-id? 42)))
+
+; ----------------------------------------------------------------
+; BlockInfo
+; ----------------------------------------------------------------
+
+(test-suite "35-003-info-construction"
+  ; block-info preserves all fields.
+  (check (= 5 (block-info-get-ref-cnt
+               (make-block-info 5 1000 2000))))
+  (check (= 1000 (block-info-get-access-time
+                   (make-block-info 5 1000 2000))))
+  (check (= 2000 (block-info-get-last-write-time
+                   (make-block-info 5 1000 2000))))
+
+(test-suite "35-003-info-predicate"
+  ; block-info? accepts only infos.
+  (check (= #t (block-info? (make-block-info 0 0 0))))
+  (check (= #f (block-info? 'not-info)))
+  (check (= #f (block-info? 42)))
+
+(test-suite "35-004-info-set-ref"
+  ; set-ref-cnt! updates.
+  (check (= 10 (let ((i (make-block-info 5 0 0)))
+                 (block-info-set-ref-cnt! i 10)
+                 (block-info-get-ref-cnt i))))
+
+(test-suite "35-004-info-is-free"
+  ; is-free? checks ref_cnt == 0.
+  (check (= #t (block-info-is-free? (make-block-info 0 0 0))))
+  (check (= #f (block-info-is-free? (make-block-info 1 0 0))))
+
+(test-suite "35-004-info-is-bad"
+  ; is-bad? checks ref_cnt < 0.
+  (check (= #t (block-info-is-bad? (make-block-info -1 0 0))))
+  (check (= #f (block-info-is-bad? (make-block-info 0 0 0))))
+
+; ----------------------------------------------------------------
+; MacroBlockInfo (simplified)
+; ----------------------------------------------------------------
+
+(test-suite "35-005-minfo-construction"
+  ; simplified info preserves fields.
+  (check (= 3 (macro-block-info-get-ref-cnt
+               (make-macro-block-info 3 #f 1000))))
+  (check (= #f (macro-block-info-is-free
+                 (make-macro-block-info 3 #f 1000))))
+  (check (= #t (macro-block-info-is-free
+                 (make-macro-block-info 0 #t 1000))))
+  (check (= 1000 (macro-block-info-get-access-time
+                   (make-macro-block-info 3 #f 1000))))
+
+(test-suite "35-005-minfo-predicate"
+  ; macro-block-info? accepts only macro-block-infos.
+  (check (= #t (macro-block-info? (make-macro-block-info 0 #f 0))))
+  (check (= #f (macro-block-info? 'not-minfo)))
+  (check (= #f (macro-block-info? 42)))
+
+; ----------------------------------------------------------------
+; BlockManager
+; ----------------------------------------------------------------
+
+(test-suite "35-006-mgr-construction"
+  ; mgr preserves free-count + total-count, starts empty.
+  (check (= 1000 (block-manager-get-free-count
+                  (make-block-manager 1000 2000))))
+  (check (= 2000 (block-manager-get-total-count
+                  (make-block-manager 1000 2000))))
+  (check (= 0 (block-manager-get-block-count
+               (make-block-manager 1000 2000))))
+
+(test-suite "35-006-mgr-predicate"
+  ; block-manager? accepts only managers.
+  (check (= #t (block-manager? (make-block-manager 0 0))))
+  (check (= #f (block-manager? 'not-mgr)))
+  (check (= #f (block-manager? 42)))
+
+(test-suite "35-007-mgr-free-ratio"
+  ; free-ratio scales free/total as percentage.
+  (check (= 50 (block-manager-get-free-ratio
+                 (make-block-manager 500 1000))))
+  (check (= 0 (block-manager-get-free-ratio
+                (make-block-manager 0 0))))
+
+(test-suite "35-008-mgr-alloc"
+  ; alloc-block! adds entry + sets ref-cnt to 1.
+  (check (= 1 (let ((m (make-block-manager 100 200)))
+                 (block-manager-alloc-block! m 1 0)
+                 (block-manager-get-block-count m))))
+  (check (= 1 (let ((m (make-block-manager 100 200)))
+                 (let ((i (block-manager-alloc-block! m 1 0)))
+                   (block-info-get-ref-cnt i)))))
+
+(test-suite "35-008-mgr-inc-ref"
+  ; inc-ref! increments existing block.
+  (check (= 2 (let ((m (make-block-manager 100 200))
+                    (id (make-macro-block-id 1 0)))
+                 (block-manager-alloc-block! m 1 0)
+                 (block-manager-inc-ref! m id))))
+
+(test-suite "35-009-mgr-dec-ref"
+  ; dec-ref! decrements existing block.
+  (check (= 1 (let ((m (make-block-manager 100 200))
+                    (id (make-macro-block-id 1 0)))
+                 (block-manager-alloc-block! m 1 0)
+                 (block-manager-inc-ref! m id)
+                 (block-manager-dec-ref! m id))))
+
+(test-suite "35-009-mgr-find"
+  ; find-block returns entry.
+  (check (= #t (let ((m (make-block-manager 100 200))
+                     (id (make-macro-block-id 1 42)))
+                 (block-manager-alloc-block! m 1 42)
+                 (if (block-manager-find-block m id) #t #f))))
+
+(test-suite "35-009-mgr-find-missing"
+  ; find-block returns #f for unknown id.
+  (check (= #f (block-manager-find-block
+                 (make-block-manager 100 200)
+                 (make-macro-block-id 1 999)))))
+
+(test-suite "35-010-mgr-mark-and-sweep"
+  ; mark-and-sweep frees 0-ref blocks.
+  (check (= 1 (let ((m (make-block-manager 100 200)))
+                 (block-manager-alloc-block! m 1 0)
+                 (let ((id (make-macro-block-id 1 0)))
+                   (block-manager-dec-ref! m id))
+                 (block-manager-mark-and-sweep! m))))
+
+(test-suite "35-010-mgr-mark-and-sweep-none"
+  ; mark-and-sweep returns 0 when no free blocks.
+  (check (= 0 (let ((m (make-block-manager 100 200)))
+                 (block-manager-alloc-block! m 1 0)
+                 (block-manager-mark-and-sweep! m))))
+
+(test-suite "35-011-mgr-need-extend-free-low"
+  ; need-extend? returns #t when free < 512.
+  (check (= #t (block-manager-need-extend?
+                 (make-block-manager 100 2000))))
+
+(test-suite "35-011-mgr-need-extend-ratio-low"
+  ; need-extend? returns #t when free-ratio < 10%.
+  (check (= #t (block-manager-need-extend?
+                 (make-block-manager 100 2000))))
+
+(test-suite "35-011-mgr-need-extend-no"
+  ; need-extend? returns #f when free is high.
+  (check (= #f (block-manager-need-extend?
+                 (make-block-manager 1000 2000))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

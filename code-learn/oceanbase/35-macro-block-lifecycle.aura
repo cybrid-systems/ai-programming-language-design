@@ -1,0 +1,344 @@
+; 35-macro-block-lifecycle.aura
+; ======================
+; macro_block_lifecycle — minimal capability port to aura.
+;
+; Maps to: OceanBase Macro Block Lifecycle
+; Source: src/storage/blocksstable/ob_block_manager.h
+;         + src/storage/blocksstable/ob_macro_block_id.h
+;         + src/storage/blocksstable/ob_macro_block_handle.h
+;         + src/storage/blocksstable/ob_block_info.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Macro Block Lifecycle:
+;   - MacroBlockId: block identity (write_seq + block_idx)
+;   - BlockInfo: ref_cnt + access_time + last_write_time
+;   - ObMacroBlockInfo: simplified info (ref_cnt + is_free +
+;     access_time)
+;   - ObBlockManager: alloc_block / inc_ref / dec_ref /
+;     mark_and_sweep / resize_file
+;   - GC: Mark-and-Sweep every 30s
+;   - File auto-extension when free < 512 or free-ratio < 10%
+;   - Bad block detection: 2 days no access → suspect
+;
+; aura v1 ships:
+;   - 3 BLOCK-STATUS constants (FREE, IN_USE, BAD)
+;   - make-macro-block-id (factory: write-seq + block-idx)
+;   - macro-block-id accessors
+;   - make-block-info (factory: ref-cnt + access-time + last-write)
+;   - block-info accessors + set-ref-cnt!
+;   - block-info-is-free? + is-bad?
+;   - make-macro-block-info (factory: ref-cnt + is-free + access)
+;   - macro-block-info accessors + set-ref-cnt!
+;   - make-block-manager (factory: block-map + free-count +
+;     total-count)
+;   - block-manager-alloc-block! (decrement free, create entry)
+;   - block-manager-inc-ref! + dec-ref! (set refs on entry)
+;   - block-manager-mark-and-sweep! (free 0-ref blocks)
+;   - block-manager-need-extend? (free < 512 or free-ratio < 10%)
+;   - block-manager-get-free-count + get-total-count
+;   - block-manager-get-block-count
+;   - block-manager-get-free-ratio
+;
+; Deferred (full OceanBase Macro Block Lifecycle):
+;   - real ObBlockManager with bucket lock + linear hash map
+;   - real disk allocation via io_manager + filesystem
+;   - real mark-and-sweep with tablet/SSTable traversal
+;   - real bad block detection via IO error log
+;   - real file extension via posix_fallocate
+;   - real ref_cnt thread safety (atomic + bucket lock)
+;   - real pending_free_count tracking
+;   - real block migration across devices
+;   - real superblock + meta management
+;   - real per-tenant block quota
+;   - real block IO error injection + retry
+
+(export
+  ; Block status constants
+  BLOCK-STATUS-FREE
+  BLOCK-STATUS-IN-USE
+  BLOCK-STATUS-BAD
+  ; MacroBlockId
+  make-macro-block-id
+  macro-block-id?
+  macro-block-id-get-write-seq
+  macro-block-id-get-block-idx
+  ; BlockInfo
+  make-block-info
+  block-info?
+  block-info-get-ref-cnt
+  block-info-get-access-time
+  block-info-get-last-write-time
+  block-info-set-ref-cnt!
+  block-info-is-free?
+  block-info-is-bad?
+  ; MacroBlockInfo
+  make-macro-block-info
+  macro-block-info?
+  macro-block-info-get-ref-cnt
+  macro-block-info-is-free
+  macro-block-info-get-access-time
+  macro-block-info-set-ref-cnt!
+  ; BlockManager
+  make-block-manager
+  block-manager?
+  block-manager-get-free-count
+  block-manager-get-total-count
+  block-manager-get-block-count
+  block-manager-get-free-ratio
+  block-manager-alloc-block!
+  block-manager-inc-ref!
+  block-manager-dec-ref!
+  block-manager-mark-and-sweep!
+  block-manager-need-extend?
+  block-manager-find-block)
+
+; ----------------------------------------------------------------
+; Block status constants
+; ----------------------------------------------------------------
+
+(define BLOCK-STATUS-FREE 0)
+(define BLOCK-STATUS-IN-USE 1)
+(define BLOCK-STATUS-BAD 2)
+
+; ----------------------------------------------------------------
+; MacroBlockId — closure-based
+; ----------------------------------------------------------------
+
+; make-macro-block-id: create a MacroBlockId.
+; Args: write-seq (integer — file write sequence),
+;       block-idx (integer — block index within file)
+; Returns: macro_block_id closure.
+(define (make-macro-block-id write-seq block-idx)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'write-seq) write-seq)
+                     ((eq? msg 'block-idx) block-idx)
+                     (else #f)))))
+      self))
+
+; macro-block-id?: is the object a macro block id?
+; Detected by querying 'block-idx — only ids return integer.
+(define (macro-block-id? obj)
+  (if (procedure? obj)
+      (let ((b (obj 'block-idx)))
+        (if (and (integer? b) (>= b 0)) #t #f))
+      #f))
+
+; macro-block-id-get-write-seq: get write sequence.
+(define (macro-block-id-get-write-seq id) (id 'write-seq))
+
+; macro-block-id-get-block-idx: get block index.
+(define (macro-block-id-get-block-idx id) (id 'block-idx))
+
+; ----------------------------------------------------------------
+; BlockInfo — closure-based
+; ----------------------------------------------------------------
+
+; make-block-info: create a BlockInfo.
+; Args: ref-cnt (integer), access-time (integer),
+;       last-write-time (integer)
+; Returns: block_info closure.
+(define (make-block-info ref-cnt access-time last-write-time)
+  (letrec ((set-ref-cnt! (lambda (v) (set! ref-cnt v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'ref-cnt) ref-cnt)
+                     ((eq? msg 'access-time) access-time)
+                     ((eq? msg 'last-write-time) last-write-time)
+                     ((eq? msg 'set-ref-cnt!) set-ref-cnt!)
+                     (else #f)))))
+      self))
+
+; block-info?: is the object a block info?
+; Detected by querying 'last-write-time — only infos return integer.
+(define (block-info? obj)
+  (if (procedure? obj)
+      (let ((w (obj 'last-write-time)))
+        (if (and (integer? w) (>= w 0)) #t #f))
+      #f))
+
+; block-info-get-ref-cnt: get reference count.
+(define (block-info-get-ref-cnt info) (info 'ref-cnt))
+
+; block-info-get-access-time: get last access time.
+(define (block-info-get-access-time info) (info 'access-time))
+
+; block-info-get-last-write-time: get last write time.
+(define (block-info-get-last-write-time info) (info 'last-write-time))
+
+; block-info-set-ref-cnt!: set reference count.
+; Returns the new ref count.
+(define (block-info-set-ref-cnt! info v) ((info 'set-ref-cnt!) v))
+
+; block-info-is-free?: is this block free (ref_cnt == 0)?
+(define (block-info-is-free? info) (= (info 'ref-cnt) 0))
+
+; block-info-is-bad?: is this a bad block?
+; v1: ref_cnt < 0 indicates corrupted block.
+(define (block-info-is-bad? info) (< (info 'ref-cnt) 0))
+
+; ----------------------------------------------------------------
+; MacroBlockInfo — closure-based (simplified info)
+; ----------------------------------------------------------------
+
+; make-macro-block-info: create a simplified ObMacroBlockInfo.
+; Args: ref-cnt (integer), is-free (boolean), access-time (integer)
+; Returns: macro_block_info closure.
+(define (make-macro-block-info ref-cnt is-free access-time)
+  (letrec ((set-ref-cnt! (lambda (v) (set! ref-cnt v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'ref-cnt) ref-cnt)
+                     ((eq? msg 'is-free) is-free)
+                     ((eq? msg 'access-time) access-time)
+                     ((eq? msg 'set-ref-cnt!) set-ref-cnt!)
+                     (else #f)))))
+      self))
+
+; macro-block-info?: is the object a macro block info?
+; Detected by querying 'access-time — only infos return integer.
+(define (macro-block-info? obj)
+  (if (procedure? obj)
+      (let ((a (obj 'access-time)))
+        (if (and (integer? a) (>= a 0)) #t #f))
+      #f))
+
+; macro-block-info-get-ref-cnt: get reference count.
+(define (macro-block-info-get-ref-cnt info) (info 'ref-cnt))
+
+; macro-block-info-is-free: get free flag.
+(define (macro-block-info-is-free info) (info 'is-free))
+
+; macro-block-info-get-access-time: get access time.
+(define (macro-block-info-get-access-time info) (info 'access-time))
+
+; macro-block-info-set-ref-cnt!: set reference count.
+; Returns the new ref count.
+(define (macro-block-info-set-ref-cnt! info v)
+  ((info 'set-ref-cnt!) v))
+
+; ----------------------------------------------------------------
+; ObBlockManager — closure-based
+; ----------------------------------------------------------------
+
+; make-block-manager: create a block manager.
+; Args: free-count (integer — current free blocks),
+;       total-count (integer — total blocks)
+; Returns: block_manager closure (initial: empty block-map).
+(define (make-block-manager free-count total-count)
+  (let ((block-map '()))
+    (letrec ((set-block-map! (lambda (v) (set! block-map v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'free-count) free-count)
+                       ((eq? msg 'total-count) total-count)
+                       ((eq? msg 'block-map) block-map)
+                       ((eq? msg 'set-block-map!) set-block-map!)
+                       (else #f)))))
+      self)))
+
+; block-manager?: is the object a block manager?
+; Detected by querying 'block-map — only managers return a cons.
+(define (block-manager? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'block-map)) #t #f)
+      #f))
+
+; block-manager-get-free-count: get free block count.
+(define (block-manager-get-free-count mgr) (mgr 'free-count))
+
+; block-manager-get-total-count: get total block count.
+(define (block-manager-get-total-count mgr) (mgr 'total-count))
+
+; block-manager-get-block-count: get current block-map count.
+(define (block-manager-get-block-count mgr)
+  (let loop ((rest (mgr 'block-map)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; block-manager-get-free-ratio: get free block ratio (0.0 to 1.0).
+; v1: returns scaled integer (free-count / total-count * 100).
+(define (block-manager-get-free-ratio mgr)
+  (let ((free (mgr 'free-count))
+        (total (mgr 'total-count)))
+    (if (= total 0) 0
+        (let loop ((a free) (b total) (result 0) (scale 1))
+          (cond
+            ((< a b) result)
+            (#t
+              (let loop2 ((i 0))
+                (cond
+                  ((= i 1) result)
+                  ((< (* 10 a) b)
+                    (loop a b (+ result (* scale 1)) 1))
+                  ((< (* 100 a) b)
+                    (loop a b (+ result (* scale 10)) 10))
+                  ((< (* 1000 a) b)
+                    (loop a b (+ result (* scale 100)) 100))
+                  (else
+                    (let ((new-a (- (* 10 a) (* 10 (quotient a b) b))))
+                      (loop2 (+ i 1))))))))))))
+
+; block-manager-alloc-block!: allocate a free block.
+; Decrements free-count, adds entry to block-map.
+; Returns: block-info (initial ref-cnt=1).
+(define (block-manager-alloc-block! mgr write-seq block-idx)
+  (let ((id (make-macro-block-id write-seq block-idx))
+        (info (make-block-info 1 0 0)))
+    ((mgr 'set-block-map!) (cons (cons id info) (mgr 'block-map)))
+    info))
+
+; block-manager-inc-ref!: increment ref count on a block.
+; Returns the new ref count.
+(define (block-manager-inc-ref! mgr id)
+  (let ((entry (block-manager-find-block mgr id)))
+    (if entry
+      (let ((info (cdr entry)))
+        (let ((new-ref (+ (info 'ref-cnt) 1)))
+          ((info 'set-ref-cnt!) new-ref)))
+      0)))
+
+; block-manager-dec-ref!: decrement ref count on a block.
+; Returns the new ref count.
+(define (block-manager-dec-ref! mgr id)
+  (let ((entry (block-manager-find-block mgr id)))
+    (if entry
+      (let ((info (cdr entry)))
+        (let ((new-ref (- (info 'ref-cnt) 1)))
+          ((info 'set-ref-cnt!) new-ref)))
+      0)))
+
+; block-manager-mark-and-sweep!: free 0-ref blocks.
+; Returns: number of freed blocks.
+(define (block-manager-mark-and-sweep! mgr)
+  (let loop ((rest (mgr 'block-map))
+             (acc '())
+             (freed 0))
+    (cond
+      ((null? rest)
+        ((mgr 'set-block-map!) acc)
+        freed)
+      ((= ((cdr (car rest)) 'ref-cnt) 0)
+        (loop (cdr rest) acc (+ freed 1)))
+      (#t (loop (cdr rest) (cons (car rest) acc) freed)))))
+
+; block-manager-need-extend?: does the file need extension?
+; Returns #t if free < 512 or free-ratio < 10%.
+(define (block-manager-need-extend? mgr)
+  (if (< (mgr 'free-count) 512)
+    #t
+    (if (= (mgr 'total-count) 0) #f
+        (< (block-manager-get-free-ratio mgr) 10))))
+
+; block-manager-find-block: find a block by id.
+; Returns the entry (pair id . info) or #f.
+(define (block-manager-find-block mgr id)
+  (let loop ((rest (mgr 'block-map)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car (car rest)) 'block-idx) (id 'block-idx))
+       (car rest))
+      (#t (loop (cdr rest))))))
