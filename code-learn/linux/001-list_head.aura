@@ -1,0 +1,465 @@
+; 001-list_head.aura
+; ===================
+; Intrusive doubly-linked circular list — Linux list_head capability port.
+;
+; Maps to: 001-list_head-analysis.md
+; Source: include/linux/list.h (Linux 7.0-rc1) + include/linux/container_of.h
+;
+; ## Design notes (v2 — closure-based)
+;
+; Linux's list_head is a circular doubly-linked list where the node is
+; EMBEDDED in the containing struct, recovered via container_of(ptr, type,
+; member) = ptr - offsetof(type, member) — a compile-time pointer subtraction.
+;
+; aura has no pointer arithmetic, so we adapt by storing an explicit owner
+; back-reference on each node. Recovery is O(1) via list-entry.
+;
+; ## Why closures
+;
+; aura issue #3235 (filed 2026-08-21): `vector-set!`, `hash-set!`, `set-car!`
+; all crash at runtime in the current pipeline. Only `set!` on closure-captured
+; variables works. So each list_head node is implemented as a closure that
+; holds mutable state via captured `next` / `prev` / `owner` bindings.
+;
+; Trade-off vs Linux:
+;   - 1 extra dispatch per accessor call (vs single MOV on x86)
+;   - All O(1) ops remain O(1) asymptotically
+;   - Embedded design preserved (node + parent share lifetime)
+;
+; ## Closure protocol
+;
+;   (node 'tag)         → 'list_head
+;   (node 'next)        → next node or #f
+;   (node 'prev)        → prev node or #f
+;   (node 'owner)       → owner value (any) or #f
+;   ((node 'set-next!) v)  → set next, returns v
+;   ((node 'set-prev!) v)  → set prev, returns v
+;   ((node 'set-owner!) o) → set owner, returns o
+;   (node 'init!)       → (re-)init as self-referencing empty list
+;
+; ## Public API (Scheme-style; mutating procs end with !)
+;
+; All operations map 1:1 to the Linux API in include/linux/list.h.
+
+(export
+  ; Construction
+  make-list-head make-list-head-with-owner
+  list-head-init! list-head-attach-owner!
+  ; Accessors (low-level — prefer list-entry for owner recovery)
+  list-head-next list-head-prev list-head-owner
+  ; Predicates
+  list-head? list-head-empty? list-head-singular?
+  list-head-is-head? list-head-is-first? list-head-is-last?
+  ; Insertion
+  list-head-add! list-head-add-tail!
+  ; Deletion
+  list-head-del! list-head-del-init!
+  ; Move
+  list-head-move! list-head-move-tail!
+  ; Replace / swap
+  list-head-replace! list-head-replace-init! list-head-swap!
+  ; Rotate
+  list-head-rotate-left! list-head-rotate-to-front!
+  ; Splice
+  list-head-splice! list-head-splice-init!
+  list-head-splice-tail! list-head-splice-tail-init!
+  ; Cut
+  list-head-cut-position! list-head-cut-before!
+  ; Entry helpers (container_of + family)
+  list-entry list-first-entry list-last-entry
+  list-first-entry-or-null list-last-entry-or-null
+  list-next-entry list-prev-entry
+  ; Iteration (function form — take a closure)
+  list-for-each list-for-each-safe
+  list-for-each-prev list-for-each-prev-safe
+  list-for-each-entry list-for-each-entry-reverse
+  list-for-each-entry-safe
+  ; Misc
+  list-count-nodes
+  ; Low-level (for users building higher-level abstractions)
+  __list-add! __list-del!)
+
+; ----------------------------------------------------------------
+; Closure-based node factory
+;
+; Each node is a procedure that dispatches on a message symbol. The mutable
+; state (next, prev, owner) lives in the closure's captured environment and
+; is updated via set! (which DOES work in aura, per #3235 workaround).
+; ----------------------------------------------------------------
+
+; make-list-head: empty standalone head node (self-referencing).
+;
+; Note: aura parser/scoper bug — `set!` inside `(lambda ...)` inside a `cond`
+; clause body causes the lambda's parameter binding to be lost (e.g. `msg`
+; becomes "unbound"). Workaround: define setter functions as letrec bindings
+; BEFORE the closure, and have the closure's cond body REFERENCE these named
+; setters rather than define inline lambdas. See issue #3235 follow-up.
+(define (make-list-head)
+  (let ((next #f) (prev #f) (owner #f))
+    (letrec ((set-next! (lambda (v) (set! next v) v))
+             (set-prev! (lambda (v) (set! prev v) v))
+             (set-owner! (lambda (o) (set! owner o) o))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tag) 'list_head)
+                       ((eq? msg 'next) next)
+                       ((eq? msg 'prev) prev)
+                       ((eq? msg 'owner) owner)
+                       ((eq? msg 'set-next!) set-next!)
+                       ((eq? msg 'set-prev!) set-prev!)
+                       ((eq? msg 'set-owner!) set-owner!)
+                       (else #f)))))
+      (set! next self)
+      (set! prev self)
+      self)))
+
+; make-list-head-with-owner: head node whose owner field is set.
+(define (make-list-head-with-owner o)
+  (let ((next #f) (prev #f) (owner o))
+    (letrec ((set-next! (lambda (v) (set! next v) v))
+             (set-prev! (lambda (v) (set! prev v) v))
+             (set-owner! (lambda (o) (set! owner o) o))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tag) 'list_head)
+                       ((eq? msg 'next) next)
+                       ((eq? msg 'prev) prev)
+                       ((eq? msg 'owner) owner)
+                       ((eq? msg 'set-next!) set-next!)
+                       ((eq? msg 'set-prev!) set-prev!)
+                       ((eq? msg 'set-owner!) set-owner!)
+                       (else #f)))))
+      (set! next self)
+      (set! prev self)
+      self)))
+
+; list-head-init!: in-place init (analog to INIT_LIST_HEAD).
+; Reset next/prev to self. Note: does NOT reset owner — callers who want to
+; clear owner should call list-head-attach-owner! explicitly with #f.
+(define (list-head-init! h)
+  ((h 'set-next!) h)
+  ((h 'set-prev!) h)
+  h)
+
+; list-head-attach-owner!: set the owner of an existing list_head.
+; Typical usage: after creating a user struct with embedded list_head,
+; call (list-head-attach-owner! (struct-list-head s) s).
+(define (list-head-attach-owner! h owner) ((h 'set-owner!) owner))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+(define (list-head-next h) (h 'next))
+(define (list-head-prev h) (h 'prev))
+(define (list-head-owner h) (h 'owner))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+; list-head?: structural predicate — is v a list_head closure?
+(define (list-head? v)
+  (and (procedure? v)
+       (eq? (v 'tag) 'list_head)))
+
+; list-head-empty?: is the list empty (head's next is head)?
+(define (list-head-empty? h)
+  (eq? (list-head-next h) h))
+
+; list-head-singular?: is there exactly one element?
+(define (list-head-singular? h)
+  (and (not (list-head-empty? h))
+       (eq? (list-head-next h) (list-head-prev h))))
+
+; list-head-is-head?: is pos the head of this list?
+(define (list-head-is-head? pos head)
+  (eq? pos head))
+
+; list-head-is-first?: is node the first node after head?
+(define (list-head-is-first? node head)
+  (eq? (list-head-prev node) head))
+
+; list-head-is-last?: is node the last node before head?
+(define (list-head-is-last? node head)
+  (eq? (list-head-next node) head))
+
+; ----------------------------------------------------------------
+; Low-level primitives
+; ----------------------------------------------------------------
+
+; __list-add!: insert `new` between `prev` and `next`.
+; Order matches list.h:154 (next->prev first, then new, then prev->next).
+(define (__list-add! new prev next)
+  ((next 'set-prev!) new)
+  ((new 'set-next!) next)
+  ((new 'set-prev!) prev)
+  ((prev 'set-next!) new))
+
+; __list-del!: unlink prev<->next (bypassing the middle node).
+(define (__list-del! prev next)
+  ((next 'set-prev!) prev)
+  ((prev 'set-next!) next))
+
+; ----------------------------------------------------------------
+; Insertion
+; ----------------------------------------------------------------
+
+; list-head-add!: insert new right after head (LIFO / stack order).
+(define (list-head-add! new head)
+  (__list-add! new head (list-head-next head)))
+
+; list-head-add-tail!: insert new right before head (FIFO / queue order).
+(define (list-head-add-tail! new head)
+  (__list-add! new (list-head-prev head) head))
+
+; ----------------------------------------------------------------
+; Deletion
+; ----------------------------------------------------------------
+
+; list-head-del!: remove entry. Entry is left dangling (next/prev unchanged
+; but no longer in the list). Caller may re-init or discard.
+(define (list-head-del! entry)
+  (__list-del! (list-head-prev entry) (list-head-next entry)))
+
+; list-head-del-init!: remove entry and re-init it (entry becomes empty).
+(define (list-head-del-init! entry)
+  (list-head-del! entry)
+  (list-head-init! entry))
+
+; ----------------------------------------------------------------
+; Move
+; ----------------------------------------------------------------
+
+; list-head-move!: move `list` to head's front.
+(define (list-head-move! list head)
+  (__list-del! (list-head-prev list) (list-head-next list))
+  (__list-add! list head (list-head-next head)))
+
+; list-head-move-tail!: move `list` to head's tail.
+(define (list-head-move-tail! list head)
+  (__list-del! (list-head-prev list) (list-head-next list))
+  (__list-add! list (list-head-prev head) head))
+
+; ----------------------------------------------------------------
+; Replace / swap
+; ----------------------------------------------------------------
+
+; list-head-replace!: splice `new` into old's position.
+; old's pointers are NOT updated (matches list.h:249 semantics).
+(define (list-head-replace! old new)
+  (let ((old-next (list-head-next old))
+        (old-prev (list-head-prev old)))
+    ((old-next 'set-prev!) new)
+    ((old-prev 'set-next!) new)
+    ((new 'set-next!) old-next)
+    ((new 'set-prev!) old-prev)))
+
+; list-head-replace-init!: replace + re-init old.
+(define (list-head-replace-init! old new)
+  (list-head-replace! old new)
+  (list-head-init! old))
+
+; list-head-swap!: swap positions of a and b. Handles the case where a is
+; b's prev (circular boundary condition).
+(define (list-head-swap! a b)
+  (let ((b-prev (list-head-prev b)))
+    (list-head-del! b)
+    (list-head-replace! a b)
+    (when (eq? b-prev a)
+      (set! b-prev b))
+    (list-head-add! a b-prev)))
+
+; ----------------------------------------------------------------
+; Rotate
+; ----------------------------------------------------------------
+
+; list-head-rotate-left!: move first node to tail.
+(define (list-head-rotate-left! head)
+  (when (not (list-head-empty? head))
+    (let ((first (list-head-next head)))
+      (list-head-move-tail! first head))))
+
+; list-head-rotate-to-front!: rotate list so `list` becomes first.
+(define (list-head-rotate-to-front! list head)
+  (list-head-move-tail! head list))
+
+; ----------------------------------------------------------------
+; Splice
+; ----------------------------------------------------------------
+
+; list-head-splice!: move all of `list` (which must be non-empty) to head's
+; front. `list` is left non-empty — caller must re-init it.
+(define (list-head-splice! list head)
+  (when (not (list-head-empty? list))
+    (let ((first (list-head-next list))
+          (last  (list-head-prev list)))
+      ((last 'set-next!) (list-head-next head))
+      ((list-head-next head) 'set-prev!) last)
+    ((head 'set-next!) (list-head-next list))
+    ((list-head-next list) 'set-prev!) head))
+
+; list-head-splice-init!: splice + re-init list to empty.
+(define (list-head-splice-init! list head)
+  (when (not (list-head-empty? list))
+    (list-head-splice! list head)
+    (list-head-init! list)))
+
+; list-head-splice-tail!: move all of `list` to head's tail.
+(define (list-head-splice-tail! list head)
+  (when (not (list-head-empty? list))
+    (let ((first (list-head-next list))
+          (last  (list-head-prev list)))
+      ((last 'set-next!) head)
+      ((list-head-prev head) 'set-next!) first)
+    ((first 'set-prev!) (list-head-prev head))
+    ((head 'set-prev!) (list-head-prev list))))
+
+; list-head-splice-tail-init!: tail splice + re-init list.
+(define (list-head-splice-tail-init! list head)
+  (when (not (list-head-empty? list))
+    (list-head-splice-tail! list head)
+    (list-head-init! list)))
+
+; ----------------------------------------------------------------
+; Cut
+; ----------------------------------------------------------------
+
+; list-head-cut-position!: cut `head` at `entry`.
+; After: `list` contains head's prefix up to and including entry;
+;        head contains entry's suffix.
+(define (list-head-cut-position! list head entry)
+  (let ((new-first (list-head-next entry)))
+    ((list 'set-next!) (list-head-next head))
+    ((list-head-next head) 'set-prev!) list)
+  ((list 'set-prev!) entry)
+  ((entry 'set-next!) list)
+  ((head 'set-next!) new-first)
+  ((new-first 'set-prev!) head))
+
+; list-head-cut-before!: cut `head` before `entry`.
+; After: `list` contains everything strictly before entry;
+;        entry becomes head's first node.
+(define (list-head-cut-before! list head entry)
+  (when (eq? (list-head-next head) entry)
+    (list-head-init! list))
+  (let ((first (list-head-next head))
+        (last  (list-head-prev entry)))
+    ((list 'set-next!) first)
+    ((first 'set-prev!) list)
+    ((list 'set-prev!) last)
+    ((last 'set-next!) list)
+    ((head 'set-next!) entry)
+    ((entry 'set-prev!) head)))
+
+; ----------------------------------------------------------------
+; Entry helpers (container_of + family)
+; ----------------------------------------------------------------
+
+; list-entry: recover the owner of a list_head node. O(1) thanks to the
+; stored owner field (aura adaptation; Linux uses pointer arithmetic).
+(define (list-entry node) (list-head-owner node))
+
+; list-first-entry: owner of head's first node (assumes non-empty).
+(define (list-first-entry head) (list-head-owner (list-head-next head)))
+
+; list-last-entry: owner of head's last node (assumes non-empty).
+(define (list-last-entry head) (list-head-owner (list-head-prev head)))
+
+; list-first-entry-or-null: first owner's value, or #f if empty.
+(define (list-first-entry-or-null head)
+  (let ((next (list-head-next head)))
+    (if (eq? next head) #f (list-head-owner next))))
+
+; list-last-entry-or-null: last owner's value, or #f if empty.
+(define (list-last-entry-or-null head)
+  (let ((prev (list-head-prev head)))
+    (if (eq? prev head) #f (list-head-owner prev))))
+
+; list-next-entry: next entry's owner; wraps to first if entry is last.
+(define (list-next-entry entry head)
+  (let ((next (list-head-next entry)))
+    (if (eq? next head)
+        (list-first-entry head)
+        (list-head-owner next))))
+
+; list-prev-entry: prev entry's owner; wraps to last if entry is first.
+(define (list-prev-entry entry head)
+  (let ((prev (list-head-prev entry)))
+    (if (eq? prev head)
+        (list-last-entry head)
+        (list-head-owner prev))))
+
+; ----------------------------------------------------------------
+; Iteration (function form — take a closure)
+; ----------------------------------------------------------------
+
+; list-for-each: apply (f node) to each node from head->next to before head.
+(define (list-for-each f head)
+  (let loop ((node (list-head-next head)))
+    (when (not (eq? node head))
+      (f node)
+      (loop (list-head-next node)))))
+
+; list-for-each-safe: like list-for-each but safe against node deletion
+; during iteration (pre-fetches next).
+(define (list-for-each-safe f head)
+  (let ((first (list-head-next head)))
+    (when (not (eq? first head))
+      (let loop ((pos first)
+                 (next (list-head-next first)))
+        (f pos)
+        (when (not (eq? next head))
+          (loop next (list-head-next next)))))))
+
+; list-for-each-prev: reverse iteration.
+(define (list-for-each-prev f head)
+  (let loop ((node (list-head-prev head)))
+    (when (not (eq? node head))
+      (f node)
+      (loop (list-head-prev node)))))
+
+; list-for-each-prev-safe: reverse safe iteration.
+(define (list-for-each-prev-safe f head)
+  (let ((last (list-head-prev head)))
+    (when (not (eq? last head))
+      (let loop ((pos last)
+                 (prev (list-head-prev last)))
+        (f pos)
+        (when (not (eq? prev head))
+          (loop prev (list-head-prev prev)))))))
+
+; list-for-each-entry: apply (f owner) to each entry's owner.
+(define (list-for-each-entry f head)
+  (let loop ((node (list-head-next head)))
+    (when (not (eq? node head))
+      (f (list-head-owner node))
+      (loop (list-head-next node)))))
+
+; list-for-each-entry-reverse: reverse iteration over owners.
+(define (list-for-each-entry-reverse f head)
+  (let loop ((node (list-head-prev head)))
+    (when (not (eq? node head))
+      (f (list-head-owner node))
+      (loop (list-head-prev node)))))
+
+; list-for-each-entry-safe: safe iteration over owners; body may delete.
+(define (list-for-each-entry-safe f head)
+  (let ((first (list-head-next head)))
+    (when (not (eq? first head))
+      (let loop ((pos first)
+                 (next (list-head-next first)))
+        (f (list-head-owner pos))
+        (when (not (eq? next head))
+          (loop next (list-head-next next)))))))
+
+; ----------------------------------------------------------------
+; Misc
+; ----------------------------------------------------------------
+
+; list-count-nodes: O(n) count. The only O(n) list_head operation.
+(define (list-count-nodes head)
+  (let loop ((node (list-head-next head)) (n 0))
+    (if (eq? node head)
+        n
+        (loop (list-head-next node) (+ n 1)))))
