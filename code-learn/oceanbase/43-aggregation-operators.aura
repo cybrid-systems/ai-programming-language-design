@@ -1,0 +1,333 @@
+; 43-aggregation-operators.aura
+; ======================
+; aggregate + group_by — minimal capability port to aura.
+;
+; Maps to: OceanBase Scalar / Hash / Merge Aggregation + Distinct
+; Source: src/sql/engine/aggregate/ob_scalar_aggregate_op.h
+;         + src/sql/engine/aggregate/ob_hash_groupby_op.h
+;         + src/sql/engine/aggregate/ob_merge_groupby_op.h
+;         + src/sql/engine/aggregate/ob_groupby_op.h
+;         + src/sql/engine/aggregate/ob_aggregate_processor.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Aggregation:
+;   - 5 AGGR-TYPE constants: COUNT / SUM / AVG / MAX / MIN
+;   - 3 AGGR-STAGE constants: ONE-STAGE / TWO-STAGE / THREE-STAGE
+;   - ObAggrFuncSpec: per-aggregate-function spec
+;   - ObAggregateProcessor: aggregate processor (SUM/COUNT/...)
+;   - ObScalarAggregateOp: no GROUP BY global aggregation
+;   - ObHashGroupByOp: hash-based group by (in-mem hash + spill)
+;   - ObMergeGroupByOp: merge-based group by (input pre-sorted)
+;
+; aura v1 ships:
+;   - 5 AGGR-TYPE constants
+;   - 3 AGGR-STAGE constants
+;   - make-aggr-func-spec (factory: type + column-idx + is-distinct)
+;   - aggr-func-spec accessors + set-distinct!
+;   - make-aggregate-processor (factory: aggr-funcs + stage)
+;   - aggregate-processor accessors + count + set-stage!
+;   - make-scalar-aggregate-op (factory: input-rows + processor)
+;   - scalar-aggregate-op accessors + set-result-row!
+;   - make-hash-groupby-op (factory: group-exprs + bucket-count +
+;     bypass-enabled + skew-detection-enabled)
+;   - hash-groupby-op accessors + set-group-row-count!
+;   - make-merge-groupby-op (factory: group-exprs + is-input-sorted)
+;   - merge-groupby-op accessors
+;
+; Deferred (full OceanBase Aggregation):
+;   - real ObGroupBySpec + ObGroupByOp base class with
+;     AggrInfoFixedArray + three-stage stage fields
+;   - real ObAggregateProcessor with collect / add_calc /
+;     max_calc / sum_calc / count_calc (per-aggr-type dispatch)
+;   - real ObScalarAggregateOp with single-row aggr path
+;     (COUNT/SUM/MIN/MAX fast path)
+;   - real ObHashGroupByOp with ObExtendHashTable +
+;     ObGroupRowHashTable + set/find cycle + spill-to-disk
+;   - real ObMergeGroupByOp with sorted-input scanning
+;   - real ObHashDistinctOp + ObMergeDistinctOp
+;   - real adaptive bypass controller
+;   - real skew detection (popular_map_)
+;   - real HyperLogLog NDV estimator (llc_est_)
+;   - real ObGroupRowItem + ObGbyBloomFilter
+;   - real prefetch optimization
+;   - real ROLLUP / CUBE support (Merge only)
+;   - real JSON_AGG / ARRAY_AGG / XMLAGG / APPROX_COUNT
+;   - real vectorized batch aggr
+
+(export
+  ; AggrType constants
+  AGGR-TYPE-COUNT
+  AGGR-TYPE-SUM
+  AGGR-TYPE-AVG
+  AGGR-TYPE-MAX
+  AGGR-TYPE-MIN
+  ; AggrStage constants
+  AGGR-STAGE-ONE-STAGE
+  AGGR-STAGE-TWO-STAGE
+  AGGR-STAGE-THREE-STAGE
+  ; AggrFuncSpec
+  make-aggr-func-spec
+  aggr-func-spec?
+  aggr-func-spec-get-type
+  aggr-func-spec-get-column-idx
+  aggr-func-spec-get-is-distinct
+  aggr-func-spec-set-distinct!
+  ; AggregateProcessor
+  make-aggregate-processor
+  aggregate-processor?
+  aggregate-processor-get-aggr-funcs
+  aggregate-processor-get-stage
+  aggregate-processor-count
+  aggregate-processor-set-stage!
+  ; ScalarAggregateOp
+  make-scalar-aggregate-op
+  scalar-aggregate-op?
+  scalar-aggregate-op-get-input-rows
+  scalar-aggregate-op-get-processor
+  scalar-aggregate-op-get-result-row
+  scalar-aggregate-op-set-result-row!
+  ; HashGroupByOp
+  make-hash-groupby-op
+  hash-groupby-op?
+  hash-groupby-op-get-group-exprs
+  hash-groupby-op-get-bucket-count
+  hash-groupby-op-get-bypass-enabled
+  hash-groupby-op-get-skew-detection-enabled
+  hash-groupby-op-get-group-row-count
+  hash-groupby-op-set-group-row-count!
+  ; MergeGroupByOp
+  make-merge-groupby-op
+  merge-groupby-op?
+  merge-groupby-op-get-group-exprs
+  merge-groupby-op-get-is-input-sorted)
+
+; ----------------------------------------------------------------
+; AggrType constants
+; ----------------------------------------------------------------
+
+(define AGGR-TYPE-COUNT 0)
+(define AGGR-TYPE-SUM 1)
+(define AGGR-TYPE-AVG 2)
+(define AGGR-TYPE-MAX 3)
+(define AGGR-TYPE-MIN 4)
+
+; ----------------------------------------------------------------
+; AggrStage constants
+; ----------------------------------------------------------------
+
+(define AGGR-STAGE-ONE-STAGE 0)
+(define AGGR-STAGE-TWO-STAGE 1)
+(define AGGR-STAGE-THREE-STAGE 2)
+
+; ----------------------------------------------------------------
+; ObAggrFuncSpec — closure-based
+; ----------------------------------------------------------------
+
+; make-aggr-func-spec: create an aggregate function spec.
+; Args: type (integer), column-idx (integer),
+;       is-distinct (boolean)
+; Returns: aggr_func_spec closure (initial: is-distinct mutable).
+(define (make-aggr-func-spec type column-idx is-distinct)
+  (let ((set-is-distinct! (lambda (v) (set! is-distinct v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'type) type)
+                  ((eq? msg 'column-idx) column-idx)
+                  ((eq? msg 'is-distinct) is-distinct)
+                  ((eq? msg 'set-distinct!) set-is-distinct!)
+                  (else #f)))))
+    self))
+
+; aggr-func-spec?: is the object an aggr func spec?
+; Detected by querying 'column-idx — only specs return integer.
+(define (aggr-func-spec? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'column-idx)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; aggr-func-spec-get-type: get aggr type.
+(define (aggr-func-spec-get-type s) (s 'type))
+
+; aggr-func-spec-get-column-idx: get source column index.
+(define (aggr-func-spec-get-column-idx s) (s 'column-idx))
+
+; aggr-func-spec-get-is-distinct: get is-distinct flag.
+(define (aggr-func-spec-get-is-distinct s) (s 'is-distinct))
+
+; aggr-func-spec-set-distinct!: set is-distinct flag.
+; Returns the new flag.
+(define (aggr-func-spec-set-distinct! s v)
+  ((s 'set-distinct!) v))
+
+; ----------------------------------------------------------------
+; ObAggregateProcessor — closure-based
+; ----------------------------------------------------------------
+
+; make-aggregate-processor: create an aggregate processor.
+; Args: aggr-funcs (cons list), stage (integer)
+; Returns: aggregate_processor closure (initial: stage mutable).
+(define (make-aggregate-processor aggr-funcs stage)
+  (let ((set-stage! (lambda (v) (set! stage v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'aggr-funcs) aggr-funcs)
+                  ((eq? msg 'stage) stage)
+                  ((eq? msg 'set-stage!) set-stage!)
+                  (else #f)))))
+    self))
+
+; aggregate-processor?: is the object an aggregate processor?
+; Detected by querying 'stage — only processors return integer.
+(define (aggregate-processor? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'stage)))
+        (if (and (integer? s) (>= s 0)
+                 (<= s AGGR-STAGE-THREE-STAGE)) #t #f))
+      #f))
+
+; aggregate-processor-get-aggr-funcs: get aggr func list.
+(define (aggregate-processor-get-aggr-funcs p) (p 'aggr-funcs))
+
+; aggregate-processor-get-stage: get aggr stage.
+(define (aggregate-processor-get-stage p) (p 'stage))
+
+; aggregate-processor-count: count aggr funcs.
+(define (aggregate-processor-count p)
+  (let loop ((rest (p 'aggr-funcs)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; aggregate-processor-set-stage!: set stage.
+; Returns the new stage.
+(define (aggregate-processor-set-stage! p v)
+  ((p 'set-stage!) v))
+
+; ----------------------------------------------------------------
+; ObScalarAggregateOp — closure-based (no GROUP BY)
+; ----------------------------------------------------------------
+
+; make-scalar-aggregate-op: create a scalar aggregate op.
+; Args: input-rows (integer), processor (aggregate processor)
+; Returns: scalar_aggregate_op closure (initial: result-row=0).
+(define (make-scalar-aggregate-op input-rows processor)
+  (let ((result-row 0)
+        (set-result-row! (lambda (v) (set! result-row v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'input-rows) input-rows)
+                  ((eq? msg 'processor) processor)
+                  ((eq? msg 'result-row) result-row)
+                  ((eq? msg 'set-result-row!) set-result-row!)
+                  (else #f)))))
+    self))
+
+; scalar-aggregate-op?: is the object a scalar aggregate op?
+; Detected by querying 'input-rows — only ops return integer.
+(define (scalar-aggregate-op? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'input-rows)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; scalar-aggregate-op-get-input-rows: get input row count.
+(define (scalar-aggregate-op-get-input-rows op) (op 'input-rows))
+
+; scalar-aggregate-op-get-processor: get aggregate processor.
+(define (scalar-aggregate-op-get-processor op) (op 'processor))
+
+; scalar-aggregate-op-get-result-row: get result row index.
+(define (scalar-aggregate-op-get-result-row op) (op 'result-row))
+
+; scalar-aggregate-op-set-result-row!: set result row index.
+; Returns the new index.
+(define (scalar-aggregate-op-set-result-row! op v)
+  ((op 'set-result-row!) v))
+
+; ----------------------------------------------------------------
+; ObHashGroupByOp — closure-based (hash-based group by)
+; ----------------------------------------------------------------
+
+; make-hash-groupby-op: create a hash group by op.
+; Args: group-exprs (cons list), bucket-count (integer),
+;       bypass-enabled (boolean), skew-detection-enabled (boolean)
+; Returns: hash_groupby_op closure (initial: group-row-count=0).
+(define (make-hash-groupby-op group-exprs bucket-count
+                              bypass-enabled skew-detection-enabled)
+  (let ((group-row-count 0)
+        (set-grc! (lambda (v) (set! group-row-count v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'group-exprs) group-exprs)
+                  ((eq? msg 'bucket-count) bucket-count)
+                  ((eq? msg 'bypass-enabled) bypass-enabled)
+                  ((eq? msg 'skew-detection-enabled)
+                    skew-detection-enabled)
+                  ((eq? msg 'group-row-count) group-row-count)
+                  ((eq? msg 'set-group-row-count!) set-grc!)
+                  (else #f)))))
+    self))
+
+; hash-groupby-op?: is the object a hash group by op?
+; Detected by querying 'bucket-count — only ops return integer.
+(define (hash-groupby-op? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'bucket-count)))
+        (if (and (integer? r) (> r 0)) #t #f))
+      #f))
+
+; hash-groupby-op-get-group-exprs: get group expressions.
+(define (hash-groupby-op-get-group-exprs op) (op 'group-exprs))
+
+; hash-groupby-op-get-bucket-count: get initial bucket count.
+(define (hash-groupby-op-get-bucket-count op) (op 'bucket-count))
+
+; hash-groupby-op-get-bypass-enabled: get adaptive bypass switch.
+(define (hash-groupby-op-get-bypass-enabled op)
+  (op 'bypass-enabled))
+
+; hash-groupby-op-get-skew-detection-enabled: get skew detection.
+(define (hash-groupby-op-get-skew-detection-enabled op)
+  (op 'skew-detection-enabled))
+
+; hash-groupby-op-get-group-row-count: get current group count.
+(define (hash-groupby-op-get-group-row-count op)
+  (op 'group-row-count))
+
+; hash-groupby-op-set-group-row-count!: set group row count.
+; Returns the new count.
+(define (hash-groupby-op-set-group-row-count! op v)
+  ((op 'set-group-row-count!) v))
+
+; ----------------------------------------------------------------
+; ObMergeGroupByOp — closure-based (merge-based group by)
+; ----------------------------------------------------------------
+
+; make-merge-groupby-op: create a merge group by op.
+; Args: group-exprs (cons list), is-input-sorted (boolean)
+; Returns: merge_groupby_op closure.
+(define (make-merge-groupby-op group-exprs is-input-sorted)
+  (let ((self (lambda (msg)
+                (cond
+                  ((eq? msg 'group-exprs) group-exprs)
+                  ((eq? msg 'is-input-sorted) is-input-sorted)
+                  (else #f)))))
+    self))
+
+; merge-groupby-op?: is the object a merge group by op?
+; Detected by querying 'is-input-sorted — only ops return boolean.
+(define (merge-groupby-op? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'is-input-sorted)))
+        (if (or (eq? s #t) (eq? s #f)) #t #f))
+      #f))
+
+; merge-groupby-op-get-group-exprs: get group expressions.
+(define (merge-groupby-op-get-group-exprs op) (op 'group-exprs))
+
+; merge-groupby-op-get-is-input-sorted: get input sorted flag.
+(define (merge-groupby-op-get-is-input-sorted op)
+  (op 'is-input-sorted))

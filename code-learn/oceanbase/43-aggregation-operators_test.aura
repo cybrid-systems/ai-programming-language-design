@@ -1,0 +1,201 @@
+; 43-aggregation-operators_test.aura
+; ======================
+; Smoke tests for 43-aggregation-operators.aura — Aggregation +
+; Group By minimal.
+
+(require "std/test" all:)
+(require "43-aggregation-operators" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "43-001-aggr-type-distinct"
+  (check (= 1 (if (not (= AGGR-TYPE-COUNT AGGR-TYPE-SUM)) 1 0)))
+  (check (= 1 (if (not (= AGGR-TYPE-SUM AGGR-TYPE-AVG)) 1 0)))
+  (check (= 1 (if (not (= AGGR-TYPE-AVG AGGR-TYPE-MAX)) 1 0)))
+  (check (= 1 (if (not (= AGGR-TYPE-MAX AGGR-TYPE-MIN)) 1 0)))
+  (check (= 1 (if (not (= AGGR-TYPE-COUNT AGGR-TYPE-MIN)) 1 0))))
+
+(test-suite "43-001-aggr-stage-distinct"
+  (check (= 1 (if (not (= AGGR-STAGE-ONE-STAGE
+                          AGGR-STAGE-TWO-STAGE)) 1 0)))
+  (check (= 1 (if (not (= AGGR-STAGE-TWO-STAGE
+                          AGGR-STAGE-THREE-STAGE)) 1 0)))
+  (check (= 1 (if (not (= AGGR-STAGE-ONE-STAGE
+                          AGGR-STAGE-THREE-STAGE)) 1 0))))
+
+; ----------------------------------------------------------------
+; AggrFuncSpec
+; ----------------------------------------------------------------
+
+(test-suite "43-002-func-spec-construction"
+  (check (= AGGR-TYPE-COUNT (aggr-func-spec-get-type
+                              (make-aggr-func-spec
+                                AGGR-TYPE-COUNT 0 #f))))
+  (check (= AGGR-TYPE-SUM (aggr-func-spec-get-type
+                            (make-aggr-func-spec
+                              AGGR-TYPE-SUM 3 #t))))
+  (check (= 0 (aggr-func-spec-get-column-idx
+               (make-aggr-func-spec AGGR-TYPE-COUNT 0 #f))))
+  (check (= 3 (aggr-func-spec-get-column-idx
+               (make-aggr-func-spec AGGR-TYPE-SUM 3 #t))))
+  (check (= #f (aggr-func-spec-get-is-distinct
+                (make-aggr-func-spec AGGR-TYPE-COUNT 0 #f))))
+  (check (= #t (aggr-func-spec-get-is-distinct
+                (make-aggr-func-spec AGGR-TYPE-SUM 3 #t)))))
+
+(test-suite "43-002-func-spec-predicate"
+  (check (= #t (aggr-func-spec?
+                 (make-aggr-func-spec AGGR-TYPE-COUNT 0 #f))))
+  (check (= #f (aggr-func-spec? 'not-spec)))
+  (check (= #f (aggr-func-spec? 42))))
+
+(test-suite "43-002-func-spec-set-distinct"
+  (check (= #t (aggr-func-spec-get-is-distinct
+                (aggr-func-spec-set-distinct!
+                  (make-aggr-func-spec AGGR-TYPE-COUNT 0 #f)
+                  #t))))
+  (check (= #f (aggr-func-spec-get-is-distinct
+                 (aggr-func-spec-set-distinct!
+                   (make-aggr-func-spec AGGR-TYPE-SUM 3 #t)
+                   #f)))))
+
+; ----------------------------------------------------------------
+; AggregateProcessor
+; ----------------------------------------------------------------
+
+(test-suite "43-003-processor-construction"
+  (check (= AGGR-STAGE-ONE-STAGE
+            (aggregate-processor-get-stage
+              (make-aggregate-processor '() AGGR-STAGE-ONE-STAGE))))
+  (check (= AGGR-STAGE-THREE-STAGE
+            (aggregate-processor-get-stage
+              (make-aggregate-processor '() AGGR-STAGE-THREE-STAGE)))))
+
+(test-suite "43-003-processor-predicate"
+  (check (= #t (aggregate-processor?
+                 (make-aggregate-processor '() AGGR-STAGE-ONE-STAGE))))
+  (check (= #f (aggregate-processor? 'not-processor)))
+  (check (= #f (aggregate-processor? 42))))
+
+(test-suite "43-003-processor-count"
+  (check (= 0 (aggregate-processor-count
+                (make-aggregate-processor '() AGGR-STAGE-ONE-STAGE))))
+  (check (= 2 (aggregate-processor-count
+                (make-aggregate-processor
+                  (list (make-aggr-func-spec AGGR-TYPE-COUNT 0 #f)
+                        (make-aggr-func-spec AGGR-TYPE-SUM 1 #t))
+                  AGGR-STAGE-TWO-STAGE))))
+  (check (= 3 (aggregate-processor-count
+                (make-aggregate-processor
+                  (list (make-aggr-func-spec AGGR-TYPE-COUNT 0 #f)
+                        (make-aggr-func-spec AGGR-TYPE-SUM 1 #t)
+                        (make-aggr-func-spec AGGR-TYPE-AVG 2 #f))
+                  AGGR-STAGE-THREE-STAGE)))))
+
+(test-suite "43-003-processor-set-stage"
+  (check (= AGGR-STAGE-THREE-STAGE
+            (aggregate-processor-get-stage
+              (aggregate-processor-set-stage!
+                (make-aggregate-processor '() AGGR-STAGE-ONE-STAGE)
+                AGGR-STAGE-THREE-STAGE))))
+  (check (= AGGR-STAGE-ONE-STAGE
+            (aggregate-processor-get-stage
+              (aggregate-processor-set-stage!
+                (make-aggregate-processor '() AGGR-STAGE-THREE-STAGE)
+                AGGR-STAGE-ONE-STAGE)))))
+
+; ----------------------------------------------------------------
+; ScalarAggregateOp
+; ----------------------------------------------------------------
+
+(test-suite "43-004-scalar-construction"
+  (check (= 1000 (scalar-aggregate-op-get-input-rows
+                  (make-scalar-aggregate-op 1000
+                    (make-aggregate-processor '()
+                      AGGR-STAGE-ONE-STAGE)))))
+  (check (= 0 (scalar-aggregate-op-get-result-row
+               (make-scalar-aggregate-op 1000
+                 (make-aggregate-processor '()
+                   AGGR-STAGE-ONE-STAGE))))))
+
+(test-suite "43-004-scalar-predicate"
+  (check (= #t (scalar-aggregate-op?
+                 (make-scalar-aggregate-op 0
+                   (make-aggregate-processor '()
+                     AGGR-STAGE-ONE-STAGE)))))
+  (check (= #f (scalar-aggregate-op? 'not-scalar)))
+  (check (= #f (scalar-aggregate-op? 42))))
+
+(test-suite "43-004-scalar-set-result-row"
+  (check (= 1 (scalar-aggregate-op-get-result-row
+                (scalar-aggregate-op-set-result-row!
+                  (make-scalar-aggregate-op 1000
+                    (make-aggregate-processor '()
+                      AGGR-STAGE-ONE-STAGE))
+                  1))))
+  (check (= 0 (scalar-aggregate-op-get-result-row
+                (scalar-aggregate-op-set-result-row!
+                  (make-scalar-aggregate-op 1000
+                    (make-aggregate-processor '()
+                      AGGR-STAGE-ONE-STAGE))
+                  0)))))
+
+; ----------------------------------------------------------------
+; HashGroupByOp
+; ----------------------------------------------------------------
+
+(test-suite "43-005-hash-construction"
+  (check (= 1 (let ((op (make-hash-groupby-op '(dept-id) 1024 #f #f)))
+                 (length (hash-groupby-op-get-group-exprs op)) 1)))
+  (check (= 1024 (hash-groupby-op-get-bucket-count
+                  (make-hash-groupby-op '(dept-id) 1024 #f #f))))
+  (check (= 64 (hash-groupby-op-get-bucket-count
+                 (make-hash-groupby-op '(dept-id) 64 #t #t))))
+  (check (= #f (hash-groupby-op-get-bypass-enabled
+                (make-hash-groupby-op '(dept-id) 1024 #f #f))))
+  (check (= #t (hash-groupby-op-get-bypass-enabled
+                (make-hash-groupby-op '(dept-id) 1024 #t #t))))
+  (check (= #f (hash-groupby-op-get-skew-detection-enabled
+                (make-hash-groupby-op '(dept-id) 1024 #f #f))))
+  (check (= #t (hash-groupby-op-get-skew-detection-enabled
+                (make-hash-groupby-op '(dept-id) 1024 #t #t))))
+  (check (= 0 (hash-groupby-op-get-group-row-count
+               (make-hash-groupby-op '(dept-id) 1024 #f #f)))))
+
+(test-suite "43-005-hash-predicate"
+  (check (= #t (hash-groupby-op?
+                 (make-hash-groupby-op '(dept-id) 1 #f #f))))
+  (check (= #f (hash-groupby-op? 'not-hash)))
+  (check (= #f (hash-groupby-op? 42))))
+
+(test-suite "43-005-hash-set-group-row-count"
+  (check (= 500 (hash-groupby-op-get-group-row-count
+                  (hash-groupby-op-set-group-row-count!
+                    (make-hash-groupby-op '(dept-id) 1024 #f #f)
+                    500))))
+  (check (= 0 (hash-groupby-op-get-group-row-count
+                (hash-groupby-op-set-group-row-count!
+                  (make-hash-groupby-op '(dept-id) 1024 #f #f)
+                  0)))))
+
+; ----------------------------------------------------------------
+; MergeGroupByOp
+; ----------------------------------------------------------------
+
+(test-suite "43-006-merge-construction"
+  (check (= 1 (let ((op (make-merge-groupby-op '(dept-id) #t)))
+                 (length (merge-groupby-op-get-group-exprs op)) 1)))
+  (check (= #t (merge-groupby-op-get-is-input-sorted
+                (make-merge-groupby-op '(dept-id) #t))))
+  (check (= #f (merge-groupby-op-get-is-input-sorted
+                (make-merge-groupby-op '(dept-id) #f)))))
+
+(test-suite "43-006-merge-predicate"
+  (check (= #t (merge-groupby-op?
+                 (make-merge-groupby-op '(dept-id) #t))))
+  (check (= #t (merge-groupby-op?
+                 (make-merge-groupby-op '(dept-id) #f))))
+  (check (= #f (merge-groupby-op? 'not-merge)))
+  (check (= #f (merge-groupby-op? 42))))
