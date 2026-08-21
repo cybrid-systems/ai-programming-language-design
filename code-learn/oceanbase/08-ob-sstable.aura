@@ -1,0 +1,435 @@
+; 08-ob-sstable.aura
+; ======================
+; sstable — minimal capability port to aura.
+;
+; Maps to: OceanBase SSTable physical file layout
+; Source: src/storage/blocksstable/ob_block_sstable_struct.h
+;         + ob_server_super_block.h + .cpp
+;         + ob_macro_block_header.h + ob_micro_block_header.h
+;         + ob_index_block_aggregator.h
+;         + ob_bloom_filter_cache.h (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase SSTable on-disk layout:
+;   - ObServerSuperBlock (file header with magic + version + block_size)
+;   - ObMacroBlockHeader (2 MB blocks containing micro blocks)
+;   - ObMicroBlockHeader (row group header with row count + encoding)
+;   - 5 magic numbers (each block section type)
+;   - Block types: DATA / INDEX / BLOOM_FILTER
+;   - Row store types: FLAT / ENCODING / SELECTIVE
+;   - Compressor types: NONE / LZ4 / SNAPPY / ZSTD
+;   - Index Tree (Macro Index + Micro Index + Skip Index Agg)
+;   - Bloom Filter block (optional, before Trailer)
+;   - Trailer / SSTable Basic Meta
+;
+; aura has no disk I/O, no real magic verification. v1 ships:
+;   - 5 MAGIC constants (SERVER_SUPER_BLOCK, MICRO_BLOCK_HEADER,
+;     BF_MACRO_BLOCK_HEADER, BF_MICRO_BLOCK_HEADER,
+;     LINKED_MACRO_BLOCK_HEADER)
+;   - 3 BLOCK-TYPE constants (DATA / INDEX / BLOOM_FILTER)
+;   - 3 ROW-STORE-TYPE constants (FLAT / ENCODING / SELECTIVE)
+;   - 4 COMPRESSOR-TYPE constants (NONE / LZ4 / SNAPPY / ZSTD)
+;   - OB-DEFAULT-MACRO-BLOCK-SIZE = 2 MB
+;   - make-super-block (ObServerSuperBlock factory)
+;   - make-macro-block-header (ObMacroBlockHeader factory)
+;   - make-micro-block-header (ObMicroBlockHeader factory)
+;   - make-sstable-meta (ObSSTableBasicMeta factory)
+;   - make-bloom-filter-block (ObBloomFilterBlock factory)
+;   - has-valid-magic? predicate (verifies magic matches)
+;   - block-type accessors
+;
+; Deferred (full OceanBase SSTable):
+;   - actual file I/O + block manager integration
+;   - macro/micro block checksum computation (CRC)
+;   - LZ4 / Snappy / ZSTD compression
+;   - row encoding (ObEncodingHashTable + ObColumnEncoder)
+;   - index block aggregator (ObIndexBlockAggregator)
+;   - bloom filter cache (ObBloomFilterCache)
+;   - SSTable trailer / footer
+;   - multi-level SSTable (mini / minor / medium / major)
+
+(export
+  ; Magic constants
+  MICRO-BLOCK-HEADER-MAGIC BF-MACRO-BLOCK-HEADER-MAGIC
+  BF-MICRO-BLOCK-HEADER-MAGIC SERVER-SUPER-BLOCK-MAGIC
+  LINKED-MACRO-BLOCK-HEADER-MAGIC
+  ; Block types
+  BLOCK-TYPE-DATA BLOCK-TYPE-INDEX BLOCK-TYPE-BLOOM-FILTER
+  ; Row store types
+  ROW-STORE-TYPE-FLAT ROW-STORE-TYPE-ENCODING
+  ROW-STORE-TYPE-SELECTIVE
+  ; Compressor types
+  COMPRESSOR-TYPE-NONE COMPRESSOR-TYPE-LZ4
+  COMPRESSOR-TYPE-SNAPPY COMPRESSOR-TYPE-ZSTD
+  ; Default block size
+  OB-DEFAULT-MACRO-BLOCK-SIZE
+  ; ObServerSuperBlock
+  make-super-block super-block?
+  super-block-get-magic super-block-get-format-version
+  super-block-get-block-size super-block-get-file-id
+  super-block-set-format-version! super-block-set-block-size!
+  super-block-set-file-id!
+  has-valid-super-block-magic?
+  ; ObMacroBlockHeader
+  make-macro-block-header macro-block-header?
+  macro-block-header-get-magic macro-block-header-get-type
+  macro-block-header-get-size macro-block-header-get-checksum
+  macro-block-header-get-micro-block-count
+  macro-block-header-set-type! macro-block-header-set-checksum!
+  macro-block-header-set-micro-block-count!
+  has-valid-macro-block-magic?
+  ; ObMicroBlockHeader
+  make-micro-block-header micro-block-header?
+  micro-block-header-get-magic micro-block-header-get-column-count
+  micro-block-header-get-row-count micro-block-header-get-row-store-type
+  micro-block-header-get-data-length micro-block-header-get-checksum
+  micro-block-header-get-compressor-type
+  micro-block-header-set-row-count!
+  micro-block-header-set-data-length! micro-block-header-set-checksum!
+  has-valid-micro-block-magic?
+  ; ObSSTableBasicMeta
+  make-sstable-meta sstable-meta?
+  sstable-meta-get-row-count sstable-meta-get-row-count-checksum
+  sstable-meta-get-max-trans-version sstable-meta-get-occupy-size
+  sstable-meta-set-row-count!
+  ; ObBloomFilterBlock
+  make-bloom-filter-block bloom-filter-block?
+  bloom-filter-block-get-macro-id bloom-filter-block-get-row-count
+  bloom-filter-block-get-nhash bloom-filter-block-get-nbit)
+
+; ----------------------------------------------------------------
+; Magic number constants (per ob_block_sstable_struct.h:48-56)
+; ----------------------------------------------------------------
+;
+; Original hex (32-bit):
+;   MICRO_BLOCK_HEADER_MAGIC     = 0x0AED0A05
+;   BF_MACRO_BLOCK_HEADER_MAGIC  = 0x0AED0A06
+;   BF_MICRO_BLOCK_HEADER_MAGIC  = 0x0AED0A07
+;   SERVER_SUPER_BLOCK_MAGIC     = 0x0AED0A04
+;   LINKED_MACRO_BLOCK_HEADER_MAGIC = 0x0AED0A08
+;
+; Converted to decimal:
+;   0x0AED0A05 = 183315973  (183 million)
+;   0x0AED0A06 = 183315974
+;   0x0AED0A07 = 183315975
+;   0x0AED0A04 = 183315972
+;   0x0AED0A08 = 183315976
+
+(define MICRO-BLOCK-HEADER-MAGIC 183315973)
+(define BF-MACRO-BLOCK-HEADER-MAGIC 183315974)
+(define BF-MICRO-BLOCK-HEADER-MAGIC 183315975)
+(define SERVER-SUPER-BLOCK-MAGIC 183315972)
+(define LINKED-MACRO-BLOCK-HEADER-MAGIC 183315976)
+
+; ----------------------------------------------------------------
+; Block type constants
+; ----------------------------------------------------------------
+
+(define BLOCK-TYPE-DATA 1)
+(define BLOCK-TYPE-INDEX 2)
+(define BLOCK-TYPE-BLOOM-FILTER 3)
+
+; ----------------------------------------------------------------
+; Row store type constants
+; ----------------------------------------------------------------
+
+(define ROW-STORE-TYPE-FLAT 1)
+(define ROW-STORE-TYPE-ENCODING 2)
+(define ROW-STORE-TYPE-SELECTIVE 3)
+
+; ----------------------------------------------------------------
+; Compressor type constants
+; ----------------------------------------------------------------
+
+(define COMPRESSOR-TYPE-NONE 0)
+(define COMPRESSOR-TYPE-LZ4 1)
+(define COMPRESSOR-TYPE-SNAPPY 2)
+(define COMPRESSOR-TYPE-ZSTD 3)
+
+; ----------------------------------------------------------------
+; Default block size — 2 MB
+; ----------------------------------------------------------------
+;
+; Per OB (ob_sstable.h): OB_DEFAULT_MACRO_BLOCK_SIZE = 2 MB = 2*1024*1024
+
+(define OB-DEFAULT-MACRO-BLOCK-SIZE 2097152)
+
+; ----------------------------------------------------------------
+; ObServerSuperBlock — closure-based
+; ----------------------------------------------------------------
+
+; make-super-block: create ObServerSuperBlock.
+; Args: format-version (integer), block-size (integer), file-id (integer)
+; Returns: super_block closure.
+(define (make-super-block format-version block-size file-id)
+  (letrec ((set-format-version! (lambda (v) (set! format-version v) v))
+           (set-block-size! (lambda (v) (set! block-size v) v))
+           (set-file-id! (lambda (v) (set! file-id v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'magic) SERVER-SUPER-BLOCK-MAGIC)
+                     ((eq? msg 'format-version) format-version)
+                     ((eq? msg 'block-size) block-size)
+                     ((eq? msg 'file-id) file-id)
+                     ((eq? msg 'set-format-version!) set-format-version!)
+                     ((eq? msg 'set-block-size!) set-block-size!)
+                     ((eq? msg 'set-file-id!) set-file-id!)
+                     (else #f)))))
+      self)))
+
+; super-block?: is the object a super block?
+; Detected by querying 'magic — only super_blocks return SERVER-SUPER-BLOCK-MAGIC.
+(define (super-block? obj)
+  (if (procedure? obj)
+      (if (= (obj 'magic) SERVER-SUPER-BLOCK-MAGIC) #t #f)
+      #f))
+
+; super-block-get-magic: get magic number
+(define (super-block-get-magic sb) (sb 'magic))
+
+; super-block-get-format-version: get format_version_
+(define (super-block-get-format-version sb) (sb 'format-version))
+
+; super-block-get-block-size: get block_size_
+(define (super-block-get-block-size sb) (sb 'block-size))
+
+; super-block-get-file-id: get file_id_
+(define (super-block-get-file-id sb) (sb 'file-id))
+
+; super-block-set-format-version!: set format_version_.
+; Returns the new value.
+(define (super-block-set-format-version! sb v)
+  ((sb 'set-format-version!) v))
+
+; super-block-set-block-size!: set block_size_.
+(define (super-block-set-block-size! sb v)
+  ((sb 'set-block-size!) v))
+
+; super-block-set-file-id!: set file_id_.
+(define (super-block-set-file-id! sb v)
+  ((sb 'set-file-id!) v))
+
+; has-valid-super-block-magic?: verify magic matches expected.
+(define (has-valid-super-block-magic? sb)
+  (= (sb 'magic) SERVER-SUPER-BLOCK-MAGIC))
+
+; ----------------------------------------------------------------
+; ObMacroBlockHeader — closure-based
+; ----------------------------------------------------------------
+
+; make-macro-block-header: create ObMacroBlockHeader.
+; Args: type (integer), checksum (integer), micro-block-count (integer)
+; Returns: macro_block_header closure.
+(define (make-macro-block-header type checksum micro-block-count)
+  (letrec ((set-type! (lambda (v) (set! type v) v))
+           (set-checksum! (lambda (v) (set! checksum v) v))
+           (set-micro-block-count! (lambda (v) (set! micro-block-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'magic) BF-MACRO-BLOCK-HEADER-MAGIC)
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'checksum) checksum)
+                     ((eq? msg 'micro-block-count) micro-block-count)
+                     ((eq? msg 'set-type!) set-type!)
+                     ((eq? msg 'set-checksum!) set-checksum!)
+                     ((eq? msg 'set-micro-block-count!) set-micro-block-count!)
+                     (else #f)))))
+      self)))
+
+; macro-block-header?: is the object a macro block header?
+; Detected by querying 'magic — only macro_headers return BF-MACRO-BLOCK-HEADER-MAGIC.
+(define (macro-block-header? obj)
+  (if (procedure? obj)
+      (if (= (obj 'magic) BF-MACRO-BLOCK-HEADER-MAGIC) #t #f)
+      #f))
+
+; macro-block-header-get-magic: get magic.
+(define (macro-block-header-get-magic mbh) (mbh 'magic))
+
+; macro-block-header-get-type: get block type.
+(define (macro-block-header-get-type mbh) (mbh 'type))
+
+; macro-block-header-get-size: get block size (= OB-DEFAULT-MACRO-BLOCK-SIZE).
+; Note: macro blocks are typically a fixed 2 MB; stored in super-block
+; rather than per-header. v1 returns the default size.
+(define (macro-block-header-get-size mbh) OB-DEFAULT-MACRO-BLOCK-SIZE)
+
+; macro-block-header-get-checksum: get checksum.
+(define (macro-block-header-get-checksum mbh) (mbh 'checksum))
+
+; macro-block-header-get-micro-block-count: get micro_block_count.
+(define (macro-block-header-get-micro-block-count mbh) (mbh 'micro-block-count))
+
+; macro-block-header-set-type!: set block type.
+(define (macro-block-header-set-type! mbh v)
+  ((mbh 'set-type!) v))
+
+; macro-block-header-set-checksum!: set checksum.
+(define (macro-block-header-set-checksum! mbh v)
+  ((mbh 'set-checksum!) v))
+
+; macro-block-header-set-micro-block-count!: set micro_block_count.
+(define (macro-block-header-set-micro-block-count! mbh v)
+  ((mbh 'set-micro-block-count!) v))
+
+; has-valid-macro-block-magic?: verify magic matches.
+(define (has-valid-macro-block-magic? mbh)
+  (= (mbh 'magic) BF-MACRO-BLOCK-HEADER-MAGIC))
+
+; ----------------------------------------------------------------
+; ObMicroBlockHeader — closure-based
+; ----------------------------------------------------------------
+
+; make-micro-block-header: create ObMicroBlockHeader.
+; Args: column-count (integer), row-count (integer),
+;       row-store-type (integer), data-length (integer),
+;       checksum (integer), compressor-type (integer)
+; Returns: micro_block_header closure.
+(define (make-micro-block-header column-count row-count row-store-type
+                              data-length checksum compressor-type)
+  (letrec ((set-row-count! (lambda (v) (set! row-count v) v))
+           (set-data-length! (lambda (v) (set! data-length v) v))
+           (set-checksum! (lambda (v) (set! checksum v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'magic) MICRO-BLOCK-HEADER-MAGIC)
+                     ((eq? msg 'column-count) column-count)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'row-store-type) row-store-type)
+                     ((eq? msg 'data-length) data-length)
+                     ((eq? msg 'checksum) checksum)
+                     ((eq? msg 'compressor-type) compressor-type)
+                     ((eq? msg 'set-row-count!) set-row-count!)
+                     ((eq? msg 'set-data-length!) set-data-length!)
+                     ((eq? msg 'set-checksum!) set-checksum!)
+                     (else #f)))))
+      self)))
+
+; micro-block-header?: is the object a micro block header?
+; Detected by querying 'magic — only micro_headers return MICRO-BLOCK-HEADER-MAGIC.
+(define (micro-block-header? obj)
+  (if (procedure? obj)
+      (if (= (obj 'magic) MICRO-BLOCK-HEADER-MAGIC) #t #f)
+      #f))
+
+; micro-block-header-get-magic: get magic.
+(define (micro-block-header-get-magic mbh) (mbh 'magic))
+
+; micro-block-header-get-column-count: get column_count_.
+(define (micro-block-header-get-column-count mbh) (mbh 'column-count))
+
+; micro-block-header-get-row-count: get row_count_.
+(define (micro-block-header-get-row-count mbh) (mbh 'row-count))
+
+; micro-block-header-get-row-store-type: get row_store_type_.
+(define (micro-block-header-get-row-store-type mbh) (mbh 'row-store-type))
+
+; micro-block-header-get-data-length: get data_length_ (compressed size).
+(define (micro-block-header-get-data-length mbh) (mbh 'data-length))
+
+; micro-block-header-get-checksum: get data_checksum_.
+(define (micro-block-header-get-checksum mbh) (mbh 'checksum))
+
+; micro-block-header-get-compressor-type: get compressor_type_.
+(define (micro-block-header-get-compressor-type mbh) (mbh 'compressor-type))
+
+; micro-block-header-set-row-count!: set row_count_.
+(define (micro-block-header-set-row-count! mbh v)
+  ((mbh 'set-row-count!) v))
+
+; micro-block-header-set-data-length!: set data_length_.
+(define (micro-block-header-set-data-length! mbh v)
+  ((mbh 'set-data-length!) v))
+
+; micro-block-header-set-checksum!: set data_checksum_.
+(define (micro-block-header-set-checksum! mbh v)
+  ((mbh 'set-checksum!) v))
+
+; has-valid-micro-block-magic?: verify magic matches.
+(define (has-valid-micro-block-magic? mbh)
+  (= (mbh 'magic) MICRO-BLOCK-HEADER-MAGIC))
+
+; ----------------------------------------------------------------
+; ObSSTableBasicMeta — closure-based
+; ----------------------------------------------------------------
+
+; make-sstable-meta: create ObSSTableBasicMeta.
+; Args: row-count (integer), row-count-checksum (integer),
+;       max-trans-version (integer), occupy-size (integer)
+; Returns: sstable_meta closure.
+(define (make-sstable-meta row-count row-count-checksum max-trans-version
+                        occupy-size)
+  (letrec ((set-row-count! (lambda (v) (set! row-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'row-count-checksum) row-count-checksum)
+                     ((eq? msg 'max-trans-version) max-trans-version)
+                     ((eq? msg 'occupy-size) occupy-size)
+                     ((eq? msg 'set-row-count!) set-row-count!)
+                     (else #f)))))
+      self)))
+
+; sstable-meta?: is the object an sstable meta?
+; Detected by querying 'occupy-size — only sstable_metas return an integer.
+(define (sstable-meta? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'occupy-size)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; sstable-meta-get-row-count: get row_count.
+(define (sstable-meta-get-row-count m) (m 'row-count))
+
+; sstable-meta-get-row-count-checksum: get row_count_checksum.
+(define (sstable-meta-get-row-count-checksum m) (m 'row-count-checksum))
+
+; sstable-meta-get-max-trans-version: get max_trans_version.
+(define (sstable-meta-get-max-trans-version m) (m 'max-trans-version))
+
+; sstable-meta-get-occupy-size: get occupy_size.
+(define (sstable-meta-get-occupy-size m) (m 'occupy-size))
+
+; sstable-meta-set-row-count!: set row_count.
+(define (sstable-meta-set-row-count! m v)
+  ((m 'set-row-count!) v))
+
+; ----------------------------------------------------------------
+; ObBloomFilterBlock — closure-based
+; ----------------------------------------------------------------
+
+; make-bloom-filter-block: create ObBloomFilterBlock.
+; Args: macro-id (integer), row-count (integer),
+;       nhash (integer), nbit (integer)
+; Returns: bloom_filter_block closure.
+(define (make-bloom-filter-block macro-id row-count nhash nbit)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'magic) BF-MICRO-BLOCK-HEADER-MAGIC)
+                     ((eq? msg 'macro-id) macro-id)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'nhash) nhash)
+                     ((eq? msg 'nbit) nbit)
+                     (else #f)))))
+      self)))
+
+; bloom-filter-block?: is the object a bloom filter block?
+; Detected by querying 'nhash — only bloom_blocks return a positive integer.
+(define (bloom-filter-block? obj)
+  (if (procedure? obj)
+      (let ((h (obj 'nhash)))
+        (if (and (integer? h) (>= h 1)) #t #f))
+      #f))
+
+; bloom-filter-block-get-macro-id: get macro_id (associated Macro Block).
+(define (bloom-filter-block-get-macro-id b) (b 'macro-id))
+
+; bloom-filter-block-get-row-count: get row_count.
+(define (bloom-filter-block-get-row-count b) (b 'row-count))
+
+; bloom-filter-block-get-nhash: get nhash (number of hash functions).
+(define (bloom-filter-block-get-nhash b) (b 'nhash))
+
+; bloom-filter-block-get-nbit: get nbit (bit array size).
+(define (bloom-filter-block-get-nbit b) (b 'nbit))

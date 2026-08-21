@@ -1,0 +1,271 @@
+; 08-ob-sstable_test.aura
+; ========================
+; Smoke tests for 08-ob-sstable.aura — SSTable physical layout minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/08-ob-sstable_test.aura
+;
+; Verified automatically (smoke):
+;   - 5 MAGIC constants distinct (large 32-bit values)
+;   - 3 BLOCK-TYPE constants distinct
+;   - 3 ROW-STORE-TYPE constants distinct
+;   - 4 COMPRESSOR-TYPE constants distinct
+;   - OB-DEFAULT-MACRO-BLOCK-SIZE = 2 MB
+;   - make-super-block construction + accessors + setters
+;   - has-valid-super-block-magic?
+;   - make-macro-block-header + accessors + setters
+;   - has-valid-macro-block-magic?
+;   - make-micro-block-header + accessors + setters
+;   - has-valid-micro-block-magic?
+;   - make-sstable-meta + accessors
+;   - make-bloom-filter-block + accessors
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Magic numbers correctly distinguish block sections
+;
+; Deferred (full OceanBase SSTable):
+;   - actual file I/O + block manager integration
+;   - macro/micro block checksum computation (CRC)
+;   - LZ4 / Snappy / ZSTD compression
+;   - row encoding (ObEncodingHashTable + ObColumnEncoder)
+;   - index block aggregator (ObIndexBlockAggregator)
+;   - bloom filter cache (ObBloomFilterCache)
+;   - SSTable trailer / footer
+;   - multi-level SSTable (mini / minor / medium / major)
+
+(require "std/test" all:)
+(require "08-ob-sstable" all:)
+
+; ----------------------------------------------------------------
+; Magic constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "08-001-magic-constants-distinct"
+  ; 5 MAGIC constants are distinct.
+  (check (= 1 (if (not (= MICRO-BLOCK-HEADER-MAGIC BF-MACRO-BLOCK-HEADER-MAGIC)) 1 0)))
+  (check (= 1 (if (not (= BF-MICRO-BLOCK-HEADER-MAGIC SERVER-SUPER-BLOCK-MAGIC)) 1 0)))
+  (check (= 1 (if (not (= SERVER-SUPER-BLOCK-MAGIC LINKED-MACRO-BLOCK-HEADER-MAGIC)) 1 0)))
+  (check (= 1 (if (not (= BF-MACRO-BLOCK-HEADER-MAGIC LINKED-MACRO-BLOCK-HEADER-MAGIC)) 1 0))))
+
+(test-suite "08-001-block-type-distinct"
+  ; 3 BLOCK-TYPE constants are distinct.
+  (check (= 1 (if (not (= BLOCK-TYPE-DATA BLOCK-TYPE-INDEX)) 1 0)))
+  (check (= 1 (if (not (= BLOCK-TYPE-INDEX BLOCK-TYPE-BLOOM-FILTER)) 1 0))))
+
+(test-suite "08-001-row-store-type-distinct"
+  ; 3 ROW-STORE-TYPE constants are distinct.
+  (check (= 1 (if (not (= ROW-STORE-TYPE-FLAT ROW-STORE-TYPE-ENCODING)) 1 0)))
+  (check (= 1 (if (not (= ROW-STORE-TYPE-ENCODING ROW-STORE-TYPE-SELECTIVE)) 1 0))))
+
+(test-suite "08-001-compressor-type-distinct"
+  ; 4 COMPRESSOR-TYPE constants are distinct.
+  (check (= 1 (if (not (= COMPRESSOR-TYPE-NONE COMPRESSOR-TYPE-LZ4)) 1 0)))
+  (check (= 1 (if (not (= COMPRESSOR-TYPE-LZ4 COMPRESSOR-TYPE-SNAPPY)) 1 0)))
+  (check (= 1 (if (not (= COMPRESSOR-TYPE-SNAPPY COMPRESSOR-TYPE-ZSTD)) 1 0))))
+
+(test-suite "08-001-default-block-size"
+  ; OB-DEFAULT-MACRO-BLOCK-SIZE = 2 MB = 2097152 bytes.
+  (check (= 2097152 OB-DEFAULT-MACRO-BLOCK-SIZE)))
+
+; ----------------------------------------------------------------
+; ObServerSuperBlock
+; ----------------------------------------------------------------
+
+(test-suite "08-002-super-block-construction"
+  ; super-block preserves format-version, block-size, file-id.
+  (check (= 1 (super-block-get-format-version
+                (make-super-block 1 2097152 42))))
+  (check (= 2097152 (super-block-get-block-size
+                       (make-super-block 1 2097152 42))))
+  (check (= 42 (super-block-get-file-id
+                (make-super-block 1 2097152 42)))))
+
+(test-suite "08-002-super-block-magic"
+  ; super-block has correct magic.
+  (check (= #t (eq? SERVER-SUPER-BLOCK-MAGIC
+                 (super-block-get-magic
+                   (make-super-block 1 2097152 42)))))
+
+(test-suite "08-002-super-block-predicate"
+  ; super-block? accepts only super_blocks.
+  (check (= #t (super-block? (make-super-block 1 2097152 42))))
+  (check (= #f (super-block? 'not-a-sb)))
+  (check (= #f (super-block? 42))))
+
+(test-suite "08-002-super-block-has-valid-magic"
+  ; has-valid-super-block-magic? returns #t.
+  (check (= #t (has-valid-super-block-magic?
+                 (make-super-block 1 2097152 42))))
+
+(test-suite "08-002-super-block-setters"
+  ; super-block setters update fields.
+  (check (= 2 (let ((sb (make-super-block 1 2097152 42)))
+                (super-block-set-format-version! sb 2)
+                (super-block-get-format-version sb))))
+  (check (= 4194304 (let ((sb (make-super-block 1 2097152 42)))
+                    (super-block-set-block-size! sb 4194304)
+                    (super-block-get-block-size sb))))
+  (check (= 100 (let ((sb (make-super-block 1 2097152 42)))
+                 (super-block-set-file-id! sb 100)
+                 (super-block-get-file-id sb))))
+
+; ----------------------------------------------------------------
+; ObMacroBlockHeader
+; ----------------------------------------------------------------
+
+(test-suite "08-003-macro-block-header-construction"
+  ; macro_block_header preserves type, checksum, micro-block-count.
+  (check (= BLOCK-TYPE-DATA (macro-block-header-get-type
+                                (make-macro-block-header BLOCK-TYPE-DATA 12345 10))))
+  (check (= 12345 (macro-block-header-get-checksum
+                   (make-macro-block-header BLOCK-TYPE-DATA 12345 10))))
+  (check (= 10 (macro-block-header-get-micro-block-count
+                (make-macro-block-header BLOCK-TYPE-DATA 12345 10)))))
+
+(test-suite "08-003-macro-block-header-magic"
+  ; macro_block_header has correct magic.
+  (check (= #t (eq? BF-MACRO-BLOCK-HEADER-MAGIC
+                 (macro-block-header-get-magic
+                   (make-macro-block-header BLOCK-TYPE-DATA 0 0)))))
+
+(test-suite "08-003-macro-block-header-predicate"
+  ; macro-block-header? accepts only macro_headers.
+  (check (= #t (macro-block-header?
+                 (make-macro-block-header BLOCK-TYPE-DATA 0 0))))
+  (check (= #f (macro-block-header? 'not-a-mbh)))
+  (check (= #f (macro-block-header? 42))))
+
+(test-suite "08-003-macro-block-header-has-valid-magic"
+  ; has-valid-macro-block-magic? returns #t.
+  (check (= #t (has-valid-macro-block-magic?
+                 (make-macro-block-header BLOCK-TYPE-DATA 0 0))))
+
+(test-suite "08-003-macro-block-header-size"
+  ; macro-block-header-size is OB-DEFAULT-MACRO-BLOCK-SIZE.
+  (check (= OB-DEFAULT-MACRO-BLOCK-SIZE
+             (macro-block-header-get-size
+               (make-macro-block-header BLOCK-TYPE-DATA 0 0)))))
+
+(test-suite "08-003-macro-block-header-setters"
+  ; macro-block-header setters update fields.
+  (check (= BLOCK-TYPE-INDEX
+             (let ((mbh (make-macro-block-header BLOCK-TYPE-DATA 0 0)))
+               (macro-block-header-set-type! mbh BLOCK-TYPE-INDEX)
+               (macro-block-header-get-type mbh))))
+  (check (= 20 (let ((mbh (make-macro-block-header BLOCK-TYPE-DATA 0 10)))
+                 (macro-block-header-set-micro-block-count! mbh 20)
+                 (macro-block-header-get-micro-block-count mbh))))
+
+; ----------------------------------------------------------------
+; ObMicroBlockHeader
+; ----------------------------------------------------------------
+
+(test-suite "08-004-micro-block-header-construction"
+  ; micro_block_header preserves column-count, row-count, etc.
+  (check (= 5 (micro-block-header-get-column-count
+               (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                       COMPRESSOR-TYPE-NONE))))
+  (check (= 100 (micro-block-header-get-row-count
+                  (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                          COMPRESSOR-TYPE-NONE))))
+  (check (= ROW-STORE-TYPE-FLAT
+             (micro-block-header-get-row-store-type
+               (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                       COMPRESSOR-TYPE-NONE))))
+  (check (= 4096 (micro-block-header-get-data-length
+                  (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                          COMPRESSOR-TYPE-NONE))))
+  (check (= COMPRESSOR-TYPE-LZ4
+             (micro-block-header-get-compressor-type
+               (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                       COMPRESSOR-TYPE-LZ4)))))
+
+(test-suite "08-004-micro-block-header-magic"
+  ; micro_block_header has correct magic.
+  (check (= #t (eq? MICRO-BLOCK-HEADER-MAGIC
+                 (micro-block-header-get-magic
+                   (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                           COMPRESSOR-TYPE-NONE)))))
+
+(test-suite "08-004-micro-block-header-predicate"
+  ; micro-block-header? accepts only micro_headers.
+  (check (= #t (micro-block-header?
+                 (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                         COMPRESSOR-TYPE-NONE))))
+  (check (= #f (micro-block-header? 'not-a-mbh)))
+  (check (= #f (micro-block-header? 42))))
+
+(test-suite "08-004-micro-block-header-has-valid-magic"
+  ; has-valid-micro-block-magic? returns #t.
+  (check (= #t (has-valid-micro-block-magic?
+                 (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                         COMPRESSOR-TYPE-NONE))))
+
+(test-suite "08-004-micro-block-header-setters"
+  ; micro-block-header setters update fields.
+  (check (= 200 (let ((mbh (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                            COMPRESSOR-TYPE-NONE)))
+                  (micro-block-header-set-row-count! mbh 200)
+                  (micro-block-header-get-row-count mbh))))
+  (check (= 8192 (let ((mbh (make-micro-block-header 5 100 ROW-STORE-TYPE-FLAT 4096 0
+                                            COMPRESSOR-TYPE-NONE)))
+                  (micro-block-header-set-data-length! mbh 8192)
+                  (micro-block-header-get-data-length mbh))))
+
+; ----------------------------------------------------------------
+; ObSSTableBasicMeta
+; ----------------------------------------------------------------
+
+(test-suite "08-005-sstable-meta-construction"
+  ; sstable_meta preserves fields.
+  (check (= 1000 (sstable-meta-get-row-count
+                  (make-sstable-meta 1000 12345 5000 1048576))))
+  (check (= 12345 (sstable-meta-get-row-count-checksum
+                   (make-sstable-meta 1000 12345 5000 1048576))))
+  (check (= 5000 (sstable-meta-get-max-trans-version
+                  (make-sstable-meta 1000 12345 5000 1048576))))
+  (check (= 1048576 (sstable-meta-get-occupy-size
+                     (make-sstable-meta 1000 12345 5000 1048576)))))
+
+(test-suite "08-005-sstable-meta-predicate"
+  ; sstable-meta? accepts only sstable_metas.
+  (check (= #t (sstable-meta? (make-sstable-meta 0 0 0 0))))
+  (check (= #f (sstable-meta? 'not-a-meta)))
+  (check (= #f (sstable-meta? 42))))
+
+(test-suite "08-005-sstable-meta-setter"
+  ; sstable-meta-set-row-count! updates.
+  (check (= 2000 (let ((m (make-sstable-meta 1000 0 0 0)))
+                  (sstable-meta-set-row-count! m 2000)
+                  (sstable-meta-get-row-count m))))
+
+; ----------------------------------------------------------------
+; ObBloomFilterBlock
+; ----------------------------------------------------------------
+
+(test-suite "08-006-bloom-filter-block-construction"
+  ; bloom_filter_block preserves macro-id, row-count, nhash, nbit.
+  (check (= 1 (bloom-filter-block-get-macro-id
+               (make-bloom-filter-block 1 100 7 8192))))
+  (check (= 100 (bloom-filter-block-get-row-count
+                 (make-bloom-filter-block 1 100 7 8192))))
+  (check (= 7 (bloom-filter-block-get-nhash
+               (make-bloom-filter-block 1 100 7 8192))))
+  (check (= 8192 (bloom-filter-block-get-nbit
+                 (make-bloom-filter-block 1 100 7 8192)))))
+
+(test-suite "08-006-bloom-filter-block-predicate"
+  ; bloom-filter-block? accepts only bloom_blocks.
+  (check (= #t (bloom-filter-block?
+                 (make-bloom-filter-block 1 100 7 8192))))
+  (check (= #f (bloom-filter-block? 'not-a-bf)))
+  (check (= #f (bloom-filter-block? 42))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
