@@ -1,0 +1,163 @@
+; 043-swap_test.aura
+; =====================
+; Smoke tests for 043-swap.aura — swap subsystem minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/043-swap_test.aura
+;
+; Verified automatically (smoke):
+;   - swap_info_struct / swap_entry_t / swap_count construction
+;   - swap-info? / swap-entry? / swap-count? predicates
+;   - swap-info-add-page / remove-page (page count tracking)
+;   - swap-inc / swap-dec (per-page refcount)
+;   - swap-count-continued? / set-continued!
+;
+; Verified via separate probes during development:
+;   - swap-info-remove-page clamped at 0
+;   - swap-dec clamped at 0
+;
+; Deferred (full Linux swap):
+;   - real backing store I/O
+;   - swap_activate / swap_deactivate
+;   - swap entry encoding (PTE-format)
+;   - swapoff / swapon syscalls
+;   - cgroup memory.swap.*
+;   - zswap / zram / zpool
+;   - swap slot allocation bitmap
+;   - swap cache
+
+(require "std/test" all:)
+(require "043-swap" all:)
+
+; ----------------------------------------------------------------
+; swap_info_struct construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "swap-001-info-construction"
+  ; swap_info_struct preserves flags, max; pages=0 initially.
+  (check (= 1 (swap-info-flags (make-swap-info 1 1000))))
+  (check (= 1000 (swap-info-max (make-swap-info 1 1000))))
+  (check (= 0 (swap-info-pages (make-swap-info 1 1000)))))
+
+(test-suite "swap-001-info-predicate"
+  ; swap-info? accepts only swap_info_struct closures.
+  (check (= 1 (if (swap-info? (make-swap-info 1 100)) 1 0)))
+  (check (= 1 (if (not (swap-info? 'not-a-swap)) 1 0)))
+  (check (= 1 (if (not (swap-info? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; swap_info add/remove page
+; ----------------------------------------------------------------
+
+(test-suite "swap-002-info-add-page"
+  ; swap-info-add-page increments pages.
+  (check (= 1 (let ((s (make-swap-info 1 1000)))
+                (swap-info-add-page s)
+                (swap-info-pages s)))))
+
+(test-suite "swap-002-info-add-multiple"
+  ; Multiple add-page accumulate.
+  (check (= 5 (let ((s (make-swap-info 1 1000)))
+                (swap-info-add-page s)
+                (swap-info-add-page s)
+                (swap-info-add-page s)
+                (swap-info-add-page s)
+                (swap-info-add-page s)
+                (swap-info-pages s)))))
+
+(test-suite "swap-002-info-remove-page"
+  ; swap-info-remove-page decrements pages.
+  (check (= 2 (let ((s (make-swap-info 1 1000)))
+                (swap-info-add-page s)
+                (swap-info-add-page s)
+                (swap-info-add-page s)
+                (swap-info-remove-page s)
+                (swap-info-pages s)))))
+
+(test-suite "swap-002-info-remove-clamp-zero"
+  ; swap-info-remove-page at 0 stays at 0.
+  (check (= 0 (let ((s (make-swap-info 1 1000)))
+                (swap-info-remove-page s)
+                (swap-info-pages s)))))
+
+; ----------------------------------------------------------------
+; swap_entry construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "swap-003-entry-construction"
+  ; swap_entry_t preserves type, offset.
+  (check (= 1 (swap-entry-type (make-swap-entry 1 4096))))
+  (check (= 4096 (swap-entry-offset (make-swap-entry 1 4096)))))
+
+(test-suite "swap-003-entry-predicate"
+  ; swap-entry? accepts only swap_entry_t closures.
+  (check (= 1 (if (swap-entry? (make-swap-entry 1 0)) 1 0)))
+  (check (= 1 (if (not (swap-entry? 'not-an-entry)) 1 0)))
+  (check (= 1 (if (not (swap-entry? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; swap_count construction + predicate + continued?
+; ----------------------------------------------------------------
+
+(test-suite "swap-004-count-construction"
+  ; swap_count preserves count, continued?.
+  (check (= 3 (swap-count-count (make-swap-count 3 #f))))
+  (check (= 1 (if (not (swap-count-continued?
+                         (make-swap-count 3 #f))) 1 0))))
+
+(test-suite "swap-004-count-continued-init"
+  ; make-swap-count with #t sets continued?.
+  (check (= 1 (if (swap-count-continued?
+                    (make-swap-count 3 #t)) 1 0))))
+
+(test-suite "swap-004-count-set-continued"
+  ; swap-count-set-continued! toggles flag.
+  (check (= 1 (let ((sc (make-swap-count 3 #f)))
+                (swap-count-set-continued! sc #t)
+                (if (swap-count-continued? sc) 1 0)))))
+
+(test-suite "swap-004-count-predicate"
+  ; swap-count? accepts only swap_count closures.
+  (check (= 1 (if (swap-count? (make-swap-count 1 #f)) 1 0)))
+  (check (= 1 (if (not (swap-count? 'not-a-count)) 1 0)))
+  (check (= 1 (if (not (swap-count? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; swap-inc / swap-dec
+; ----------------------------------------------------------------
+
+(test-suite "swap-005-inc"
+  ; swap-inc increments refcount.
+  (check (= 2 (let ((sc (make-swap-count 1 #f)))
+                (swap-inc sc)
+                (swap-count-count sc)))))
+
+(test-suite "swap-005-inc-multiple"
+  ; Multiple inc accumulate.
+  (check (= 5 (let ((sc (make-swap-count 1 #f)))
+                (swap-inc sc)
+                (swap-inc sc)
+                (swap-inc sc)
+                (swap-inc sc)
+                (swap-count-count sc)))))
+
+(test-suite "swap-005-dec"
+  ; swap-dec decrements refcount.
+  (check (= 1 (let ((sc (make-swap-count 3 #f)))
+                (swap-dec sc)
+                (swap-dec sc)
+                (swap-count-count sc)))))
+
+(test-suite "swap-005-dec-clamp-zero"
+  ; swap-dec at 0 stays at 0.
+  (check (= 0 (let ((sc (make-swap-count 0 #f)))
+                (swap-dec sc)
+                (swap-count-count sc)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

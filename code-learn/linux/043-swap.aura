@@ -1,0 +1,205 @@
+; 043-swap.aura
+; =====================
+; swap — minimal capability port to aura.
+;
+; Maps to: Linux kernel swap subsystem
+; Source: mm/swapfile.c + mm/swap_state.c + include/linux/swap.h
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux swap subsystem evicts pages from RAM to backing store:
+;   - struct swap_info_struct (swap device descriptor: flags,
+;     pages, max)
+;   - struct swap_entry_t (PTE-encoded swap entry: type, offset)
+;   - swap_count (per-page reference count + continued flag)
+;   - swapin / swapout (page in/out)
+;   - swap_activate / swap_deactivate
+;   - swapfile_readpage / swapfile_writepage
+;   - SWP_USED / SWP_WRITEOK flags
+;   - swap_count_continued (multi-page continuation count)
+;
+; aura has no memory backing store, no I/O. v1 ships:
+;   - make-swap-info (flags, pages, max)
+;   - make-swap-entry (type, offset)
+;   - make-swap-count (count, continued?)
+;   - swap-info-add-page / swap-info-remove-page (count tracking)
+;   - swap-inc / swap-dec (per-page refcount, clamped at 0)
+;   - swap-info? / swap-entry? / swap-count? predicates
+;
+; Deferred (full Linux swap):
+;   - real backing store I/O (swapfile_readpage / writepage)
+;   - swap_activate / swap_deactivate (mempolicy integration)
+;   - swap entry encoding (PTE-format)
+;   - swapoff / swapon syscalls
+;   - cgroup memory.swap.* controls
+;   - zswap / zram / zpool
+;   - swap slot allocation bitmap
+;   - swap cache
+;   - cluster / readaround optimization
+
+(export
+  make-swap-info
+  swap-info?
+  swap-info-flags
+  swap-info-pages
+  swap-info-max
+  swap-info-add-page
+  swap-info-remove-page
+  make-swap-entry
+  swap-entry?
+  swap-entry-type
+  swap-entry-offset
+  make-swap-count
+  swap-count?
+  swap-count-count
+  swap-count-continued?
+  swap-count-set-continued!
+  swap-inc
+  swap-dec)
+
+; ----------------------------------------------------------------
+; swap_info_struct — closure-based, mutable pages count
+; ----------------------------------------------------------------
+
+; make-swap-info: create a swap device descriptor.
+; Args: flags (integer), max (integer — max pages)
+; Returns: swap_info_struct closure (initial: 0 pages used).
+(define (make-swap-info flags max)
+  (let ((pages 0))
+    (letrec ((set-pages! (lambda (v) (set! pages v) v))
+             (inc-pages!  (lambda () (set! pages (+ pages 1)) pages))
+             (dec-pages!  (lambda () (set! pages (- pages 1)) pages))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'pages) pages)
+                       ((eq? msg 'max)   max)
+                       ((eq? msg 'set-pages!) set-pages!)
+                       ((eq? msg 'inc-pages!)  inc-pages!)
+                       ((eq? msg 'dec-pages!)  dec-pages!)
+                       (else #f)))))
+      self)))
+
+; swap-info?: is the object a swap_info_struct?
+; Detected by querying 'max — only swap_info_struct closures return
+; a positive integer for max.
+(define (swap-info? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'max)))
+        (if (and (integer? m) (> m 0)) #t #f))
+      #f))
+
+; swap-info-flags: get swap flags (SWP_USED etc.)
+(define (swap-info-flags info) (info 'flags))
+
+; swap-info-pages: get current pages used
+(define (swap-info-pages info) (info 'pages))
+
+; swap-info-max: get max pages capacity
+(define (swap-info-max info) (info 'max))
+
+; swap-info-add-page: increment pages used.
+; Returns the new pages count.
+(define (swap-info-add-page info)
+  ((info 'inc-pages!)))
+
+; swap-info-remove-page: decrement pages used (clamped at 0).
+; Returns the new pages count.
+(define (swap-info-remove-page info)
+  (let ((current (info 'pages)))
+    (if (= current 0)
+        0
+        ((info 'dec-pages!)))))
+
+; ----------------------------------------------------------------
+; swap_entry_t — closure-based (PTE-encoded swap entry)
+; ----------------------------------------------------------------
+
+; make-swap-entry: create a swap entry.
+; Args: type (integer — swap slot type), offset (integer — page
+;       offset within swap slot)
+; Returns: swap_entry_t closure.
+(define (make-swap-entry type offset)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'offset) offset)
+                     (else #f)))))
+    self))
+
+; swap-entry?: is the object a swap_entry_t?
+; Detected by querying 'type — only swap_entry_t closures return an
+; integer for type.
+(define (swap-entry? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'type)))
+        (if (integer? t) #t #f))
+      #f))
+
+; swap-entry-type: get swap slot type
+(define (swap-entry-type entry) (entry 'type))
+
+; swap-entry-offset: get page offset within slot
+(define (swap-entry-offset entry) (entry 'offset))
+
+; ----------------------------------------------------------------
+; swap_count — closure-based, mutable count + continued flag
+; ----------------------------------------------------------------
+
+; make-swap-count: create a per-page reference count.
+; Args: count (integer), continued? (boolean — part of multi-page
+;       continuation?)
+; Returns: swap_count closure.
+(define (make-swap-count count continued?)
+  (letrec ((set-count!      (lambda (v) (set! count v) v))
+           (set-continued!  (lambda (v) (set! continued? v) v))
+           (inc-count!      (lambda () (set! count (+ count 1)) count))
+           (dec-count!      (lambda () (set! count (- count 1)) count))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'count) count)
+                     ((eq? msg 'continued?) continued?)
+                     ((eq? msg 'set-count!)     set-count!)
+                     ((eq? msg 'set-continued!) set-continued!)
+                     ((eq? msg 'inc-count!)     inc-count!)
+                     ((eq? msg 'dec-count!)     dec-count!)
+                     (else #f)))))
+    self))
+
+; swap-count?: is the object a swap_count?
+; Detected by querying 'continued? — only swap_count closures return
+; a boolean.
+(define (swap-count? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'continued?)))
+        (if (or (eq? c #t) (eq? c #f)) #t #f))
+      #f))
+
+; swap-count-count: get current refcount
+(define (swap-count-count sc) (sc 'count))
+
+; swap-count-continued?: is this part of a multi-page continuation?
+(define (swap-count-continued? sc) (sc 'continued?))
+
+; swap-count-set-continued!: set continued flag (for testing).
+; Returns the new continued state.
+(define (swap-count-set-continued! sc value)
+  ((sc 'set-continued!) value))
+
+; ----------------------------------------------------------------
+; Per-page reference count operations
+; ----------------------------------------------------------------
+
+; swap-inc: increment per-page refcount (proxy).
+; Returns the new count.
+(define (swap-inc sc)
+  ((sc 'inc-count!)))
+
+; swap-dec: decrement per-page refcount (clamped at 0).
+; Returns the new count.
+(define (swap-dec sc)
+  (let ((current (sc 'count)))
+    (if (= current 0)
+        0
+        ((sc 'dec-count!)))))
