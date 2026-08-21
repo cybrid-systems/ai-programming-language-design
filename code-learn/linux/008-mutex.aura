@@ -1,0 +1,103 @@
+; 008-mutex.aura
+; ==================
+; Mutex — minimal capability port to aura.
+;
+; Maps to: 008-mutex-analysis.md
+; Source: include/linux/mutex.h + kernel/locking/mutex.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux mutex integrates with the scheduler:
+;   - mutex_lock blocks (puts current task to sleep via schedule)
+;   - Optimistic spinning (MCS osq) — fast-path optimization
+;   - atomic_long_t owner with bit flags (WAITERS / HANDOFF / PICKUP)
+;   - debug_mutexes / lockdep integration
+;   - rt_mutex (priority-inheritance variant)
+;
+; aura has no scheduler, no atomics, no debug subsystems.
+; v1 ships the data structure + acquire/release semantics (single-threaded):
+;   - make-mutex
+;   - mutex-lock (acquire — instant in single-threaded)
+;   - mutex-unlock (release)
+;   - mutex-trylock (non-blocking acquire — returns #t/#f)
+;   - mutex-locked?
+;   - mutex-owner (current owner value or #f)
+;
+; Deferred (full Linux mutex, separate issues):
+;   - Blocking (mutex_lock calls schedule on contention)
+;   - Optimistic spinning (MCS osq)
+;   - Atomic owner with bit flags
+;   - rt_mutex (priority inheritance)
+;   - debug_mutexes / lockdep
+;   - Mutex wait queue (FIFO via first_waiter)
+;   - CONFIG_DEBUG_LOCK_ALLOC
+
+(export
+  make-mutex
+  mutex-locked?
+  mutex-lock
+  mutex-unlock
+  mutex-trylock
+  mutex-owner)
+
+; ----------------------------------------------------------------
+; Mutex (closure with owner field)
+; ----------------------------------------------------------------
+
+; Make a mutex. owner=#f means unlocked.
+(define (make-mutex)
+  (let ((owner #f)
+        (waiters 0))             ; count of pending lock attempts (informational)
+    (letrec ((set-owner! (lambda (v) (set! owner v) v))
+             (set-waiters! (lambda (v) (set! waiters v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'owner) owner)
+                       ((eq? msg 'waiters) waiters)
+                       ((eq? msg 'set-owner!) set-owner!)
+                       ((eq? msg 'set-waiters!) set-waiters!)
+                       ((eq? msg 'locked?) (not (not owner)))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+; mutex-locked?: is the mutex currently held?
+(define (mutex-locked? m)
+  (not (not (m 'owner))))
+
+; mutex-owner: current owner value, or #f if unlocked.
+(define (mutex-owner m)
+  (m 'owner))
+
+; ----------------------------------------------------------------
+; Acquire / release
+; ----------------------------------------------------------------
+
+; mutex-lock: acquire the mutex, setting caller as owner.
+; Single-threaded: instant. In a real OS, this would block on contention.
+; The caller passes an owner token (typically current thread id).
+; Returns the owner token on success.
+(define (mutex-lock m owner-token)
+  ((m 'set-owner!) owner-token)
+  owner-token)
+
+; mutex-trylock: try to acquire without blocking.
+; Returns owner-token on success, #f if already held.
+(define (mutex-trylock m owner-token)
+  (if (mutex-locked? m)
+      #f
+      (begin
+        ((m 'set-owner!) owner-token)
+        owner-token)))
+
+; mutex-unlock: release the mutex.
+; Returns #t on success, #f if the mutex was not held.
+(define (mutex-unlock m)
+  (if (mutex-locked? m)
+      (begin
+        ((m 'set-owner!) #f)
+        #t)
+      #f))

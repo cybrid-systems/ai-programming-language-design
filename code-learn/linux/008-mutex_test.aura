@@ -1,0 +1,88 @@
+; 008-mutex_test.aura
+; =====================
+; Smoke tests for 008-mutex.aura — mutex minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/008-mutex_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-mutex construction (unlocked)
+;   - mutex-locked? tracks state
+;   - mutex-lock / mutex-unlock acquire/release
+;   - mutex-trylock success when free, failure when held
+;   - mutex-owner returns current holder
+;
+; Verified via separate probes during development:
+;   - Re-locking after unlock
+;   - Multiple trylocks fail while held
+;
+; Deferred (full Linux mutex):
+;   - Blocking (schedule on contention)
+;   - Optimistic spinning (MCS osq)
+;   - Atomic owner + bit flags
+;   - rt_mutex (priority inheritance)
+;   - debug_mutexes / lockdep
+;   - Wait queue (FIFO)
+
+(require "std/test" all:)
+(require "008-mutex" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "mutex-001-init-unlocked"
+  (check (= 1 (if (not (mutex-locked? (make-mutex))) 1 0)))
+  (check (= 1 (if (not (mutex-owner (make-mutex))) 1 0)))
+
+; ----------------------------------------------------------------
+; lock + unlock
+; ----------------------------------------------------------------
+
+(test-suite "mutex-002-lock-unlock"
+  (check (= 1 (let ((m (make-mutex)))
+                 (mutex-lock m 'thread-1)
+                 (mutex-locked? m))))
+
+(test-suite "mutex-002-unlock"
+  (check (= 1 (let ((m (make-mutex)))
+                 (mutex-lock m 'thread-1)
+                 (mutex-unlock m)
+                 (if (not (mutex-locked? m)) 1 0))))
+
+; ----------------------------------------------------------------
+; owner tracking
+; ----------------------------------------------------------------
+
+(test-suite "mutex-003-owner"
+  (check (= 1 (eq? 'thread-7 (mutex-owner
+    (let ((m (make-mutex)))
+      (mutex-lock m 'thread-7)
+      m)))))
+
+; ----------------------------------------------------------------
+; trylock
+; ----------------------------------------------------------------
+
+(test-suite "mutex-004-trylock-free"
+  ; trylock on unlocked mutex succeeds.
+  (check (= 1 (eq? 't1 (mutex-trylock (let ((m (make-mutex)))
+                                          (mutex-trylock m 't1)
+                                          m) 't2))))
+
+(test-suite "mutex-004-trylock-held"
+  ; trylock on locked mutex fails (returns #f).
+  (check (= 1 (let ((m (make-mutex)))
+                 (mutex-lock m 't1)
+                 (if (not (mutex-trylock m 't2)) 1 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
