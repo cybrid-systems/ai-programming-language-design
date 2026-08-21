@@ -1,0 +1,160 @@
+; 042-memcg_test.aura
+; ======================
+; Smoke tests for 042-memcg.aura — memory cgroup minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/042-memcg_test.aura
+;
+; Verified automatically (smoke):
+;   - mem_cgroup construction (id, name, limit, current, peak, events)
+;   - mem-cgroup? predicate
+;   - mem-cgroup-set-limit!
+;   - mem-cgroup-charge / uncharge (proxy via event counters)
+;   - 5 event counters + mem-cgroup-event-increment!
+;   - mem-cgroup-reset
+;
+; Verified via separate probes during development:
+;   - Each event counter starts at 0 + increments independently
+;   - mem-cgroup-event-increment! with invalid event returns 0
+;
+; Deferred (full Linux memcg):
+;   - real per-page accounting
+;   - try_to_free_pages / reclaim
+;   - memory.high soft limit
+;   - memcg-aware OOM killer
+;   - memcg kmem / swap accounting
+
+(require "std/test" all:)
+(require "042-memcg" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "memcg-001-construction"
+  ; mem_cgroup preserves id, name, limit, current, peak.
+  (check (= 1 (mem-cgroup-id (make-mem-cgroup 1 'app 1000000 100000))))
+  (check (= 'app (mem-cgroup-name (make-mem-cgroup 1 'app 1000000 100000))))
+  (check (= 1000000 (mem-cgroup-limit
+                      (make-mem-cgroup 1 'app 1000000 100000))))
+  (check (= 100000 (mem-cgroup-current
+                     (make-mem-cgroup 1 'app 1000000 100000))))
+  (check (= 100000 (mem-cgroup-peak
+                    (make-mem-cgroup 1 'app 1000000 100000)))))
+
+(test-suite "memcg-001-predicate"
+  ; mem-cgroup? accepts only mem_cgroup closures.
+  (check (= 1 (if (mem-cgroup? (make-mem-cgroup 1 'a 0 0)) 1 0)))
+  (check (= 1 (if (not (mem-cgroup? 'not-a-cgroup)) 1 0)))
+  (check (= 1 (if (not (mem-cgroup? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Event counters init
+; ----------------------------------------------------------------
+
+(test-suite "memcg-002-events-init"
+  ; All 5 events start at 0.
+  (check (= 0 (mem-cgroup-event-low
+               (make-mem-cgroup 1 'a 0 0))))
+  (check (= 0 (mem-cgroup-event-high
+               (make-mem-cgroup 1 'a 0 0))))
+  (check (= 0 (mem-cgroup-event-max
+               (make-mem-cgroup 1 'a 0 0))))
+  (check (= 0 (mem-cgroup-event-oom
+               (make-mem-cgroup 1 'a 0 0))))
+  (check (= 0 (mem-cgroup-event-kill
+               (make-mem-cgroup 1 'a 0 0)))))
+
+; ----------------------------------------------------------------
+; set-limit!
+; ----------------------------------------------------------------
+
+(test-suite "memcg-003-set-limit"
+  ; mem-cgroup-set-limit! updates limit.
+  (check (= 2000000 (let ((cg (make-mem-cgroup 1 'app 1000000 0)))
+                      (mem-cgroup-set-limit! cg 2000000)
+                      (mem-cgroup-limit cg)))))
+
+; ----------------------------------------------------------------
+; charge / uncharge (proxy via events)
+; ----------------------------------------------------------------
+
+(test-suite "memcg-004-charge"
+  ; mem-cgroup-charge increments low event counter as proxy.
+  (check (= 1 (let ((cg (make-mem-cgroup 1 'app 1000000 0)))
+                (mem-cgroup-charge cg 4096)
+                (mem-cgroup-event-low cg)))))
+
+(test-suite "memcg-004-charge-multiple"
+  ; Multiple charges accumulate.
+  (check (= 3 (let ((cg (make-mem-cgroup 1 'app 1000000 0)))
+                (mem-cgroup-charge cg 4096)
+                (mem-cgroup-charge cg 8192)
+                (mem-cgroup-charge cg 16384)
+                (mem-cgroup-event-low cg)))))
+
+(test-suite "memcg-004-uncharge"
+  ; mem-cgroup-uncharge increments high event counter as proxy.
+  (check (= 1 (let ((cg (make-mem-cgroup 1 'app 1000000 0)))
+                (mem-cgroup-uncharge cg 4096)
+                (mem-cgroup-event-high cg)))))
+
+; ----------------------------------------------------------------
+; event-increment!
+; ----------------------------------------------------------------
+
+(test-suite "memcg-005-event-increment-low"
+  ; mem-cgroup-event-increment! increments low event.
+  (check (= 1 (let ((cg (make-mem-cgroup 1 'a 0 0)))
+                (mem-cgroup-event-increment! cg 'low)
+                (mem-cgroup-event-low cg)))))
+
+(test-suite "memcg-005-event-increment-max"
+  ; mem-cgroup-event-increment! increments max event.
+  (check (= 1 (let ((cg (make-mem-cgroup 1 'a 0 0)))
+                (mem-cgroup-event-increment! cg 'max)
+                (mem-cgroup-event-max cg)))))
+
+(test-suite "memcg-005-event-increment-oom"
+  ; mem-cgroup-event-increment! increments oom event.
+  (check (= 1 (let ((cg (make-mem-cgroup 1 'a 0 0)))
+                (mem-cgroup-event-increment! cg 'oom)
+                (mem-cgroup-event-oom cg)))))
+
+(test-suite "memcg-005-event-increment-kill"
+  ; mem-cgroup-event-increment! increments kill event.
+  (check (= 1 (let ((cg (make-mem-cgroup 1 'a 0 0)))
+                (mem-cgroup-event-increment! cg 'kill)
+                (mem-cgroup-event-kill cg)))))
+
+(test-suite "memcg-005-event-increment-invalid"
+  ; mem-cgroup-event-increment! with invalid event returns 0.
+  (check (= 0 (let ((cg (make-mem-cgroup 1 'a 0 0)))
+                (mem-cgroup-event-increment! cg 'invalid)))))
+
+; ----------------------------------------------------------------
+; reset
+; ----------------------------------------------------------------
+
+(test-suite "memcg-006-reset"
+  ; mem-cgroup-reset clears all 5 event counters.
+  (check (= 0 (let ((cg (make-mem-cgroup 1 'app 1000000 0)))
+                (mem-cgroup-event-increment! cg 'low)
+                (mem-cgroup-event-increment! cg 'high)
+                (mem-cgroup-event-increment! cg 'max)
+                (mem-cgroup-event-increment! cg 'oom)
+                (mem-cgroup-event-increment! cg 'kill)
+                (mem-cgroup-reset cg)
+                (+ (mem-cgroup-event-low cg)
+                   (mem-cgroup-event-high cg)
+                   (mem-cgroup-event-max cg)
+                   (mem-cgroup-event-oom cg)
+                   (mem-cgroup-event-kill cg))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
