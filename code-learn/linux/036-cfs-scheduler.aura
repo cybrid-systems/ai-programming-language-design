@@ -1,0 +1,210 @@
+; 036-cfs-scheduler.aura
+; ========================
+; cfs_scheduler — minimal capability port to aura.
+;
+; Maps to: Linux kernel CFS (Completely Fair Scheduler)
+; Source: kernel/sched/fair.c + include/linux/sched.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux CFS is the default fair scheduler providing:
+;   - struct sched_entity (se): load, weight, vruntime,
+;     sum_exec_runtime, on_rq, depth
+;   - struct cfs_rq: nr_running, min_vruntime, tasks_timeline
+;     (RB-tree), tasks_weighted_sum, runnable_load_avg
+;   - enqueue_task_cfs / dequeue_task_cfs
+;   - pick_next_task_cfs (returns leftmost = lowest vruntime)
+;   - update_curr_cfs (entity runs for delta, increases vruntime)
+;   - sched_slice / sched_min_granularity / sched_latency
+;   - entity_key: vruntime - cfs_rq.min_vruntime (used in RB-tree key)
+;
+; aura has no kernel, no scheduler, no vruntime clock. v1 ships:
+;   - make-sched-entity (load, weight, vruntime) + set-vruntime!
+;   - make-cfs-rq (nr-running, min-vruntime, tasks list)
+;   - cfs-rq-enqueue-task / cfs-rq-dequeue-task
+;   - cfs-rq-pick-next-task (returns min-vruntime entity or #f)
+;   - cfs-rq-update-curr (entity runs for delta, increments vruntime)
+;   - cfs-rq-nr-running / cfs-rq-min-vruntime
+;   - sched-entity? / cfs-rq? predicates
+;
+; Deferred (full Linux CFS):
+;   - real vruntime clock (sched_clock)
+;   - RB-tree of tasks (leftmost = next)
+;   - load tracking (load_avg, runnable_load_avg)
+;   - wakeup preemption
+;   - sched_slice / sched_min_granularity
+;   - sched_entity_on_rq flag
+;   - migration / load balancing
+;   - entity_key (vruntime - min_vruntime)
+;   - PELT (per-entity load tracking)
+;   - throttled / throttled_clock
+
+(export
+  make-sched-entity
+  sched-entity?
+  sched-entity-load
+  sched-entity-weight
+  sched-entity-vruntime
+  sched-entity-set-vruntime!
+  make-cfs-rq
+  cfs-rq?
+  cfs-rq-nr-running
+  cfs-rq-min-vruntime
+  cfs-rq-enqueue-task
+  cfs-rq-dequeue-task
+  cfs-rq-pick-next-task
+  cfs-rq-update-curr)
+
+; ----------------------------------------------------------------
+; sched_entity — closure-based, mutable vruntime
+; ----------------------------------------------------------------
+
+; make-sched-entity: create a scheduler entity.
+; Args: load (integer), weight (integer), vruntime (integer)
+; Returns: sched_entity closure.
+(define (make-sched-entity load weight vruntime)
+  (letrec ((set-vruntime! (lambda (v) (set! vruntime v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'load) load)
+                     ((eq? msg 'weight) weight)
+                     ((eq? msg 'vruntime) vruntime)
+                     ((eq? msg 'set-vruntime!) set-vruntime!)
+                     (else #f)))))
+    self))
+
+; sched-entity?: is the object a sched_entity?
+; Detected by querying 'weight — only sched_entity closures return
+; a positive integer for weight.
+(define (sched-entity? obj)
+  (if (procedure? obj)
+      (let ((w (obj 'weight)))
+        (if (and (integer? w) (> w 0)) #t #f))
+      #f))
+
+; sched-entity-load: get entity load
+(define (sched-entity-load se) (se 'load))
+
+; sched-entity-weight: get entity weight (sched_weight)
+(define (sched-entity-weight se) (se 'weight))
+
+; sched-entity-vruntime: get entity vruntime
+(define (sched-entity-vruntime se) (se 'vruntime))
+
+; sched-entity-set-vruntime!: set entity vruntime (for testing)
+(define (sched-entity-set-vruntime! se new-vruntime)
+  ((se 'set-vruntime!) new-vruntime))
+
+; ----------------------------------------------------------------
+; cfs_rq — closure-based, mutable tasks list + min-vruntime
+; ----------------------------------------------------------------
+
+; make-cfs-rq: create a CFS runqueue.
+; Returns: cfs_rq closure (initial: 0 running, min-vruntime 0).
+(define (make-cfs-rq)
+  (let ((nr-running 0)
+        (min-vruntime 0)
+        (tasks '()))
+    (letrec ((set-nr-running!  (lambda (v) (set! nr-running v) v))
+             (set-min-vruntime! (lambda (v) (set! min-vruntime v) v))
+             (set-tasks!        (lambda (v) (set! tasks v) v))
+             (inc-nr-running!   (lambda () (set! nr-running (+ nr-running 1)) nr-running))
+             (dec-nr-running!   (lambda () (set! nr-running (- nr-running 1)) nr-running))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'nr-running) nr-running)
+                       ((eq? msg 'min-vruntime) min-vruntime)
+                       ((eq? msg 'tasks) tasks)
+                       ((eq? msg 'set-nr-running!)  set-nr-running!)
+                       ((eq? msg 'set-min-vruntime!) set-min-vruntime!)
+                       ((eq? msg 'set-tasks!)        set-tasks!)
+                       ((eq? msg 'inc-nr-running!)   inc-nr-running!)
+                       ((eq? msg 'dec-nr-running!)   dec-nr-running!)
+                       (else #f)))))
+      self)))
+
+; cfs-rq?: is the object a cfs_rq?
+; Detected by querying 'tasks — only cfs_rq closures return a list.
+(define (cfs-rq? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'tasks)) #t #f)
+      #f))
+
+; cfs-rq-nr-running: get count of running tasks
+(define (cfs-rq-nr-running rq) (rq 'nr-running))
+
+; cfs-rq-min-vruntime: get min vruntime
+(define (cfs-rq-min-vruntime rq) (rq 'min-vruntime))
+
+; ----------------------------------------------------------------
+; Enqueue / dequeue
+; ----------------------------------------------------------------
+
+; cfs-rq-enqueue-task: enqueue a sched_entity on this runqueue.
+; Updates nr-running + min-vruntime (if entity has lower vruntime).
+; Returns the new nr-running.
+(define (cfs-rq-enqueue-task rq se)
+  ((rq 'set-tasks!) (cons se (rq 'tasks)))
+  ((rq 'inc-nr-running!))
+  (let ((entity-vruntime (sched-entity-vruntime se))
+        (current-min (rq 'min-vruntime)))
+    (if (< entity-vruntime current-min)
+        ((rq 'set-min-vruntime!) entity-vruntime)))
+  (rq 'nr-running))
+
+; cfs-rq-dequeue-task: dequeue a sched_entity from this runqueue.
+; Decrements nr-running (clamped at 0).
+; Returns the new nr-running.
+(define (cfs-rq-dequeue-task rq se)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((rq 'set-tasks!)
+                             (cons-rev acc '()))
+                            ((rq 'set-tasks!) acc))
+                        found?)
+                       ((eq? (car rest) se)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (rq 'tasks) '()))
+  (let ((current (rq 'nr-running)))
+    (if (= current 0)
+        0
+        ((rq 'dec-nr-running!)))))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; ----------------------------------------------------------------
+; Pick next task
+; ----------------------------------------------------------------
+
+; cfs-rq-pick-next-task: return the sched_entity with the smallest
+; vruntime. Returns #f if no tasks.
+(define (cfs-rq-pick-next-task rq)
+  (let loop ((rest (rq 'tasks)) (best #f))
+    (cond
+      ((null? rest) best)
+      ((or (eq? best #f)
+           (< (sched-entity-vruntime (car rest))
+              (sched-entity-vruntime best)))
+       (loop (cdr rest) (car rest)))
+      (else
+       (loop (cdr rest) best)))))
+
+; ----------------------------------------------------------------
+; update_curr
+; ----------------------------------------------------------------
+
+; cfs-rq-update-curr: an entity ran for `delta` time. Increase its
+; vruntime by delta. Returns the new vruntime.
+(define (cfs-rq-update-curr rq se delta)
+  (let ((new-vruntime (+ (sched-entity-vruntime se) delta)))
+    ((se 'set-vruntime!) new-vruntime)))

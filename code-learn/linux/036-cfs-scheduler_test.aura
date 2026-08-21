@@ -1,0 +1,166 @@
+; 036-cfs-scheduler_test.aura
+; ==============================
+; Smoke tests for 036-cfs-scheduler.aura — CFS minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/036-cfs-scheduler_test.aura
+;
+; Verified automatically (smoke):
+;   - sched_entity / cfs_rq construction
+;   - sched-entity? / cfs-rq? predicates
+;   - cfs-rq-enqueue-task (nr-running increments, min-vruntime tracks)
+;   - cfs-rq-dequeue-task (nr-running decrements, clamped at 0)
+;   - cfs-rq-update-curr (vruntime increases by delta)
+;   - cfs-rq-pick-next-task (returns min-vruntime entity)
+;
+; Verified via separate probes during development:
+;   - Multiple enqueues — pick-next-task returns the one with
+;     the lowest vruntime
+;   - update-curr changes vruntime after which pick-next-task
+;     may return a different entity
+;
+; Deferred (full Linux CFS):
+;   - real vruntime clock (sched_clock)
+;   - RB-tree of tasks (leftmost = next)
+;   - load tracking / PELT
+;   - wakeup preemption
+;   - sched_slice / sched_min_granularity
+;   - entity_key (vruntime - min_vruntime)
+
+(require "std/test" all:)
+(require "036-cfs-scheduler" all:)
+
+; ----------------------------------------------------------------
+; sched_entity construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "cfs-001-entity-construction"
+  ; sched_entity preserves load, weight, vruntime.
+  (check (= 1024 (sched-entity-load (make-sched-entity 1024 2 0))))
+  (check (= 2 (sched-entity-weight (make-sched-entity 1024 2 0))))
+  (check (= 0 (sched-entity-vruntime (make-sched-entity 1024 2 0)))))
+
+(test-suite "cfs-001-entity-set-vruntime"
+  ; sched-entity-set-vruntime! updates vruntime.
+  (check (= 5000 (let ((se (make-sched-entity 1024 2 0)))
+                  (sched-entity-set-vruntime! se 5000)
+                  (sched-entity-vruntime se)))))
+
+(test-suite "cfs-001-entity-predicate"
+  ; sched-entity? accepts only sched_entity closures.
+  (check (= 1 (if (sched-entity? (make-sched-entity 1024 2 0)) 1 0)))
+  (check (= 1 (if (not (sched-entity? 'not-an-entity)) 1 0)))
+  (check (= 1 (if (not (sched-entity? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; cfs_rq construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "cfs-002-rq-construction"
+  ; cfs_rq starts empty: nr-running=0, min-vruntime=0.
+  (check (= 0 (cfs-rq-nr-running (make-cfs-rq))))
+  (check (= 0 (cfs-rq-min-vruntime (make-cfs-rq)))))
+
+(test-suite "cfs-002-rq-predicate"
+  ; cfs-rq? accepts only cfs_rq closures.
+  (check (= 1 (if (cfs-rq? (make-cfs-rq)) 1 0)))
+  (check (= 1 (if (not (cfs-rq? 'not-an-rq)) 1 0)))
+  (check (= 1 (if (not (cfs-rq? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; enqueue / dequeue
+; ----------------------------------------------------------------
+
+(test-suite "cfs-003-enqueue"
+  ; cfs-rq-enqueue-task increments nr-running.
+  (check (= 1 (let ((rq (make-cfs-rq)))
+                (cfs-rq-enqueue-task rq
+                  (make-sched-entity 1024 2 0))
+                (cfs-rq-nr-running rq)))))
+
+(test-suite "cfs-003-enqueue-multiple"
+  ; Multiple enqueues accumulate.
+  (check (= 3 (let ((rq (make-cfs-rq)))
+                (cfs-rq-enqueue-task rq (make-sched-entity 1024 2 0))
+                (cfs-rq-enqueue-task rq (make-sched-entity 1024 2 100))
+                (cfs-rq-enqueue-task rq (make-sched-entity 1024 2 200))
+                (cfs-rq-nr-running rq)))))
+
+(test-suite "cfs-003-enqueue-min-vruntime"
+  ; cfs-rq-enqueue-task updates min-vruntime to lowest.
+  (check (= 0 (let ((rq (make-cfs-rq)))
+                (cfs-rq-enqueue-task rq (make-sched-entity 1024 2 0))
+                (cfs-rq-enqueue-task rq (make-sched-entity 1024 2 100))
+                (cfs-rq-min-vruntime rq)))))
+
+(test-suite "cfs-003-dequeue"
+  ; cfs-rq-dequeue-task decrements nr-running.
+  (check (= 1 (let ((rq (make-cfs-rq)))
+                (let ((se (make-sched-entity 1024 2 0)))
+                  (cfs-rq-enqueue-task rq se)
+                  (cfs-rq-enqueue-task rq (make-sched-entity 1024 2 100))
+                  (cfs-rq-dequeue-task rq se)
+                  (cfs-rq-nr-running rq))))))
+
+(test-suite "cfs-003-dequeue-clamp-zero"
+  ; cfs-rq-dequeue-task at 0 stays at 0.
+  (check (= 0 (let ((rq (make-cfs-rq)))
+                (let ((se (make-sched-entity 1024 2 0)))
+                  (cfs-rq-dequeue-task rq se)
+                  (cfs-rq-nr-running rq))))))
+
+; ----------------------------------------------------------------
+; update_curr
+; ----------------------------------------------------------------
+
+(test-suite "cfs-004-update-curr"
+  ; cfs-rq-update-curr increases entity vruntime by delta.
+  (check (= 100 (let ((se (make-sched-entity 1024 2 0)))
+                  (cfs-rq-update-curr (make-cfs-rq) se 100)
+                  (sched-entity-vruntime se)))))
+
+(test-suite "cfs-004-update-curr-multiple"
+  ; Multiple updates accumulate.
+  (check (= 350 (let ((se (make-sched-entity 1024 2 0)))
+                  (cfs-rq-update-curr (make-cfs-rq) se 100)
+                  (cfs-rq-update-curr (make-cfs-rq) se 150)
+                  (cfs-rq-update-curr (make-cfs-rq) se 100)
+                  (sched-entity-vruntime se)))))
+
+; ----------------------------------------------------------------
+; pick_next_task
+; ----------------------------------------------------------------
+
+(test-suite "cfs-005-pick-next-empty"
+  ; cfs-rq-pick-next-task on empty rq returns #f.
+  (check (= 1 (if (not (cfs-rq-pick-next-task (make-cfs-rq))) 1 0))))
+
+(test-suite "cfs-005-pick-next-min-vruntime"
+  ; cfs-rq-pick-next-task returns entity with min vruntime.
+  (check (= 1 (let ((rq (make-cfs-rq)))
+                (let ((a (make-sched-entity 1024 2 100))
+                      (b (make-sched-entity 1024 2 50))
+                      (c (make-sched-entity 1024 2 200)))
+                  (cfs-rq-enqueue-task rq a)
+                  (cfs-rq-enqueue-task rq b)
+                  (cfs-rq-enqueue-task rq c)
+                  (if (eq? b (cfs-rq-pick-next-task rq)) 1 0))))))
+
+(test-suite "cfs-005-pick-next-after-update"
+  ; After update-curr + enqueue, pick-next returns updated entity.
+  (check (= 1 (let ((rq (make-cfs-rq)))
+                (let ((a (make-sched-entity 1024 2 100))
+                      (b (make-sched-entity 1024 2 50)))
+                  (cfs-rq-enqueue-task rq a)
+                  (cfs-rq-enqueue-task rq b)
+                  ; b had lower vruntime; update a to be even lower
+                  (cfs-rq-update-curr rq a -200)
+                  (if (eq? a (cfs-rq-pick-next-task rq)) 1 0))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
