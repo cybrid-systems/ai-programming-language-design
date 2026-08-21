@@ -1,0 +1,300 @@
+; 046-rt-scheduler.aura
+; ========================
+; rt_scheduler — minimal capability port to aura.
+;
+; Maps to: Linux kernel Real-Time scheduler (SCHED_RR / SCHED_FIFO)
+; Source: kernel/sched/rt.c + include/linux/sched/rt.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux RT scheduler provides real-time scheduling policies:
+;   - struct sched_rt_entity (rt_se): timeout, nr_cpus_allowed,
+;     flags, priority, policy
+;   - struct rt_rq (real-time runqueue): nr_running, highest-prio,
+;     priority bitmap
+;   - rt_sched_class (scheduler class registration)
+;   - sched_setattr / sched_getattr syscalls
+;   - SCHED_RR (round-robin) / SCHED_FIFO (first-in-first-out)
+;   - rt_task_tick (timer tick handler for time slicing)
+;   - RT priority range: 0 (highest) to 99 (lowest)
+;
+; aura has no real-time scheduling, no time slicing. v1 ships:
+;   - make-rt-entity (timeout, cpus-allowed, flags, priority, policy)
+;   - rt-entity-set-priority! / set-policy! / set-timeout!
+;   - make-rt-rq (nr-running, highest-prio, bitmap-as-list)
+;   - rt-rq-enqueue-task / rt-rq-dequeue-task
+;   - rt-rq-pick-next-task (returns highest-prio entity or #f)
+;   - rt-rq-update-curr (rt-time-slice tracking)
+;   - 'fifo / 'rr policy symbols
+;   - rt-entity? / rt-rq? predicates
+;
+; Note: priority bitmap is represented as a cons-based list of pairs
+; (priority . count) — avoids broken aura bitwise arithmetic.
+;
+; Deferred (full Linux RT scheduler):
+;   - real rt_task_tick time-slice accounting
+;   - sched_setattr / sched_getattr syscalls
+;   - real-time throttling (sched_rt_runtime / sched_rt_period)
+;   - RT_GROUP_SCHED (cgroup-based RT bandwidth)
+;   - RT mutex priority inheritance
+;   - actual 100-bit bitmap implementation
+;   - RT bandwidth control
+;   - cpu.cfs_quota_us interaction with RT
+
+(export
+  make-rt-entity
+  rt-entity?
+  rt-entity-timeout
+  rt-entity-cpus-allowed
+  rt-entity-flags
+  rt-entity-priority
+  rt-entity-policy
+  rt-entity-set-priority!
+  rt-entity-set-policy!
+  rt-entity-set-timeout!
+  make-rt-rq
+  rt-rq?
+  rt-rq-nr-running
+  rt-rq-highest-prio
+  rt-rq-bitmap
+  rt-rq-enqueue-task
+  rt-rq-dequeue-task
+  rt-rq-pick-next-task
+  rt-rq-update-curr
+  'fifo
+  'rr)
+
+; ----------------------------------------------------------------
+; sched_rt_entity — closure-based, mutable state via letrec setters
+; ----------------------------------------------------------------
+
+; make-rt-entity: create a real-time scheduler entity.
+; Args: timeout (integer — runtime_ns), cpus-allowed (integer — bitmask),
+;       flags (integer), priority (integer — 0=highest, 99=lowest),
+;       policy (symbol — 'fifo or 'rr)
+; Returns: sched_rt_entity closure.
+(define (make-rt-entity timeout cpus-allowed flags priority policy)
+  (letrec ((set-priority! (lambda (v) (set! priority v) v))
+           (set-policy!   (lambda (v) (set! policy v) v))
+           (set-timeout!  (lambda (v) (set! timeout v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'timeout) timeout)
+                     ((eq? msg 'cpus-allowed) cpus-allowed)
+                     ((eq? msg 'flags) flags)
+                     ((eq? msg 'priority) priority)
+                     ((eq? msg 'policy) policy)
+                     ((eq? msg 'set-priority!) set-priority!)
+                     ((eq? msg 'set-policy!)   set-policy!)
+                     ((eq? msg 'set-timeout!)  set-timeout!)
+                     (else #f)))))
+    self))
+
+; rt-entity?: is the object a sched_rt_entity?
+; Detected by querying 'cpus-allowed — only rt_entity closures return
+; a non-negative integer (bitmask).
+(define (rt-entity? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'cpus-allowed)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; rt-entity-timeout: get runtime_ns timeout
+(define (rt-entity-timeout e) (e 'timeout))
+
+; rt-entity-cpus-allowed: get allowed CPUs bitmask
+(define (rt-entity-cpus-allowed e) (e 'cpus-allowed))
+
+; rt-entity-flags: get rt entity flags
+(define (rt-entity-flags e) (e 'flags))
+
+; rt-entity-priority: get RT priority (0=highest, 99=lowest)
+(define (rt-entity-priority e) (e 'priority))
+
+; rt-entity-policy: get scheduling policy ('fifo or 'rr)
+(define (rt-entity-policy e) (e 'policy))
+
+; rt-entity-set-priority!: set RT priority.
+; Returns the new priority.
+(define (rt-entity-set-priority! e new-prio)
+  ((e 'set-priority!) new-prio))
+
+; rt-entity-set-policy!: set scheduling policy.
+; Returns the new policy.
+(define (rt-entity-set-policy! e new-policy)
+  ((e 'set-policy!) new-policy))
+
+; rt-entity-set-timeout!: set runtime_ns timeout.
+; Returns the new timeout.
+(define (rt-entity-set-timeout! e new-timeout)
+  ((e 'set-timeout!) new-timeout))
+
+; ----------------------------------------------------------------
+; rt_rq — closure-based, mutable via letrec setters
+; Priority bitmap is a cons list of (priority . count) pairs.
+; ----------------------------------------------------------------
+
+; make-rt-rq: create a real-time runqueue.
+; Returns: rt_rq closure (initial: 0 running, prio=100 — sentinel
+; meaning "no tasks", empty bitmap).
+(define (make-rt-rq)
+  (let ((nr-running 0)
+        (highest-prio 100)
+        (bitmap '()))
+    (letrec ((set-nr-running!  (lambda (v) (set! nr-running v) v))
+             (set-highest-prio! (lambda (v) (set! highest-prio v) v))
+             (set-bitmap!       (lambda (v) (set! bitmap v) v))
+             (inc-nr-running!   (lambda () (set! nr-running (+ nr-running 1)) nr-running))
+             (dec-nr-running!   (lambda () (set! nr-running (- nr-running 1)) nr-running))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'nr-running)   nr-running)
+                       ((eq? msg 'highest-prio) highest-prio)
+                       ((eq? msg 'bitmap)       bitmap)
+                       ((eq? msg 'set-nr-running!)  set-nr-running!)
+                       ((eq? msg 'set-highest-prio!) set-highest-prio!)
+                       ((eq? msg 'set-bitmap!)       set-bitmap!)
+                       ((eq? msg 'inc-nr-running!)   inc-nr-running!)
+                       ((eq? msg 'dec-nr-running!)   dec-nr-running!)
+                       (else #f)))))
+      self)))
+
+; rt-rq?: is the object a rt_rq?
+; Detected by querying 'bitmap — only rt_rq closures return a list.
+(define (rt-rq? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'bitmap)) #t #f)
+      #f))
+
+; rt-rq-nr-running: get number of running RT tasks
+(define (rt-rq-nr-running rq) (rq 'nr-running))
+
+; rt-rq-highest-prio: get highest priority (0 = highest)
+(define (rt-rq-highest-prio rq) (rq 'highest-prio))
+
+; rt-rq-bitmap: get priority bitmap (cons list of (prio . count))
+(define (rt-rq-bitmap rq) (rq 'bitmap))
+
+; ----------------------------------------------------------------
+; Bitmap helpers — cons-based list of (priority . count) pairs
+; ----------------------------------------------------------------
+
+; bitmap-inc: increment count for `prio` in bitmap, creating entry
+; if missing.
+(define (bitmap-inc bm prio)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            (cons-rev-3 acc '())
+                            (cons-rev-3 (cons (cons prio 1) acc) '())))
+                        ((= (car (car rest)) prio)
+                         (set! found? #t)
+                         (cons-rev-3 (cons (cons prio (+ (cdr (car rest)) 1))
+                                           acc)
+                                     '()))
+                        (else
+                         (search (cdr rest) (cons (car rest) acc)))))))
+    (search bm '())))
+
+; bitmap-dec: decrement count for `prio` in bitmap, removing entry
+; when count reaches 0.
+(define (bitmap-dec bm prio)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            (cons-rev-3 acc '())
+                            (cons-rev-3 acc '())))
+                       ((= (car (car rest)) prio)
+                        (set! found? #t)
+                        (let ((new-count (- (cdr (car rest)) 1)))
+                          (if (= new-count 0)
+                              (search (cdr rest) acc)
+                              (search (cdr rest)
+                                      (cons (cons prio new-count) acc)))))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search bm '())))
+
+; bitmap-min-prio: find the lowest priority number (highest priority)
+; in bitmap. Returns #f if empty.
+(define (bitmap-min-prio bm)
+  (let loop ((rest bm) (best #f))
+    (cond
+      ((null? rest) best)
+      ((or (eq? best #f)
+           (< (car (car rest)) (car best)))
+       (loop (cdr rest) (car rest)))
+      (else
+       (loop (cdr rest) best)))))
+
+; cons-rev-3: helper — (cons-rev-3 acc rest) = (append (reverse acc) rest)
+(define (cons-rev-3 acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev-3 (cdr acc) (cons (car acc) rest))))
+
+; ----------------------------------------------------------------
+; enqueue / dequeue
+; ----------------------------------------------------------------
+
+; rt-rq-enqueue-task: enqueue a real-time entity on this runqueue.
+; Updates nr-running + highest-prio + bitmap.
+; Returns the new nr-running.
+(define (rt-rq-enqueue-task rq e)
+  ((rq 'inc-nr-running!))
+  (let ((prio (rt-entity-priority e)))
+    ((rq 'set-bitmap!) (bitmap-inc (rq 'bitmap) prio))
+    (let ((min-prio (bitmap-min-prio (rq 'bitmap))))
+      (if (and (not (eq? min-prio #f))
+               (< (car min-prio) (rq 'highest-prio)))
+          ((rq 'set-highest-prio!) (car min-prio)))))
+  (rq 'nr-running))
+
+; rt-rq-dequeue-task: dequeue a real-time entity from this runqueue.
+; Decrements nr-running (clamped at 0). Updates highest-prio + bitmap.
+; Returns the new nr-running.
+(define (rt-rq-dequeue-task rq e)
+  (let ((prio (rt-entity-priority e)))
+    ((rq 'set-bitmap!) (bitmap-dec (rq 'bitmap) prio))
+    (let ((min-prio (bitmap-min-prio (rq 'bitmap))))
+      (if (eq? min-prio #f)
+          ((rq 'set-highest-prio!) 100)
+          ((rq 'set-highest-prio!) (car min-prio)))))
+  (let ((current (rq 'nr-running)))
+    (if (= current 0)
+        0
+        ((rq 'dec-nr-running!)))))
+
+; ----------------------------------------------------------------
+; pick_next_task
+; ----------------------------------------------------------------
+
+; rt-rq-pick-next-task: return the rt-entity with the highest priority.
+; v in highest priority = lowest priority number.
+; Iterates registered tasks list — caller provides it.
+; Returns the rt_entity or #f if no tasks.
+(define (rt-rq-pick-next-task rq tasks)
+  (let loop ((rest tasks) (best #f))
+    (cond
+      ((null? rest) best)
+      ((or (eq? best #f)
+           (< (rt-entity-priority (car rest))
+              (rt-entity-priority best)))
+       (loop (cdr rest) (car rest)))
+      (else
+       (loop (cdr rest) best)))))
+
+; ----------------------------------------------------------------
+; update_curr
+; ----------------------------------------------------------------
+
+; rt-rq-update-curr: an RT entity ran for `delta` time. Update its
+; timeout (decreases remaining time slice).
+; Returns the new timeout.
+(define (rt-rq-update-curr rq e delta)
+  (let ((new-timeout (- (rt-entity-timeout e) delta)))
+    ((e 'set-timeout!) new-timeout)))

@@ -1,0 +1,189 @@
+; 046-rt-scheduler_test.aura
+; ============================
+; Smoke tests for 046-rt-scheduler.aura — RT scheduler minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/046-rt-scheduler_test.aura
+;
+; Verified automatically (smoke):
+;   - rt_entity / rt_rq construction
+;   - rt-entity? / rt-rq? predicates
+;   - rt-entity-set-priority! / set-policy! / set-timeout!
+;   - rt-rq-enqueue-task (nr-running, highest-prio, bitmap)
+;   - rt-rq-dequeue-task (nr-running, highest-prio, bitmap)
+;   - rt-rq-pick-next-task (returns highest-prio entity)
+;   - rt-rq-update-curr (timeout decreases)
+;
+; Verified via separate probes during development:
+;   - Bitmap tracks priorities as cons list
+;   - Multiple enqueues / dequeues
+;   - Dequeue at 0 stays at 0 (clamped)
+;
+; Deferred (full Linux RT scheduler):
+;   - real rt_task_tick time-slice accounting
+;   - sched_setattr / sched_getattr syscalls
+;   - real-time throttling (sched_rt_runtime / sched_rt_period)
+;   - RT_GROUP_SCHED (cgroup-based RT bandwidth)
+;   - actual 100-bit bitmap implementation
+
+(require "std/test" all:)
+(require "046-rt-scheduler" all:)
+
+; ----------------------------------------------------------------
+; rt_entity construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "rt-001-entity-construction"
+  ; rt_entity preserves timeout, cpus-allowed, flags, priority, policy.
+  (check (= 1000000 (rt-entity-timeout
+                      (make-rt-entity 1000000 1 0 50 'fifo))))
+  (check (= 1 (rt-entity-cpus-allowed
+               (make-rt-entity 1000000 1 0 50 'fifo))))
+  (check (= 0 (rt-entity-flags
+               (make-rt-entity 1000000 1 0 50 'fifo))))
+  (check (= 50 (rt-entity-priority
+                (make-rt-entity 1000000 1 0 50 'fifo))))
+  (check (= 'fifo (rt-entity-policy
+                   (make-rt-entity 1000000 1 0 50 'fifo)))))
+
+(test-suite "rt-001-entity-predicate"
+  ; rt-entity? accepts only rt_entity closures.
+  (check (= 1 (if (rt-entity? (make-rt-entity 1000 1 0 50 'fifo)) 1 0)))
+  (check (= 1 (if (not (rt-entity? 'not-an-entity)) 1 0)))
+  (check (= 1 (if (not (rt-entity? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; rt_entity setters
+; ----------------------------------------------------------------
+
+(test-suite "rt-002-entity-set-priority"
+  ; rt-entity-set-priority! updates priority.
+  (check (= 20 (let ((e (make-rt-entity 1000 1 0 50 'fifo)))
+                (rt-entity-set-priority! e 20)
+                (rt-entity-priority e)))))
+
+(test-suite "rt-002-entity-set-policy"
+  ; rt-entity-set-policy! updates policy.
+  (check (= 'rr (let ((e (make-rt-entity 1000 1 0 50 'fifo)))
+                  (rt-entity-set-policy! e 'rr)
+                  (rt-entity-policy e)))))
+
+(test-suite "rt-002-entity-set-timeout"
+  ; rt-entity-set-timeout! updates timeout.
+  (check (= 2000000 (let ((e (make-rt-entity 1000 1 0 50 'fifo)))
+                      (rt-entity-set-timeout! e 2000000)
+                      (rt-entity-timeout e)))))
+
+; ----------------------------------------------------------------
+; rt_rq construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "rt-003-rq-construction"
+  ; New rt_rq starts empty: nr-running=0, highest-prio=100, empty bitmap.
+  (check (= 0 (rt-rq-nr-running (make-rt-rq))))
+  (check (= 100 (rt-rq-highest-prio (make-rt-rq))))
+  (check (= 1 (if (null? (rt-rq-bitmap (make-rt-rq))) 1 0))))
+
+(test-suite "rt-003-rq-predicate"
+  ; rt-rq? accepts only rt_rq closures.
+  (check (= 1 (if (rt-rq? (make-rt-rq)) 1 0)))
+  (check (= 1 (if (not (rt-rq? 'not-an-rq)) 1 0)))
+  (check (= 1 (if (not (rt-rq? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; enqueue / dequeue
+; ----------------------------------------------------------------
+
+(test-suite "rt-004-enqueue"
+  ; rt-rq-enqueue-task increments nr-running.
+  (check (= 1 (let ((rq (make-rt-rq)))
+                (rt-rq-enqueue-task rq
+                  (make-rt-entity 1000 1 0 50 'fifo))
+                (rt-rq-nr-running rq)))))
+
+(test-suite "rt-004-enqueue-highest-prio"
+  ; rt-rq-enqueue-task updates highest-prio.
+  (check (= 50 (let ((rq (make-rt-rq)))
+                 (rt-rq-enqueue-task rq
+                   (make-rt-entity 1000 1 0 50 'fifo))
+                 (rt-rq-highest-prio rq)))))
+
+(test-suite "rt-004-enqueue-bitmap"
+  ; rt-rq-enqueue-task updates bitmap (cons list).
+  (check (= 1 (if (null? (rt-rq-bitmap (make-rt-rq))) 0
+                (let ((rq (make-rt-rq)))
+                  (rt-rq-enqueue-task rq
+                    (make-rt-entity 1000 1 0 50 'fifo))
+                  (if (null? (rt-rq-bitmap rq)) 0 1))))))
+
+(test-suite "rt-004-enqueue-multiple"
+  ; Multiple enqueues accumulate.
+  (check (= 2 (let ((rq (make-rt-rq)))
+                (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 50 'fifo))
+                (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 30 'rr))
+                (rt-rq-nr-running rq)))))
+
+(test-suite "rt-004-enqueue-multiple-highest-prio"
+  ; Multiple enqueues — highest-prio tracks lowest number.
+  (check (= 30 (let ((rq (make-rt-rq)))
+                 (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 50 'fifo))
+                 (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 30 'rr))
+                 (rt-rq-highest-prio rq)))))
+
+(test-suite "rt-004-dequeue"
+  ; rt-rq-dequeue-task decrements nr-running.
+  (check (= 0 (let ((rq (make-rt-rq)))
+                (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 50 'fifo))
+                (rt-rq-dequeue-task rq (make-rt-entity 1000 1 0 50 'fifo))
+                (rt-rq-nr-running rq)))))
+
+(test-suite "rt-004-dequeue-clamp-zero"
+  ; rt-rq-dequeue-task at 0 stays at 0.
+  (check (= 0 (let ((rq (make-rt-rq)))
+                (rt-rq-dequeue-task rq (make-rt-entity 1000 1 0 50 'fifo))
+                (rt-rq-nr-running rq)))))
+
+; ----------------------------------------------------------------
+; pick_next_task
+; ----------------------------------------------------------------
+
+(test-suite "rt-005-pick-next-empty"
+  ; rt-rq-pick-next-task on empty task list returns #f.
+  (check (= 1 (if (not (rt-rq-pick-next-task (make-rt-rq) '())) 1 0))))
+
+(test-suite "rt-005-pick-next-min-prio"
+  ; rt-rq-pick-next-task returns entity with lowest priority number.
+  (check (= 1 (let ((rq (make-rt-rq))
+                    (tasks (list (make-rt-entity 1000 1 0 50 'fifo)
+                                 (make-rt-entity 1000 1 0 30 'rr)
+                                 (make-rt-entity 1000 1 0 70 'fifo))))
+                (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 50 'fifo))
+                (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 30 'rr))
+                (rt-rq-enqueue-task rq (make-rt-entity 1000 1 0 70 'fifo))
+                (let ((victim (rt-rq-pick-next-task rq tasks)))
+                  (if (= (rt-entity-priority victim) 30) 1 0))))))
+
+; ----------------------------------------------------------------
+; update_curr
+; ----------------------------------------------------------------
+
+(test-suite "rt-006-update-curr"
+  ; rt-rq-update-curr decreases timeout by delta.
+  (check (= 900000 (let ((e (make-rt-entity 1000000 1 0 50 'fifo)))
+                    (rt-rq-update-curr (make-rt-rq) e 100000)
+                    (rt-entity-timeout e)))))
+
+(test-suite "rt-006-update-curr-multiple"
+  ; Multiple updates accumulate.
+  (check (= 700000 (let ((e (make-rt-entity 1000000 1 0 50 'fifo)))
+                    (rt-rq-update-curr (make-rt-rq) e 100000)
+                    (rt-rq-update-curr (make-rt-rq) e 200000)
+                    (rt-entity-timeout e)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
