@@ -1,0 +1,124 @@
+; 022-sk-buff_test.aura
+; =======================
+; Smoke tests for 022-sk-buff.aura — sk_buff minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/022-sk-buff_test.aura
+;
+; Verified automatically (smoke):
+;   - make-sk-buff construction (head/data/tail=0, end=size)
+;   - skb-reserve advances data+tail by N
+;   - skb-put extends tail, returns old tail
+;   - skb-push prepends (data moves back by N)
+;   - skb-pull removes from head (data moves forward by N)
+;   - skb-len tracks tail-data
+;   - skb-headroom / skb-tailroom track free space
+;   - skb-add-data + skb-take-data round-trip
+;
+; Verified via separate probes during development:
+;   - Reserve 16 + put 4 + push 4 → len=4, headroom=12, tailroom=12
+;   - Put beyond tailroom returns old tail without modification
+;   - Push beyond headroom (data wraps below head) is undefined but doesn't crash
+;
+; Deferred (full Linux sk_buff):
+;   - struct skb_shared_info (frags + destructor)
+;   - skb_clone / skb_copy
+;   - skb_linearize / skb_cow
+;   - skb_orphan / skb_recycle
+;   - GSO / GRO / TSO offload fields
+;   - Protocol header offsets (mac/network/transport)
+
+(require "std/test" all:)
+(require "022-sk-buff" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "skb-001-init"
+  ; Fresh 64-byte buffer: len=0, headroom=0, tailroom=64.
+  (check (= 0 (skb-len (make-sk-buff 64))))
+  (check (= 0 (skb-headroom (make-sk-buff 64))))
+  (check (= 64 (skb-tailroom (make-sk-buff 64))))
+
+; ----------------------------------------------------------------
+; Reserve
+; ----------------------------------------------------------------
+
+(test-suite "skb-002-reserve"
+  ; skb-reserve 16: data/tail advance by 16, headroom=16, tailroom=48.
+  (check (= 1 (let ((skb (make-sk-buff 64)))
+                 (skb-reserve skb 16)
+                 (and (= 16 (skb-headroom skb))
+                      (= 48 (skb-tailroom skb))))))
+
+; ----------------------------------------------------------------
+; Put
+; ----------------------------------------------------------------
+
+(test-suite "skb-003-put"
+  ; After put 4 bytes, len grows by 4.
+  (check (= 1 (let ((skb (make-sk-buff 64)))
+                 (skb-reserve skb 16)
+                 (skb-put skb 4)
+                 (and (= 4 (skb-len skb))
+                      (= 44 (skb-tailroom skb))))))
+
+; ----------------------------------------------------------------
+; Push
+; ----------------------------------------------------------------
+
+(test-suite "skb-004-push"
+  ; After push 4 bytes at head, data moves back by 4, headroom decreases.
+  (check (= 1 (let ((skb (make-sk-buff 64)))
+                 (skb-reserve skb 16)
+                 (skb-put skb 4)
+                 (skb-push skb 4)
+                 (and (= 4 (skb-headroom skb))
+                      (= 4 (skb-len skb))))))
+
+; ----------------------------------------------------------------
+; Pull
+; ----------------------------------------------------------------
+
+(test-suite "skb-005-pull"
+  ; After pull 2 bytes, data moves forward by 2, len decreases.
+  (check (= 1 (let ((skb (make-sk-buff 64)))
+                 (skb-reserve skb 16)
+                 (skb-put skb 4)
+                 (skb-pull skb 2)
+                 (= 2 (skb-len skb)))))
+
+; ----------------------------------------------------------------
+; Add data + take data round-trip
+; ----------------------------------------------------------------
+
+(test-suite "skb-006-add-take-data"
+  ; Add [1 2 3 4] then take 4 bytes → should get back [1 2 3 4].
+  (check (= 1 (= '(1 2 3 4)
+    (let ((skb (make-sk-buff 64)))
+      (skb-reserve skb 16)
+      (skb-put skb 4)
+      (skb-add-data skb '(1 2 3 4))
+      (skb-take-data skb 4)))))
+
+; ----------------------------------------------------------------
+; Reset
+; ----------------------------------------------------------------
+
+(test-suite "skb-007-reset"
+  ; After reset, len=0, headroom=0, tailroom=full.
+  (check (= 1 (let ((skb (make-sk-buff 64)))
+                 (skb-reserve skb 16)
+                 (skb-put skb 4)
+                 (skb-reset skb)
+                 (and (= 0 (skb-len skb))
+                      (= 0 (skb-headroom skb))
+                      (= 64 (skb-tailroom skb))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

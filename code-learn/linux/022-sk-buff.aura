@@ -1,0 +1,178 @@
+; 022-sk-buff.aura
+; ========================
+; sk_buff (Socket Kernel Buffer) — minimal capability port to aura.
+;
+; Maps to: 022-sk-buff-analysis.md
+; Source: include/linux/skbuff.h + net/core/skbuff.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux sk_buff is the central network packet data structure:
+;   - struct sk_buff (200 bytes, 4 cache lines): next/prev list, dev, sk,
+;     tstamp, cb[6], head/data/tail/end, len, data_len, mac_header,
+;     network_header, transport_header, skb_shared_info at end
+;   - Zero-copy protocol layering: skb_push (add L4 header) / skb_pull
+;     (strip L4 header) by moving data pointer
+;   - skb_put / skb_reserve (allocate / reserve tail room)
+;   - skb_clone (share data with parent) / skb_copy (full copy)
+;   - pskb_expand_head / skb_realloc_headroom
+;   - skb_shared_info + frags (scatter-gather I/O)
+;   - 852 symbols in skbuff.h, 551 in skbuff.c
+;
+; aura has no networking, no protocols, no net_device, no socket layer.
+; v1 ships the data pointer + head/tail + zero-copy manipulation primitives:
+;   - make-sk-buff (closure with buffer + head/data/tail/end pointers)
+;   - skb-data / skb-len
+;   - skb-headroom / skb-tailroom
+;   - skb-reserve (advance data + tail)
+;   - skb-put (extend tail by N bytes)
+;   - skb-push (prepend N bytes at head)
+;   - skb-pull (remove N bytes from head)
+;   - skb-add-data (append raw bytes at tail)
+;   - skb-take-data (read N bytes from head)
+;   - skb-reset (reset head/data/tail pointers)
+;
+; Deferred (full Linux sk_buff):
+;   - struct skb_shared_info (frags + ipvs_property + destructor)
+;   - skb_clone / skb_copy (sharing semantics)
+;   - skb_linearize (linearize paged skb)
+;   - skb_cow (copy-on-write)
+;   - skb_orphan (detach from socket)
+;   - skb_recycle (reuse without alloc)
+;   - GSO / GRO / TSO segmentation offload fields
+;   - Network protocol header offsets (mac_header / network_header /
+;     transport_header)
+;   - pskb_may_pull / skb_pull / skb_push (the actual functions)
+
+(export
+  make-sk-buff
+  skb-data
+  skb-len
+  skb-headroom
+  skb-tailroom
+  skb-reserve
+  skb-put
+  skb-push
+  skb-pull
+  skb-add-data
+  skb-take-data
+  skb-reset)
+
+; ----------------------------------------------------------------
+; sk_buff (closure with buffer + head/data/tail/end)
+;
+; The buffer is a single mutable string (aura doesn't have byte arrays,
+; so we use a string-like list-of-chars for byte granularity).
+;
+; Head/data/tail/end are integer indices into the buffer:
+;   - head:    fixed for buffer lifetime
+;   - data:    start of protocol data (moves with skb_push/skb_pull)
+;   - tail:    end of protocol data (moves with skb_put)
+;   - end:     fixed capacity (head + buffer-size)
+;
+; Initial layout: data == tail == head (empty buffer).
+; ----------------------------------------------------------------
+
+; Make a sk_buff with the given buffer size (bytes allocated).
+(define (make-sk-buff size)
+  (let ((buf (make-vector size 0))      ; mutable byte buffer (initial zeros)
+        (head 0)
+        (data 0)
+        (tail 0)
+        (end size))
+    (letrec ((set-data! (lambda (v) (set! data v) v))
+             (set-tail!  (lambda (v) (set! tail v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'buf) buf)
+                       ((eq? msg 'head) head)
+                       ((eq? msg 'data) data)
+                       ((eq? msg 'tail) tail)
+                       ((eq? msg 'end) end)
+                       ((eq? msg 'set-data!) set-data!)
+                       ((eq? msg 'set-tail!) set-tail!)
+                       ((eq? msg 'len) (- tail data))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+; skb-data: get the current data pointer (start of packet data).
+(define (skb-data skb) (skb 'data))
+
+; skb-len: get the current data length (tail - data).
+(define (skb-len skb) (skb 'len))
+
+; skb-headroom: bytes between head and data (free space at front).
+(define (skb-headroom skb)
+  (- (skb 'data) (skb 'head)))
+
+; skb-tailroom: bytes between tail and end (free space at back).
+(define (skb-tailroom skb)
+  (- (skb 'end) (skb 'tail)))
+
+; ----------------------------------------------------------------
+; Zero-copy pointer manipulation
+; ----------------------------------------------------------------
+
+; skb-reserve: reserve N bytes at head + at tail.
+; Sets data = head + N (advance), tail = data (empty content).
+; Common usage: align buffer + reserve header room.
+(define (skb-reserve skb n)
+  ((skb 'set-data!) (+ (skb 'head) n))
+  ((skb 'set-tail!)  (+ (skb 'head) n)))
+
+; skb-put: extend tail by N bytes (allocate room at tail).
+; Returns the old tail position (start of new data).
+(define (skb-put skb n)
+  (let ((old-tail (skb 'tail)))
+    ((skb 'set-tail!) (+ (skb 'tail) n))
+    old-tail))
+
+; skb-push: prepend N bytes at head (advance data pointer back).
+; Returns the new data position.
+(define (skb-push skb n)
+  ((skb 'set-data!) (- (skb 'data) n))
+  (skb 'data))
+
+; skb-pull: remove N bytes from head (advance data pointer forward).
+; Returns the new data position.
+(define (skb-pull skb n)
+  ((skb 'set-data!) (+ (skb 'data) n))
+  (skb 'data))
+
+; ----------------------------------------------------------------
+; Data accessors (operate on the buffer directly)
+; ----------------------------------------------------------------
+
+; skb-add-data: write N bytes (as integers) at the current tail.
+; Caller must have reserved tail room via skb-put.
+; Returns the new tail position.
+(define (skb-add-data skb bytes)
+  (let ((start (skb-put skb (length bytes))))
+    (let loop ((i 0) (buf (skb 'buf)) (pos start))
+      (if (>= i (length bytes))
+          (skb 'tail)
+          (begin
+            (vector-set! buf pos (list-ref bytes i))
+            (loop (+ i 1) buf (+ pos 1)))))))
+
+; skb-take-data: read N bytes from the current data position.
+; Caller must have data available (e.g., after skb-reserve + skb-add-data).
+; Returns the list of N bytes.
+(define (skb-take-data skb n)
+  (let loop ((i 0) (buf (skb 'buf)) (pos (skb 'data)) (acc '()))
+    (if (>= i n)
+        (reverse acc)
+        (loop (+ i 1) buf (+ pos 1) (cons (vector-ref buf pos) acc)))))
+
+; ----------------------------------------------------------------
+; Reset
+; ----------------------------------------------------------------
+
+; skb-reset: reset data + tail to head (empty buffer, no free headroom).
+(define (skb-reset skb)
+  ((skb 'set-data!) (skb 'head))
+  ((skb 'set-tail!) (skb 'head)))
