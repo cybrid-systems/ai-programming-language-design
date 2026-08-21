@@ -1,0 +1,238 @@
+; 037-vmalloc.aura
+; =====================
+; vmalloc — minimal capability port to aura.
+;
+; Maps to: Linux kernel vmalloc subsystem
+; Source: mm/vmalloc.c + include/linux/vmalloc.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux vmalloc is the kernel virtual memory allocator providing
+; non-contiguous virtual address ranges:
+;   - struct vm_struct (addr, size, flags, pages, nr_pages)
+;   - struct vm_area_struct (VMA) for vmap range
+;   - get_vm_area / free_vm_area
+;   - vmalloc / vfree
+;   - __vmalloc / __vfree
+;   - vmalloc_to_page / vmalloc_to_pfn
+;   - ioremap / iounmap (memory-mapped I/O)
+;   - vmap / vunmap
+;   - VM_IOREMAP / VM_ALLOC / VM_MAP / VM_USERMAP flags
+;
+; aura has no kernel memory mapping, no vmap range. v1 ships:
+;   - make-vm-struct (addr, size, flags)
+;   - make-vm-area (addr, size)
+;   - vm-alloc (factory + registry insert)
+;   - vm-free (registry remove)
+;   - vm-find (find by addr)
+;   - vm-map / vm-unmap (track mapped range)
+;   - vm-count / vm-allocated-count
+;   - vm-struct? / vm-area? predicates
+;
+; Deferred (full Linux vmalloc):
+;   - real virtual-to-physical page mapping
+;   - vmap_page_range / vunmap_page_range
+;   - vmalloc_fault
+;   - ioremap / iounmap page table updates
+;   - HUGE_VMAP allocations
+;   - vmalloc_node / NUMA-aware allocations
+;   - vmalloc_32 / vmalloc_user
+;   - VMALLOC_TOTAL / VMALLOC_END
+
+(export
+  make-vm-struct
+  vm-struct?
+  vm-struct-addr
+  vm-struct-size
+  vm-struct-flags
+  make-vm-area
+  vm-area?
+  vm-area-addr
+  vm-area-size
+  vm-area-mapped?
+  vm-map
+  vm-unmap
+  vm-alloc
+  vm-free
+  vm-find
+  vm-count
+  vm-allocated-count
+  vm-allocated-bytes)
+
+; ----------------------------------------------------------------
+; vm_struct — closure-based
+; ----------------------------------------------------------------
+
+; make-vm-struct: create a vmalloc descriptor.
+; Args: addr (integer), size (integer), flags (integer)
+; Returns: vm_struct closure.
+(define (make-vm-struct addr size flags)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'addr) addr)
+                       ((eq? msg 'size) size)
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; vm-struct?: is the object a vm_struct?
+; Detected by querying 'flags — only vm_struct closures return an
+; integer for flags.
+(define (vm-struct? obj)
+  (if (procedure? obj)
+      (if (integer? (obj 'flags)) #t #f)
+      #f))
+
+; vm-struct-addr: get virtual address
+(define (vm-struct-addr v) (v 'addr))
+
+; vm-struct-size: get allocation size in bytes
+(define (vm-struct-size v) (v 'size))
+
+; vm-struct-flags: get allocation flags
+(define (vm-struct-flags v) (v 'flags))
+
+; ----------------------------------------------------------------
+; vm_area — closure-based, mutable mapped state
+; ----------------------------------------------------------------
+
+; make-vm-area: create a vmap area.
+; Args: addr (integer), size (integer)
+; Returns: vm_area closure.
+(define (make-vm-area addr size)
+  (let ((mapped? #f))
+    (letrec ((set-mapped! (lambda (v) (set! mapped? v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'addr) addr)
+                       ((eq? msg 'size) size)
+                       ((eq? msg 'mapped?) mapped?)
+                       ((eq? msg 'set-mapped!) set-mapped!)
+                       (else #f)))))
+      self)))
+
+; vm-area?: is the object a vm_area?
+; Detected by querying 'mapped? — only vm_area closures return a
+; boolean.
+(define (vm-area? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mapped?)))
+        (if (or (eq? m #t) (eq? m #f)) #t #f))
+      #f))
+
+; vm-area-addr: get virtual address
+(define (vm-area-addr area) (area 'addr))
+
+; vm-area-size: get area size in bytes
+(define (vm-area-size area) (area 'size))
+
+; vm-area-mapped?: is the area mapped?
+(define (vm-area-mapped? area) (area 'mapped?))
+
+; vm-map: mark area as mapped.
+; Returns the new mapped state.
+(define (vm-map area)
+  ((area 'set-mapped!) #t))
+
+; vm-unmap: mark area as unmapped.
+; Returns the new mapped state.
+(define (vm-unmap area)
+  ((area 'set-mapped!) #f))
+
+; ----------------------------------------------------------------
+; Alloc registry — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-alloc-registry: empty registry.
+(define (make-alloc-registry)
+  (let ((allocs '())
+        (next-id 0)
+        (allocated-bytes 0))
+    (letrec ((set-allocs!          (lambda (v) (set! allocs v) v))
+             (set-next-id!         (lambda (v) (set! next-id v) v))
+             (set-allocated-bytes! (lambda (v) (set! allocated-bytes v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) allocs)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'allocated-bytes) allocated-bytes)
+                       ((eq? msg 'set-allocs!)          set-allocs!)
+                       ((eq? msg 'set-next-id!)         set-next-id!)
+                       ((eq? msg 'set-allocated-bytes!) set-allocated-bytes!)
+                       (else #f)))))
+      self)))
+
+; Global alloc registry
+(define g-alloc-registry (make-alloc-registry))
+
+; vm-alloc: register a vm_struct, assign unique id.
+; Tracks total allocated bytes.
+; Returns the assigned id.
+(define (vm-alloc v)
+  (let ((new-id (+ (g-alloc-registry 'next-id) 1)))
+    ((g-alloc-registry 'set-next-id!) new-id)
+    ((v 'set-id!) new-id)
+    ((g-alloc-registry 'set-allocs!)
+     (cons v (g-alloc-registry 'list)))
+    ((g-alloc-registry 'set-allocated-bytes!)
+     (+ (g-alloc-registry 'allocated-bytes) (vm-struct-size v)))
+    new-id))
+
+; vm-free: remove a vm_struct from the registry, subtract bytes.
+; Returns #t if removed, #f if not found.
+(define (vm-free v)
+  (letrec ((found? #f)
+           (freed-size 0)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-alloc-registry 'set-allocs!)
+                             (cons-rev acc '()))
+                            ((g-alloc-registry 'set-allocs!) acc))
+                        found?)
+                       ((eq? (car rest) v)
+                        (set! found? #t)
+                        (set! freed-size (vm-struct-size v))
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-alloc-registry 'list) '())
+    (if found?
+        ((g-alloc-registry 'set-allocated-bytes!)
+         (- (g-alloc-registry 'allocated-bytes) freed-size))
+        #f)))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; vm-find: find a vm_struct by addr.
+; Returns the vm_struct or #f if not found.
+(define (vm-find addr)
+  (let loop ((rest (g-alloc-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((= (vm-struct-addr (car rest)) addr) (car rest))
+      (else (loop (cdr rest))))))
+
+; vm-count: count of registered allocations
+(define (vm-count)
+  (let loop ((rest (g-alloc-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; vm-allocated-count: number of currently-allocated vm_structs
+(define (vm-allocated-count)
+  (vm-count))
+
+; vm-allocated-bytes: total bytes currently allocated
+(define (vm-allocated-bytes)
+  (g-alloc-registry 'allocated-bytes))

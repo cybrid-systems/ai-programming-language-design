@@ -1,0 +1,138 @@
+; 037-vmalloc_test.aura
+; ========================
+; Smoke tests for 037-vmalloc.aura — vmalloc minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/037-vmalloc_test.aura
+;
+; Verified automatically (smoke):
+;   - vm_struct / vm_area construction
+;   - vm-struct? / vm-area? predicates
+;   - vm-map / vm-unmap (mapped state)
+;   - vm-alloc (id assignment + byte tracking)
+;   - vm-free (remove + byte subtraction)
+;   - vm-find (by addr)
+;   - vm-count / vm-allocated-bytes
+;
+; Verified via separate probes during development:
+;   - Multiple allocs accumulate bytes
+;   - vm-free returns #f for non-registered
+;   - vm-find returns #f for unknown addr
+;
+; Deferred (full Linux vmalloc):
+;   - real virtual-to-physical page mapping
+;   - vmap_page_range / vunmap_page_range
+;   - vmalloc_fault
+;   - ioremap / iounmap page table updates
+;   - HUGE_VMAP allocations
+
+(require "std/test" all:)
+(require "037-vmalloc" all:)
+
+; ----------------------------------------------------------------
+; vm_struct construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "vm-001-struct-construction"
+  ; vm_struct preserves addr, size, flags.
+  (check (= 0xffff0000 (vm-struct-addr
+                          (make-vm-struct 0xffff0000 4096 1))))
+  (check (= 4096 (vm-struct-size
+                   (make-vm-struct 0xffff0000 4096 1))))
+  (check (= 1 (vm-struct-flags
+                (make-vm-struct 0xffff0000 4096 1)))))
+
+(test-suite "vm-001-struct-predicate"
+  ; vm-struct? accepts only vm_struct closures.
+  (check (= 1 (if (vm-struct? (make-vm-struct 0 0 0)) 1 0)))
+  (check (= 1 (if (not (vm-struct? 'not-a-vm)) 1 0)))
+  (check (= 1 (if (not (vm-struct? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; vm_area construction + predicate + map/unmap
+; ----------------------------------------------------------------
+
+(test-suite "vm-002-area-construction"
+  ; vm_area preserves addr, size.
+  (check (= 0xffff1000 (vm-area-addr
+                         (make-vm-area 0xffff1000 8192))))
+  (check (= 8192 (vm-area-size
+                   (make-vm-area 0xffff1000 8192)))))
+
+(test-suite "vm-002-area-unmapped-init"
+  ; New vm_area starts unmapped.
+  (check (= 1 (if (not (vm-area-mapped?
+                         (make-vm-area 0xffff1000 8192))) 1 0))))
+
+(test-suite "vm-002-area-map"
+  ; vm-map sets mapped? to #t.
+  (check (= 1 (let ((a (make-vm-area 0xffff1000 8192)))
+                (vm-map a)
+                (if (vm-area-mapped? a) 1 0)))))
+
+(test-suite "vm-002-area-unmap"
+  ; vm-unmap sets mapped? to #f after map.
+  (check (= 1 (let ((a (make-vm-area 0xffff1000 8192)))
+                (vm-map a)
+                (vm-unmap a)
+                (if (not (vm-area-mapped? a)) 1 0)))))
+
+(test-suite "vm-002-area-predicate"
+  ; vm-area? accepts only vm_area closures.
+  (check (= 1 (if (vm-area? (make-vm-area 0 0)) 1 0)))
+  (check (= 1 (if (not (vm-area? 'not-an-area)) 1 0)))
+  (check (= 1 (if (not (vm-area? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; vm-alloc / vm-free
+; ----------------------------------------------------------------
+
+(test-suite "vm-003-alloc"
+  ; vm-alloc assigns sequential id.
+  (check (= 1 (vm-alloc (make-vm-struct 0xffff2000 4096 1)))))
+
+(test-suite "vm-003-alloc-tracks-bytes"
+  ; vm-allocated-bytes tracks total.
+  (check (= 1 (> (vm-allocated-bytes) 0))))
+
+(test-suite "vm-003-free"
+  ; vm-free removes + find returns #f.
+  (check (= 1 (let ((v (make-vm-struct 0xffff3000 4096 1)))
+                (vm-alloc v)
+                (vm-free v)
+                (if (not (vm-find 0xffff3000)) 1 0)))))
+
+(test-suite "vm-003-free-not-found"
+  ; vm-free returns #f for non-registered vm_struct.
+  (check (= 1 (if (not (vm-free
+                          (make-vm-struct 0xffff4000 4096 1))) 1 0))))
+
+; ----------------------------------------------------------------
+; vm-find / vm-count
+; ----------------------------------------------------------------
+
+(test-suite "vm-004-find"
+  ; vm-find returns the registered vm_struct by addr.
+  (check (= 1 (let ((v (make-vm-struct 0xffff5000 4096 1)))
+                (vm-alloc v)
+                (if (eq? v (vm-find 0xffff5000)) 1 0)))))
+
+(test-suite "vm-004-find-missing"
+  ; vm-find returns #f for unknown addr.
+  (check (= 1 (if (not (vm-find 0xffff6000)) 1 0))))
+
+(test-suite "vm-004-count"
+  ; vm-count is positive after allocs.
+  (check (= 1 (> (vm-count) 0))))
+
+(test-suite "vm-004-allocated-count"
+  ; vm-allocated-count == vm-count.
+  (check (= 1 (= (vm-allocated-count) (vm-count)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
