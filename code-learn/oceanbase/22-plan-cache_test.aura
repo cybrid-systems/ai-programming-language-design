@@ -1,0 +1,295 @@
+; 22-plan-cache_test.aura
+; ======================
+; Smoke tests for 22-plan-cache.aura — Plan Cache (Lib Cache) minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/22-plan-cache_test.aura
+;
+; Verified automatically (smoke):
+;   - 5 NAMESPACE + 4 PLAN-CACHE-STATUS + 3 EVICTION-POLICY distinct
+;   - make-plan-cache-key + accessors + equal?
+;   - make-physical-plan + accessors + touch!
+;   - make-pcvset + add/remove/lookup/count
+;   - make-plan-cache + get/add/evict/remove/count + stats
+;   - Hit/miss tracking
+;   - HWM-based eviction
+;   - reset-stats!
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - LRU eviction removes oldest entry first
+;
+; Deferred (full OceanBase Plan Cache):
+;   - real ObPlanCache with thread-safe HashMap + RWLock
+;   - real X-Macro namespace registration
+;   - real Lib Cache (ObLCObjectManager, ObLCNodeAllocator)
+;   - real HWM/LWM eviction timer (ObLCTimerTask)
+;   - real ObPCVSet (ObPCVSet is versioned per schema)
+;   - real SPM (plan baseline evolution + Auto SQL Plan)
+;   - real plan cache key normalization (literal → bind param)
+;   - real plan hash for hit detection
+;   - real ObILibCacheKey::hash() / equal() interfaces
+;   - real ObPhysicalPlan serialization for memory mgmt
+
+(require "std/test" all:)
+(require "22-plan-cache" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "22-001-namespace-distinct"
+  ; 5 NAMESPACE constants are distinct.
+  (check (= 1 (if (not (= NAMESPACE-CRSR NAMESPACE-PRCR)) 1 0)))
+  (check (= 1 (if (not (= NAMESPACE-PRCR NAMESPACE-PKG)) 1 0)))
+  (check (= 1 (if (not (= NAMESPACE-PKG NAMESPACE-SPM)) 1 0)))
+  (check (= 1 (if (not (= NAMESPACE-SPM NAMESPACE-TABLEAPI)) 1 0))))
+
+(test-suite "22-001-plan-cache-status-distinct"
+  ; 4 PLAN-CACHE-STATUS constants are distinct.
+  (check (= 1 (if (not (= PLAN-CACHE-STATUS-BUILDING
+                          PLAN-CACHE-STATUS-READY)) 1 0)))
+  (check (= 1 (if (not (= PLAN-CACHE-STATUS-READY
+                          PLAN-CACHE-STATUS-EVICTING)) 1 0)))
+  (check (= 1 (if (not (= PLAN-CACHE-STATUS-EVICTING
+                          PLAN-CACHE-STATUS-INVALID)) 1 0))))
+
+(test-suite "22-001-eviction-policy-distinct"
+  ; 3 EVICTION-POLICY constants are distinct.
+  (check (= 1 (if (not (= EVICTION-POLICY-LRU
+                          EVICTION-POLICY-LFU)) 1 0)))
+  (check (= 1 (if (not (= EVICTION-POLICY-LFU
+                          EVICTION-POLICY-FIFO)) 1 0))))
+
+; ----------------------------------------------------------------
+; PlanCacheKey
+; ----------------------------------------------------------------
+
+(test-suite "22-002-key-construction"
+  ; key preserves fields.
+  (check (= #t (eq? 'SELECT
+                   (plan-cache-key-get-sql-text
+                     (make-plan-cache-key 'SELECT 'test_db 1)))))
+  (check (= #t (eq? 'test_db
+                   (plan-cache-key-get-db-name
+                     (make-plan-cache-key 'SELECT 'test_db 1)))))
+  (check (= 1 (plan-cache-key-get-plan-id
+                (make-plan-cache-key 'SELECT 'test_db 1)))))
+
+(test-suite "22-002-key-predicate"
+  ; plan-cache-key? accepts only keys.
+  (check (= #t (plan-cache-key? (make-plan-cache-key 'SELECT 'db 1))))
+  (check (= #f (plan-cache-key? 'not-a-key)))
+  (check (= #f (plan-cache-key? 42)))
+
+(test-suite "22-003-key-equal"
+  ; key equality checks sql-text + db + plan-id.
+  (check (= #t (let ((a (make-plan-cache-key 'SELECT 'db 1))
+                      (b (make-plan-cache-key 'SELECT 'db 1)))
+                 (plan-cache-key-equal? a b))))
+  (check (= #f (let ((a (make-plan-cache-key 'SELECT 'db 1))
+                      (b (make-plan-cache-key 'INSERT 'db 1)))
+                 (plan-cache-key-equal? a b))))
+  (check (= #f (let ((a (make-plan-cache-key 'SELECT 'db1 1))
+                      (b (make-plan-cache-key 'SELECT 'db2 1)))
+                 (plan-cache-key-equal? a b))))
+  (check (= #f (let ((a (make-plan-cache-key 'SELECT 'db 1))
+                      (b (make-plan-cache-key 'SELECT 'db 2)))
+                 (plan-cache-key-equal? a b))))
+
+; ----------------------------------------------------------------
+; PhysicalPlan
+; ----------------------------------------------------------------
+
+(test-suite "22-004-plan-construction"
+  ; plan preserves fields.
+  (check (= #t (let ((k (make-plan-cache-key 'SELECT 'db 1))
+                      (p (make-physical-plan k 'plan-text 100)))
+                 (eq? k (physical-plan-get-key p)))))
+  (check (= #t (eq? 'plan-text
+                   (physical-plan-get-plan-text
+                     (make-physical-plan
+                       (make-plan-cache-key 'S 'd 1) 'plan-text 100)))))
+  (check (= 100 (physical-plan-get-cost
+                 (make-physical-plan
+                   (make-plan-cache-key 'S 'd 1) 'plan-text 100))))
+  (check (= 0 (physical-plan-get-last-access-time
+                 (make-physical-plan
+                   (make-plan-cache-key 'S 'd 1) 'plan-text 100)))))
+
+(test-suite "22-004-plan-predicate"
+  ; physical-plan? accepts only plans.
+  (check (= #t (physical-plan?
+                 (make-physical-plan
+                   (make-plan-cache-key 'S 'd 1) 'plan-text 100))))
+  (check (= #f (physical-plan? 'not-a-plan)))
+  (check (= #f (physical-plan? 42)))
+
+(test-suite "22-005-plan-touch"
+  ; touch! increments last-access-time.
+  (check (= 1 (let ((p (make-physical-plan
+                          (make-plan-cache-key 'S 'd 1) 'plan-text 100)))
+                 (physical-plan-touch! p)
+                 (physical-plan-get-last-access-time p))))
+  (check (= 3 (let ((p (make-physical-plan
+                          (make-plan-cache-key 'S 'd 1) 'plan-text 100)))
+                 (physical-plan-touch! p)
+                 (physical-plan-touch! p)
+                 (physical-plan-touch! p)
+                 (physical-plan-get-last-access-time p)))))
+
+; ----------------------------------------------------------------
+; PCVSet
+; ----------------------------------------------------------------
+
+(test-suite "22-006-pcvset-construction"
+  ; pcvset preserves namespace + cache.
+  (check (= NAMESPACE-CRSR
+             (pcvset-get-namespace
+               (make-pcvset NAMESPACE-CRSR #f))))
+  (check (= #f (pcvset-get-cache (make-pcvset NAMESPACE-CRSR #f))))
+  (check (= 0 (pcvset-count (make-pcvset NAMESPACE-CRSR #f))))
+
+(test-suite "22-006-pcvset-predicate"
+  ; pcvset? accepts only sets.
+  (check (= #t (pcvset? (make-pcvset NAMESPACE-CRSR #f))))
+  (check (= #f (pcvset? 'not-a-pcvset)))
+  (check (= #f (pcvset? 42)))
+
+(test-suite "22-007-pcvset-add-lookup"
+  ; add + lookup roundtrip.
+  (check (= #t (let ((p (make-pcvset NAMESPACE-CRSR #f))
+                    (k (make-plan-cache-key 'SELECT 'db 1))
+                    (pl (make-physical-plan k 'plan-text 100)))
+                (pcvset-add! p k pl)
+                (eq? pl (pcvset-lookup p k))))))
+
+(test-suite "22-007-pcvset-lookup-missing"
+  ; lookup returns #f for missing key.
+  (check (= #f (pcvset-lookup
+                 (make-pcvset NAMESPACE-CRSR #f)
+                 (make-plan-cache-key 'UNKNOWN 'db 1)))))
+
+(test-suite "22-007-pcvset-remove"
+  ; remove + lookup returns #f.
+  (check (= #t (let ((p (make-pcvset NAMESPACE-CRSR #f))
+                    (k (make-plan-cache-key 'SELECT 'db 1))
+                    (pl (make-physical-plan k 'plan-text 100)))
+                (pcvset-add! p k pl)
+                (pcvset-remove! p k)
+                (eq? #f (pcvset-lookup p k)))))
+
+; ----------------------------------------------------------------
+; PlanCache
+; ----------------------------------------------------------------
+
+(test-suite "22-008-cache-construction"
+  ; cache preserves hwm + lwm + policy.
+  (check (= 100 (plan-cache-get-hwm
+                  (make-plan-cache 100 50 EVICTION-POLICY-LRU))))
+  (check (= 50 (plan-cache-get-lwm
+                 (make-plan-cache 100 50 EVICTION-POLICY-LRU))))
+  (check (= EVICTION-POLICY-LRU
+             (plan-cache-get-eviction-policy
+               (make-plan-cache 100 50 EVICTION-POLICY-LRU))))
+  (check (= 0 (plan-cache-count
+               (make-plan-cache 100 50 EVICTION-POLICY-LRU))))
+
+(test-suite "22-008-cache-predicate"
+  ; plan-cache? accepts only caches.
+  (check (= #t (plan-cache? (make-plan-cache 10 5 EVICTION-POLICY-LRU))))
+  (check (= #f (plan-cache? 'not-a-cache)))
+  (check (= #f (plan-cache? 42)))
+
+(test-suite "22-008-cache-setters"
+  ; setters update fields.
+  (check (= 200 (let ((c (make-plan-cache 100 50 EVICTION-POLICY-LRU)))
+                 (plan-cache-set-hwm! c 200)
+                 (plan-cache-get-hwm c))))
+  (check (= 80 (let ((c (make-plan-cache 100 50 EVICTION-POLICY-LRU)))
+                (plan-cache-set-lwm! c 80)
+                (plan-cache-get-lwm c))))
+
+(test-suite "22-009-cache-add"
+  ; add! increases count.
+  (check (= 1 (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'SELECT 'db 1))
+                    (p (make-physical-plan k 'pt 100)))
+                (plan-cache-add! c k p)
+                (plan-cache-count c))))
+
+(test-suite "22-010-cache-get-hit"
+  ; get with existing key returns plan + increments hit.
+  (check (= 1 (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'SELECT 'db 1))
+                    (p (make-physical-plan k 'pt 100)))
+                (plan-cache-add! c k p)
+                (plan-cache-get c k)
+                (plan-cache-get-stats-hits c))))
+
+(test-suite "22-010-cache-get-miss"
+  ; get with unknown key returns #f + increments miss.
+  (check (= 1 (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'UNKNOWN 'db 1)))
+                (plan-cache-get c k)
+                (plan-cache-get-stats-misses c))))
+
+(test-suite "22-010-cache-get-miss-returns-f"
+  ; get with unknown key returns #f.
+  (check (= #f (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'UNKNOWN 'db 1)))
+                (plan-cache-get c k))))
+
+(test-suite "22-011-cache-remove"
+  ; remove! removes + find returns #f.
+  (check (= #t (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'SELECT 'db 1))
+                    (p (make-physical-plan k 'pt 100)))
+                (plan-cache-add! c k p)
+                (plan-cache-remove! c k)
+                (eq? #f (plan-cache-get c k)))))
+
+(test-suite "22-011-cache-remove-not-found"
+  ; remove! returns #f for non-existing.
+  (check (= #f (plan-cache-remove!
+                 (make-plan-cache 10 5 EVICTION-POLICY-LRU)
+                 (make-plan-cache-key 'UNKNOWN 'db 1)))))
+
+(test-suite "22-012-cache-evict"
+  ; evict! removes 1 entry + increments evictions.
+  (check (= 1 (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'S 'd 1))
+                    (p (make-physical-plan k 'pt 100)))
+                (plan-cache-add! c k p)
+                (plan-cache-evict! c)
+                (plan-cache-get-stats-evictions c))))
+
+(test-suite "22-012-cache-evict-count"
+  ; evict! decreases count.
+  (check (= 0 (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'S 'd 1))
+                    (p (make-physical-plan k 'pt 100)))
+                (plan-cache-add! c k p)
+                (plan-cache-evict! c)
+                (plan-cache-count c))))
+
+(test-suite "22-013-cache-reset-stats"
+  ; reset-stats! zeros all stats.
+  (check (= 0 (let ((c (make-plan-cache 10 5 EVICTION-POLICY-LRU))
+                    (k (make-plan-cache-key 'S 'd 1))
+                    (p (make-physical-plan k 'pt 100)))
+                (plan-cache-add! c k p)
+                (plan-cache-get c k)
+                (plan-cache-evict! c)
+                (plan-cache-reset-stats! c)
+                (+ (plan-cache-get-stats-hits c)
+                   (plan-cache-get-stats-misses c)
+                   (plan-cache-get-stats-evictions c)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

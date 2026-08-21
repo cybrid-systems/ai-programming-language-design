@@ -1,0 +1,529 @@
+; 22-plan-cache.aura
+; ======================
+; plan_cache — minimal capability port to aura.
+;
+; Maps to: OceanBase Plan Cache (Lib Cache framework + SPM)
+; Source: src/sql/plan_cache/ob_plan_cache.{h,cpp}
+;         + src/sql/plan_cache/ob_i_lib_cache_key.h
+;         + src/sql/plan_cache/ob_i_lib_cache_object.h
+;         + src/sql/plan_cache/ob_pcv_set.h
+;         + src/sql/plan_cache/ob_lib_cache_register.h
+;         + src/sql/spm/ob_spm.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Plan Cache:
+;   - ObPlanCache: top-level cache manager
+;   - Lib Cache framework: hash table Key → Node → Object
+;   - 5 namespaces (NS_CRSR / NS_PRCR / NS_PKG / NS_SPM /
+;     NS_TABLEAPI) — X-Macro registered
+;   - ObPlanCacheKey: SQL text + db + plan_id
+;   - ObPhysicalPlan: cached plan object
+;   - ObPCVSet: namespace-scoped plan cache view
+;   - SPM (SQL Plan Management): plan baseline evolution
+;   - LRU eviction with HWM/LWM memory watermarks
+;   - Timer task for periodic eviction
+;
+; aura v1 ships:
+;   - 5 NAMESPACE constants (NS-CRSR, NS-PRCR, NS-PKG, NS-SPM,
+;     NS-TABLEAPI)
+;   - 4 PLAN-CACHE-STATUS constants (BUILDING, READY, EVICTING,
+;     INVALID)
+;   - 3 EVICTION-POLICY constants (LRU, LFU, FIFO)
+;   - make-plan-cache-key (sql-text + db-name + plan-id)
+;   - plan-cache-key accessors + equal?
+;   - make-physical-plan (key + plan-text + cost)
+;   - physical-plan accessors + last-access-time
+;   - make-pcvset (namespace + plan-cache)
+;   - pcvset-get / pcvset-add! / pcvset-remove!
+;   - pcvset-get-count
+;   - make-plan-cache (HWM + LWM + eviction-policy)
+;   - plan-cache-get (with stats: hit/miss)
+;   - plan-cache-add! (with HWM check)
+;   - plan-cache-evict! (LRU eviction)
+;   - plan-cache-get-stats (hits + misses + evictions)
+;   - plan-cache-reset-stats!
+;
+; Deferred (full OceanBase Plan Cache):
+;   - real ObPlanCache with thread-safe HashMap + RWLock
+;   - real X-Macro namespace registration
+;   - real Lib Cache (ObLCObjectManager, ObLCNodeAllocator)
+;   - real HWM/LWM eviction timer (ObLCTimerTask)
+;   - real ObPCVSet (ObPCVSet is versioned per schema)
+;   - real SPM (plan baseline evolution + Auto SQL Plan)
+;   - real plan cache key normalization (literal → bind param)
+;   - real plan hash for hit detection
+;   - real ObILibCacheKey::hash() / equal() interfaces
+;   - real ObPhysicalPlan serialization for memory mgmt
+
+(export
+  ; Namespace constants
+  NAMESPACE-CRSR NAMESPACE-PRCR NAMESPACE-PKG
+  NAMESPACE-SPM NAMESPACE-TABLEAPI
+  ; Plan cache status constants
+  PLAN-CACHE-STATUS-BUILDING
+  PLAN-CACHE-STATUS-READY
+  PLAN-CACHE-STATUS-EVICTING
+  PLAN-CACHE-STATUS-INVALID
+  ; Eviction policy constants
+  EVICTION-POLICY-LRU
+  EVICTION-POLICY-LFU
+  EVICTION-POLICY-FIFO
+  ; Plan cache key
+  make-plan-cache-key plan-cache-key?
+  plan-cache-key-get-sql-text
+  plan-cache-key-get-db-name
+  plan-cache-key-get-plan-id
+  plan-cache-key-equal?
+  ; Physical plan
+  make-physical-plan physical-plan?
+  physical-plan-get-key physical-plan-get-plan-text
+  physical-plan-get-cost physical-plan-get-last-access-time
+  physical-plan-set-last-access-time!
+  physical-plan-touch!
+  ; PCVSet (namespace-scoped)
+  make-pcvset pcvset?
+  pcvset-get-namespace pcvset-get-cache
+  pcvset-get plan-cache-key-get-sql-text
+  ; Wait, re-define pcvset-get to avoid conflict
+  ; (aura disallows redefinition — just use direct dispatch)
+  ; Plan cache
+  make-plan-cache plan-cache?
+  plan-cache-get-hwm plan-cache-get-lwm
+  plan-cache-get-eviction-policy
+  plan-cache-set-hwm! plan-cache-set-lwm!
+  plan-cache-get plan-cache-add!
+  plan-cache-evict! plan-cache-remove!
+  plan-cache-count plan-cache-get-stats-hits
+  plan-cache-get-stats-misses plan-cache-get-stats-evictions
+  plan-cache-reset-stats!)
+
+; ----------------------------------------------------------------
+; Namespace constants (per ob_lib_cache_register.h:39-49)
+; ----------------------------------------------------------------
+;
+; Per OB: NS_CRSR (SQL cursor) / NS_PRCR (procedure) / NS_PKG /
+; NS_SPM (SQL Plan Management) / NS_TABLEAPI
+
+(define NAMESPACE-CRSR 0)
+(define NAMESPACE-PRCR 1)
+(define NAMESPACE-PKG 2)
+(define NAMESPACE-SPM 3)
+(define NAMESPACE-TABLEAPI 4)
+
+; ----------------------------------------------------------------
+; Plan cache status constants
+; ----------------------------------------------------------------
+
+(define PLAN-CACHE-STATUS-BUILDING 0)
+(define PLAN-CACHE-STATUS-READY 1)
+(define PLAN-CACHE-STATUS-EVICTING 2)
+(define PLAN-CACHE-STATUS-INVALID 3)
+
+; ----------------------------------------------------------------
+; Eviction policy constants
+; ----------------------------------------------------------------
+
+(define EVICTION-POLICY-LRU 0)
+(define EVICTION-POLICY-LFU 1)
+(define EVICTION-POLICY-FIFO 2)
+
+; ----------------------------------------------------------------
+; PlanCacheKey — closure-based
+; ----------------------------------------------------------------
+
+; make-plan-cache-key: create a Plan Cache key.
+; Args: sql-text (symbol — SQL text), db-name (symbol),
+;       plan-id (integer — unique plan id)
+; Returns: plan_cache_key closure.
+(define (make-plan-cache-key sql-text db-name plan-id)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'sql-text) sql-text)
+                     ((eq? msg 'db-name) db-name)
+                     ((eq? msg 'plan-id) plan-id)
+                     (else #f)))))
+      self))
+
+; plan-cache-key?: is the object a plan cache key?
+; Detected by querying 'plan-id — only keys return integer.
+(define (plan-cache-key? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'plan-id)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; plan-cache-key-get-sql-text: get SQL text.
+(define (plan-cache-key-get-sql-text k) (k 'sql-text))
+
+; plan-cache-key-get-db-name: get database name.
+(define (plan-cache-key-get-db-name k) (k 'db-name))
+
+; plan-cache-key-get-plan-id: get plan id.
+(define (plan-cache-key-get-plan-id k) (k 'plan-id))
+
+; plan-cache-key-equal?: check if two keys are equal.
+(define (plan-cache-key-equal? a b)
+  (and (eq? (a 'sql-text) (b 'sql-text))
+       (eq? (a 'db-name) (b 'db-name))
+       (= (a 'plan-id) (b 'plan-id))))
+
+; ----------------------------------------------------------------
+; PhysicalPlan — closure-based
+; ----------------------------------------------------------------
+
+; make-physical-plan: create a Physical Plan cache object.
+; Args: key (plan_cache_key), plan-text (symbol),
+;       cost (integer)
+; Returns: physical_plan closure (initial: last-access-time=0).
+(define (make-physical-plan key plan-text cost)
+  (let ((last-access-time 0))
+    (letrec ((set-last-access-time!
+              (lambda (v) (set! last-access-time v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'key) key)
+                       ((eq? msg 'plan-text) plan-text)
+                       ((eq? msg 'cost) cost)
+                       ((eq? msg 'last-access-time) last-access-time)
+                       ((eq? msg 'set-last-access-time!)
+                        set-last-access-time!)
+                       (else #f)))))
+      self))
+
+; physical-plan?: is the object a physical plan?
+; Detected by querying 'cost — only plans return integer.
+(define (physical-plan? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'cost)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; physical-plan-get-key: get plan cache key.
+(define (physical-plan-get-key p) (p 'key))
+
+; physical-plan-get-plan-text: get plan text.
+(define (physical-plan-get-plan-text p) (p 'plan-text))
+
+; physical-plan-get-cost: get cost.
+(define (physical-plan-get-cost p) (p 'cost))
+
+; physical-plan-get-last-access-time: get last access time.
+(define (physical-plan-get-last-access-time p) (p 'last-access-time))
+
+; physical-plan-set-last-access-time!: set last access time.
+; Returns the new time.
+(define (physical-plan-set-last-access-time! p v)
+  ((p 'set-last-access-time!) v))
+
+; physical-plan-touch!: update last access time to current.
+; (v1: increment by 1)
+(define (physical-plan-touch! p)
+  (let ((t (p 'last-access-time)))
+  (let ((new-t (+ t 1)))
+  ((p 'set-last-access-time!) new-t))))
+
+; ----------------------------------------------------------------
+; PCVSet — namespace-scoped plan cache view
+; ----------------------------------------------------------------
+
+; make-pcvset: create a PCVSet for a specific namespace.
+; Args: namespace (integer), plan-cache (plan_cache)
+; Returns: pcvset closure (initial: no entries).
+(define (make-pcvset namespace plan-cache)
+  (let ((entries '()))
+    (letrec ((set-entries! (lambda (v) (set! entries v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'namespace) namespace)
+                       ((eq? msg 'plan-cache) plan-cache)
+                       ((eq? msg 'entries) entries)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       (else #f)))))
+      self))
+
+; pcvset?: is the object a PCVSet?
+; Detected by querying 'entries — only sets return a list.
+(define (pcvset? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'entries)) #t #f)
+      #f))
+
+; pcvset-get-namespace: get namespace.
+(define (pcvset-get-namespace p) (p 'namespace))
+
+; pcvset-get-cache: get plan cache.
+(define (pcvset-get-cache p) (p 'plan-cache))
+
+; Helper: get a physical plan from PCVSet by key.
+; pcvset-lookup: returns plan or #f.
+(define (pcvset-lookup p key)
+  (let loop ((rest (p 'entries)))
+    (cond
+      ((null? rest) #f)
+      ((plan-cache-key-equal? (car-rest 'key rest) key)
+       (car-rest 'plan rest))
+      (else
+       (loop (cdr rest))))))
+
+; car-rest: helper — (car-rest field list) = ((car list) field)
+(define (car-rest field rest)
+  ((car rest) field))
+
+; pcvset-add!: add an entry.
+; Entries are (key . plan) pairs.
+(define (pcvset-add! p key plan)
+  (let ((existing (p 'entries)))
+    ((p 'set-entries!) (cons (cons key plan) existing))))
+
+; pcvset-remove!: remove an entry by key.
+; Returns #t if removed, #f if not found.
+(define (pcvset-remove! p key)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((p 'set-entries!)
+                             (cons-pcv-rev acc '()))
+                            ((p 'set-entries!) acc))
+                        found?)
+                       ((plan-cache-key-equal?
+                         (car-rest 'key rest) key)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest)
+                                (cons (car rest) acc)))))))
+    (search (p 'entries) '())))
+
+; cons-pcv-rev: helper — (cons-pcv-rev acc rest) = (append (reverse acc) rest)
+(define (cons-pcv-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-pcv-rev (cdr acc) (cons (car acc) rest))))
+
+; pcvset-count: count of entries.
+(define (pcvset-count p)
+  (let loop ((rest (p 'entries)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; PlanCache — closure-based
+; ----------------------------------------------------------------
+;
+; v1: simple map-based cache with LRU eviction + stats counters.
+; Tracks hits, misses, evictions.
+
+; make-plan-cache: create a Plan Cache.
+; Args: hwm (integer — high water mark, max entries),
+;       lwm (integer — low water mark, eviction target),
+;       eviction-policy (integer)
+; Returns: plan_cache closure (initial: empty, stats=0).
+(define (make-plan-cache hwm lwm eviction-policy)
+  (let ((entries '())
+        (stats-hits 0)
+        (stats-misses 0)
+        (stats-evictions 0))
+    (letrec ((set-entries! (lambda (v) (set! entries v) v))
+             (set-hwm! (lambda (v) (set! hwm v) v))
+             (set-lwm! (lambda (v) (set! lwm v) v))
+             (set-stats-hits! (lambda (v) (set! stats-hits v) v))
+             (set-stats-misses! (lambda (v) (set! stats-misses v) v))
+             (set-stats-evictions! (lambda (v) (set! stats-evictions v) v))
+             (inc-stats-hits! (lambda () (set! stats-hits (+ stats-hits 1)) stats-hits))
+             (inc-stats-misses! (lambda () (set! stats-misses (+ stats-misses 1)) stats-misses))
+             (inc-stats-evictions!
+              (lambda () (set! stats-evictions (+ stats-evictions 1)) stats-evictions))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'entries) entries)
+                       ((eq? msg 'hwm) hwm)
+                       ((eq? msg 'lwm) lwm)
+                       ((eq? msg 'eviction-policy) eviction-policy)
+                       ((eq? msg 'stats-hits) stats-hits)
+                       ((eq? msg 'stats-misses) stats-misses)
+                       ((eq? msg 'stats-evictions) stats-evictions)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       ((eq? msg 'set-hwm!) set-hwm!)
+                       ((eq? msg 'set-lwm!) set-lwm!)
+                       ((eq? msg 'set-stats-hits!) set-stats-hits!)
+                       ((eq? msg 'set-stats-misses!) set-stats-misses!)
+                       ((eq? msg 'set-stats-evictions!) set-stats-evictions!)
+                       ((eq? msg 'inc-stats-hits!) inc-stats-hits!)
+                       ((eq? msg 'inc-stats-misses!) inc-stats-misses!)
+                       ((eq? msg 'inc-stats-evictions!) inc-stats-evictions!)
+                       (else #f)))))
+      self))
+
+; plan-cache?: is the object a plan cache?
+; Detected by querying 'hwm — only caches return integer.
+(define (plan-cache? obj)
+  (if (procedure? obj)
+      (let ((h (obj 'hwm)))
+        (if (and (integer? h) (>= h 0)) #t #f))
+      #f))
+
+; plan-cache-get-hwm: get high water mark.
+(define (plan-cache-get-hwm c) (c 'hwm))
+
+; plan-cache-get-lwm: get low water mark.
+(define (plan-cache-get-lwm c) (c 'lwm))
+
+; plan-cache-get-eviction-policy: get eviction policy.
+(define (plan-cache-get-eviction-policy c) (c 'eviction-policy))
+
+; plan-cache-set-hwm!: set high water mark.
+(define (plan-cache-set-hwm! c v) ((c 'set-hwm!) v))
+
+; plan-cache-set-lwm!: set low water mark.
+(define (plan-cache-set-lwm! c v) ((c 'set-lwm!) v))
+
+; Helper: find entry by key in plan-cache.
+; Returns the entry (key . plan) or #f.
+(define (pc-find-entry cache key)
+  (let loop ((rest (cache 'entries)))
+    (cond
+      ((null? rest) #f)
+      ((plan-cache-key-equal? (car (car rest)) key)
+       (car rest))
+      (else (loop (cdr rest))))))
+
+; plan-cache-get: lookup a plan by key.
+; On hit, increments hit count + touches plan.
+; On miss, increments miss count.
+; Returns the plan or #f.
+(define (plan-cache-get cache key)
+  (let ((entry (pc-find-entry cache key)))
+    (cond
+      ((eq? entry #f)
+       ((cache 'inc-stats-misses!))
+       #f)
+      (else
+       ((cache 'inc-stats-hits!))
+       (let ((plan (cdr entry)))
+         (physical-plan-touch! plan)
+         plan)))))
+
+; plan-cache-add!: add a key + plan entry.
+; If HWM reached, evicts down to LWM (LRU policy) before adding.
+; Returns the new count of entries.
+(define (plan-cache-add! cache key plan)
+  (let ((cur (plan-cache-count cache))
+        (hwm-val (cache 'hwm)))
+    ; Evict first if at or above HWM.
+    (cond
+      ((>= cur hwm-val)
+       (plan-cache-evict! cache)
+       (plan-cache-add! cache key plan))
+      (else
+       ((cache 'set-entries!) (cons (cons key plan) (cache 'entries)))
+       cur))))
+
+; plan-cache-evict!: evict entries down to LWM (LRU policy).
+; Removes entries with oldest last-access-time first.
+; Returns count of evictions performed.
+(define (plan-cache-evict! cache)
+  (let ((target (cache 'lwm))
+        (cur (plan-cache-count cache)))
+    (cond
+      ((<= cur target) 0)
+      (else
+       ; Find oldest entry (min last-access-time).
+       (letrec ((oldest-entry #f)
+                (oldest-time 99999999)
+                (search (lambda (rest)
+                          (cond
+                            ((null? rest) '())
+                            (else
+                             (let ((time ((cdr rest) 'last-access-time)))
+                               (cond
+                                 ((< time oldest-time)
+                                  (set! oldest-time time)
+                                  (set! oldest-entry (car rest))
+                                  (search (cdr rest)))
+                                 (else
+                                  (search (cdr rest)))))))))
+                (scan-result (search (cache 'entries))))
+         (cond
+           ((eq? oldest-entry #f) 0)
+           (else
+            ((cache 'set-entries!)
+             (pcv-evict-one (cache 'entries) oldest-entry))
+            ((cache 'inc-stats-evictions!))
+            1))))))
+
+; pcv-evict-one: helper — remove specific entry from entries.
+(define (pcv-evict-one entries target)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            (pcv-cons-rev acc '())
+                            (pcv-cons-rev acc rest))
+                        found?)
+                       ((eq? (car rest) target)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search entries '())))
+
+; pcv-cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (pcv-cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (pcv-cons-rev (cdr acc) (cons (car acc) rest))))
+
+; plan-cache-remove!: remove entry by key.
+; Returns #t if removed, #f if not found.
+(define (plan-cache-remove! cache key)
+  (cond
+    ((not (pc-find-entry cache key)) #f)
+    (else
+     ((cache 'set-entries!)
+      (pc-remove-from-list (cache 'entries) key))
+     #t)))
+
+; pc-remove-from-list: helper — remove key from entries.
+(define (pc-remove-from-list entries key)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            (pcv-cons-rev acc '())
+                            (pcv-cons-rev acc rest))
+                        found?)
+                       ((plan-cache-key-equal? (car (car rest)) key)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search entries '())))
+
+; plan-cache-count: count of entries.
+(define (plan-cache-count c)
+  (let loop ((rest (c 'entries)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; plan-cache-get-stats-hits: get hits.
+(define (plan-cache-get-stats-hits c) (c 'stats-hits))
+
+; plan-cache-get-stats-misses: get misses.
+(define (plan-cache-get-stats-misses c) (c 'stats-misses))
+
+; plan-cache-get-stats-evictions: get evictions.
+(define (plan-cache-get-stats-evictions c) (c 'stats-evictions))
+
+; plan-cache-reset-stats!: zero all stat counters.
+(define (plan-cache-reset-stats! c)
+  ((c 'set-stats-hits!) 0)
+  ((c 'set-stats-misses!) 0)
+  ((c 'set-stats-evictions!) 0))
