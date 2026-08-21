@@ -1,0 +1,406 @@
+; 13-clog.aura
+; =====================
+; clog — minimal capability port to aura.
+;
+; Maps to: OceanBase Clog subsystem (LogService ↔ Storage bridge)
+; Source: src/logservice/ob_log_base_type.h
+;         + src/logservice/ob_log_base_header.h
+;         + src/logservice/ob_replay_handler.h
+;         + src/logservice/ob_log_replay_service.h
+;         + src/storage/tx/ob_tx_log.h
+;         + src/storage/tx/ob_tx_replay_executor.h
+;         + src/storage/ls/ob_ls_storage_clog_handler.h
+;         + src/memtable/ob_redo_log_generator.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Clog subsystem:
+;   - ObLogBaseType: 60+ log base types (TRANS_SERVICE,
+;     TABLET_OP, MAJOR_FREEZE, DDL, KEEP_ALIVE, MEDIUM_COMPACTION)
+;   - ObTxLogType: transaction-level log types (TX_REDO_LOG,
+;     TX_PREPARE_LOG, TX_COMMIT_LOG, TX_ABORT_LOG, TX_CLEAR_LOG,
+;     TX_START_WORKING_LOG)
+;   - ObLogBaseHeader: header with log type + pre/post_replay_barrier
+;     + replay_hint
+;   - ObReplayHandler: registry of sub-handlers by type, replay
+;     dispatch
+;   - ObLogReplayService: top-level replay service
+;   - ObRedoLogGenerator: creates redo log entries
+;   - ObTxReplayExecutor: replays tx logs to Memtable
+;   - ObLogApplyService: PALF commit callback dispatch
+;
+; aura has no PALF, no replay. v1 ships:
+;   - 8 LOG-BASE-TYPE constants (TRANS_SERVICE, TABLET_OP,
+;     DDL, KEEP_ALIVE, MAJOR_FREEZE, MEDIUM_COMPACTION,
+;     TABLET_MIGRATE, EMPTY)
+;   - 6 TX-LOG-TYPE constants (REDO, PREPARE, COMMIT, ABORT,
+;     CLEAR, START-WORKING)
+;   - make-log-base-header (factory: type + pre-barrier +
+;     post-barrier + hint)
+;   - log-base-header accessors
+;   - make-replay-handler (registry of sub-handlers)
+;   - replay-handler-register! / replay-handler-dispatch!
+;     (lookup handler by type + invoke replay)
+;   - replay-handler-count-handlers
+;   - make-redo-log-entry (factory: tx-id + table-id + row-data)
+;   - redo-log-entry accessors
+;   - make-log-apply-service (PALF commit callback dispatch)
+;   - log-apply-service-register! / log-apply-service-apply!
+;   - log-apply-service-get-stats (applied + skipped counters)
+;
+; Deferred (full OceanBase Clog):
+;   - real ObReplayHandler with all 60+ sub-handlers
+;   - real ObLogBaseHeader binary serialization
+;   - real ObRedoLogGenerator with row encoding
+;   - real ObTxReplayExecutor with redo + undo parsing
+;   - real ObLogReplayService (PALF fetch + replay pipeline)
+;   - real ObLogFetcher (catch-up replication)
+;   - real ObLogApplyService (PALF commit callback chain)
+;   - real ObReplayBarrier (pre/post replay barrier enforcement)
+
+(export
+  ; LogBaseType constants
+  LOG-BASE-TYPE-TRANS-SERVICE
+  LOG-BASE-TYPE-TABLET-OP
+  LOG-BASE-TYPE-DDL
+  LOG-BASE-TYPE-KEEP-ALIVE
+  LOG-BASE-TYPE-MAJOR-FREEZE
+  LOG-BASE-TYPE-MEDIUM-COMPACTION
+  LOG-BASE-TYPE-TABLET-MIGRATE
+  LOG-BASE-TYPE-EMPTY
+  ; TxLogType constants
+  TX-LOG-TYPE-REDO
+  TX-LOG-TYPE-PREPARE
+  TX-LOG-TYPE-COMMIT
+  TX-LOG-TYPE-ABORT
+  TX-LOG-TYPE-CLEAR
+  TX-LOG-TYPE-START-WORKING
+  ; LogBaseHeader
+  make-log-base-header log-base-header?
+  log-base-header-get-log-type
+  log-base-header-need-pre-replay-barrier?
+  log-base-header-need-post-replay-barrier?
+  log-base-header-get-replay-hint
+  log-base-header-set-log-type!
+  log-base-header-set-pre-replay-barrier!
+  log-base-header-set-post-replay-barrier!
+  log-base-header-set-replay-hint!
+  ; ReplayHandler
+  make-replay-handler replay-handler?
+  replay-handler-register! replay-handler-dispatch!
+  replay-handler-count-handlers
+  replay-handler-find-by-type
+  ; RedoLogEntry
+  make-redo-log-entry redo-log-entry?
+  redo-log-entry-get-tx-id redo-log-entry-get-table-id
+  redo-log-entry-get-row-data redo-log-entry-get-scn
+  redo-log-entry-set-tx-id! redo-log-entry-set-table-id!
+  redo-log-entry-set-scn!
+  ; LogApplyService
+  make-log-apply-service log-apply-service?
+  log-apply-service-register! log-apply-service-apply!
+  log-apply-service-get-applied-count
+  log-apply-service-get-skipped-count
+  log-apply-service-inc-applied!
+  log-apply-service-inc-skipped!)
+
+; ----------------------------------------------------------------
+; LogBaseType constants (subset per ob_log_base_type.h:30-70)
+; ----------------------------------------------------------------
+;
+; Per OB (60+ types). aura v1 ships a representative subset.
+
+(define LOG-BASE-TYPE-TRANS-SERVICE 1)
+(define LOG-BASE-TYPE-TABLET-OP 2)
+(define LOG-BASE-TYPE-DDL 5)
+(define LOG-BASE-TYPE-KEEP-ALIVE 6)
+(define LOG-BASE-TYPE-MAJOR-FREEZE 10)
+(define LOG-BASE-TYPE-MEDIUM-COMPACTION 18)
+(define LOG-BASE-TYPE-TABLET-MIGRATE 25)
+(define LOG-BASE-TYPE-EMPTY 100)
+
+; ----------------------------------------------------------------
+; TxLogType constants (per ob_tx_log.h:79-94)
+; ----------------------------------------------------------------
+;
+; Per OB:
+;   TX_REDO_LOG = 0x1
+;   TX_PREPARE_LOG = 0x80
+;   TX_COMMIT_LOG = 0x100
+;   TX_ABORT_LOG = 0x200
+;   TX_CLEAR_LOG = 0x400
+;   TX_START_WORKING_LOG = 0x100000
+
+(define TX-LOG-TYPE-REDO 1)
+(define TX-LOG-TYPE-PREPARE 128)
+(define TX-LOG-TYPE-COMMIT 256)
+(define TX-LOG-TYPE-ABORT 512)
+(define TX-LOG-TYPE-CLEAR 1024)
+(define TX-LOG-TYPE-START-WORKING 1048576)
+
+; ----------------------------------------------------------------
+; ObLogBaseHeader — closure-based
+; ----------------------------------------------------------------
+
+; make-log-base-header: create ObLogBaseHeader.
+; Args: log-type (integer), pre-barrier? (boolean),
+;       post-barrier? (boolean), replay-hint (integer)
+; Returns: log_base_header closure.
+(define (make-log-base-header log-type pre-barrier? post-barrier? replay-hint)
+  (letrec ((set-log-type! (lambda (v) (set! log-type v) v))
+           (set-pre-barrier! (lambda (v) (set! pre-barrier? v) v))
+           (set-post-barrier! (lambda (v) (set! post-barrier? v) v))
+           (set-replay-hint! (lambda (v) (set! replay-hint v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'log-type) log-type)
+                     ((eq? msg 'pre-barrier?) pre-barrier?)
+                     ((eq? msg 'post-barrier?) post-barrier?)
+                     ((eq? msg 'replay-hint) replay-hint)
+                     ((eq? msg 'set-log-type!) set-log-type!)
+                     ((eq? msg 'set-pre-barrier!) set-pre-barrier!)
+                     ((eq? msg 'set-post-barrier!) set-post-barrier!)
+                     ((eq? msg 'set-replay-hint!) set-replay-hint!)
+                     (else #f)))))
+      self)))
+
+; log-base-header?: is the object a log base header?
+; Detected by querying 'pre-barrier? — only headers return a boolean.
+(define (log-base-header? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'pre-barrier?)))
+        (if (or (eq? p #t) (eq? p #f)) #t #f))
+      #f))
+
+; log-base-header-get-log-type: get log base type.
+(define (log-base-header-get-log-type h) (h 'log-type))
+
+; log-base-header-need-pre-replay-barrier?: does this log need
+; pre-replay barrier?
+(define (log-base-header-need-pre-replay-barrier? h) (h 'pre-barrier?))
+
+; log-base-header-need-post-replay-barrier?: does this log need
+; post-replay barrier?
+(define (log-base-header-need-post-replay-barrier? h) (h 'post-barrier?))
+
+; log-base-header-get-replay-hint: get replay hint.
+(define (log-base-header-get-replay-hint h) (h 'replay-hint))
+
+; log-base-header-set-log-type!: set log type.
+(define (log-base-header-set-log-type! h v) ((h 'set-log-type!) v))
+
+; log-base-header-set-pre-replay-barrier!: set pre-barrier flag.
+(define (log-base-header-set-pre-replay-barrier! h v)
+  ((h 'set-pre-barrier!) v))
+
+; log-base-header-set-post-replay-barrier!: set post-barrier flag.
+(define (log-base-header-set-post-replay-barrier! h v)
+  ((h 'set-post-barrier!) v))
+
+; log-base-header-set-replay-hint!: set replay hint.
+(define (log-base-header-set-replay-hint! h v)
+  ((h 'set-replay-hint!) v))
+
+; ----------------------------------------------------------------
+; ObReplayHandler — registry of sub-handlers by type
+; ----------------------------------------------------------------
+;
+; Per OB (ob_replay_handler.h):
+;   - register_handler(type, handler)
+;   - replay(type, buffer, nbytes, lsn, scn)
+;
+; aura v1: model handler as a procedure (type, lsn, scn) → result.
+; type is registered with the handler closure.
+
+; make-replay-handler: create empty replay handler.
+; Returns: replay_handler closure.
+(define (make-replay-handler)
+  (let ((handlers '()))
+    (letrec ((set-handlers! (lambda (v) (set! handlers v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handlers) handlers)
+                       ((eq? msg 'set-handlers!) set-handlers!)
+                       (else #f)))))
+      self)))
+
+; replay-handler?: is the object a replay handler?
+; Detected by querying 'handlers — only handlers return a list.
+(define (replay-handler? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'handlers)) #t #f)
+      #f))
+
+; replay-handler-register!: register a sub-handler for a type.
+; Each entry is a pair (type . handler-procedure).
+; Returns the new count of handlers.
+(define (replay-handler-register! rh type handler)
+  (let ((existing (rh 'handlers)))
+    ((rh 'set-handlers!) (cons (cons type handler) existing))))
+
+; replay-handler-find-by-type: find handler by log-type.
+; Returns the handler-procedure or #f.
+(define (replay-handler-find-by-type rh type)
+  (let loop ((rest (rh 'handlers)))
+    (cond
+      ((null? rest) #f)
+      ((= (car (car rest)) type) (cdr (car rest)))
+      (else (loop (cdr rest))))))
+
+; replay-handler-dispatch!: dispatch replay to handler for given type.
+; Calls the registered handler with (lsn, scn).
+; Returns the result of the handler, or #f if no handler registered.
+(define (replay-handler-dispatch! rh type lsn scn)
+  (let ((handler (replay-handler-find-by-type rh type)))
+    (if (procedure? handler)
+        (handler lsn scn)
+        #f)))
+
+; replay-handler-count-handlers: count registered handlers.
+(define (replay-handler-count-handlers rh)
+  (let loop ((rest (rh 'handlers)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; ObRedoLogEntry — closure-based
+; ----------------------------------------------------------------
+;
+; Per OB (ob_redo_log_generator.h): redo log = tx_id + table_id +
+; row_data + scn.
+
+; make-redo-log-entry: create a RedoLogEntry.
+; Args: tx-id (integer), table-id (integer), row-data (any),
+;       scn (integer)
+; Returns: redo_log_entry closure.
+(define (make-redo-log-entry tx-id table-id row-data scn)
+  (letrec ((set-tx-id! (lambda (v) (set! tx-id v) v))
+           (set-table-id! (lambda (v) (set! table-id v) v))
+           (set-scn! (lambda (v) (set! scn v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tx-id) tx-id)
+                     ((eq? msg 'table-id) table-id)
+                     ((eq? msg 'row-data) row-data)
+                     ((eq? msg 'scn) scn)
+                     ((eq? msg 'set-tx-id!) set-tx-id!)
+                     ((eq? msg 'set-table-id!) set-table-id!)
+                     ((eq? msg 'set-scn!) set-scn!)
+                     (else #f)))))
+      self)))
+
+; redo-log-entry?: is the object a redo log entry?
+; Detected by querying 'table-id — only redo_entries return integer.
+(define (redo-log-entry? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'table-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; redo-log-entry-get-tx-id: get tx_id.
+(define (redo-log-entry-get-tx-id e) (e 'tx-id))
+
+; redo-log-entry-get-table-id: get table_id.
+(define (redo-log-entry-get-table-id e) (e 'table-id))
+
+; redo-log-entry-get-row-data: get row data payload.
+(define (redo-log-entry-get-row-data e) (e 'row-data))
+
+; redo-log-entry-get-scn: get SCN.
+(define (redo-log-entry-get-scn e) (e 'scn))
+
+; redo-log-entry-set-tx-id!: set tx_id.
+(define (redo-log-entry-set-tx-id! e v) ((e 'set-tx-id!) v))
+
+; redo-log-entry-set-table-id!: set table_id.
+(define (redo-log-entry-set-table-id! e v) ((e 'set-table-id!) v))
+
+; redo-log-entry-set-scn!: set SCN.
+(define (redo-log-entry-set-scn! e v) ((e 'set-scn!) v))
+
+; ----------------------------------------------------------------
+; ObLogApplyService — PALF commit callback dispatch
+; ----------------------------------------------------------------
+;
+; Per OB (ob_log_apply_service.h):
+;   - register_subhandler(log_type, sub_handler)
+;   - apply(log_base_header, log_buffer, lsn, scn) — invoked on
+;     PALF commit callback
+;
+; aura v1: same model as replay handler.
+
+; make-log-apply-service: create empty apply service.
+; Returns: log_apply_service closure.
+(define (make-log-apply-service)
+  (let ((handlers '())
+        (applied-count 0)
+        (skipped-count 0))
+    (letrec ((set-handlers! (lambda (v) (set! handlers v) v))
+             (set-applied! (lambda (v) (set! applied-count v) v))
+             (set-skipped! (lambda (v) (set! skipped-count v) v))
+             (inc-applied! (lambda () (set! applied-count (+ applied-count 1)) applied-count))
+             (inc-skipped! (lambda () (set! skipped-count (+ skipped-count 1)) skipped-count))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handlers) handlers)
+                       ((eq? msg 'applied-count) applied-count)
+                       ((eq? msg 'skipped-count) skipped-count)
+                       ((eq? msg 'set-handlers!) set-handlers!)
+                       ((eq? msg 'set-applied!) set-applied!)
+                       ((eq? msg 'set-skipped!) set-skipped!)
+                       ((eq? msg 'inc-applied!) inc-applied!)
+                       ((eq? msg 'inc-skipped!) inc-skipped!)
+                       (else #f)))))
+      self)))
+
+; log-apply-service?: is the object a log apply service?
+; Detected by querying 'applied-count — only services return integer.
+(define (log-apply-service? obj)
+  (if (procedure? obj)
+      (let ((a (obj 'applied-count)))
+        (if (and (integer? a) (>= a 0)) #t #f))
+      #f))
+
+; log-apply-service-register!: register a sub-handler for a
+; log-type. Handler procedure signature: (log-base-header,
+; log-buffer, lsn, scn) → result.
+; Returns the new count of handlers.
+(define (log-apply-service-register! svc log-type handler)
+  (let ((existing (svc 'handlers)))
+    ((svc 'set-handlers!) (cons (cons log-type handler) existing))))
+
+; log-apply-service-apply!: dispatch apply to handler for given
+; header's log-type. Increments applied-count on success,
+; skipped-count on no handler.
+; Returns the result of the handler, or #f if no handler.
+(define (log-apply-service-apply! svc log-base-header log-buffer lsn scn)
+  (let ((log-type (log-base-header-get-log-type log-base-header))
+        (handlers (svc 'handlers)))
+    (let loop ((rest handlers) (result #f))
+      (cond
+        ((null? rest)
+         ; No handler for this type — skip.
+         ((svc 'inc-skipped!))
+         #f)
+        ((= (car (car rest)) log-type)
+         ; Found handler — invoke + bump applied.
+         ((svc 'inc-applied!))
+         ((cdr (car rest)) log-base-header log-buffer lsn scn))
+        (else
+         (loop (cdr rest) result))))))
+
+; log-apply-service-get-applied-count: get applied counter.
+(define (log-apply-service-get-applied-count svc) (svc 'applied-count))
+
+; log-apply-service-get-skipped-count: get skipped counter.
+(define (log-apply-service-get-skipped-count svc) (svc 'skipped-count))
+
+; log-apply-service-inc-applied!: increment applied counter.
+(define (log-apply-service-inc-applied! svc)
+  ((svc 'inc-applied!)))
+
+; log-apply-service-inc-skipped!: increment skipped counter.
+(define (log-apply-service-inc-skipped! svc)
+  ((svc 'inc-skipped!)))

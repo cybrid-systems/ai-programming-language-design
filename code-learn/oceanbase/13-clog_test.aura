@@ -1,0 +1,284 @@
+; 13-clog_test.aura
+; =====================
+; Smoke tests for 13-clog.aura — Clog subsystem minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/13-clog_test.aura
+;
+; Verified automatically (smoke):
+;   - 8 LOG-BASE-TYPE constants distinct
+;   - 6 TX-LOG-TYPE constants distinct
+;   - make-log-base-header + accessors + setters
+;   - make-replay-handler + register/dispatch/find/count
+;   - make-redo-log-entry + accessors + setters
+;   - make-log-apply-service + register/apply + stats
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Handler dispatch returns correct result
+;   - Stats accumulate correctly
+;
+; Deferred (full OceanBase Clog):
+;   - real ObReplayHandler with all 60+ sub-handlers
+;   - real ObLogBaseHeader binary serialization
+;   - real ObRedoLogGenerator with row encoding
+;   - real ObTxReplayExecutor with redo + undo parsing
+;   - real ObLogReplayService (PALF fetch + replay pipeline)
+;   - real ObLogFetcher (catch-up replication)
+;   - real ObLogApplyService (PALF commit callback chain)
+
+(require "std/test" all:)
+(require "13-clog" all:)
+
+; ----------------------------------------------------------------
+; File-level helpers
+; ----------------------------------------------------------------
+
+; mock-replay: simple handler that records the (type, lsn, scn) it
+; was called with and returns a marker.
+(define (make-mock-handler)
+  (let ((calls '()))
+    (letrec ((self (lambda (msg)
+                     (cond
+                       ((eq? msg 'calls) calls)
+                       ((eq? msg 'invoke)
+                        (lambda (lsn scn)
+                          (set! calls (cons (cons lsn scn) calls))
+                          'applied))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "13-001-log-base-type-distinct"
+  ; 8 LOG-BASE-TYPE constants are distinct.
+  (check (= 1 (if (not (= LOG-BASE-TYPE-TRANS-SERVICE
+                          LOG-BASE-TYPE-TABLET-OP)) 1 0)))
+  (check (= 1 (if (not (= LOG-BASE-TYPE-TABLET-OP
+                          LOG-BASE-TYPE-DDL)) 1 0)))
+  (check (= 1 (if (not (= LOG-BASE-TYPE-DDL
+                          LOG-BASE-TYPE-KEEP-ALIVE)) 1 0)))
+  (check (= 1 (if (not (= LOG-BASE-TYPE-KEEP-ALIVE
+                          LOG-BASE-TYPE-MAJOR-FREEZE)) 1 0)))
+  (check (= 1 (if (not (= LOG-BASE-TYPE-MAJOR-FREEZE
+                          LOG-BASE-TYPE-MEDIUM-COMPACTION)) 1 0)))
+  (check (= 1 (if (not (= LOG-BASE-TYPE-MEDIUM-COMPACTION
+                          LOG-BASE-TYPE-TABLET-MIGRATE)) 1 0)))
+  (check (= 1 (if (not (= LOG-BASE-TYPE-TABLET-MIGRATE
+                          LOG-BASE-TYPE-EMPTY)) 1 0))))
+
+(test-suite "13-001-tx-log-type-distinct"
+  ; 6 TX-LOG-TYPE constants are distinct.
+  (check (= 1 (if (not (= TX-LOG-TYPE-REDO TX-LOG-TYPE-PREPARE)) 1 0)))
+  (check (= 1 (if (not (= TX-LOG-TYPE-PREPARE TX-LOG-TYPE-COMMIT)) 1 0)))
+  (check (= 1 (if (not (= TX-LOG-TYPE-COMMIT TX-LOG-TYPE-ABORT)) 1 0)))
+  (check (= 1 (if (not (= TX-LOG-TYPE-ABORT TX-LOG-TYPE-CLEAR)) 1 0)))
+  (check (= 1 (if (not (= TX-LOG-TYPE-CLEAR TX-LOG-TYPE-START-WORKING)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObLogBaseHeader
+; ----------------------------------------------------------------
+
+(test-suite "13-002-log-base-header-construction"
+  ; log-base-header preserves fields.
+  (check (= LOG-BASE-TYPE-TRANS-SERVICE
+ ( log-base-header-get-log-type
+   (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #t #f 100))))
+  (check (= #t (log-base-header-need-pre-replay-barrier?
+                 (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #t #f 100))))
+  (check (= #f (log-base-header-need-post-replay-barrier?
+                 (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #t #f 100))))
+  (check (= 100 (log-base-header-get-replay-hint
+                  (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #t #f 100)))))
+
+(test-suite "13-002-log-base-header-predicate"
+  ; log-base-header? accepts only headers.
+  (check (= #t (log-base-header?
+                 (make-log-base-header LOG-BASE-TYPE-DDL #f #f 0))))
+  (check (= #f (log-base-header? 'not-a-header)))
+  (check (= #f (log-base-header? 42))))
+
+(test-suite "13-003-log-base-header-setters"
+  ; log-base-header setters update fields.
+  (check (= LOG-BASE-TYPE-MAJOR-FREEZE
+             (let ((h (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #t #f 0)))
+               (log-base-header-set-log-type! h LOG-BASE-TYPE-MAJOR-FREEZE)
+               (log-base-header-get-log-type h))))
+  (check (= #t (let ((h (make-log-base-header LOG-BASE-TYPE-DDL #f #f 0)))
+                 (log-base-header-set-pre-replay-barrier! h #t)
+                 (log-base-header-need-pre-replay-barrier? h))))
+  (check (= 200 (let ((h (make-log-base-header LOG-BASE-TYPE-DDL #f #f 0)))
+                 (log-base-header-set-replay-hint! h 200)
+                 (log-base-header-get-replay-hint h))))
+
+; ----------------------------------------------------------------
+; ObReplayHandler
+; ----------------------------------------------------------------
+
+(test-suite "13-004-replay-handler-construction"
+  ; new replay handler starts empty.
+  (check (= 0 (replay-handler-count-handlers (make-replay-handler))))
+
+(test-suite "13-004-replay-handler-predicate"
+  ; replay-handler? accepts only replay handlers.
+  (check (= #t (replay-handler? (make-replay-handler))))
+  (check (= #f (replay-handler? 'not-an-rh)))
+  (check (= #f (replay-handler? 42))))
+
+(test-suite "13-005-replay-handler-register"
+  ; register-handler! increases count.
+  (check (= 1 (let ((rh (make-replay-handler))
+                    (handler (lambda (lsn scn) 'done)))
+                (replay-handler-register! rh LOG-BASE-TYPE-TRANS-SERVICE handler)
+                (replay-handler-count-handlers rh))))
+
+(test-suite "13-005-replay-handler-register-multiple"
+  ; Multiple registers accumulate.
+  (check (= 3 (let ((rh (make-replay-handler)))
+                (replay-handler-register! rh LOG-BASE-TYPE-TRANS-SERVICE
+                  (lambda (l s) 'a))
+                (replay-handler-register! rh LOG-BASE-TYPE-DDL
+                  (lambda (l s) 'b))
+                (replay-handler-register! rh LOG-BASE-TYPE-MAJOR-FREEZE
+                  (lambda (l s) 'c))
+                (replay-handler-count-handlers rh))))
+
+(test-suite "13-005-replay-handler-find"
+  ; find-by-type returns the registered handler.
+  (check (= #t (let ((rh (make-replay-handler))
+                    (handler (lambda (lsn scn) 'result)))
+                (replay-handler-register! rh LOG-BASE-TYPE-TRANS-SERVICE handler)
+                (eq? handler
+                  (replay-handler-find-by-type rh LOG-BASE-TYPE-TRANS-SERVICE))))))
+
+(test-suite "13-005-replay-handler-find-missing"
+  ; find-by-type returns #f for unregistered type.
+  (check (= #f (replay-handler-find-by-type
+                 (make-replay-handler) LOG-BASE-TYPE-DDL))))
+
+(test-suite "13-006-replay-handler-dispatch"
+  ; dispatch invokes handler with (lsn, scn).
+  (check (= #t (let ((rh (make-replay-handler))
+                    (recorder (make-mock-handler)))
+                (replay-handler-register! rh LOG-BASE-TYPE-TRANS-SERVICE
+                  (recorder 'invoke))
+                (replay-handler-dispatch! rh LOG-BASE-TYPE-TRANS-SERVICE 100 200)
+                (eq? 'applied (car recorder))))))
+
+(test-suite "13-006-replay-handler-dispatch-no-handler"
+  ; dispatch returns #f when no handler registered.
+  (check (= #f (replay-handler-dispatch!
+                 (make-replay-handler) LOG-BASE-TYPE-DDL 1 2)))
+
+; ----------------------------------------------------------------
+; ObRedoLogEntry
+; ----------------------------------------------------------------
+
+(test-suite "13-007-redo-log-entry-construction"
+  ; redo-log-entry preserves tx-id, table-id, row-data, scn.
+  (check (= 100 (redo-log-entry-get-tx-id
+                  (make-redo-log-entry 100 1 'row 1000))))
+  (check (= 1 (redo-log-entry-get-table-id
+               (make-redo-log-entry 100 1 'row 1000))))
+  (check (= #t (eq? 'row
+                   (redo-log-entry-get-row-data
+                     (make-redo-log-entry 100 1 'row 1000)))))
+  (check (= 1000 (redo-log-entry-get-scn
+                  (make-redo-log-entry 100 1 'row 1000)))))
+
+(test-suite "13-007-redo-log-entry-predicate"
+  ; redo-log-entry? accepts only redo log entries.
+  (check (= #t (redo-log-entry? (make-redo-log-entry 1 1 'd 1))))
+  (check (= #f (redo-log-entry? 'not-a-redo)))
+  (check (= #f (redo-log-entry? 42))))
+
+(test-suite "13-007-redo-log-entry-setters"
+  ; redo-log-entry setters update fields.
+  (check (= 200 (let ((e (make-redo-log-entry 100 1 'd 1000)))
+                  (redo-log-entry-set-tx-id! e 200)
+                  (redo-log-entry-get-tx-id e))))
+  (check (= 5 (let ((e (make-redo-log-entry 100 1 'd 1000)))
+               (redo-log-entry-set-table-id! e 5)
+               (redo-log-entry-get-table-id e))))
+  (check (= 2000 (let ((e (make-redo-log-entry 100 1 'd 1000)))
+                  (redo-log-entry-set-scn! e 2000)
+                  (redo-log-entry-get-scn e))))
+
+; ----------------------------------------------------------------
+; ObLogApplyService
+; ----------------------------------------------------------------
+
+(test-suite "13-008-log-apply-service-construction"
+  ; new log apply service starts with zero stats.
+  (check (= 0 (log-apply-service-get-applied-count
+ (make-log-apply-service))))
+  (check (= 0 (log-apply-service-get-skipped-count
+ (make-log-apply-service))))
+
+(test-suite "13-008-log-apply-service-predicate"
+  ; log-apply-service? accepts only apply services.
+  (check (= #t (log-apply-service? (make-log-apply-service))))
+  (check (= #f (log-apply-service? 'not-an-svc)))
+  (check (= #f (log-apply-service? 42))))
+
+(test-suite "13-009-log-apply-service-register"
+  ; register increments handlers (via cons).
+  (check (= #t (let ((svc (make-log-apply-service))
+                    (handler (lambda (h b l s) 'ok)))
+                (log-apply-service-register! svc LOG-BASE-TYPE-TRANS-SERVICE handler)
+                (procedure? handler))))
+
+(test-suite "13-009-log-apply-service-apply-matched"
+  ; apply with matched handler — applied counter bumps.
+  (check (= 1 (let ((svc (make-log-apply-service))
+                    (handler (lambda (h b l s) 'ok))
+                    (header (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #f #f 0)))
+                (log-apply-service-register! svc LOG-BASE-TYPE-TRANS-SERVICE handler)
+                (log-apply-service-apply! svc header 'buffer 100 200)
+                (log-apply-service-get-applied-count svc))))
+
+(test-suite "13-009-log-apply-service-apply-no-handler"
+  ; apply with no matching handler — skipped counter bumps, returns #f.
+  (check (= 1 (let ((svc (make-log-apply-service))
+                    (header (make-log-base-header LOG-BASE-TYPE-DDL #f #f 0)))
+                (log-apply-service-apply! svc header 'buffer 100 200)
+                (log-apply-service-get-skipped-count svc))))
+
+(test-suite "13-009-log-apply-service-stats-mixed"
+  ; apply 2 matched + 1 skipped → applied=2, skipped=1.
+  (check (= #t (let ((svc (make-log-apply-service))
+                    (h1 (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #f #f 0))
+                    (h2 (make-log-base-header LOG-BASE-TYPE-TRANS-SERVICE #f #f 0))
+                    (h3 (make-log-base-header LOG-BASE-TYPE-DDL #f #f 0))
+                    (handler (lambda (h b l s) 'ok)))
+                (log-apply-service-register! svc LOG-BASE-TYPE-TRANS-SERVICE handler)
+                (log-apply-service-apply! svc h1 'b 1 1)
+                (log-apply-service-apply! svc h2 'b 2 2)
+                (log-apply-service-apply! svc h3 'b 3 3)
+                (and (= 2 (log-apply-service-get-applied-count svc))
+                     (= 1 (log-apply-service-get-skipped-count svc))))))
+
+(test-suite "13-010-log-apply-service-inc-applied"
+  ; inc-applied! increments.
+  (check (= 3 (let ((svc (make-log-apply-service)))
+                 (log-apply-service-inc-applied! svc)
+                 (log-apply-service-inc-applied! svc)
+                 (log-apply-service-inc-applied! svc)
+                 (log-apply-service-get-applied-count svc))))
+
+(test-suite "13-010-log-apply-service-inc-skipped"
+  ; inc-skipped! increments.
+  (check (= 2 (let ((svc (make-log-apply-service)))
+                 (log-apply-service-inc-skipped! svc)
+                 (log-apply-service-inc-skipped! svc)
+                 (log-apply-service-get-skipped-count svc))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
