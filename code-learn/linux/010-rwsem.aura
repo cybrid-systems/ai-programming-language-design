@@ -1,0 +1,139 @@
+; 010-rwsem.aura
+; ==================
+; RWSEM (reader-writer semaphore) — minimal capability port to aura.
+;
+; Maps to: 010-rwsem-analysis.md
+; Source: include/linux/rwsem.h + kernel/locking/rwsem.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux rwsem uses atomic ops + bit-encoded count:
+;   - RWSEM_WRITER_LOCKED (bit 0): writer holds lock
+;   - RWSEM_FLAG_WAITERS (bit 1): waiters present
+;   - RWSEM_FLAG_HANDOFF (bit 2): handoff in progress
+;   - RWSEM_FLAG_READFAIL (bit 63): reader acquisition failed
+;   - RWSEM_READER_BIAS (1 << 8 = 256): reader counter unit
+;
+; aura has no atomics, no bit-packed ints.
+; v1 ships the data structure + reader/writer acquire/release semantics
+; (single-threaded):
+;   - make-rwsem
+;   - rwsem-read-lock / rwsem-read-unlock
+;   - rwsem-write-lock / rwsem-write-unlock
+;   - rwsem-read-trylock / rwsem-write-trylock
+;   - rwsem-reader-count
+;   - rwsem-writer-active?
+;   - rwsem-locked?
+;
+; Deferred (full Linux rwsem, separate issues):
+;   - Atomic cmpxchg fast path
+;   - Optimistic spinning (MCS osq)
+;   - Bit-encoded count (WAITERS / HANDOFF / READFAIL)
+;   - Wait queue (rwsem_waiter, first_waiter)
+;   - Blocking down_read / down_write
+;   - DEBUG_RWSEMS_WARN_ON etc.
+
+(export
+  make-rwsem
+  rwsem-read-lock
+  rwsem-read-unlock
+  rwsem-write-lock
+  rwsem-write-unlock
+  rwsem-read-trylock
+  rwsem-write-trylock
+  rwsem-reader-count
+  rwsem-writer-active?
+  rwsem-locked?)
+
+; ----------------------------------------------------------------
+; RWSEM (closure with reader count + writer owner)
+; ----------------------------------------------------------------
+
+; Make a reader-writer semaphore. Initially no readers, no writer.
+; - readers: count of current readers (non-negative integer)
+; - writer: writer owner token (or #f if no writer)
+(define (make-rwsem)
+  (let ((readers 0)
+        (writer #f))
+    (letrec ((set-readers! (lambda (v) (set! readers v) v))
+             (set-writer!  (lambda (v) (set! writer v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'readers) readers)
+                       ((eq? msg 'writer) writer)
+                       ((eq? msg 'set-readers!) set-readers!)
+                       ((eq? msg 'set-writer!) set-writer!)
+                       ((eq? msg 'writer-active?) (not (not writer)))
+                       ((eq? msg 'locked?) (or (> readers 0) writer))
+                       (else #f)))))
+      self)))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+; rwsem-reader-count: number of current readers.
+(define (rwsem-reader-count s)
+  (s 'readers))
+
+; rwsem-writer-active?: is a writer currently holding the lock?
+(define (rwsem-writer-active? s)
+  (not (not (s 'writer)))
+
+; rwsem-locked?: is the lock held by anyone (readers or writer)?
+(define (rwsem-locked? s)
+  (or (> (s 'readers) 0) (s 'writer)))
+
+; ----------------------------------------------------------------
+; Reader acquire / release
+; ----------------------------------------------------------------
+
+; rwsem-read-lock: acquire read access. Multiple readers allowed.
+; Returns the new reader count on success, or #f if a writer holds the lock.
+(define (rwsem-read-lock s)
+  (if (rwsem-writer-active? s)
+      #f
+      (begin
+        ((s 'set-readers!) (+ (s 'readers) 1))
+        (s 'readers))))
+
+; rwsem-read-unlock: release one reader slot.
+; Returns the new reader count, or #f if no readers (caller bug).
+(define (rwsem-read-unlock s)
+  (let ((n (s 'readers)))
+    (if (= n 0)
+        #f
+        (begin
+          ((s 'set-readers!) (- n 1))
+          (- n 1)))))
+
+; rwsem-read-trylock: non-blocking reader acquire. Same as rwsem-read-lock
+; in v1 (no actual blocking).
+(define (rwsem-read-trylock s)
+  (rwsem-read-lock s))
+
+; ----------------------------------------------------------------
+; Writer acquire / release
+; ----------------------------------------------------------------
+
+; rwsem-write-lock: acquire exclusive write access.
+; Returns writer token on success, or #f if readers or another writer hold.
+(define (rwsem-write-lock s writer-token)
+  (if (or (> (s 'readers) 0) (s 'writer))
+      #f
+      (begin
+        ((s 'set-writer!) writer-token)
+        writer-token)))
+
+; rwsem-write-unlock: release write access.
+; Returns #t on success, #f if no writer (caller bug).
+(define (rwsem-write-unlock s)
+  (if (s 'writer)
+      (begin
+        ((s 'set-writer!) #f)
+        #t)
+      #f))
+
+; rwsem-write-trylock: non-blocking writer acquire.
+(define (rwsem-write-trylock s writer-token)
+  (rwsem-write-lock s writer-token))

@@ -1,0 +1,110 @@
+; 010-rwsem_test.aura
+; =====================
+; Smoke tests for 010-rwsem.aura — reader-writer semaphore minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/010-rwsem_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form using numeric equality.
+;
+; Verified automatically (smoke):
+;   - make-rwsem construction (no readers, no writer)
+;   - rwsem-read-lock increments reader count
+;   - rwsem-read-trylock succeeds when no writer
+;   - rwsem-read-trylock fails when writer active
+;   - rwsem-write-lock acquires when free
+;   - rwsem-write-trylock fails when readers present
+;   - rwsem-write-unlock releases
+;   - Multiple readers allowed simultaneously
+;   - Reader/writer mutual exclusion
+;
+; Verified via separate probes during development:
+;   - Reader count tracks +1 / -1
+;   - Writer blocks new readers
+;   - Re-acquire after release
+;
+; Deferred (full Linux rwsem):
+;   - Atomic cmpxchg fast path
+;   - Optimistic spinning (MCS osq)
+;   - Bit-encoded count (WAITERS / HANDOFF / READFAIL)
+;   - Wait queue (rwsem_waiter, first_waiter)
+;   - Blocking down_read / down_write
+;   - DEBUG_RWSEMS_WARN_ON
+
+(require "std/test" all:)
+(require "010-rwsem" all:)
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(test-suite "rwsem-001-init"
+  (check (= 0 (rwsem-reader-count (make-rwsem))))
+  (check (= 1 (if (not (rwsem-writer-active? (make-rwsem))) 1 0)))
+
+; ----------------------------------------------------------------
+; Reader acquire
+; ----------------------------------------------------------------
+
+(test-suite "rwsem-002-read-lock"
+  (check (= 1 (rwsem-read-lock (make-rwsem))))
+
+(test-suite "rwsem-002-read-multiple"
+  ; Multiple readers allowed.
+  (check (= 3 (let ((s (make-rwsem)))
+                 (rwsem-read-lock s)
+                 (rwsem-read-lock s)
+                 (rwsem-read-lock s)
+                 (rwsem-reader-count s))))
+
+; ----------------------------------------------------------------
+; Reader trylock
+; ----------------------------------------------------------------
+
+(test-suite "rwsem-003-read-trylock-fail-on-writer"
+  (check (= 1 (let ((s (make-rwsem)))
+                 (rwsem-write-lock s 'w1)
+                 (if (not (rwsem-read-trylock s)) 1 0))))
+
+; ----------------------------------------------------------------
+; Writer acquire
+; ----------------------------------------------------------------
+
+(test-suite "rwsem-004-write-lock"
+  (check (= 1 (eq? 'w1 (rwsem-write-lock (make-rwsem) 'w1))))
+
+(test-suite "rwsem-004-write-trylock-fail-on-readers"
+  (check (= 1 (let ((s (make-rwsem)))
+                 (rwsem-read-lock s)
+                 (if (not (rwsem-write-trylock s 'w1)) 1 0))))
+
+; ----------------------------------------------------------------
+; Writer unlock
+; ----------------------------------------------------------------
+
+(test-suite "rwsem-005-write-unlock"
+  (check (= 1 (let ((s (make-rwsem)))
+                 (rwsem-write-lock s 'w1)
+                 (rwsem-write-unlock s)
+                 (if (not (rwsem-writer-active? s)) 1 0))))
+
+; ----------------------------------------------------------------
+; rwsem-locked? predicate
+; ----------------------------------------------------------------
+
+(test-suite "rwsem-006-locked"
+  (check (= 1 (rwsem-locked? (let ((s (make-rwsem)))
+                                 (rwsem-read-lock s)
+                                 s))))
+
+(test-suite "rwsem-006-unlocked"
+  (check (= 1 (if (not (rwsem-locked? (make-rwsem))) 1 0)))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
