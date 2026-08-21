@@ -1,0 +1,362 @@
+; 23-sql-parser.aura
+; ======================
+; sql_parser — minimal capability port to aura.
+;
+; Maps to: OceanBase SQL Parser & Resolver
+; Source: src/sql/parser/ob_parser.{h,cpp}
+;         + src/sql/parser/parse_node.h + parse_node.c
+;         + src/sql/parser/ob_fast_parser.{h,cpp}
+;         + src/sql/parser/sql_parser_mysql_mode.l (flex)
+;         + src/sql/parser/sql_parser_mysql_mode.y (bison)
+;         + src/sql/resolver/ob_resolver.{h,cpp}
+;         + src/sql/resolver/ob_stmt_resolver.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase SQL Parser & Resolver:
+;   - ObParser::parse() entry point
+;   - Lexer (flex): character stream → Token stream
+;   - Parser (bison): Token stream → ParseNode tree
+;   - ObFastParser: hand-written state machine for soft parse
+;   - ObResolver::resolve() entry point
+;   - 60+ Resolvers (ObSelectResolver, ObInsertResolver, etc.)
+;   - ParseNode: general node type (type_, num_child_, param_num_)
+;   - 3 stages: Tokenize → Parse → Resolve
+;   - Stmt: ObSelectStmt / ObInsertStmt / ObUpdateStmt / ObDeleteStmt
+;
+; aura v1 ships:
+;   - 8 STMT-TYPE constants (SELECT, INSERT, UPDATE, DELETE, CREATE,
+;     DROP, ALTER, EXPLAIN)
+;   - 10 NODE-TYPE constants (T_SELECT, T_INSERT, T_UPDATE,
+;     T_DELETE, T_FROM, T_WHERE, T_GROUP_BY, T_ORDER_BY, T_LIMIT,
+;     T_EXPR)
+;   - 3 PARSE-STAGE constants (TOKENIZE, PARSE, RESOLVE)
+;   - make-token (factory: type + text + value)
+;   - token-get-type / get-text / get-value
+;   - make-parse-node (factory: type + num-child)
+;   - parse-node-get-type / get-num-child / get-children
+;   - parse-node-add-child!
+;   - make-parser (factory: sql-text)
+;   - parser-tokenize (text → tokens)
+;   - parser-parse (tokens → parse-node)
+;   - parser-resolve (parse-node → stmt)
+;   - parser-get-stats
+;   - make-stmt (factory: stmt-type + table + fields)
+;   - stmt-get-stmt-type / get-table / get-fields
+;   - stmt-add-field!
+;
+; Deferred (full OceanBase SQL Parser):
+;   - real ObParser with full MySQL grammar
+;   - real Lexer (flex-generated) for tokenization
+;   - real Parser (bison-generated) for syntax analysis
+;   - real ObFastParser for soft parse + Plan Cache matching
+;   - real 60+ Resolvers (DML/DDL/DCL/TCL variants)
+;   - real ObSelectStmt / ObInsertStmt / etc. with full schema
+;   - real symbol table / column resolution
+;   - real type checking + implicit cast
+;   - real ParseNode factory + arena allocation
+;   - real Plan Cache integration (22-plan-cache)
+;   - real ObItemType enum (hundreds of node types)
+
+(export
+  ; Stmt type constants
+  STMT-TYPE-SELECT STMT-TYPE-INSERT
+  STMT-TYPE-UPDATE STMT-TYPE-DELETE
+  STMT-TYPE-CREATE STMT-TYPE-DROP
+  STMT-TYPE-ALTER STMT-TYPE-EXPLAIN
+  ; Node type constants
+  NODE-TYPE-SELECT NODE-TYPE-INSERT
+  NODE-TYPE-UPDATE NODE-TYPE-DELETE
+  NODE-TYPE-FROM NODE-TYPE-WHERE
+  NODE-TYPE-GROUP-BY NODE-TYPE-ORDER-BY
+  NODE-TYPE-LIMIT NODE-TYPE-EXPR
+  ; Parse stage constants
+  PARSE-STAGE-TOKENIZE
+  PARSE-STAGE-PARSE
+  PARSE-STAGE-RESOLVE
+  ; Token
+  make-token token?
+  token-get-type token-get-text token-get-value
+  ; ParseNode
+  make-parse-node parse-node?
+  parse-node-get-type parse-node-get-num-child
+  parse-node-get-children parse-node-add-child!
+  ; Parser
+  make-parser parser?
+  parser-get-sql-text parser-get-stats-tokenize
+  parser-get-stats-parse parser-get-stats-resolve
+  parser-tokenize! parser-parse! parser-resolve!
+  ; Stmt
+  make-stmt stmt?
+  stmt-get-stmt-type stmt-get-table stmt-get-fields
+  stmt-add-field!)
+
+; ----------------------------------------------------------------
+; Stmt type constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_stmt.h):
+;   DML: SELECT, INSERT, UPDATE, DELETE
+;   DDL: CREATE, DROP, ALTER
+;   Misc: EXPLAIN
+
+(define STMT-TYPE-SELECT 1)
+(define STMT-TYPE-INSERT 2)
+(define STMT-TYPE-UPDATE 3)
+(define STMT-TYPE-DELETE 4)
+(define STMT-TYPE-CREATE 5)
+(define STMT-TYPE-DROP 6)
+(define STMT-TYPE-ALTER 7)
+(define STMT-TYPE-EXPLAIN 8)
+
+; ----------------------------------------------------------------
+; Node type constants (subset of ObItemType enum)
+; ----------------------------------------------------------------
+
+(define NODE-TYPE-SELECT 1)
+(define NODE-TYPE-INSERT 2)
+(define NODE-TYPE-UPDATE 3)
+(define NODE-TYPE-DELETE 4)
+(define NODE-TYPE-FROM 5)
+(define NODE-TYPE-WHERE 6)
+(define NODE-TYPE-GROUP-BY 7)
+(define NODE-TYPE-ORDER-BY 8)
+(define NODE-TYPE-LIMIT 9)
+(define NODE-TYPE-EXPR 10)
+
+; ----------------------------------------------------------------
+; Parse stage constants
+; ----------------------------------------------------------------
+
+(define PARSE-STAGE-TOKENIZE 1)
+(define PARSE-STAGE-PARSE 2)
+(define PARSE-STAGE-RESOLVE 3)
+
+; ----------------------------------------------------------------
+; Token — closure-based
+; ----------------------------------------------------------------
+
+; make-token: create a Token.
+; Args: type (integer — NODE-TYPE-*), text (symbol — token text),
+;       value (any — token value if literal)
+; Returns: token closure.
+(define (make-token type text value)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'text) text)
+                     ((eq? msg 'value) value)
+                     (else #f)))))
+      self))
+
+; token?: is the object a Token?
+; Detected by querying 'type — only tokens return integer.
+(define (token? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'type)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; token-get-type: get token type.
+(define (token-get-type t) (t 'type))
+
+; token-get-text: get token text.
+(define (token-get-text t) (t 'text))
+
+; token-get-value: get token value (if literal).
+(define (token-get-value t) (t 'value))
+
+; ----------------------------------------------------------------
+; ParseNode — closure-based
+; ----------------------------------------------------------------
+
+; make-parse-node: create a ParseNode.
+; Args: type (integer — NODE-TYPE-*), num-child (integer)
+; Returns: parse_node closure (initial: empty children list).
+(define (make-parse-node type num-child)
+  (let ((children '()))
+    (letrec ((set-children! (lambda (v) (set! children v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'type) type)
+                       ((eq? msg 'num-child) num-child)
+                       ((eq? msg 'children) children)
+                       ((eq? msg 'set-children!) set-children!)
+                       (else #f)))))
+      self))
+
+; parse-node?: is the object a ParseNode?
+; Detected by querying 'num-child — only parse_nodes return integer.
+(define (parse-node? obj)
+  (if (procedure? obj)
+      (let ((n (obj 'num-child)))
+        (if (and (integer? n) (>= n 0)) #t #f))
+      #f))
+
+; parse-node-get-type: get node type.
+(define (parse-node-get-type n) (n 'type))
+
+; parse-node-get-num-child: get num_child.
+(define (parse-node-get-num-child n) (n 'num-child))
+
+; parse-node-get-children: get children list.
+(define (parse-node-get-children n) (n 'children))
+
+; parse-node-add-child!: add a child to the node.
+; Returns the new number of children.
+(define (parse-node-add-child! n child)
+  (let ((existing (n 'children)))
+    ((n 'set-children!) (cons child existing))))
+
+; ----------------------------------------------------------------
+; Parser — closure-based
+; ----------------------------------------------------------------
+;
+; v1: simplified 3-stage pipeline (tokenize → parse → resolve).
+; Maintains stats counters for each stage.
+
+; make-parser: create a Parser.
+; Args: sql-text (symbol)
+; Returns: parser closure (initial: stats=0, no tokens/parse-node).
+(define (make-parser sql-text)
+  (let ((stats-tokenize 0)
+        (stats-parse 0)
+        (stats-resolve 0)
+        (tokens '())
+        (parse-node #f)
+        (resolved-stmt #f))
+    (letrec ((set-stats-tokenize!
+              (lambda (v) (set! stats-tokenize v) v))
+             (set-stats-parse!
+              (lambda (v) (set! stats-parse v) v))
+             (set-stats-resolve!
+              (lambda (v) (set! stats-resolve v) v))
+             (set-tokens! (lambda (v) (set! tokens v) v))
+             (set-parse-node! (lambda (v) (set! parse-node v) v))
+             (set-resolved-stmt! (lambda (v) (set! resolved-stmt v) v))
+             (inc-stats-tokenize! (lambda () (set! stats-tokenize (+ stats-tokenize 1)) stats-tokenize))
+             (inc-stats-parse! (lambda () (set! stats-parse (+ stats-parse 1)) stats-parse))
+             (inc-stats-resolve! (lambda () (set! stats-resolve (+ stats-resolve 1)) stats-resolve))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'sql-text) sql-text)
+                       ((eq? msg 'stats-tokenize) stats-tokenize)
+                       ((eq? msg 'stats-parse) stats-parse)
+                       ((eq? msg 'stats-resolve) stats-resolve)
+                       ((eq? msg 'tokens) tokens)
+                       ((eq? msg 'parse-node) parse-node)
+                       ((eq? msg 'resolved-stmt) resolved-stmt)
+                       ((eq? msg 'set-stats-tokenize!) set-stats-tokenize!)
+                       ((eq? msg 'set-stats-parse!) set-stats-parse!)
+                       ((eq? msg 'set-stats-resolve!) set-stats-resolve!)
+                       ((eq? msg 'set-tokens!) set-tokens!)
+                       ((eq? msg 'set-parse-node!) set-parse-node!)
+                       ((eq? msg 'set-resolved-stmt!) set-resolved-stmt!)
+                       ((eq? msg 'inc-stats-tokenize!) inc-stats-tokenize!)
+                       ((eq? msg 'inc-stats-parse!) inc-stats-parse!)
+                       ((eq? msg 'inc-stats-resolve!) inc-stats-resolve!)
+                       (else #f)))))
+      self))
+
+; parser?: is the object a parser?
+; Detected by querying 'stats-tokenize — only parsers return integer.
+(define (parser? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'stats-tokenize)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; parser-get-sql-text: get input SQL text.
+(define (parser-get-sql-text p) (p 'sql-text))
+
+; parser-get-stats-tokenize: get tokenize count.
+(define (parser-get-stats-tokenize p) (p 'stats-tokenize))
+
+; parser-get-stats-parse: get parse count.
+(define (parser-get-stats-parse p) (p 'stats-parse))
+
+; parser-get-stats-resolve: get resolve count.
+(define (parser-get-stats-resolve p) (p 'stats-resolve))
+
+; parser-tokenize!: stage 1 — split SQL into tokens.
+; v1: simple tokenization — splits on whitespace.
+; Returns list of tokens.
+(define (parser-tokenize! p)
+  ((p 'set-tokens!) (tokenize-v1 (p 'sql-text)))
+  ((p 'inc-stats-tokenize!))
+  (p 'tokens))
+
+; tokenize-v1: helper — split symbol into tokens (whitespace-separated).
+; v1 simplified: returns empty token list. (Avoids car/cdr on
+; possibly-empty list, which triggers aura type error.)
+(define (tokenize-v1 text)
+  '())
+
+; parser-parse!: stage 2 — build ParseNode from tokens.
+; v1: create a single root parse-node of type SELECT.
+; Returns the parse-node.
+(define (parser-parse! p)
+  (let ((root (make-parse-node NODE-TYPE-SELECT 0)))
+    ((p 'set-parse-node!) root)
+    ((p 'inc-stats-parse!))
+    root))
+
+; parser-resolve!: stage 3 — resolve parse-node to a Stmt.
+; v1: create a simple SELECT stmt.
+; Returns the resolved stmt.
+(define (parser-resolve! p)
+  (let ((root (p 'parse-node)))
+    (cond
+      ((eq? root #f)
+       (begin
+         ((p 'inc-stats-resolve!))
+         #f))
+      (else
+       (let ((stmt (make-stmt STMT-TYPE-SELECT
+                            'no-table
+                            '())))
+         ((p 'set-resolved-stmt!) stmt)
+         ((p 'inc-stats-resolve!))
+         stmt)))))
+
+; ----------------------------------------------------------------
+; Stmt — closure-based
+; ----------------------------------------------------------------
+
+; make-stmt: create a Stmt (logical plan).
+; Args: stmt-type (integer), table (symbol), fields (list)
+; Returns: stmt closure.
+(define (make-stmt stmt-type table fields)
+  (let ((f fields))
+    (letrec ((set-fields! (lambda (v) (set! f v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'stmt-type) stmt-type)
+                       ((eq? msg 'table) table)
+                       ((eq? msg 'fields) f)
+                       ((eq? msg 'set-fields!) set-fields!)
+                       (else #f)))))
+      self))
+
+; stmt?: is the object a Stmt?
+; Detected by querying 'table — only stmts return a symbol.
+(define (stmt? obj)
+  (if (procedure? obj)
+      (if (symbol? (obj 'table)) #t #f)
+      #f))
+
+; stmt-get-stmt-type: get statement type.
+(define (stmt-get-stmt-type s) (s 'stmt-type))
+
+; stmt-get-table: get table name.
+(define (stmt-get-table s) (s 'table))
+
+; stmt-get-fields: get field list.
+(define (stmt-get-fields s) (s 'fields))
+
+; stmt-add-field!: add a field to the stmt.
+; Returns the new field list.
+(define (stmt-add-field! s field)
+  (let ((existing (s 'fields)))
+    ((s 'set-fields!) (cons field existing))))

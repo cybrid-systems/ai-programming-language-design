@@ -1,0 +1,234 @@
+; 23-sql-parser_test.aura
+; ======================
+; Smoke tests for 23-sql-parser.aura — SQL Parser & Resolver minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/23-sql-parser_test.aura
+;
+; Verified automatically (smoke):
+;   - 8 STMT-TYPE + 10 NODE-TYPE + 3 PARSE-STAGE distinct
+;   - make-token + accessors
+;   - make-parse-node + accessors + add-child!
+;   - make-parser + 3-stage pipeline (tokenize/parse/resolve)
+;   - make-stmt + accessors + add-field!
+;   - Parser stats tracking
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Pipeline flow tokenize → parse → resolve
+;
+; Deferred (full OceanBase SQL Parser):
+;   - real ObParser with full MySQL grammar
+;   - real Lexer (flex-generated) for tokenization
+;   - real Parser (bison-generated) for syntax analysis
+;   - real ObFastParser for soft parse + Plan Cache matching
+;   - real 60+ Resolvers (DML/DDL/DCL/TCL variants)
+;   - real ObSelectStmt / ObInsertStmt / etc. with full schema
+;   - real symbol table / column resolution
+;   - real type checking + implicit cast
+;   - real ParseNode factory + arena allocation
+;   - real Plan Cache integration (22-plan-cache)
+;   - real ObItemType enum (hundreds of node types)
+
+(require "std/test" all:)
+(require "23-sql-parser" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "23-001-stmt-type-distinct"
+  ; 8 STMT-TYPE constants are distinct.
+  (check (= 1 (if (not (= STMT-TYPE-SELECT
+                          STMT-TYPE-INSERT)) 1 0)))
+  (check (= 1 (if (not (= STMT-TYPE-INSERT
+                          STMT-TYPE-UPDATE)) 1 0)))
+  (check (= 1 (if (not (= STMT-TYPE-UPDATE
+                          STMT-TYPE-DELETE)) 1 0)))
+  (check (= 1 (if (not (= STMT-TYPE-DELETE
+                          STMT-TYPE-CREATE)) 1 0)))
+  (check (= 1 (if (not (= STMT-TYPE-CREATE
+                          STMT-TYPE-DROP)) 1 0)))
+  (check (= 1 (if (not (= STMT-TYPE-DROP
+                          STMT-TYPE-ALTER)) 1 0)))
+  (check (= 1 (if (not (= STMT-TYPE-ALTER
+                          STMT-TYPE-EXPLAIN)) 1 0))))
+
+(test-suite "23-001-node-type-distinct"
+  ; 10 NODE-TYPE constants are distinct.
+  (check (= 1 (if (not (= NODE-TYPE-SELECT
+                          NODE-TYPE-INSERT)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-INSERT
+                          NODE-TYPE-UPDATE)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-UPDATE
+                          NODE-TYPE-DELETE)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-DELETE
+                          NODE-TYPE-FROM)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-FROM
+                          NODE-TYPE-WHERE)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-WHERE
+                          NODE-TYPE-GROUP-BY)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-GROUP-BY
+                          NODE-TYPE-ORDER-BY)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-ORDER-BY
+                          NODE-TYPE-LIMIT)) 1 0)))
+  (check (= 1 (if (not (= NODE-TYPE-LIMIT
+                          NODE-TYPE-EXPR)) 1 0))))
+
+(test-suite "23-001-parse-stage-distinct"
+  ; 3 PARSE-STAGE constants are distinct.
+  (check (= 1 (if (not (= PARSE-STAGE-TOKENIZE
+                          PARSE-STAGE-PARSE)) 1 0)))
+  (check (= 1 (if (not (= PARSE-STAGE-PARSE
+                          PARSE-STAGE-RESOLVE)) 1 0))))
+
+; ----------------------------------------------------------------
+; Token
+; ----------------------------------------------------------------
+
+(test-suite "23-002-token-construction"
+  ; token preserves fields.
+  (check (= 1 (token-get-type (make-token 1 'SELECT 'val))))
+  (check (= #t (eq? 'SELECT (token-get-text (make-token 1 'SELECT 'val)))))
+  (check (= #t (eq? 'val (token-get-value (make-token 1 'SELECT 'val))))))
+
+(test-suite "23-002-token-predicate"
+  ; token? accepts only tokens.
+  (check (= #t (token? (make-token 1 'SELECT 'val))))
+  (check (= #f (token? 'not-a-token)))
+  (check (= #f (token? 42)))
+
+; ----------------------------------------------------------------
+; ParseNode
+; ----------------------------------------------------------------
+
+(test-suite "23-003-parse-node-construction"
+  ; parse-node preserves type + num-child.
+  (check (= NODE-TYPE-SELECT
+             (parse-node-get-type (make-parse-node NODE-TYPE-SELECT 0))))
+  (check (= 0 (parse-node-get-num-child (make-parse-node NODE-TYPE-SELECT 0))))
+  (check (= 5 (parse-node-get-num-child (make-parse-node NODE-TYPE-FROM 5))))
+  (check (= #f (null? (parse-node-get-children (make-parse-node NODE-TYPE-SELECT 0)))))
+
+(test-suite "23-003-parse-node-predicate"
+  ; parse-node? accepts only parse-nodes.
+  (check (= #t (parse-node? (make-parse-node NODE-TYPE-SELECT 0))))
+  (check (= #f (parse-node? 'not-a-node)))
+  (check (= #f (parse-node? 42)))
+
+(test-suite "23-004-parse-node-add-child"
+  ; add-child! adds to children list.
+  (check (= #t (let ((n (make-parse-node NODE-TYPE-SELECT 0)))
+                 (parse-node-add-child! n 'child-1)
+                 (let ((children (parse-node-get-children n)))
+                   (and (not (null? children))
+                        (eq? 'child-1 (car children)))))))
+
+(test-suite "23-004-parse-node-add-multiple"
+  ; Multiple add-children accumulate.
+  (check (= 3 (let ((n (make-parse-node NODE-TYPE-SELECT 0)))
+                 (parse-node-add-child! n 'c1)
+                 (parse-node-add-child! n 'c2)
+                 (parse-node-add-child! n 'c3)
+                 (length (parse-node-get-children n)))))
+
+; ----------------------------------------------------------------
+; Parser
+; ----------------------------------------------------------------
+
+(test-suite "23-005-parser-construction"
+  ; parser preserves sql-text + initial stats.
+  (check (= #t (eq? 'SELECT
+                   (parser-get-sql-text
+                     (make-parser 'SELECT)))))
+  (check (= 0 (parser-get-stats-tokenize (make-parser 'SELECT))))
+  (check (= 0 (parser-get-stats-parse (make-parser 'SELECT))))
+  (check (= 0 (parser-get-stats-resolve (make-parser 'SELECT))))
+
+(test-suite "23-005-parser-predicate"
+  ; parser? accepts only parsers.
+  (check (= #t (parser? (make-parser 'SELECT))))
+  (check (= #f (parser? 'not-a-parser)))
+  (check (= #f (parser? 42)))
+
+(test-suite "23-006-parser-tokenize"
+  ; tokenize! increments stat + returns token list.
+  (check (= 1 (let ((p (make-parser 'SELECT)))
+                 (parser-tokenize! p)
+                 (parser-get-stats-tokenize p))))
+
+(test-suite "23-006-parser-parse"
+  ; parse! increments stat + returns parse-node.
+  (check (= 1 (let ((p (make-parser 'SELECT)))
+                 (parser-parse! p)
+                 (parser-get-stats-parse p))))
+  (check (= #t (let ((p (make-parser 'SELECT)))
+                 (parse-node? (parser-parse! p)))))
+
+(test-suite "23-006-parser-resolve"
+  ; resolve! increments stat + returns stmt.
+  (check (= 1 (let ((p (make-parser 'SELECT)))
+                 (parser-parse! p)
+                 (parser-resolve! p)
+                 (parser-get-stats-resolve p))))
+  (check (= #t (let ((p (make-parser 'SELECT)))
+                 (parser-parse! p)
+                 (stmt? (parser-resolve! p)))))
+
+(test-suite "23-007-parser-full-pipeline"
+  ; Full pipeline: tokenize → parse → resolve.
+  (check (= #t (let ((p (make-parser 'SELECT)))
+                 (parser-tokenize! p)
+                 (let ((parse-result (parser-parse! p)))
+                   (parser-resolve! p)
+                   (and (= 1 (parser-get-stats-tokenize p))
+                        (= 1 (parser-get-stats-parse p))
+                        (= 1 (parser-get-stats-resolve p))
+                        (parse-node? parse-result)
+                        (stmt? (parser-resolve! p)))))))
+
+(test-suite "23-007-parser-tokenize-multiple"
+  ; Multiple tokenize! calls accumulate stats.
+  (check (= 3 (let ((p (make-parser 'SELECT)))
+                 (parser-tokenize! p)
+                 (parser-tokenize! p)
+                 (parser-tokenize! p)
+                 (parser-get-stats-tokenize p))))
+
+; ----------------------------------------------------------------
+; Stmt
+; ----------------------------------------------------------------
+
+(test-suite "23-008-stmt-construction"
+  ; stmt preserves fields.
+  (check (= STMT-TYPE-SELECT
+             (stmt-get-stmt-type (make-stmt STMT-TYPE-SELECT 'users '()))))
+  (check (= #t (eq? 'users
+                   (stmt-get-table (make-stmt STMT-TYPE-SELECT 'users '())))))
+  (check (= 0 (length (stmt-get-fields
+                         (make-stmt STMT-TYPE-SELECT 'users '())))))
+
+(test-suite "23-008-stmt-predicate"
+  ; stmt? accepts only stmts.
+  (check (= #t (stmt? (make-stmt STMT-TYPE-SELECT 'users '()))))
+  (check (= #f (stmt? 'not-a-stmt)))
+  (check (= #f (stmt? 42)))
+
+(test-suite "23-008-stmt-add-field"
+  ; add-field! increases field count.
+  (check (= 1 (let ((s (make-stmt STMT-TYPE-SELECT 'users '())))
+                 (stmt-add-field! s 'id)
+                 (length (stmt-get-fields s)))))
+  (check (= 3 (let ((s (make-stmt STMT-TYPE-SELECT 'users '())))
+                 (stmt-add-field! s 'id)
+                 (stmt-add-field! s 'name)
+                 (stmt-add-field! s 'email)
+                 (length (stmt-get-fields s)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
