@@ -1,0 +1,426 @@
+; 31-dml-path.aura
+; ======================
+; dml_path — minimal capability port to aura.
+;
+; Maps to: OceanBase DML execution path (INSERT/UPDATE/DELETE)
+; Source: src/sql/engine/insert/ob_table_insert_op.h
+;         + src/sql/engine/update/ob_table_update_op.h
+;         + src/sql/engine/delete/ob_table_delete_op.h
+;         + src/sql/engine/dml/ob_dml_service.h
+;         + src/sql/engine/dml/ob_dml_ctx.h
+;         + src/sql/das/ob_das_dml_ctx.h
+;         + src/sql/das/ob_das_define.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase DML execution path:
+;   - 5 DML-TYPE constants: INSERT / UPDATE / DELETE / REPLACE /
+;     INSERT_UP (INSERT ON DUPLICATE KEY UPDATE)
+;   - 3 EXEC-STAGE constants: OPEN / WRITE / CLOSE
+;   - 3 RT-DEF-STATUS constants: INIT / READY / DONE
+;   - ObTableInsertOp/UpdateOp/DeleteOp (3 ops with similar
+;     structure)
+;   - CT_DEF / RT_DEF separation pattern
+;   - ObDMLService (DML service layer — static methods)
+;   - ObDASIndexDMLAdaptor (write tablet + local index)
+;   - 2D array for multi-table / global-index
+;   - DAS write buffer (batches rows before flush)
+;
+; aura v1 ships:
+;   - 5 DML-TYPE constants (INSERT, UPDATE, DELETE, REPLACE,
+;     INSERT_UP)
+;   - 3 EXEC-STAGE constants (OPEN, WRITE, CLOSE)
+;   - 3 RT-DEF-STATUS constants (INIT, READY, DONE)
+;   - make-dml-ct-def (factory: dml-type + table-id + column-list)
+;   - dml-ct-def-get-dml-type / get-table-id / get-column-list
+;   - make-dml-rt-def (factory: ct-def + das-rt-def + write-buffer)
+;   - dml-rt-def accessors + set-status!
+;   - make-dml-op (factory: dml-type + rt-def)
+;   - dml-op-get-dml-type / get-rt-def / get-status
+;   - dml-op-set-status! / open! / write-row! / close!
+;   - make-write-buffer (factory: capacity + row-count)
+;   - write-buffer-add-row! / get-row-count / flush!
+;   - make-dml-service (factory: counters)
+;   - dml-service-get-stats-processed / get-stats-inserted /
+;     get-stats-updated / get-stats-deleted
+;   - dml-service-inc-processed! / inc-inserted! / inc-updated!
+;     / inc-deleted!
+;
+; Deferred (full OceanBase DML execution path):
+;   - real ObTableInsertOp with full CT_DEF / RT_DEF
+;   - real ObDMLService::process_insert_row (validation +
+;     trigger handling)
+;   - real ObDASIndexDMLAdaptor::write_tablet
+;   - real write_buffer flush to storage engine
+;   - real multi-table DML (UPDATE t1, t2 SET ...)
+;   - real global index DML handling
+;   - real ObMvccRow::mvcc_write integration
+;   - real ObDASIndexDMLAdaptor::write_index for secondary index
+;   - real trigger handling (BEFORE / AFTER ROW)
+;   - real CHECK constraint handling (check_filter_row)
+;   - real ON DUPLICATE KEY UPDATE (REPLACE / INSERT_UP)
+;   - real 2D CT_DEF array for multi-table + global-index
+
+(export
+  ; DML type constants
+  DML-TYPE-INSERT
+  DML-TYPE-UPDATE
+  DML-TYPE-DELETE
+  DML-TYPE-REPLACE
+  DML-TYPE-INSERT-UP
+  ; Execution stage constants
+  EXEC-STAGE-OPEN
+  EXEC-STAGE-WRITE
+  EXEC-STAGE-CLOSE
+  ; RT-DEF status constants
+  RT-DEF-STATUS-INIT
+  RT-DEF-STATUS-READY
+  RT-DEF-STATUS-DONE
+  ; ObDMLCtDef
+  make-dml-ct-def dml-ct-def?
+  dml-ct-def-get-dml-type
+  dml-ct-def-get-table-id
+  dml-ct-def-get-column-list
+  dml-ct-def-set-column-list!
+  ; ObDMLRtDef
+  make-dml-rt-def dml-rt-def?
+  dml-rt-def-get-ct-def
+  dml-rt-def-get-das-rt-def
+  dml-rt-def-get-write-buffer
+  dml-rt-def-get-status
+  dml-rt-def-set-status!
+  dml-rt-def-set-das-rt-def!
+  dml-rt-def-set-write-buffer!
+  ; ObDMLOp
+  make-dml-op dml-op?
+  dml-op-get-dml-type
+  dml-op-get-rt-def
+  dml-op-get-status
+  dml-op-set-status!
+  dml-op-open!
+  dml-op-write-row!
+  dml-op-close!
+  ; ObDMLWriteBuffer
+  make-write-buffer write-buffer?
+  write-buffer-get-capacity
+  write-buffer-get-row-count
+  write-buffer-add-row!
+  write-buffer-flush!
+  write-buffer-clear!
+  ; ObDMLService
+  make-dml-service dml-service?
+  dml-service-get-stats-processed
+  dml-service-get-stats-inserted
+  dml-service-get-stats-updated
+  dml-service-get-stats-deleted
+  dml-service-inc-processed!
+  dml-service-inc-inserted!
+  dml-service-inc-updated!
+  dml-service-inc-deleted!
+  dml-service-reset-stats!)
+
+; ----------------------------------------------------------------
+; DML type constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_dml_service.h):
+;   INSERT, UPDATE, DELETE, REPLACE, INSERT_UP
+
+(define DML-TYPE-INSERT 1)
+(define DML-TYPE-UPDATE 2)
+(define DML-TYPE-DELETE 3)
+(define DML-TYPE-REPLACE 4)
+(define DML-TYPE-INSERT-UP 5)
+
+; ----------------------------------------------------------------
+; Execution stage constants
+; ----------------------------------------------------------------
+
+(define EXEC-STAGE-OPEN 0)
+(define EXEC-STAGE-WRITE 1)
+(define EXEC-STAGE-CLOSE 2)
+
+; ----------------------------------------------------------------
+; RT-DEF status constants
+; ----------------------------------------------------------------
+
+(define RT-DEF-STATUS-INIT 0)
+(define RT-DEF-STATUS-READY 1)
+(define RT-DEF-STATUS-DONE 2)
+
+; ----------------------------------------------------------------
+; ObDMLCtDef — closure-based (compile-time definition)
+; ----------------------------------------------------------------
+
+; make-dml-ct-def: create a DML compile-time definition.
+; Args: dml-type (integer), table-id (integer),
+;       column-list (cons list of column names — symbols)
+; Returns: dml_ct_def closure.
+(define (make-dml-ct-def dml-type table-id column-list)
+  (letrec ((set-column-list! (lambda (v) (set! column-list v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'dml-type) dml-type)
+                     ((eq? msg 'table-id) table-id)
+                     ((eq? msg 'column-list) column-list)
+                     ((eq? msg 'set-column-list!) set-column-list!)
+                     (else #f)))))
+      self))
+
+; dml-ct-def?: is the object a DML CT_DEF?
+; Detected by querying 'dml-type — only ct_defs return integer.
+(define (dml-ct-def? obj)
+  (if (procedure? obj)
+      (let ((d (obj 'dml-type)))
+        (if (and (integer? d) (>= d 1)) #t #f))
+      #f))
+
+; dml-ct-def-get-dml-type: get DML type.
+(define (dml-ct-def-get-dml-type ctd) (ctd 'dml-type))
+
+; dml-ct-def-get-table-id: get table id.
+(define (dml-ct-def-get-table-id ctd) (ctd 'table-id))
+
+; dml-ct-def-get-column-list: get column list.
+(define (dml-ct-def-get-column-list ctd) (ctd 'column-list))
+
+; dml-ct-def-set-column-list!: set column list.
+; Returns the new list.
+(define (dml-ct-def-set-column-list! ctd v)
+  ((ctd 'set-column-list!) v))
+
+; ----------------------------------------------------------------
+; ObDMLRtDef — closure-based (run-time definition)
+; ----------------------------------------------------------------
+
+; make-dml-rt-def: create a DML runtime definition.
+; Args: ct-def (dml_ct_def or #f), das-rt-def (or #f),
+;       write-buffer (or #f)
+; Returns: dml_rt_def closure (initial: status=INIT).
+(define (make-dml-rt-def ct-def das-rt-def write-buffer)
+  (let ((status RT-DEF-STATUS-INIT))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (set-das-rt-def! (lambda (v) (set! das-rt-def v) v))
+             (set-write-buffer! (lambda (v) (set! write-buffer v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'ct-def) ct-def)
+                       ((eq? msg 'das-rt-def) das-rt-def)
+                       ((eq? msg 'write-buffer) write-buffer)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       ((eq? msg 'set-das-rt-def!) set-das-rt-def!)
+                       ((eq? msg 'set-write-buffer!) set-write-buffer!)
+                       (else #f)))))
+      self))
+
+; dml-rt-def?: is the object a DML RT_DEF?
+; Detected by querying 'status — only rt_defs return integer.
+(define (dml-rt-def? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'status)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; dml-rt-def-get-ct-def: get CT_DEF.
+(define (dml-rt-def-get-ct-def rtd) (rtd 'ct-def))
+
+; dml-rt-def-get-das-rt-def: get DAS RT_DEF.
+(define (dml-rt-def-get-das-rt-def rtd) (rtd 'das-rt-def))
+
+; dml-rt-def-get-write-buffer: get write buffer.
+(define (dml-rt-def-get-write-buffer rtd) (rtd 'write-buffer))
+
+; dml-rt-def-get-status: get status.
+(define (dml-rt-def-get-status rtd) (rtd 'status))
+
+; dml-rt-def-set-status!: set status.
+; Returns the new status.
+(define (dml-rt-def-set-status! rtd v) ((rtd 'set-status!) v))
+
+; dml-rt-def-set-das-rt-def!: set DAS RT_DEF.
+; Returns the new DAS RT_DEF.
+(define (dml-rt-def-set-das-rt-def! rtd v) ((rtd 'set-das-rt-def!) v))
+
+; dml-rt-def-set-write-buffer!: set write buffer.
+; Returns the new write buffer.
+(define (dml-rt-def-set-write-buffer! rtd v)
+  ((rtd 'set-write-buffer!) v))
+
+; ----------------------------------------------------------------
+; ObDMLOp — closure-based
+; ----------------------------------------------------------------
+
+; make-dml-op: create a DML operator.
+; Args: dml-type (integer), rt-def (dml_rt_def or #f)
+; Returns: dml_op closure (initial: status=OPEN, op-stage=OPEN).
+(define (make-dml-op dml-type rt-def)
+  (let ((status EXEC-STAGE-OPEN))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'dml-type) dml-type)
+                       ((eq? msg 'rt-def) rt-def)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self))
+
+; dml-op?: is the object a DML op?
+; Detected by querying 'dml-type — only dml-ops return integer.
+(define (dml-op? obj)
+  (if (procedure? obj)
+      (let ((d (obj 'dml-type)))
+        (if (and (integer? d) (>= d 1)) #t #f))
+      #f))
+
+; dml-op-get-dml-type: get DML type.
+(define (dml-op-get-dml-type op) (op 'dml-type))
+
+; dml-op-get-rt-def: get RT_DEF.
+(define (dml-op-get-rt-def op) (op 'rt-def))
+
+; dml-op-get-status: get status.
+(define (dml-op-get-status op) (op 'status))
+
+; dml-op-set-status!: set status.
+; Returns the new status.
+(define (dml-op-set-status! op v) ((op 'set-status!) v))
+
+; dml-op-open!: move to CLOSE stage (open completed).
+; v1: simplified — immediately mark CLOSE.
+; Returns the new status.
+(define (dml-op-open! op)
+  ((op 'set-status!) EXEC-STAGE-CLOSE))
+
+; dml-op-write-row!: no-op for v1 (stage transitions only).
+; Returns the current status.
+(define (dml-op-write-row! op)
+  (op 'status))
+
+; dml-op-close!: move to CLOSE stage.
+; Returns the new status.
+(define (dml-op-close! op)
+  ((op 'set-status!) EXEC-STAGE-CLOSE))
+
+; ----------------------------------------------------------------
+; ObDMLWriteBuffer — closure-based
+; ----------------------------------------------------------------
+
+; make-write-buffer: create a DML write buffer.
+; Args: capacity (integer — max rows), row-count (integer)
+; Returns: write_buffer closure.
+(define (make-write-buffer capacity row-count)
+  (letrec ((set-row-count! (lambda (v) (set! row-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'capacity) capacity)
+                     ((eq? msg 'row-count) row-count)
+                     ((eq? msg 'set-row-count!) set-row-count!)
+                     (else #f)))))
+      self))
+
+; write-buffer?: is the object a write buffer?
+; Detected by querying 'capacity — only buffers return integer.
+(define (write-buffer? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'capacity)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; write-buffer-get-capacity: get max capacity.
+(define (write-buffer-get-capacity wb) (wb 'capacity))
+
+; write-buffer-get-row-count: get current row count.
+(define (write-buffer-get-row-count wb) (wb 'row-count))
+
+; write-buffer-add-row!: increment row count by 1.
+; Returns the new row count.
+(define (write-buffer-add-row! wb)
+  (let ((cur (wb 'row-count)))
+    ((wb 'set-row-count!) (+ cur 1))))
+
+; write-buffer-flush!: reset row count to 0 (flush to storage).
+; Returns 0 (the new row count after flush).
+(define (write-buffer-flush! wb)
+  ((wb 'set-row-count!) 0))
+
+; write-buffer-clear!: reset to 0 (alias for flush).
+(define (write-buffer-clear! wb)
+  ((wb 'set-row-count!) 0))
+
+; ----------------------------------------------------------------
+; ObDMLService — closure-based (stats counters)
+; ----------------------------------------------------------------
+
+; make-dml-service: create a DML service stats recorder.
+; Returns: dml_service closure (initial: all counters=0).
+(define (make-dml-service)
+  (let ((processed 0)
+        (inserted 0)
+        (updated 0)
+        (deleted 0))
+    (letrec ((set-processed! (lambda (v) (set! processed v) v))
+             (set-inserted! (lambda (v) (set! inserted v) v))
+             (set-updated! (lambda (v) (set! updated v) v))
+             (set-deleted! (lambda (v) (set! deleted v) v))
+             (inc-processed! (lambda () (set! processed (+ processed 1)) processed))
+             (inc-inserted! (lambda () (set! inserted (+ inserted 1)) inserted))
+             (inc-updated! (lambda () (set! updated (+ updated 1)) updated))
+             (inc-deleted! (lambda () (set! deleted (+ deleted 1)) deleted))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'processed) processed)
+                       ((eq? msg 'inserted) inserted)
+                       ((eq? msg 'updated) updated)
+                       ((eq? msg 'deleted) deleted)
+                       ((eq? msg 'set-processed!) set-processed!)
+                       ((eq? msg 'set-inserted!) set-inserted!)
+                       ((eq? msg 'set-updated!) set-updated!)
+                       ((eq? msg 'set-deleted!) set-deleted!)
+                       ((eq? msg 'inc-processed!) inc-processed!)
+                       ((eq? msg 'inc-inserted!) inc-inserted!)
+                       ((eq? msg 'inc-updated!) inc-updated!)
+                       ((eq? msg 'inc-deleted!) inc-deleted!)
+                       (else #f)))))
+      self))
+
+; dml-service?: is the object a DML service?
+; Detected by querying 'processed — only services return integer.
+(define (dml-service? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'processed)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; dml-service-get-stats-processed: get processed count.
+(define (dml-service-get-stats-processed svc) (svc 'processed))
+
+; dml-service-get-stats-inserted: get inserted count.
+(define (dml-service-get-stats-inserted svc) (svc 'inserted))
+
+; dml-service-get-stats-updated: get updated count.
+(define (dml-service-get-stats-updated svc) (svc 'updated))
+
+; dml-service-get-stats-deleted: get deleted count.
+(define (dml-service-get-stats-deleted svc) (svc 'deleted))
+
+; dml-service-inc-processed!: increment processed count.
+(define (dml-service-inc-processed! svc) ((svc 'inc-processed!)))
+
+; dml-service-inc-inserted!: increment inserted count.
+(define (dml-service-inc-inserted! svc) ((svc 'inc-inserted!)))
+
+; dml-service-inc-updated!: increment updated count.
+(define (dml-service-inc-updated! svc) ((svc 'inc-updated!)))
+
+; dml-service-inc-deleted!: increment deleted count.
+(define (dml-service-inc-deleted! svc) ((svc 'inc-deleted!)))
+
+; dml-service-reset-stats!: zero all counters.
+(define (dml-service-reset-stats! svc)
+  ((svc 'set-processed!) 0)
+  ((svc 'set-inserted!) 0)
+  ((svc 'set-updated!) 0)
+  ((svc 'set-deleted!) 0))

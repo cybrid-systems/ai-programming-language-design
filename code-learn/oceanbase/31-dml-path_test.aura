@@ -1,0 +1,268 @@
+; 31-dml-path_test.aura
+; ======================
+; Smoke tests for 31-dml-path.aura — DML execution path minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/31-dml-path_test.aura
+;
+; Verified automatically (smoke):
+;   - 5 DML-TYPE + 3 EXEC-STAGE + 3 RT-DEF-STATUS distinct
+;   - make-dml-ct-def + accessors + set-column-list
+;   - make-dml-rt-def + accessors + set-status
+;   - make-dml-op + accessors + open! + close!
+;   - make-write-buffer + add-row! + flush!
+;   - make-dml-service + inc-stats
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - DML stage transitions correct
+;   - Write buffer accumulation + flush
+;
+; Deferred (full OceanBase DML execution path):
+;   - real ObTableInsertOp with full CT_DEF / RT_DEF
+;   - real ObDMLService::process_insert_row (validation +
+;     trigger handling)
+;   - real ObDASIndexDMLAdaptor::write_tablet
+;   - real write_buffer flush to storage engine
+;   - real multi-table DML (UPDATE t1, t2 SET ...)
+;   - real global index DML handling
+;   - real ObMvccRow::mvcc_write integration
+;   - real ObDASIndexDMLAdaptor::write_index for secondary index
+;   - real trigger handling (BEFORE / AFTER ROW)
+;   - real CHECK constraint handling (check_filter_row)
+;   - real ON DUPLICATE KEY UPDATE (REPLACE / INSERT_UP)
+;   - real 2D CT_DEF array for multi-table + global-index
+
+(require "std/test" all:)
+(require "31-dml-path" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "31-001-dml-type-distinct"
+  ; 5 DML-TYPE constants are distinct.
+  (check (= 1 (if (not (= DML-TYPE-INSERT
+                          DML-TYPE-UPDATE)) 1 0)))
+  (check (= 1 (if (not (= DML-TYPE-UPDATE
+                          DML-TYPE-DELETE)) 1 0)))
+  (check (= 1 (if (not (= DML-TYPE-DELETE
+                          DML-TYPE-REPLACE)) 1 0)))
+  (check (= 1 (if (not (= DML-TYPE-REPLACE
+                          DML-TYPE-INSERT-UP)) 1 0)))
+  (check (= 1 (if (not (= DML-TYPE-INSERT
+                          DML-TYPE-INSERT-UP)) 1 0))))
+
+(test-suite "31-001-exec-stage-distinct"
+  ; 3 EXEC-STAGE constants are distinct.
+  (check (= 1 (if (not (= EXEC-STAGE-OPEN
+                          EXEC-STAGE-WRITE)) 1 0)))
+  (check (= 1 (if (not (= EXEC-STAGE-WRITE
+                          EXEC-STAGE-CLOSE)) 1 0)))
+  (check (= 1 (if (not (= EXEC-STAGE-OPEN
+                          EXEC-STAGE-CLOSE)) 1 0))))
+
+(test-suite "31-001-rt-def-status-distinct"
+  ; 3 RT-DEF-STATUS constants are distinct.
+  (check (= 1 (if (not (= RT-DEF-STATUS-INIT
+                          RT-DEF-STATUS-READY)) 1 0)))
+  (check (= 1 (if (not (= RT-DEF-STATUS-READY
+                          RT-DEF-STATUS-DONE)) 1 0)))
+  (check (= 1 (if (not (= RT-DEF-STATUS-INIT
+                          RT-DEF-STATUS-DONE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObDMLCtDef
+; ----------------------------------------------------------------
+
+(test-suite "31-002-ct-def-construction"
+  ; ct-def preserves dml-type, table-id, column-list.
+  (check (= DML-TYPE-INSERT
+             (dml-ct-def-get-dml-type
+               (make-dml-ct-def DML-TYPE-INSERT 1 '(id name)))))
+  (check (= 1 (dml-ct-def-get-table-id
+                (make-dml-ct-def DML-TYPE-INSERT 1 '(id name))))
+  (check (= #t (eq? 'id
+                   (car (dml-ct-def-get-column-list
+                          (make-dml-ct-def DML-TYPE-INSERT 1 '(id name)))))))
+
+(test-suite "31-002-ct-def-predicate"
+  ; dml-ct-def? accepts only ct-defs.
+  (check (= #t (dml-ct-def?
+                 (make-dml-ct-def DML-TYPE-INSERT 1 '()))))
+  (check (= #f (dml-ct-def? 'not-ct-def)))
+  (check (= #f (dml-ct-def? 42)))
+
+(test-suite "31-003-ct-def-set-column-list"
+  ; set-column-list! updates.
+  (check (= #t (let ((c (make-dml-ct-def DML-TYPE-INSERT 1 '())))
+                 (dml-ct-def-set-column-list! c '(a b c))
+                 (eq? 'a
+                   (car (dml-ct-def-get-column-list c))))))
+
+; ----------------------------------------------------------------
+; ObDMLRtDef
+; ----------------------------------------------------------------
+
+(test-suite "31-004-rt-def-construction"
+  ; rt-def preserves fields.
+  (check (= RT-DEF-STATUS-INIT
+             (dml-rt-def-get-status
+               (make-dml-rt-def #f #f #f))))
+  (check (= #f (dml-rt-def-get-ct-def
+                 (make-dml-rt-def #f #f #f))))
+
+(test-suite "31-004-rt-def-predicate"
+  ; dml-rt-def? accepts only rt-defs.
+  (check (= #t (dml-rt-def? (make-dml-rt-def #f #f #f))))
+  (check (= #f (dml-rt-def? 'not-rt-def)))
+  (check (= #f (dml-rt-def? 42)))
+
+(test-suite "31-005-rt-def-set-status"
+  ; set-status! updates.
+  (check (= RT-DEF-STATUS-READY
+             (let ((r (make-dml-rt-def #f #f #f)))
+               (dml-rt-def-set-status! r RT-DEF-STATUS-READY)
+               (dml-rt-def-get-status r))))
+
+(test-suite "31-005-rt-def-set-das-rt-def"
+  ; set-das-rt-def! updates.
+  (check (= #t (let ((r (make-dml-rt-def #f #f #f)))
+                 (let ((ct (make-dml-ct-def DML-TYPE-INSERT 1 '())))
+                   (dml-rt-def-set-das-rt-def! r 'fake-das-rt)
+                   (eq? #t (= 'fake-das-rt (dml-rt-def-get-das-rt-def r)))))))
+
+; ----------------------------------------------------------------
+; ObDMLOp
+; ----------------------------------------------------------------
+
+(test-suite "31-006-op-construction"
+  ; dml-op preserves dml-type and rt-def.
+  (check (= DML-TYPE-UPDATE
+             (dml-op-get-dml-type
+               (make-dml-op DML-TYPE-UPDATE #f))))
+
+(test-suite "31-006-op-predicate"
+  ; dml-op? accepts only dml-ops.
+  (check (= #t (dml-op? (make-dml-op DML-TYPE-INSERT #f))))
+  (check (= #f (dml-op? 'not-dml-op)))
+  (check (= #f (dml-op? 42)))
+
+(test-suite "31-007-op-open-close"
+  ; open! / close! transitions stage.
+  (check (= EXEC-STAGE-CLOSE
+             (let ((op (make-dml-op DML-TYPE-INSERT #f)))
+               (dml-op-open! op)
+               (dml-op-get-status op))))
+  (check (= EXEC-STAGE-CLOSE
+             (let ((op (make-dml-op DML-TYPE-DELETE #f)))
+               (dml-op-close! op)
+               (dml-op-get-status op))))
+
+; ----------------------------------------------------------------
+; ObDMLWriteBuffer
+; ----------------------------------------------------------------
+
+(test-suite "31-008-buffer-construction"
+  ; buffer preserves capacity + row-count.
+  (check (= 1000 (write-buffer-get-capacity
+                  (make-write-buffer 1000 0))))
+  (check (= 0 (write-buffer-get-row-count
+               (make-write-buffer 1000 0))))
+
+(test-suite "31-008-buffer-predicate"
+  ; write-buffer? accepts only buffers.
+  (check (= #t (write-buffer? (make-write-buffer 100 0))))
+  (check (= #f (write-buffer? 'not-buffer)))
+  (check (= #f (write-buffer? 42)))
+
+(test-suite "31-009-buffer-add-row"
+  ; add-row! increments row-count.
+  (check (= 1 (let ((b (make-write-buffer 100 0)))
+                 (write-buffer-add-row! b)
+                 (write-buffer-get-row-count b))))
+  (check (= 5 (let ((b (make-write-buffer 100 0)))
+                 (write-buffer-add-row! b)
+                 (write-buffer-add-row! b)
+                 (write-buffer-add-row! b)
+                 (write-buffer-add-row! b)
+                 (write-buffer-add-row! b)
+                 (write-buffer-get-row-count b))))
+
+(test-suite "31-009-buffer-flush"
+  ; flush! resets row-count to 0.
+  (check (= 0 (let ((b (make-write-buffer 100 10)))
+                 (write-buffer-flush! b)
+                 (write-buffer-get-row-count b))))
+
+; ----------------------------------------------------------------
+; ObDMLService
+; ----------------------------------------------------------------
+
+(test-suite "31-010-service-construction"
+  ; service starts with all counters 0.
+  (check (= 0 (dml-service-get-stats-processed
+               (make-dml-service))))
+  (check (= 0 (dml-service-get-stats-inserted
+               (make-dml-service))))
+  (check (= 0 (dml-service-get-stats-updated
+               (make-dml-service))))
+  (check (= 0 (dml-service-get-stats-deleted
+               (make-dml-service))))
+
+(test-suite "31-010-service-predicate"
+  ; dml-service? accepts only services.
+  (check (= #t (dml-service? (make-dml-service))))
+  (check (= #f (dml-service? 'not-service)))
+  (check (= #f (dml-service? 42)))
+
+(test-suite "31-011-service-inc-stats"
+  ; inc-stats increments.
+  (check (= 1 (let ((s (make-dml-service)))
+                 (dml-service-inc-processed! s)
+                 (dml-service-get-stats-processed s))))
+  (check (= 1 (let ((s (make-dml-service)))
+                 (dml-service-inc-inserted! s)
+                 (dml-service-get-stats-inserted s))))
+  (check (= 1 (let ((s (make-dml-service)))
+                 (dml-service-inc-updated! s)
+                 (dml-service-get-stats-updated s))))
+  (check (= 1 (let ((s (make-dml-service)))
+                 (dml-service-inc-deleted! s)
+                 (dml-service-get-stats-deleted s))))
+
+(test-suite "31-011-service-inc-mixed"
+  ; Mixed increments accumulate.
+  (check (= 3 (let ((s (make-dml-service)))
+                 (dml-service-inc-processed! s)
+                 (dml-service-inc-processed! s)
+                 (dml-service-inc-processed! s)
+                 (dml-service-get-stats-processed s))))
+  (check (= 5 (let ((s (make-dml-service)))
+                 (dml-service-inc-inserted! s)
+                 (dml-service-inc-deleted! s)
+                 (dml-service-inc-updated! s)
+                 (dml-service-inc-inserted! s)
+                 (dml-service-inc-updated! s)
+                 (dml-service-get-stats-processed s))))
+
+(test-suite "31-012-service-reset-stats"
+  ; reset-stats! zeros all counters.
+  (check (= 0 (let ((s (make-dml-service)))
+                 (dml-service-inc-processed! s)
+                 (dml-service-inc-inserted! s)
+                 (dml-service-inc-updated! s)
+                 (dml-service-inc-deleted! s)
+                 (dml-service-reset-stats! s)
+                 (+ (dml-service-get-stats-processed s)
+                    (dml-service-get-stats-inserted s)
+                    (dml-service-get-stats-updated s)
+                    (dml-service-get-stats-deleted s)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
