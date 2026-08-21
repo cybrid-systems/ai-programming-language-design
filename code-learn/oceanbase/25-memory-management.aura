@@ -1,0 +1,350 @@
+; 25-memory-management.aura
+; ======================
+; memory_management — minimal capability port to aura.
+;
+; Maps to: OceanBase Memory Management
+; Source: deps/oblib/src/lib/allocator/ob_allocator.{h,cpp}
+;         + deps/oblib/src/lib/allocator/ob_allocator_v2.h
+;         + deps/oblib/src/lib/allocator/ob_ctx_define.h
+;         + deps/oblib/src/lib/allocator/ob_mod_define.h
+;         + deps/oblib/src/lib/allocator/ob_block_alloc_mgr.h
+;         + deps/oblib/src/lib/allocator/ob_cached_allocator.h
+;         + deps/oblib/src/lib/allocator/page_arena.h
+;         + deps/oblib/src/lib/allocator/ob_concurrent_fifo_allocator.h
+;         + deps/oblib/src/lib/allocator/ob_delay_free_allocator.h
+;         + deps/oblib/src/lib/alloc/alloc_struct.h (ObMemAttr)
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Memory Management:
+;   - 4-layer architecture: module → interface → tenant → page
+;   - ObIAllocator abstract base (alloc/free/realloc)
+;   - ObWrapperAllocator adapter
+;   - ObMemAttr: mem_class + label + size
+;   - 4 mem classes: MOD / CTX / ROW / COLUMN
+;   - ObCachedAllocator (object pool)
+;   - ObArenaAllocator (batch release)
+;   - ObMallocAllocator (global heap)
+;   - ObBlockAllocMgr (block management)
+;   - ObParallelAllocator (V2 parallel alloc)
+;   - ObDelayFreeAllocator (deferred free)
+;   - ObAsanAllocator (ASAN detection)
+;
+; aura v1 ships:
+;   - 4 ALLOC-TYPE constants (GENERAL, ARENA, CACHED, DELAYED)
+;   - 4 MEM-CLASS constants (MOD, CTX, ROW, COLUMN)
+;   - make-mem-attr (factory: mem-class + label + size)
+;   - mem-attr accessors
+;   - make-allocator (factory: alloc-type + mem-attr + total)
+;   - allocator accessors + alloc! + free!
+;   - make-allocator-pool (factory: list of allocators)
+;   - allocator-pool-add! / find-by-mem-class / count
+;   - make-cached-allocator (factory: mem-attr + total + free-list)
+;   - cached-allocator-acquire! / release! / get-free-count
+;   - make-arena-allocator (factory: mem-attr + total + offset)
+;   - arena-allocator-alloc! / reset! / get-offset
+;
+; Deferred (full OceanBase Memory Management):
+;   - real ObIAllocator with V1/V2 evolutions
+;   - real ObMallocAllocator with tenant isolation + memstore tracking
+;   - real ObParallelAllocator with lock-based parallel alloc
+;   - real ObCachedAllocator template specialization
+;   - real ObArenaAllocator with PageArena + alignment
+;   - real ObMallocAllocator with chunk allocation
+;   - real ObBlockAllocMgr with 2MB block management
+;   - real ObModIds (200+ module identifiers) + ObCtxAttrCenter
+;   - real ASAN integration for memory leak detection
+;   - real delay-free queue for thread-local free pool
+
+(export
+  ; Allocator type constants
+  ALLOC-TYPE-GENERAL
+  ALLOC-TYPE-ARENA
+  ALLOC-TYPE-CACHED
+  ALLOC-TYPE-DELAYED
+  ; Memory class constants
+  MEM-CLASS-MOD MEM-CLASS-CTX
+  MEM-CLASS-ROW MEM-CLASS-COLUMN
+  ; ObMemAttr
+  make-mem-attr mem-attr?
+  mem-attr-get-mem-class mem-attr-get-label
+  mem-attr-get-size mem-attr-set-size!
+  ; ObAllocator
+  make-allocator allocator?
+  allocator-get-alloc-type allocator-get-mem-attr
+  allocator-get-total allocator-get-used
+  allocator-set-used!
+  allocator-alloc! allocator-free!
+  ; AllocatorPool
+  make-allocator-pool allocator-pool?
+  allocator-pool-add!
+  allocator-pool-find-by-mem-class
+  allocator-pool-count
+  ; ObCachedAllocator
+  make-cached-allocator cached-allocator?
+  cached-allocator-acquire!
+  cached-allocator-release!
+  cached-allocator-get-free-count
+  ; ObArenaAllocator
+  make-arena-allocator arena-allocator?
+  arena-allocator-alloc!
+  arena-allocator-reset!
+  arena-allocator-get-offset)
+
+; ----------------------------------------------------------------
+; Allocator type constants
+; ----------------------------------------------------------------
+
+(define ALLOC-TYPE-GENERAL 1)
+(define ALLOC-TYPE-ARENA 2)
+(define ALLOC-TYPE-CACHED 3)
+(define ALLOC-TYPE-DELAYED 4)
+
+; ----------------------------------------------------------------
+; Memory class constants (per alloc_struct.h ObModIds subset)
+; ----------------------------------------------------------------
+
+(define MEM-CLASS-MOD 1)
+(define MEM-CLASS-CTX 2)
+(define MEM-CLASS-ROW 3)
+(define MEM-CLASS-COLUMN 4)
+
+; ----------------------------------------------------------------
+; ObMemAttr — closure-based
+; ----------------------------------------------------------------
+
+; make-mem-attr: create an ObMemAttr.
+; Args: mem-class (integer), label (symbol), size (integer)
+; Returns: mem_attr closure.
+(define (make-mem-attr mem-class label size)
+  (letrec ((set-size! (lambda (v) (set! size v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'mem-class) mem-class)
+                     ((eq? msg 'label) label)
+                     ((eq? msg 'size) size)
+                     ((eq? msg 'set-size!) set-size!)
+                     (else #f)))))
+      self))
+
+; mem-attr?: is the object a mem-attr?
+; Detected by querying 'label — only attrs return a symbol.
+(define (mem-attr? obj)
+  (if (procedure? obj)
+      (if (symbol? (obj 'label)) #t #f)
+      #f))
+
+; mem-attr-get-mem-class: get memory class.
+(define (mem-attr-get-mem-attr ma) ma)
+  (define (mem-attr-get-mem-class ma) (ma 'mem-class))
+
+; mem-attr-get-label: get label.
+(define (mem-attr-get-label ma) (ma 'label))
+
+; mem-attr-get-size: get size.
+(define (mem-attr-get-size ma) (ma 'size))
+
+; mem-attr-set-size!: set size.
+; Returns the new size.
+(define (mem-attr-set-size! ma v) ((ma 'set-size!) v))
+
+; ----------------------------------------------------------------
+; ObAllocator — closure-based
+; ----------------------------------------------------------------
+
+; make-allocator: create an ObAllocator.
+; Args: alloc-type (integer), mem-attr (mem_attr),
+;       total-bytes (integer)
+; Returns: allocator closure (initial: used=0).
+(define (make-allocator alloc-type mem-attr total-bytes)
+  (let ((used 0))
+    (letrec ((set-used! (lambda (v) (set! used v) v))
+             (inc-used! (lambda (delta) (set! used (+ used delta)) used))
+             (dec-used! (lambda (delta) (set! used (- used delta)) used))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'alloc-type) alloc-type)
+                       ((eq? msg 'mem-attr) mem-attr)
+                       ((eq? msg 'total) total-bytes)
+                       ((eq? msg 'used) used)
+                       ((eq? msg 'set-used!) set-used!)
+                       ((eq? msg 'inc-used!) inc-used!)
+                       ((eq? msg 'dec-used!) dec-used!)
+                       (else #f)))))
+      self))
+
+; allocator?: is the object an allocator?
+; Detected by querying 'total — only allocators return integer.
+(define (allocator? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'total)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; allocator-get-alloc-type: get allocator type.
+(define (allocator-get-alloc-type a) (a 'alloc-type))
+
+; allocator-get-mem-attr: get memory attribute.
+(define (allocator-get-mem-attr a) (a 'mem-attr))
+
+; allocator-get-total: get total bytes.
+(define (allocator-get-total a) (a 'total))
+
+; allocator-get-used: get used bytes.
+(define (allocator-get-used a) (a 'used))
+
+; allocator-set-used!: set used bytes.
+; Returns the new value.
+(define (allocator-set-used! a v) ((a 'set-used!) v))
+
+; allocator-alloc!: allocate `size` bytes.
+; Increments used + returns a virtual memory address (integer).
+; Returns integer (v1: just a unique id).
+(define (allocator-alloc! a size)
+  ((a 'inc-used!) size)
+  size)
+
+; allocator-free!: free `size` bytes.
+; Decrements used.
+; Returns the new used count.
+(define (allocator-free! a size)
+  ((a 'dec-used!) size)
+  (a 'used))
+
+; ----------------------------------------------------------------
+; AllocatorPool — closure-based registry
+; ----------------------------------------------------------------
+
+; make-allocator-pool: create a pool of allocators.
+; Returns: allocator_pool closure (initial: empty).
+(define (make-allocator-pool)
+  (let ((allocators '()))
+    (letrec ((set-allocators! (lambda (v) (set! allocators v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'allocators) allocators)
+                       ((eq? msg 'set-allocators!) set-allocators!)
+                       (else #f)))))
+      self))
+
+; allocator-pool?: is the object an allocator pool?
+; Detected by querying 'allocators — only pools return a list.
+(define (allocator-pool? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'allocators)) #t #f)
+      #f))
+
+; allocator-pool-add!: add an allocator to the pool.
+; Returns the new count.
+(define (allocator-pool-add! pool allocator)
+  (let ((existing (pool 'allocators)))
+    ((pool 'set-allocators!) (cons allocator existing))))
+
+; allocator-pool-find-by-mem-class: find allocator by mem class.
+; Returns the allocator or #f.
+(define (allocator-pool-find-by-mem-class pool mem-class)
+  (let loop ((rest (pool 'allocators)))
+    (cond
+      ((null? rest) #f)
+      ((= (mem-attr-get-mem-class (allocator-get-mem-attr (car rest)))
+          mem-class)
+       (car rest))
+      (#t (loop (cdr rest))))))
+
+; allocator-pool-count: count of allocators.
+(define (allocator-pool-count pool)
+  (let loop ((rest (pool 'allocators)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; ObCachedAllocator — closure-based (object pool)
+; ----------------------------------------------------------------
+
+; make-cached-allocator: create a cached (object pool) allocator.
+; Args: mem-attr (mem_attr), total (integer — max objects),
+;       free-list (integer — initial free count)
+; Returns: cached_allocator closure.
+(define (make-cached-allocator mem-attr total free-list)
+  (let ((free free-list))
+    (letrec ((set-free! (lambda (v) (set! free v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'mem-attr) mem-attr)
+                       ((eq? msg 'total) total)
+                       ((eq? msg 'free) free)
+                       ((eq? msg 'set-free!) set-free!)
+                       (else #f)))))
+      self))
+
+; cached-allocator?: is the object a cached allocator?
+; Detected by querying 'total — only cached return integer.
+(define (cached-allocator? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'total)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; cached-allocator-acquire!: acquire an object (decrement free).
+; Returns the new free count (or -1 if no objects available).
+(define (cached-allocator-acquire! ca)
+  (let ((current (ca 'free)))
+    (cond
+      ((<= current 0) -1)
+      (#t
+       ((ca 'set-free!) (- current 1))
+       (- current 1)))))
+
+; cached-allocator-release!: release an object (increment free).
+; Returns the new free count.
+(define (cached-allocator-release! ca)
+  (let ((current (ca 'free)))
+    ((ca 'set-free!) (+ current 1))))
+
+; cached-allocator-get-free-count: get current free count.
+(define (cached-allocator-get-free-count ca) (ca 'free))
+
+; ----------------------------------------------------------------
+; ObArenaAllocator — closure-based (batch release)
+; ----------------------------------------------------------------
+
+; make-arena-allocator: create an arena allocator.
+; Args: mem-attr (mem_attr), total (integer — arena size),
+;       offset (integer — current offset within arena)
+; Returns: arena_allocator closure.
+(define (make-arena-allocator mem-attr total offset)
+  (let ((off offset))
+    (letrec ((set-offset! (lambda (v) (set! off v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'mem-attr) mem-attr)
+                       ((eq? msg 'total) total)
+                       ((eq? msg 'offset) off)
+                       ((eq? msg 'set-offset!) set-offset!)
+                       (else #f)))))
+      self))
+
+; arena-allocator?: is the object an arena allocator?
+; Detected by querying 'total — only arenas return integer.
+(define (arena-allocator? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'total)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; arena-allocator-alloc!: allocate `size` bytes from arena.
+; Advances offset by size. Returns the new offset.
+(define (arena-allocator-alloc! aa size)
+  (let ((current (aa 'offset)))
+    ((aa 'set-offset!) (+ current size))))
+
+; arena-allocator-reset!: reset offset to 0.
+; Returns the new offset (always 0).
+(define (arena-allocator-reset! aa)
+  ((aa 'set-offset!) 0)
+  0)
+
+; arena-allocator-get-offset: get current offset.
+(define (arena-allocator-get-offset aa) (aa 'offset))
