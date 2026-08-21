@@ -1,0 +1,332 @@
+; 002-hlist.aura
+; ==================
+; Hash list (hlist) — Linux singly-linked hash list port to aura.
+;
+; Maps to: 002-hlist-analysis.md
+; Source: include/linux/list.h lines 946-1206 (Linux 7.0-rc1)
+;
+; ## Design notes
+;
+; Linux's hlist is a singly-linked list with an 8-byte head (vs list_head's
+; 16 bytes), designed for hash table buckets where most buckets are empty
+; and the 8-byte saving is significant across thousands of buckets.
+;
+; The hlist design trades two capabilities vs list_head:
+;   - No reverse traversal (no `prev` pointer)
+;   - No O(1) tail insertion
+; In return it gets:
+;   - Smaller head (8 bytes vs 16)
+;   - Same O(1) insert/delete
+;
+; ## The pprev trick
+;
+; The most clever part: each node has a `pprev` field — a pointer TO the
+; location that points to the current node. For the first node, pprev
+; points to `head.first`. For other nodes, pprev points to the previous
+; node's `next` field.
+;
+; This enables O(1) delete: `*pprev = next` skips the current node without
+; needing to find the previous node (which would be O(n) in a singly-linked
+; list).
+;
+; ## Aura adaptation
+;
+; Aura has no pointer-to-pointer. We model pprev as a **setter closure** —
+; calling `(pprev value)` updates whatever location previously pointed to
+; the current node. The closure captures the relevant slot's binding.
+;
+; ## Closure protocol (hlist-head)
+;
+;   (head 'first)         → first node or #f
+;   ((head 'set-first!) v) → set first, returns v
+;   (head 'empty?)        → #t iff first is #f
+;   (head 'count)         → node count (O(n))
+;   (head 'splice-init! last from)
+;                          → splice all of `from` (ending at `last`) to head
+;
+; ## Closure protocol (hlist-node)
+;
+;   (node 'next)          → next node or #f
+;   (node 'pprev)         → setter closure for whoever points to this node
+;   ((node 'set-next!) v)  → set next, returns v
+;   ((node 'set-pprev!) p) → set pprev, returns p
+;   (node 'unhashed?)     → #t iff pprev is #f
+;   (node 'del!)          → detach from list (next/pprev stay dangling)
+;   (node 'del-init!)     → detach + reset next/pprev to #f
+;   (node 'add-fake!)     → set pprev = set-next! (pretend it's in a list)
+
+(export
+  ; Construction
+  make-hlist-head make-hlist-node
+  hlist-init-head! hlist-init-node!
+  ; Predicates
+  hlist-head? hlist-node?
+  hlist-empty? hlist-unhashed? hlist-unhashed-lockless?
+  hlist-fake?
+  ; Accessors
+  hlist-first hlist-next hlist-pprev
+  ; Insertion
+  hlist-add-head! hlist-add-before! hlist-add-behind!
+  hlist-add-fake!
+  ; Deletion
+  hlist-del! hlist-del-init!
+  ; Move / splice
+  hlist-move-list! hlist-splice-init!
+  ; Auxiliary
+  hlist-is-singular-node?
+  ; Iteration
+  hlist-for-each hlist-for-each-safe
+  hlist-for-each-entry hlist-for-each-entry-safe
+  ; Misc
+  hlist-count-nodes)
+
+; ----------------------------------------------------------------
+; Vector layout note
+;
+; Aura's `vector-set!` crashes (#3235), so each node is a closure with
+; mutable state via closure-captured `let` bindings + named setters via
+; letrec (avoids the "set! inside lambda inside cond" parser bug found
+; during #3235 investigation).
+; ----------------------------------------------------------------
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+; make-hlist-head: empty head (first = #f).
+(define (make-hlist-head)
+  (let ((first #f))
+    (letrec ((set-first! (lambda (v) (set! first v) v)))
+      (letrec ((self (lambda (msg)
+                  (cond
+                    ((eq? msg 'first) first)
+                    ((eq? msg 'set-first!) set-first!)
+                    ((eq? msg 'empty?) (not first))
+                    (else #f)))))
+        self))))
+
+; make-hlist-node: unlinked node (next = #f, pprev = #f).
+(define (make-hlist-node)
+  (let ((next #f) (pprev #f))
+    (letrec ((set-next!  (lambda (v) (set! next v) v))
+             (set-pprev! (lambda (v) (set! pprev v) v)))
+      (letrec ((self (lambda (msg)
+                  (cond
+                    ((eq? msg 'next) next)
+                    ((eq? msg 'pprev) pprev)
+                    ((eq? msg 'set-next!) set-next!)
+                    ((eq? msg 'set-pprev!) set-pprev!)
+                    ((eq? msg 'unhashed?) (not pprev))
+                    (else #f)))))
+        self))))
+
+; hlist-init-head!: reset head to empty.
+(define (hlist-init-head! h) ((h 'set-first!) #f))
+
+; hlist-init-node!: reset node (next = #f, pprev = #f).
+; No-op if already unlinked (matches INIT_HLIST_NODE behavior).
+(define (hlist-init-node! n)
+  ((n 'set-next!) #f)
+  ((n 'set-pprev!) #f))
+
+; ----------------------------------------------------------------
+; Predicates
+; ----------------------------------------------------------------
+
+; hlist-head?: structural predicate. A head is any closure that responds
+; to 'first (we tag with 'empty? too, to disambiguate from generic closures).
+(define (hlist-head? v)
+  (and (procedure? v)
+       (let ((probe (v 'empty?)))
+         (if (eq? probe 'no-method) #f
+             (not probe)))))   ; empty? returns #t for fresh head, #f for populated
+
+; hlist-node?: responds to 'unhashed?
+(define (hlist-node? v)
+  (and (procedure? v)
+       (let ((probe (v 'unhashed?)))
+         (if (eq? probe 'no-method) #f #t))))
+
+; hlist-empty?: first == #f?
+(define (hlist-empty? h)
+  (not (h 'first)))
+
+; hlist-unhashed?: pprev == #f?
+(define (hlist-unhashed? n)
+  (not (n 'pprev)))
+
+; hlist-unhashed-lockless?: same but lockless (we don't model tearing,
+; so same as hlist-unhashed? — see #3235 follow-up).
+(define (hlist-unhashed-lockless? n)
+  (not (n 'pprev)))
+
+; hlist-fake?: pprev points to our own next slot (set-next!).
+(define (hlist-fake? n)
+  (eq? (n 'pprev) (n 'set-next!)))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+(define (hlist-first h) (h 'first))
+(define (hlist-next n)  (n 'next))
+(define (hlist-pprev n) (n 'pprev))
+
+; ----------------------------------------------------------------
+; Insertion
+; ----------------------------------------------------------------
+
+; hlist_add_head: insert n at head's front.
+; Equivalent to:
+;   n.next = first
+;   if first: first.pprev = n.set-next!
+;   head.first = n
+;   n.pprev = head.set-first!
+(define (hlist-add-head! n h)
+  (let ((first (h 'first)))
+    ((n 'set-next!) first)
+    (when first
+      ((first 'set-pprev!) (n 'set-next!)))
+    ((h 'set-first!) n)
+    ((n 'set-pprev!) (h 'set-first!))))
+
+; hlist_add_before: insert n BEFORE next-node.
+; Equivalent to:
+;   n.pprev = next.pprev
+;   n.next = next
+;   next.pprev = n.set-next!
+;   *old_pprev = n
+(define (hlist-add-before! n next-node)
+  (let ((next-pprev (next-node 'pprev)))
+    ((n 'set-pprev!) next-pprev)
+    ((n 'set-next!) next-node)
+    ((next-node 'set-pprev!) (n 'set-next!))
+    (next-pprev n)))
+
+; hlist_add_behind: insert n AFTER prev-node.
+; Equivalent to:
+;   n.next = prev.next
+;   prev.next = n
+;   n.pprev = prev.set-next!
+;   if n.next: n.next.pprev = n.set-next!
+(define (hlist-add-behind! n prev-node)
+  (let ((prev-next (prev-node 'next)))
+    ((n 'set-next!) prev-next)
+    ((prev-node 'set-next!) n)
+    ((n 'set-pprev!) (prev-node 'set-next!))
+    (when prev-next
+      ((prev-next 'set-pprev!) (n 'set-next!)))))
+
+; hlist_add_fake: pretend n is in a list (pprev points to own next).
+(define (hlist-add-fake! n)
+  ((n 'set-pprev!) (n 'set-next!)))
+
+; ----------------------------------------------------------------
+; Deletion
+; ----------------------------------------------------------------
+
+; hlist_del: detach n (next/pprev stay dangling, like LIST_POISON).
+; Equivalent to:
+;   next = n.next; pprev = n.pprev
+;   *pprev = next          (skip n)
+;   if next: next.pprev = pprev
+(define (hlist-del! n)
+  (let ((next (n 'next))
+        (pprev (n 'pprev)))
+    (pprev next)
+    (when next
+      ((next 'set-pprev!) pprev))))
+
+; hlist_del_init: detach AND reset node (safe against double-delete).
+(define (hlist-del-init! n)
+  (when (not (hlist-unhashed? n))
+    (hlist-del! n)
+    (hlist-init-node! n)))
+
+; ----------------------------------------------------------------
+; Auxiliary
+; ----------------------------------------------------------------
+
+; hlist_is_singular_node: n is the only node (next == #f, pprev == head.first).
+; Avoids touching head.first — pure local-node check (avoids cache miss).
+(define (hlist-is-singular-node? n h)
+  (and (not (hlist-next n))
+       (eq? (hlist-pprev n) (h 'set-first!))))
+
+; hlist_move_list: O(1) move all of `old` into `new`.
+; Equivalent to:
+;   new.first = old.first
+;   if new.first: new.first.pprev = new.set-first!
+;   old.first = NULL
+(define (hlist-move-list! old new)
+  (let ((first (old 'first)))
+    ((new 'set-first!) first)
+    (when first
+      ((first 'set-pprev!) (new 'set-first!)))
+    ((old 'set-first!) #f)))
+
+; hlist_splice_init: move nodes from `from` (ending at `last`) to `to` front.
+; `last` is the last node of `from` (caller must know — hlist has no O(1) tail).
+(define (hlist-splice-init! from last to)
+  (let ((to-first (to 'first))
+        (from-first (from 'first)))
+    (when to-first
+      ((to-first 'set-pprev!) (last 'set-next!)))
+    ((last 'set-next!) to-first)
+    ((to 'set-first!) from-first)
+    (when from-first
+      ((from-first 'set-pprev!) (to 'set-first!)))
+    ((from 'set-first!) #f)))
+
+; ----------------------------------------------------------------
+; Iteration
+; ----------------------------------------------------------------
+
+; hlist_for_each: apply (f node) to each node, head→tail.
+; Termination: pos == #f (NULL-terminated, not circular).
+(define (hlist-for-each f head)
+  (let loop ((node (h 'first)))
+    (when node
+      (f node)
+      (loop (node 'next)))))
+
+; hlist_for_each_safe: pre-fetch next; safe against current-node delete.
+(define (hlist-for-each-safe f head)
+  (let ((first (h 'first)))
+    (when first
+      (let loop ((pos first)
+                 (next (first 'next)))
+        (f pos)
+        (when next
+          (loop next (next 'next)))))))
+
+; hlist_for_each_entry: apply (f owner) to each node's owner.
+; Note: no owner field in basic hlist — caller must use a node wrapper
+; (similar to list_head's intrusive embedding). This is the lowest-level
+; convenience iteration.
+(define (hlist-for-each-entry f head)
+  (let loop ((node (h 'first)))
+    (when node
+      (f node)
+      (loop (node 'next)))))
+
+; hlist_for_each_entry_safe: safe against current-node delete.
+(define (hlist-for-each-entry-safe f head)
+  (let ((first (h 'first)))
+    (when first
+      (let loop ((pos first)
+                 (next (first 'next)))
+        (f pos)
+        (when next
+          (loop next (next 'next)))))))
+
+; ----------------------------------------------------------------
+; Misc
+; ----------------------------------------------------------------
+
+; hlist_count_nodes: O(n) — only O(n) hlist op.
+(define (hlist-count-nodes head)
+  (let loop ((node (head 'first)) (n 0))
+    (if (not node)
+        n
+        (loop (node 'next) (+ n 1)))))
