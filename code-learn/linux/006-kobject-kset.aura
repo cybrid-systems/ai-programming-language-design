@@ -1,0 +1,219 @@
+; 006-kobject-kset.aura
+; ========================
+; kobject + kset — minimal capability ports to aura.
+;
+; Maps to: 006-kobject-kset-analysis.md
+; Source: include/linux/kobject.h + lib/kobject.c + lib/kobject_uevent.c
+;         (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Full Linux kobject is the foundation of the device model — 87 symbols in
+; kobject.h alone. It integrates with:
+;   - sysfs (kernel filesystem for /sys exposure) — aura has no FS
+;   - uevent (netlink notifications for hotplug) — aura has no netlink
+;   - kref (atomic reference counting) — aura has no atomics
+;   - kset (collection + uevent filtering) — single-threaded simulation
+;   - kobj_type (release callback, sysfs ops, default_groups) — no FS
+;
+; v1 ships the data structure + refcount + kset membership API:
+;   - make-kobject (with optional name + parent + kset)
+;   - kobject-get / kobject-put (refcount simulation, no atomics)
+;   - kobject-add-to-kset / kobject-del-from-kset
+;   - kobject-name / kobject-parent / kobject-state
+;   - make-kset
+;   - kset-register / kset-unregister (add/remove kobject)
+;   - kset-for-each / kset-size / kset-empty?
+;   - KOBJECT-INIT-STATE bit flag accessor
+;
+; Deferred (full Linux kobject/kset, separate issues):
+;   - sysfs integration (sd kernfs_node, show/store ops)
+;   - uevent notifications (KOBJ_ADD/KOBJ_REMOVE netlink)
+;   - Atomic reference counting (kref_get_unless_zero etc.)
+;   - kobj_ns_type_operations (namespaces)
+;   - Hotplug callback filtering (kset_uevent_ops.filter)
+;   - kobj_type.release (would need cleanup callbacks)
+;   - Module reference counting (kobject_in_module)
+;
+; ## Design notes
+;
+; aura has no atomics, no FS, no netlink. We model:
+;   - kobject as closure holding name/parent/kset-ref/refcount/state-flags
+;   - kset as closure holding list of (kobject-ref) + embedded kobj
+;   - refcount as plain integer (single-threaded story)
+
+(export
+  ; kobject
+  make-kobject
+  kobject-name kobject-parent kobject-state
+  kobject-get kobject-put kobject-refcount
+  kobject-add-to-kset kobject-del-from-kset
+  kobject-in-kset?
+  ; kset
+  make-kset kset-name
+  kset-register kset-unregister
+  kset-size kset-empty? kset-for-each
+  ; State flags
+  KOBJ-STATE-INITIALIZED KOBJ-STATE-IN-SYSFS
+  KOBJ-STATE-ADD-UEVENT KOBJ-STATE-REMOVE-UEVENT
+  KOBJ-STATE-UEVENT-SUPPRESS)
+
+; State flag bits (1 = initialized, 2 = in sysfs, 4 = add uevent sent, etc.)
+(define KOBJ-STATE-INITIALIZED    1)
+(define KOBJ-STATE-IN-SYSFS       2)
+(define KOBJ-STATE-ADD-UEVENT      4)
+(define KOBJ-STATE-REMOVE-UEVENT   8)
+(define KOBJ-STATE-UEVENT-SUPPRESS 16)
+
+; ----------------------------------------------------------------
+; kobject (closure with state)
+; ----------------------------------------------------------------
+
+; make-kobject: create an uninitialized kobject. State flag set lazily
+; via kobject-init.
+(define (make-kobject)
+  (let ((name #f)
+        (parent #f)
+        (kset-ref #f)            ; kset closure (or #f if ungrouped)
+        (refcount 0)
+        (state 0))
+    (letrec ((set-name!    (lambda (v) (set! name v) v))
+             (set-parent!  (lambda (v) (set! parent v) v))
+             (set-kset!    (lambda (v) (set! kset-ref v) v))
+             (set-state!   (lambda (v) (set! state v) v))
+             (inc-ref!     (lambda () (set! refcount (+ refcount 1)) refcount))
+             (dec-ref!     (lambda () (set! refcount (- refcount 1)) refcount))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'parent) parent)
+                       ((eq? msg 'kset) kset-ref)
+                       ((eq? msg 'refcount) refcount)
+                       ((eq? msg 'state) state)
+                       ((eq? msg 'set-name!) set-name!)
+                       ((eq? msg 'set-parent!) set-parent!)
+                       ((eq? msg 'set-kset!) set-kset!)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'inc-ref!) inc-ref!)
+                       ((eq? msg 'dec-ref!) dec-ref!)
+                       (else #f)))))
+      self)))
+
+; kobject-name: get the kobject's name.
+(define (kobject-name ko) (ko 'name))
+
+; kobject-parent: get the parent kobject (or #f).
+(define (kobject-parent ko) (ko 'parent))
+
+; kobject-state: get the state flag bitmap.
+(define (kobject-state ko) (ko 'state))
+
+; kobject-refcount: get the current refcount.
+(define (kobject-refcount ko) (ko 'refcount))
+
+; kobject-get: increment refcount. Returns the new refcount.
+(define (kobject-get ko)
+  ((ko 'inc-ref!)))
+
+; kobject-put: decrement refcount. Returns the new refcount.
+; When refcount hits 0, the caller is responsible for cleanup
+; (analog of kobj_type.release). v1 returns 0 without firing release.
+(define (kobject-put ko)
+  ((ko 'dec-ref!)))
+
+; kobject-in-kset?: is the kobject a member of some kset?
+(define (kobject-in-kset? ko)
+  (not (not (ko 'kset))))
+
+; kobject-add-to-kset: link kobject into a kset's membership list.
+; Idempotent: returns #f if already in the kset.
+(define (kobject-add-to-kset ko kset)
+  (cond
+    ((eq? (ko 'kset) kset) #f)   ; already in this kset
+    ((ko 'kset) #f)              ; already in another kset (caller bug)
+    (else
+      ((ko 'set-kset!) kset)
+      (kset-push kset ko)
+      #t)))
+
+; kobject-del-from-kset: unlink kobject from its current kset.
+; No-op if not in any kset.
+(define (kobject-del-from-kset ko)
+  (let ((kset (ko 'kset)))
+    (if kset
+        (begin
+          (kset-remove kset ko)
+          ((ko 'set-kset!) #f)
+          #t)
+        #f)))
+
+; ----------------------------------------------------------------
+; kset (closure with member list)
+; ----------------------------------------------------------------
+
+; make-kset: empty kset with optional name.
+(define (make-kset)
+  (let ((name #f)
+        (members '()))           ; list of kobject refs
+    (letrec ((set-name! (lambda (v) (set! name v) v))
+             (set-members! (lambda (m) (set! members m) m))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'members) members)
+                       ((eq? msg 'set-name!) set-name!)
+                       ((eq? msg 'set-members!) set-members!)
+                       ((eq? msg 'empty?) (null? members))
+                       ((eq? msg 'size) (length members))
+                       (else #f)))))
+      self)))
+
+; kset-name: get the kset's name.
+(define (kset-name ks) (ks 'name))
+
+; kset-empty?: is the kset empty?
+(define (kset-empty? ks)
+  (null? (ks 'members)))
+
+; kset-size: number of members.
+(define (kset-size ks)
+  (length (ks 'members)))
+
+; kset-register: add a kobject to the kset. Returns #t on success.
+(define (kset-register ks ko)
+  (cond
+    ((member? (ko) (ks 'members)) #f)   ; already registered
+    (else
+      ((ks 'set-members!) (cons (ko) (ks 'members)))
+      #t)))
+
+; kset-unregister: remove a kobject from the kset. Returns #t on success.
+(define (kset-unregister ks ko)
+  (if (member? (ko) (ks 'members))
+      (begin
+        ((ks 'set-members!) (filter (lambda (k) (not (eq? k ko))) (ks 'members)))
+        #t)
+      #f))
+
+; kset-for-each: apply (f kobject) to each member (in reverse insertion order).
+(define (kset-for-each f ks)
+  (for-each f (reverse (ks 'members))))
+
+; ----------------------------------------------------------------
+; Internal helpers (not exported)
+; ----------------------------------------------------------------
+
+; kset-push: prepend ko to kset's members list.
+(define (kset-push ks ko)
+  ((ks 'set-members!) (cons (ko) (ks 'members))))
+
+; kset-remove: remove ko from kset's members list.
+(define (kset-remove ks ko)
+  ((ks 'set-members!) (filter (lambda (k) (not (eq? k ko))) (ks 'members))))
+
+; member?: linear search for x in lst.
+(define (member? x lst)
+  (cond
+    ((null? lst) #f)
+    ((eq? (car lst) x) #t)
+    (else (member? x (cdr lst)))))

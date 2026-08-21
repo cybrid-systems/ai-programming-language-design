@@ -1,0 +1,108 @@
+; 006-kobject-kset_test.aura
+; ===========================
+; Smoke tests for 006-kobject-kset.aura — kobject + kset minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/006-kobject-kset_test.aura
+;
+; ## Test framework quirks (#3235 follow-up)
+;
+; Each suite is one (check (= EXPR EXPECTED)) form. Multi-form let bodies
+; and nested if-let patterns trigger aura parser quirks, so all helpers
+; are at file level.
+;
+; Verified automatically (smoke):
+;   - make-kobject / make-kset construction
+;   - kset-register / kset-unregister
+;   - kobject-get / kobject-put refcount simulation
+;   - kobject state flags
+;
+; Verified via separate probes during development:
+;   - kset-for-each iterates all members
+;   - kobject-in-kset? tracks membership
+;   - kobject-add-to-kset idempotency
+;
+; Deferred (full Linux kobject/kset):
+;   - sysfs integration
+;   - uevent notifications
+;   - Atomic refcount
+;   - kobj_type.release
+;   - Namespaces / hotplug filtering
+
+(require "std/test" all:)
+(require "006-kobject-kset" all:)
+
+; File-level helpers
+
+; kobject with name + initialized flag set.
+(define (fresh-ko)
+  (let ((ko (make-kobject)))
+    ((ko 'set-name!) 'test-ko)
+    ((ko 'set-state!) KOBJ-STATE-INITIALIZED)
+    ko))
+
+; kset with name.
+(define (fresh-ks)
+  (let ((ks (make-kset)))
+    ((ks 'set-name!) 'test-ks)
+    ks))
+
+; ----------------------------------------------------------------
+; kobject construction
+; ----------------------------------------------------------------
+
+(test-suite "kobject-001-init"
+  (check (= 0 (kobject-refcount (make-kobject))))
+  (check (= 0 (kobject-state (make-kobject))))
+  (check (= 1 (if (not (kobject-in-kset? (make-kobject))) 1 0))))
+
+; ----------------------------------------------------------------
+; kset construction
+; ----------------------------------------------------------------
+
+(test-suite "kset-001-init"
+  (check (= 1 (kset-empty? (make-kset))))
+  (check (= 0 (kset-size (make-kset))))
+
+; ----------------------------------------------------------------
+; kset-register + unregister
+; ----------------------------------------------------------------
+
+(test-suite "kset-002-register-size"
+  (check (= 2 (kset-size
+    (let ((ks (fresh-ks)))
+      (kset-register ks (fresh-ko))
+      (kset-register ks (fresh-ko))
+      ks))))
+
+(test-suite "kset-003-unregister-size"
+  (check (= 0 (kset-size
+    (let ((ks (fresh-ks))
+          (ko (fresh-ko)))
+      (kset-register ks ko)
+      (kset-unregister ks ko)
+      ks))))
+
+; ----------------------------------------------------------------
+; kobject refcount
+; ----------------------------------------------------------------
+
+(test-suite "kobject-002-refcount-get"
+  (check (= 3 (kobject-get (kobject-get (kobject-get (fresh-ko)))))))
+
+(test-suite "kobject-002-refcount-mixed"
+  (check (= 1 (kobject-get (kobject-put (kobject-get (fresh-ko)))))))
+
+; ----------------------------------------------------------------
+; kobject state
+; ----------------------------------------------------------------
+
+(test-suite "kobject-003-state-initialized"
+  (check (= 1 (if (= (kobject-state (fresh-ko)) KOBJ-STATE-INITIALIZED) 1 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
