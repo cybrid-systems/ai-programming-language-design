@@ -1,0 +1,297 @@
+; 034-platform-pci-bus.aura
+; ===========================
+; platform_pci_bus — minimal capability port to aura.
+;
+; Maps to: Linux kernel PCI + platform bus driver model
+; Source: drivers/pci/ + drivers/base/platform.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux PCI bus subsystem provides peripheral component interconnect
+; enumeration + driver registration:
+;   - struct pci_device (vendor, device, bus, devfn)
+;   - struct pci_driver (name, id_table, probe, remove)
+;   - struct pci_bus (number, parent, children, devices)
+;   - pci_register_driver / pci_unregister_driver
+;   - pci_enable_device / pci_disable_device
+;   - struct pci_device_id (vendor + device matching)
+;   - pci_resource_start / pci_resource_len (BAR access)
+;
+; Linux platform bus subsystem provides non-PCI device driver model:
+;   - struct platform_device (name, id, resource, num_resources)
+;   - struct platform_driver (name, probe, remove)
+;   - platform_driver_register / platform_driver_unregister
+;
+; aura has no hardware buses. v1 ships:
+;   - make-pci-device (vendor, device, bus, devfn)
+;   - make-pci-driver (name) + register / unregister / find
+;   - make-pci-bus (number, devices list)
+;   - pci-add-device / pci-remove-device / pci-find-device
+;   - pci-device? / pci-driver? / pci-bus? predicates
+;   - pci-driver-count / pci-bus-device-count
+;
+; Deferred (full Linux PCI):
+;   - real PCI config space access (config_read / config_write)
+;   - BAR resource allocation
+;   - PCI IRQ routing + MSI / MSI-X
+;   - PCIe link training + hotplug
+;   - PCI NUMA affinity
+;   - ACPI / MCFG integration
+;   - platform_device resource arrays
+;   - platform_driver id_table matching
+
+(export
+  make-pci-device
+  pci-device?
+  pci-device-vendor
+  pci-device-device
+  pci-device-bus
+  pci-device-devfn
+  pci-device-enabled?
+  pci-enable-device
+  pci-disable-device
+  make-pci-driver
+  pci-driver?
+  pci-driver-name
+  pci-register-driver
+  pci-unregister-driver
+  pci-find-driver
+  pci-driver-count
+  make-pci-bus
+  pci-bus?
+  pci-bus-number
+  pci-bus-devices
+  pci-add-device
+  pci-remove-device
+  pci-find-device
+  pci-bus-device-count)
+
+; ----------------------------------------------------------------
+; pci_device — closure-based, mutable enabled state
+; ----------------------------------------------------------------
+
+; make-pci-device: create a PCI device.
+; Args: vendor (integer), device (integer), bus (integer), devfn (integer)
+; Returns: pci_device closure.
+(define (make-pci-device vendor device bus devfn)
+  (let ((enabled? #f))
+    (letrec ((set-enabled! (lambda (v) (set! enabled? v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'vendor) vendor)
+                       ((eq? msg 'device) device)
+                       ((eq? msg 'bus) bus)
+                       ((eq? msg 'devfn) devfn)
+                       ((eq? msg 'enabled?) enabled?)
+                       ((eq? msg 'set-enabled!) set-enabled!)
+                       (else #f)))))
+      self)))
+
+; pci-device?: is the object a PCI device?
+; Detected by querying 'devfn — only pci_device closures return an
+; integer for devfn (device + function in 8-bit packed form).
+(define (pci-device? obj)
+  (if (procedure? obj)
+      (let ((d (obj 'devfn)))
+        (if (and (integer? d) (>= d 0) (< d 256)) #t #f))
+      #f))
+
+; pci-device-vendor: get PCI vendor ID
+(define (pci-device-vendor dev) (dev 'vendor))
+
+; pci-device-device: get PCI device ID
+(define (pci-device-device dev) (dev 'device))
+
+; pci-device-bus: get PCI bus number
+(define (pci-device-bus dev) (dev 'bus))
+
+; pci-device-devfn: get devfn (device + function)
+(define (pci-device-devfn dev) (dev 'devfn))
+
+; pci-device-enabled?: is the device enabled?
+(define (pci-device-enabled? dev) (dev 'enabled?))
+
+; pci-enable-device: enable the device.
+; Returns the new enabled state.
+(define (pci-enable-device dev)
+  ((dev 'set-enabled!) #t))
+
+; pci-disable-device: disable the device.
+; Returns the new enabled state.
+(define (pci-disable-device dev)
+  ((dev 'set-enabled!) #f))
+
+; ----------------------------------------------------------------
+; pci_driver — closure-based
+; ----------------------------------------------------------------
+
+; make-pci-driver: create a PCI driver.
+; Args: name (symbol)
+; Returns: pci_driver closure.
+(define (make-pci-driver name)
+  (let ((id 0))
+    (letrec ((set-id! (lambda (v) (set! id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'set-id!) set-id!)
+                       (else #f)))))
+      self)))
+
+; pci-driver?: is the object a PCI driver?
+; Detected by querying 'id — only pci_driver closures return an
+; integer for id.
+(define (pci-driver? obj)
+  (if (procedure? obj)
+      (if (integer? (obj 'id)) #t #f)
+      #f))
+
+; pci-driver-name: get driver name
+(define (pci-driver-name drv) (drv 'name))
+
+; ----------------------------------------------------------------
+; Driver registry — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-driver-registry: empty registry.
+(define (make-driver-registry)
+  (let ((drivers '())
+        (next-id 0))
+    (letrec ((set-drivers!  (lambda (v) (set! drivers v) v))
+             (set-next-id! (lambda (v) (set! next-id v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) drivers)
+                       ((eq? msg 'next-id) next-id)
+                       ((eq? msg 'set-drivers!)  set-drivers!)
+                       ((eq? msg 'set-next-id!) set-next-id!)
+                       (else #f)))))
+      self)))
+
+; Global driver registry
+(define g-pci-driver-registry (make-driver-registry))
+
+; pci-register-driver: register a driver, assign unique id.
+; Returns the assigned id.
+(define (pci-register-driver drv)
+  (let ((new-id (+ (g-pci-driver-registry 'next-id) 1)))
+    ((g-pci-driver-registry 'set-next-id!) new-id)
+    ((drv 'set-id!) new-id)
+    ((g-pci-driver-registry 'set-drivers!)
+     (cons drv (g-pci-driver-registry 'list)))
+    new-id))
+
+; pci-unregister-driver: remove a driver.
+; Returns #t if removed, #f if not found.
+(define (pci-unregister-driver drv)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((g-pci-driver-registry 'set-drivers!)
+                             (cons-rev acc '()))
+                            ((g-pci-driver-registry 'set-drivers!) acc))
+                        found?)
+                       ((eq? (car rest) drv)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (g-pci-driver-registry 'list) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; pci-find-driver: find a driver by name.
+; Returns the driver or #f if not found.
+(define (pci-find-driver name)
+  (let loop ((rest (g-pci-driver-registry 'list)))
+    (cond
+      ((null? rest) #f)
+      ((eq? (pci-driver-name (car rest)) name) (car rest))
+      (else (loop (cdr rest))))))
+
+; pci-driver-count: count of registered drivers
+(define (pci-driver-count)
+  (let loop ((rest (g-pci-driver-registry 'list)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; ----------------------------------------------------------------
+; pci_bus — closure-based, mutable device list
+; ----------------------------------------------------------------
+
+; make-pci-bus: create a PCI bus.
+; Args: number (integer)
+; Returns: pci_bus closure.
+(define (make-pci-bus number)
+  (let ((devices '()))
+    (letrec ((set-devices! (lambda (v) (set! devices v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'number) number)
+                       ((eq? msg 'devices) devices)
+                       ((eq? msg 'set-devices!) set-devices!)
+                       (else #f)))))
+      self)))
+
+; pci-bus?: is the object a PCI bus?
+; Detected by querying 'devices — only pci_bus closures return a list.
+(define (pci-bus? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'devices)) #t #f)
+      #f))
+
+; pci-bus-number: get bus number
+(define (pci-bus-number bus) (bus 'number))
+
+; pci-bus-devices: get device list
+(define (pci-bus-devices bus) (bus 'devices))
+
+; pci-add-device: add a device to the bus.
+; Returns the new device list.
+(define (pci-add-device bus dev)
+  ((bus 'set-devices!) (cons dev (bus 'devices))))
+
+; pci-remove-device: remove a device from the bus.
+; Returns #t if removed, #f otherwise.
+(define (pci-remove-device bus dev)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((bus 'set-devices!)
+                             (cons-rev acc '()))
+                            ((bus 'set-devices!) acc))
+                        found?)
+                       ((eq? (car rest) dev)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (bus 'devices) '())))
+
+; pci-find-device: find a device by vendor + device ID.
+; Returns the device or #f if not found.
+(define (pci-find-device bus vendor-id device-id)
+  (let loop ((rest (bus 'devices)))
+    (cond
+      ((null? rest) #f)
+      ((and (= (pci-device-vendor (car rest)) vendor-id)
+            (= (pci-device-device (car rest)) device-id))
+       (car rest))
+      (else (loop (cdr rest))))))
+
+; pci-bus-device-count: count of devices on the bus
+(define (pci-bus-device-count bus)
+  (let loop ((rest (bus 'devices)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))

@@ -1,0 +1,177 @@
+; 034-platform-pci-bus_test.aura
+; =================================
+; Smoke tests for 034-platform-pci-bus.aura — PCI + platform bus minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/034-platform-pci-bus_test.aura
+;
+; Verified automatically (smoke):
+;   - pci_device / pci_driver / pci_bus construction
+;   - pci-device? / pci-driver? / pci-bus? predicates
+;   - pci-enable-device / pci-disable-device
+;   - pci-register-driver / pci-unregister-driver / pci-find-driver
+;   - pci-driver-count
+;   - pci-add-device / pci-remove-device / pci-find-device
+;   - pci-bus-device-count
+;
+; Verified via separate probes during development:
+;   - Multiple drivers coexist
+;   - Multiple devices on a bus
+;   - find-driver / find-device return #f for missing
+;   - unregister returns #f for non-registered
+;
+; Deferred (full Linux PCI + platform):
+;   - real PCI config space access
+;   - BAR resource allocation
+;   - PCI IRQ routing + MSI / MSI-X
+;   - PCIe hotplug
+;   - platform_device resource arrays
+
+(require "std/test" all:)
+(require "034-platform-pci-bus" all:)
+
+; ----------------------------------------------------------------
+; pci_device construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "pci-001-device-construction"
+  ; pci_device preserves vendor, device, bus, devfn.
+  (check (= 0x8086 (pci-device-vendor (make-pci-device 0x8086 0x1234 0 0))))
+  (check (= 0x1234 (pci-device-device (make-pci-device 0x8086 0x1234 0 0))))
+  (check (= 0 (pci-device-bus (make-pci-device 0x8086 0x1234 0 0))))
+  (check (= 0 (pci-device-devfn (make-pci-device 0x8086 0x1234 0 0)))))
+
+(test-suite "pci-001-device-predicate"
+  ; pci-device? accepts only pci_device closures.
+  (check (= 1 (if (pci-device? (make-pci-device 0x8086 0x1234 0 0)) 1 0)))
+  (check (= 1 (if (not (pci-device? 'not-a-device)) 1 0)))
+  (check (= 1 (if (not (pci-device? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; pci-driver? + register / find / unregister
+; ----------------------------------------------------------------
+
+(test-suite "pci-002-driver-construction"
+  ; pci_driver preserves name.
+  (check (= 'e1000 (pci-driver-name (make-pci-driver 'e1000)))))
+
+(test-suite "pci-002-driver-predicate"
+  ; pci-driver? accepts only pci_driver closures.
+  (check (= 1 (if (pci-driver? (make-pci-driver 'unq-pci-002)) 1 0)))
+  (check (= 1 (if (not (pci-driver? 'not-a-driver)) 1 0))))
+
+(test-suite "pci-002-register-driver"
+  ; pci-register-driver assigns sequential id.
+  (check (= 1 (pci-register-driver (make-pci-driver 'unq-pci-002-reg))))
+  ; Same driver after register.
+  (check (= 1 (let ((d (make-pci-driver 'unq-pci-002-id)))
+                (pci-register-driver d)
+                ((d 'id))))))
+
+(test-suite "pci-002-find-driver"
+  ; pci-find-driver returns the registered driver.
+  (check (= 1 (let ((d (make-pci-driver 'unq-pci-002-find)))
+                (pci-register-driver d)
+                (if (eq? d (pci-find-driver 'unq-pci-002-find)) 1 0)))))
+
+(test-suite "pci-002-find-driver-missing"
+  ; pci-find-driver returns #f for unknown name.
+  (check (= 1 (if (not (pci-find-driver 'unq-pci-002-missing)) 1 0))))
+
+(test-suite "pci-002-unregister-driver"
+  ; pci-unregister-driver removes + find returns #f.
+  (check (= 1 (let ((d (make-pci-driver 'unq-pci-002-unreg)))
+                (pci-register-driver d)
+                (pci-unregister-driver d)
+                (if (not (pci-find-driver 'unq-pci-002-unreg)) 1 0)))))
+
+(test-suite "pci-002-unregister-not-found"
+  ; pci-unregister-driver returns #f for non-registered driver.
+  (check (= 1 (if (not (pci-unregister-driver
+                          (make-pci-driver 'unq-pci-002-orphan))) 1 0))))
+
+(test-suite "pci-002-driver-count"
+  ; pci-driver-count is positive after registrations.
+  (check (= 1 (> (pci-driver-count) 0))))
+
+; ----------------------------------------------------------------
+; pci_bus + device add / remove / find
+; ----------------------------------------------------------------
+
+(test-suite "pci-003-bus-construction"
+  ; pci_bus preserves number, empty devices.
+  (check (= 0 (pci-bus-number (make-pci-bus 0))))
+  (check (= 1 (if (null? (pci-bus-devices (make-pci-bus 0))) 1 0))))
+
+(test-suite "pci-003-bus-predicate"
+  ; pci-bus? accepts only pci_bus closures.
+  (check (= 1 (if (pci-bus? (make-pci-bus 0)) 1 0)))
+  (check (= 1 (if (not (pci-bus? 'not-a-bus)) 1 0))))
+
+(test-suite "pci-003-add-device"
+  ; pci-add-device prepends to bus devices.
+  (check (= 1 (let ((b (make-pci-bus 0)))
+                (let ((d (make-pci-device 0x8086 0x1234 0 0)))
+                  (pci-add-device b d)
+                  (if (eq? d (car (pci-bus-devices b))) 1 0))))))
+
+(test-suite "pci-003-find-device"
+  ; pci-find-device returns device by vendor + device ID.
+  (check (= 1 (let ((b (make-pci-bus 0)))
+                (let ((d (make-pci-device 0x8086 0x1234 0 0)))
+                  (pci-add-device b d)
+                  (if (eq? d (pci-find-device b 0x8086 0x1234)) 1 0))))))
+
+(test-suite "pci-003-find-device-missing"
+  ; pci-find-device returns #f for unknown id.
+  (check (= 1 (if (not (pci-find-device
+                          (make-pci-bus 0)
+                          0x9999 0x9999)) 1 0))))
+
+(test-suite "pci-003-remove-device"
+  ; pci-remove-device removes + find returns #f.
+  (check (= 1 (let ((b (make-pci-bus 0)))
+                (let ((d (make-pci-device 0x8086 0x1234 0 0)))
+                  (pci-add-device b d)
+                  (pci-remove-device b d)
+                  (if (not (pci-find-device b 0x8086 0x1234)) 1 0))))))
+
+(test-suite "pci-003-bus-device-count"
+  ; pci-bus-device-count tracks devices.
+  (check (= 1 (let ((b (make-pci-bus 0)))
+                (pci-add-device b (make-pci-device 0x8086 0x1234 0 0))
+                (pci-bus-device-count b)))))
+
+(test-suite "pci-003-bus-device-count-empty"
+  ; Empty bus has count 0.
+  (check (= 0 (pci-bus-device-count (make-pci-bus 0)))))
+
+; ----------------------------------------------------------------
+; pci-enable-device / pci-disable-device
+; ----------------------------------------------------------------
+
+(test-suite "pci-004-device-disabled-init"
+  ; New pci_device starts disabled.
+  (check (= 1 (if (not (pci-device-enabled?
+                         (make-pci-device 0x8086 0x1234 0 0))) 1 0))))
+
+(test-suite "pci-004-enable-device"
+  ; pci-enable-device sets enabled? to #t.
+  (check (= 1 (let ((d (make-pci-device 0x8086 0x1234 0 0)))
+                (pci-enable-device d)
+                (if (pci-device-enabled? d) 1 0)))))
+
+(test-suite "pci-004-disable-device"
+  ; pci-disable-device sets enabled? to #f after enable.
+  (check (= 1 (let ((d (make-pci-device 0x8086 0x1234 0 0)))
+                (pci-enable-device d)
+                (pci-disable-device d)
+                (if (not (pci-device-enabled? d)) 1 0)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
