@@ -1,0 +1,203 @@
+; 040-ksm.aura
+; =====================
+; ksm — minimal capability port to aura.
+;
+; Maps to: Linux kernel Kernel Samepage Merging (KSM)
+; Source: mm/ksm.c + include/linux/ksm.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux KSM allows the kernel to merge identical pages between
+; processes to reduce memory consumption:
+;   - struct ksm_mm / ksm operations per-VMA
+;   - ksm_enabled / ksm_disabled (system-wide)
+;   - ksmd daemon (scans memory for mergeable pages)
+;   - pages_shared (num pages merged into a single page)
+;   - pages_sharing (num pages sharing a ksm page)
+;   - pages_unshared (pages flagged mergeable but not yet merged)
+;   - pages_volatile (unstable pages that skip next scan)
+;   - madvise MADV_MERGEABLE / MADV_UNMERGEABLE
+;   - /sys/kernel/mm/ksm/run / pages_to_scan / sleep_millisecs
+;
+; aura has no memory, no VMA, no kernel thread. v1 ships:
+;   - make-ksm-state (enabled?, pages_shared, pages_sharing,
+;     pages_unshared, pages_volatile)
+;   - ksm-enable / ksm-disable
+;   - ksm-page-shared (inc shared) / ksm-page-shared-dec
+;   - ksm-page-sharing (inc sharing) / ksm-page-sharing-dec
+;   - ksm-page-unshared / ksm-page-unshared-dec
+;   - ksm-page-volatile / ksm-page-volatile-dec
+;   - ksm-state? predicate
+;
+; Deferred (full Linux KSM):
+;   - real ksmd daemon with scan loop
+;   - rbtree tree_of_ksm_pages (sorted by checksum)
+;   - stable_node / ksm_stable_node (rbtree nodes)
+;   - cmp_and_merge_page (actual page content comparison)
+;   - get_ksm_page / try_to_merge_one_page
+;   - break_cow / replace_page
+;   - madvise_madvise_vma range iteration
+;   - /sys/kernel/mm/ksm/* per-VMA controls
+
+(export
+  make-ksm-state
+  ksm-state?
+  ksm-state-enabled?
+  ksm-state-pages-shared
+  ksm-state-pages-sharing
+  ksm-state-pages-unshared
+  ksm-state-pages-volatile
+  ksm-enable
+  ksm-disable
+  ksm-page-shared
+  ksm-page-shared-dec
+  ksm-page-sharing
+  ksm-page-sharing-dec
+  ksm-page-unshared
+  ksm-page-unshared-dec
+  ksm-page-volatile
+  ksm-page-volatile-dec
+  ksm-state-reset)
+
+; ----------------------------------------------------------------
+; ksm_state — closure-based, mutable counters via letrec setters
+; ----------------------------------------------------------------
+
+; make-ksm-state: create KSM subsystem state.
+; Returns: ksm_state closure (initial: disabled, all counters 0).
+(define (make-ksm-state)
+  (let ((enabled? #f)
+        (pages-shared 0)
+        (pages-sharing 0)
+        (pages-unshared 0)
+        (pages-volatile 0))
+    (letrec ((set-enabled!         (lambda (v) (set! enabled? v) v))
+             (set-pages-shared!    (lambda (v) (set! pages-shared v) v))
+             (set-pages-sharing!   (lambda (v) (set! pages-sharing v) v))
+             (set-pages-unshared!  (lambda (v) (set! pages-unshared v) v))
+             (set-pages-volatile!  (lambda (v) (set! pages-volatile v) v))
+             (inc-pages-shared!    (lambda () (set! pages-shared (+ pages-shared 1)) pages-shared))
+             (inc-pages-sharing!   (lambda () (set! pages-sharing (+ pages-sharing 1)) pages-sharing))
+             (inc-pages-unshared!  (lambda () (set! pages-unshared (+ pages-unshared 1)) pages-unshared))
+             (inc-pages-volatile!  (lambda () (set! pages-volatile (+ pages-volatile 1)) pages-volatile))
+             (dec-pages-shared!    (lambda () (set! pages-shared (- pages-shared 1)) pages-shared))
+             (dec-pages-sharing!   (lambda () (set! pages-sharing (- pages-sharing 1)) pages-sharing))
+             (dec-pages-unshared!  (lambda () (set! pages-unshared (- pages-unshared 1)) pages-unshared))
+             (dec-pages-volatile!  (lambda () (set! pages-volatile (- pages-volatile 1)) pages-volatile))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'enabled?)        enabled?)
+                       ((eq? msg 'pages-shared)    pages-shared)
+                       ((eq? msg 'pages-sharing)   pages-sharing)
+                       ((eq? msg 'pages-unshared)  pages-unshared)
+                       ((eq? msg 'pages-volatile)  pages-volatile)
+                       ((eq? msg 'set-enabled!)         set-enabled!)
+                       ((eq? msg 'set-pages-shared!)    set-pages-shared!)
+                       ((eq? msg 'set-pages-sharing!)   set-pages-sharing!)
+                       ((eq? msg 'set-pages-unshared!)  set-pages-unshared!)
+                       ((eq? msg 'set-pages-volatile!)  set-pages-volatile!)
+                       ((eq? msg 'inc-pages-shared!)    inc-pages-shared!)
+                       ((eq? msg 'inc-pages-sharing!)   inc-pages-sharing!)
+                       ((eq? msg 'inc-pages-unshared!)  inc-pages-unshared!)
+                       ((eq? msg 'inc-pages-volatile!)  inc-pages-volatile!)
+                       ((eq? msg 'dec-pages-shared!)    dec-pages-shared!)
+                       ((eq? msg 'dec-pages-sharing!)   dec-pages-sharing!)
+                       ((eq? msg 'dec-pages-unshared!)  dec-pages-unshared!)
+                       ((eq? msg 'dec-pages-volatile!)  dec-pages-volatile!)
+                       (else #f)))))
+      self)))
+
+; ksm-state?: is the object a ksm_state?
+; Detected by querying 'pages-shared — only ksm_state closures
+; return a non-negative integer.
+(define (ksm-state? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'pages-shared)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; ksm-state-enabled?: is KSM enabled?
+(define (ksm-state-enabled? s) (s 'enabled?))
+
+; ksm-state-pages-shared: get pages_shared count
+(define (ksm-state-pages-shared s) (s 'pages-shared))
+
+; ksm-state-pages-sharing: get pages_sharing count
+(define (ksm-state-pages-sharing s) (s 'pages-sharing))
+
+; ksm-state-pages-unshared: get pages_unshared count
+(define (ksm-state-pages-unshared s) (s 'pages-unshared))
+
+; ksm-state-pages-volatile: get pages_volatile count
+(define (ksm-state-pages-volatile s) (s 'pages-volatile))
+
+; ksm-state-reset: reset all counters + disable.
+; Returns the new enabled state.
+(define (ksm-state-reset s)
+  ((s 'set-enabled!) #f)
+  ((s 'set-pages-shared!) 0)
+  ((s 'set-pages-sharing!) 0)
+  ((s 'set-pages-unshared!) 0)
+  ((s 'set-pages-volatile!) 0))
+
+; ----------------------------------------------------------------
+; KSM control
+; ----------------------------------------------------------------
+
+; ksm-enable: enable KSM system-wide.
+; Returns the new enabled state.
+(define (ksm-enable s)
+  ((s 'set-enabled!) #t))
+
+; ksm-disable: disable KSM system-wide.
+; Returns the new enabled state.
+(define (ksm-disable s)
+  ((s 'set-enabled!) #f))
+
+; ----------------------------------------------------------------
+; Page counter operations
+; ----------------------------------------------------------------
+
+; ksm-page-shared: increment pages_shared.
+; Returns the new count.
+(define (ksm-page-shared s)
+  ((s 'inc-pages-shared!)))
+
+; ksm-page-shared-dec: decrement pages_shared (clamped at 0).
+; Returns the new count.
+(define (ksm-page-shared-dec s)
+  (let ((current (s 'pages-shared)))
+    (if (= current 0) 0 ((s 'dec-pages-shared!)))))
+
+; ksm-page-sharing: increment pages_sharing.
+; Returns the new count.
+(define (ksm-page-sharing s)
+  ((s 'inc-pages-sharing!)))
+
+; ksm-page-sharing-dec: decrement pages_sharing (clamped at 0).
+; Returns the new count.
+(define (ksm-page-sharing-dec s)
+  (let ((current (s 'pages-sharing)))
+    (if (= current 0) 0 ((s 'dec-pages-sharing!)))))
+
+; ksm-page-unshared: increment pages_unshared.
+; Returns the new count.
+(define (ksm-page-unshared s)
+  ((s 'inc-pages-unshared!)))
+
+; ksm-page-unshared-dec: decrement pages_unshared (clamped at 0).
+; Returns the new count.
+(define (ksm-page-unshared-dec s)
+  (let ((current (s 'pages-unshared)))
+    (if (= current 0) 0 ((s 'dec-pages-unshared!)))))
+
+; ksm-page-volatile: increment pages_volatile.
+; Returns the new count.
+(define (ksm-page-volatile s)
+  ((s 'inc-pages-volatile!)))
+
+; ksm-page-volatile-dec: decrement pages_volatile (clamped at 0).
+; Returns the new count.
+(define (ksm-page-volatile-dec s)
+  (let ((current (s 'pages-volatile)))
+    (if (= current 0) 0 ((s 'dec-pages-volatile!)))))

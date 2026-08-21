@@ -1,0 +1,192 @@
+; 040-ksm_test.aura
+; =====================
+; Smoke tests for 040-ksm.aura — Kernel Samepage Merging minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/040-ksm_test.aura
+;
+; Verified automatically (smoke):
+;   - ksm_state construction (initial: disabled, all counters 0)
+;   - ksm-state? predicate
+;   - ksm-enable / ksm-disable
+;   - 4 page counter operations (shared / sharing / unshared / volatile)
+;   - 4 dec variants (clamped at 0)
+;   - ksm-state-reset
+;
+; Verified via separate probes during development:
+;   - Counter inc accumulates correctly
+;   - Counter dec clamped at 0
+;
+; Deferred (full Linux KSM):
+;   - real ksmd daemon with scan loop
+;   - rbtree tree_of_ksm_pages
+;   - cmp_and_merge_page
+;   - madvise_madvise_vma range iteration
+;   - /sys/kernel/mm/ksm/* per-VMA controls
+
+(require "std/test" all:)
+(require "040-ksm" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "ksm-001-construction"
+  ; New ksm_state starts disabled with all counters 0.
+  (check (= 1 (if (not (ksm-state-enabled?
+                         (make-ksm-state))) 1 0)))
+  (check (= 0 (ksm-state-pages-shared (make-ksm-state))))
+  (check (= 0 (ksm-state-pages-sharing (make-ksm-state))))
+  (check (= 0 (ksm-state-pages-unshared (make-ksm-state))))
+  (check (= 0 (ksm-state-pages-volatile (make-ksm-state)))))
+
+(test-suite "ksm-001-predicate"
+  ; ksm-state? accepts only ksm_state closures.
+  (check (= 1 (if (ksm-state? (make-ksm-state)) 1 0)))
+  (check (= 1 (if (not (ksm-state? 'not-a-state)) 1 0)))
+  (check (= 1 (if (not (ksm-state? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; ksm-enable / ksm-disable
+; ----------------------------------------------------------------
+
+(test-suite "ksm-002-enable"
+  ; ksm-enable sets enabled? to #t.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-enable s)
+                (if (ksm-state-enabled? s) 1 0)))))
+
+(test-suite "ksm-002-disable"
+  ; ksm-disable sets enabled? to #f after enable.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-enable s)
+                (ksm-disable s)
+                (if (not (ksm-state-enabled? s)) 1 0)))))
+
+; ----------------------------------------------------------------
+; Page counter operations
+; ----------------------------------------------------------------
+
+(test-suite "ksm-003-page-shared"
+  ; ksm-page-shared increments pages_shared.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-page-shared s)
+                (ksm-state-pages-shared s)))))
+
+(test-suite "ksm-003-page-shared-multiple"
+  ; Multiple shared accumulations.
+  (check (= 3 (let ((s (make-ksm-state)))
+                (ksm-page-shared s)
+                (ksm-page-shared s)
+                (ksm-page-shared s)
+                (ksm-state-pages-shared s)))))
+
+(test-suite "ksm-003-page-shared-dec"
+  ; ksm-page-shared-dec decrements pages_shared.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-page-shared s)
+                (ksm-page-shared s)
+                (ksm-page-shared-dec s)
+                (ksm-state-pages-shared s)))))
+
+(test-suite "ksm-003-page-shared-dec-clamp"
+  ; ksm-page-shared-dec at 0 stays at 0.
+  (check (= 0 (let ((s (make-ksm-state)))
+                (ksm-page-shared-dec s)
+                (ksm-state-pages-shared s)))))
+
+(test-suite "ksm-003-page-sharing"
+  ; ksm-page-sharing increments pages_sharing.
+  (check (= 2 (let ((s (make-ksm-state)))
+                (ksm-page-sharing s)
+                (ksm-page-sharing s)
+                (ksm-state-pages-sharing s)))))
+
+(test-suite "ksm-003-page-sharing-dec"
+  ; ksm-page-sharing-dec decrements pages_sharing.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-page-sharing s)
+                (ksm-page-sharing s)
+                (ksm-page-sharing-dec s)
+                (ksm-state-pages-sharing s)))))
+
+(test-suite "ksm-003-page-sharing-dec-clamp"
+  ; ksm-page-sharing-dec at 0 stays at 0.
+  (check (= 0 (let ((s (make-ksm-state)))
+                (ksm-page-sharing-dec s)
+                (ksm-state-pages-sharing s)))))
+
+(test-suite "ksm-003-page-unshared"
+  ; ksm-page-unshared increments pages_unshared.
+  (check (= 2 (let ((s (make-ksm-state)))
+                (ksm-page-unshared s)
+                (ksm-page-unshared s)
+                (ksm-state-pages-unshared s)))))
+
+(test-suite "ksm-003-page-unshared-dec"
+  ; ksm-page-unshared-dec decrements pages_unshared.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-page-unshared s)
+                (ksm-page-unshared s)
+                (ksm-page-unshared-dec s)
+                (ksm-state-pages-unshared s)))))
+
+(test-suite "ksm-003-page-unshared-dec-clamp"
+  ; ksm-page-unshared-dec at 0 stays at 0.
+  (check (= 0 (let ((s (make-ksm-state)))
+                (ksm-page-unshared-dec s)
+                (ksm-state-pages-unshared s)))))
+
+(test-suite "ksm-003-page-volatile"
+  ; ksm-page-volatile increments pages_volatile.
+  (check (= 2 (let ((s (make-ksm-state)))
+                (ksm-page-volatile s)
+                (ksm-page-volatile s)
+                (ksm-state-pages-volatile s)))))
+
+(test-suite "ksm-003-page-volatile-dec"
+  ; ksm-page-volatile-dec decrements pages_volatile.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-page-volatile s)
+                (ksm-page-volatile s)
+                (ksm-page-volatile-dec s)
+                (ksm-state-pages-volatile s)))))
+
+(test-suite "ksm-003-page-volatile-dec-clamp"
+  ; ksm-page-volatile-dec at 0 stays at 0.
+  (check (= 0 (let ((s (make-ksm-state)))
+                (ksm-page-volatile-dec s)
+                (ksm-state-pages-volatile s)))))
+
+; ----------------------------------------------------------------
+; ksm-state-reset
+; ----------------------------------------------------------------
+
+(test-suite "ksm-004-reset"
+  ; ksm-state-reset clears all counters + disables.
+  (check (= 0 (let ((s (make-ksm-state)))
+                (ksm-enable s)
+                (ksm-page-shared s)
+                (ksm-page-sharing s)
+                (ksm-page-unshared s)
+                (ksm-page-volatile s)
+                (ksm-state-reset s)
+                (+ (ksm-state-pages-shared s)
+                   (ksm-state-pages-sharing s)
+                   (ksm-state-pages-unshared s)
+                   (ksm-state-pages-volatile s))))))
+
+(test-suite "ksm-004-reset-clears-enabled"
+  ; ksm-state-reset disables.
+  (check (= 1 (let ((s (make-ksm-state)))
+                (ksm-enable s)
+                (ksm-state-reset s)
+                (if (not (ksm-state-enabled? s)) 1 0)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
