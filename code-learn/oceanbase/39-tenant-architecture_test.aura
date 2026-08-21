@@ -1,0 +1,251 @@
+; 39-tenant-architecture_test.aura
+; ======================
+; Smoke tests for 39-tenant-architecture.aura — Tenant Architecture minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/39-tenant-architecture_test.aura
+
+(require "std/test" all:)
+(require "39-tenant-architecture" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "39-001-tenant-id-distinct"
+  (check (= 1 (if (not (= TENANT-ID-INVALID TENANT-ID-SYS)) 1 0)))
+  (check (= 1 (if (not (= TENANT-ID-SYS TENANT-ID-SERVER)) 1 0)))
+  (check (= 1 (if (not (= TENANT-ID-SERVER TENANT-ID-DTL)) 1 0)))
+  (check (= 1 (if (not (= TENANT-ID-DTL TENANT-ID-DATA)) 1 0)))
+  (check (= 1 (if (not (= TENANT-ID-DATA TENANT-ID-MAX-RESERVED)) 1 0)))
+  (check (= 1 (if (not (= TENANT-ID-MAX-RESERVED TENANT-ID-USER)) 1 0))))
+
+(test-suite "39-001-compat-distinct"
+  (check (= 1 (if (not (= COMPAT-MODE-MYSQL COMPAT-MODE-ORACLE)) 1 0))))
+
+(test-suite "39-001-status-distinct"
+  (check (= 1 (if (not (= TENANT-STATUS-CREATING
+                          TENANT-STATUS-NORMAL)) 1 0)))
+  (check (= 1 (if (not (= TENANT-STATUS-NORMAL
+                          TENANT-STATUS-DROPPING)) 1 0)))
+  (check (= 1 (if (not (= TENANT-STATUS-CREATING
+                          TENANT-STATUS-DROPPING)) 1 0))))
+
+; ----------------------------------------------------------------
+; TenantMeta
+; ----------------------------------------------------------------
+
+(test-suite "39-002-meta-construction"
+  (check (= 4 (tenant-meta-get-unit-cpu
+               (make-tenant-meta 4 8589934592 TENANT-STATUS-NORMAL 1))))
+  (check (= 8589934592 (tenant-meta-get-unit-mem
+                         (make-tenant-meta 4 8589934592
+                           TENANT-STATUS-NORMAL 1))))
+  (check (= TENANT-STATUS-NORMAL
+             (tenant-meta-get-create-status
+               (make-tenant-meta 4 8589934592 TENANT-STATUS-NORMAL 1))))
+  (check (= 1 (tenant-meta-get-epoch
+               (make-tenant-meta 4 8589934592 TENANT-STATUS-NORMAL 1)))))
+
+(test-suite "39-002-meta-predicate"
+  (check (= #t (tenant-meta? (make-tenant-meta 0 0 0 0))))
+  (check (= #f (tenant-meta? 'not-meta)))
+  (check (= #f (tenant-meta? 42)))
+
+(test-suite "39-003-meta-set-status"
+  (check (= TENANT-STATUS-DROPPING
+             (let ((m (make-tenant-meta 4 0 TENANT-STATUS-NORMAL 1)))
+               (tenant-meta-set-create-status! m TENANT-STATUS-DROPPING)
+               (tenant-meta-get-create-status m))))
+
+(test-suite "39-003-meta-set-epoch"
+  (check (= 5 (let ((m (make-tenant-meta 4 0 0 1)))
+                 (tenant-meta-set-epoch! m 5)
+                 (tenant-meta-get-epoch m))))
+
+; ----------------------------------------------------------------
+; TenantConfig
+; ----------------------------------------------------------------
+
+(test-suite "39-004-config-construction"
+  (check (= #t (eq? 'mysql_tenant
+                   (tenant-config-get-name
+                     (make-tenant-config 'mysql_tenant COMPAT-MODE-MYSQL
+                       8 17179869184)))))
+  (check (= COMPAT-MODE-MYSQL
+             (tenant-config-get-compat
+               (make-tenant-config 'mysql_tenant COMPAT-MODE-MYSQL
+                 8 17179869184))))
+  (check (= 8 (tenant-config-get-max-cpu
+               (make-tenant-config 'mysql_tenant COMPAT-MODE-MYSQL
+                 8 17179869184))))
+  (check (= 17179869184 (tenant-config-get-max-mem
+                          (make-tenant-config 'mysql_tenant
+                            COMPAT-MODE-MYSQL 8 17179869184)))))
+
+(test-suite "39-004-config-predicate"
+  (check (= #t (tenant-config?
+                 (make-tenant-config 'a COMPAT-MODE-MYSQL 0 0))))
+  (check (= #f (tenant-config? 'not-config)))
+  (check (= #f (tenant-config? 42)))
+
+(test-suite "39-005-config-set-max-cpu"
+  (check (= 16 (let ((c (make-tenant-config 'a COMPAT-MODE-MYSQL 8 0)))
+                 (tenant-config-set-max-cpu! c 16)
+                 (tenant-config-get-max-cpu c))))
+
+(test-suite "39-005-config-set-max-mem"
+  (check (= 34359738368
+             (let ((c (make-tenant-config 'a COMPAT-MODE-MYSQL 0 0)))
+               (tenant-config-set-max-mem! c 34359738368)
+               (tenant-config-get-max-mem c))))
+
+; ----------------------------------------------------------------
+; Tenant
+; ----------------------------------------------------------------
+
+(test-suite "39-006-tenant-construction"
+  (check (= TENANT-ID-USER
+             (tenant-get-id
+               (make-tenant TENANT-ID-USER
+                 (make-tenant-meta 4 0 0 1)
+                 (make-tenant-config 't COMPAT-MODE-MYSQL 8 0)
+                 (make-th-worker TENANT-ID-USER 0)
+                 (make-multi-level-queue 3)))))
+  (check (= TENANT-STATUS-NORMAL
+             (tenant-get-status
+               (make-tenant TENANT-ID-USER
+                 (make-tenant-meta 4 0 0 1)
+                 (make-tenant-config 't COMPAT-MODE-MYSQL 8 0)
+                 (make-th-worker TENANT-ID-USER 0)
+                 (make-multi-level-queue 3))))))
+
+(test-suite "39-006-tenant-predicate"
+  (check (= #t (tenant?
+                 (make-tenant TENANT-ID-USER
+                   (make-tenant-meta 0 0 0 0)
+                   (make-tenant-config 't COMPAT-MODE-MYSQL 0 0)
+                   (make-th-worker 0 0)
+                   (make-multi-level-queue 1))))
+  (check (= #f (tenant? 'not-tenant)))
+  (check (= #f (tenant? 42)))
+
+(test-suite "39-007-tenant-set-status"
+  (check (= TENANT-STATUS-DROPPING
+             (let ((t (make-tenant TENANT-ID-USER
+                       (make-tenant-meta 0 0 0 0)
+                       (make-tenant-config 't COMPAT-MODE-MYSQL 0 0)
+                       (make-th-worker 0 0)
+                       (make-multi-level-queue 1)))
+               (tenant-set-status! t TENANT-STATUS-DROPPING)
+               (tenant-get-status t))))
+
+; ----------------------------------------------------------------
+; ThWorker
+; ----------------------------------------------------------------
+
+(test-suite "39-008-worker-construction"
+  (check (= TENANT-ID-USER
+             (th-worker-get-tenant-id
+               (make-th-worker TENANT-ID-USER 0))))
+  (check (= 0 (th-worker-get-thread-id
+               (make-th-worker TENANT-ID-USER 0)))))
+
+(test-suite "39-008-worker-predicate"
+  (check (= #t (th-worker? (make-th-worker 0 0))))
+  (check (= #f (th-worker? 'not-worker)))
+  (check (= #f (th-worker? 42)))
+
+; ----------------------------------------------------------------
+; MultiLevelQueue
+; ----------------------------------------------------------------
+
+(test-suite "39-009-queue-construction"
+  (check (= 0 (multi-level-queue-get-total-count
+               (make-multi-level-queue 3)))))
+
+(test-suite "39-009-queue-predicate"
+  (check (= #t (multi-level-queue? (make-multi-level-queue 1))))
+  (check (= #f (multi-level-queue? 'not-queue)))
+  (check (= #f (multi-level-queue? 42)))
+
+(test-suite "39-010-queue-push"
+  (check (= 1 (let ((q (make-multi-level-queue 3)))
+                 (multi-level-queue-push! q 0 'a)
+                 (multi-level-queue-get-total-count q))))
+  (check (= 3 (let ((q (make-multi-level-queue 3)))
+                 (multi-level-queue-push! q 0 'a)
+                 (multi-level-queue-push! q 1 'b)
+                 (multi-level-queue-push! q 2 'c)
+                 (multi-level-queue-get-total-count q))))
+
+(test-suite "39-010-queue-pop"
+  (check (= 'a (let ((q (make-multi-level-queue 3)))
+                 (multi-level-queue-push! q 0 'a)
+                 (multi-level-queue-pop! q 0))))
+  (check (= 'b (let ((q (make-multi-level-queue 3)))
+                 (multi-level-queue-push! q 1 'b)
+                 (multi-level-queue-pop! q 1))))
+
+; ----------------------------------------------------------------
+; MultiTenant
+; ----------------------------------------------------------------
+
+(test-suite "39-011-mgr-construction"
+  (check (= 0 (multi-tenant-get-tenant-count (make-multi-tenant)))))
+
+(test-suite "39-011-mgr-predicate"
+  (check (= #t (multi-tenant? (make-multi-tenant))))
+  (check (= #f (multi-tenant? 'not-mgr)))
+  (check (= #f (multi-tenant? 42)))
+
+(test-suite "39-012-mgr-add"
+  (check (= 1 (let ((m (make-multi-tenant)))
+                 (multi-tenant-add-tenant! m
+                   (make-tenant TENANT-ID-SYS
+                     (make-tenant-meta 0 0 0 0)
+                     (make-tenant-config 'sys COMPAT-MODE-MYSQL 0 0)
+                     (make-th-worker 0 0)
+                     (make-multi-level-queue 1)))
+                 (multi-tenant-get-tenant-count m))))
+
+(test-suite "39-012-mgr-find"
+  (check (= #t (let ((m (make-multi-tenant)))
+                 (multi-tenant-add-tenant! m
+                   (make-tenant 1000
+                     (make-tenant-meta 0 0 0 0)
+                     (make-tenant-config 'user_t COMPAT-MODE-MYSQL 0 0)
+                     (make-th-worker 0 0)
+                     (make-multi-level-queue 1)))
+                 (eq? TENANT-STATUS-NORMAL
+                   (tenant-get-status
+                     (multi-tenant-find-by-id m 1000)))))))
+
+(test-suite "39-012-mgr-find-missing"
+  (check (= #f (multi-tenant-find-by-id (make-multi-tenant) 9999)))
+
+; ----------------------------------------------------------------
+; Tenant ID helpers
+; ----------------------------------------------------------------
+
+(test-suite "39-013-is-sys-tenant"
+  (check (= #t (is-sys-tenant? TENANT-ID-SYS)))
+  (check (= #f (is-sys-tenant? TENANT-ID-USER)))
+  (check (= #f (is-sys-tenant? TENANT-ID-SERVER))))
+
+(test-suite "39-013-is-virtual-tenant"
+  ; virtual: id in (1, 1000]
+  (check (= #t (is-virtual-tenant? TENANT-ID-SERVER)))
+  (check (= #t (is-virtual-tenant? TENANT-ID-DTL)))
+  (check (= #t (is-virtual-tenant? TENANT-ID-DATA)))
+  (check (= #f (is-virtual-tenant? TENANT-ID-SYS)))
+  (check (= #f (is-virtual-tenant? TENANT-ID-USER)))
+  (check (= #f (is-virtual-tenant? TENANT-ID-MAX-RESERVED))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

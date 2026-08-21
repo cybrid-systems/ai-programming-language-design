@@ -1,0 +1,493 @@
+; 39-tenant-architecture.aura
+; ======================
+; tenant_architecture — minimal capability port to aura.
+;
+; Maps to: OceanBase Tenant Architecture + Resource Isolation
+; Source: src/observer/omt/ob_multi_tenant.h
+;         + src/observer/omt/ob_tenant.h
+;         + src/observer/omt/ob_th_worker.h
+;         + src/observer/omt/ob_multi_level_queue.h
+;         + src/observer/omt/ob_tenant_config.h
+;         + deps/oblib/src/lib/ob_define.h (tenant IDs)
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Tenant Architecture:
+;   - Tenant ID constants (SYS=1, SERVER=500, DTL=508, DATA=509,
+;     MAX_RESERVED=1000, USER=1000)
+;   - Tenant compat-mode constants (MYSQL, ORACLE)
+;   - ObTenantMeta: tenant meta (unit + super-block + status)
+;   - ObTenant: tenant resource container
+;   - ObTenantConfig: per-tenant config
+;   - ObThWorker: thread-pool worker
+;   - ObMultiLevelQueue: priority queue
+;   - ObMultiTenant: multi-tenant manager
+;
+; aura v1 ships:
+;   - 6 TENANT-ID constants
+;   - 2 COMPAT-MODE constants
+;   - 3 TENANT-STATUS constants (CREATING, NORMAL, DROPPING)
+;   - make-tenant-meta (factory: unit-cpu + unit-mem +
+;     create-status + epoch)
+;   - tenant-meta accessors + set-status! + set-epoch!
+;   - make-tenant-config (factory: name + compat + max-cpu +
+;     max-mem)
+;   - tenant-config accessors + set-max-cpu! + set-max-mem!
+;   - make-tenant (factory: id + meta + config + worker +
+;     queue)
+;   - tenant accessors + set-status!
+;   - make-th-worker (factory: tenant-id + thread-id)
+;   - th-worker accessors
+;   - make-multi-level-queue (factory: levels)
+;   - multi-level-queue-get-total-count
+;   - multi-level-queue-push! + pop!
+;   - make-multi-tenant (factory: empty tenants)
+;   - multi-tenant-get-tenant-count + add-tenant! + find-by-id
+;   - tenant-id-helpers (is-sys-tenant? + is-virtual-tenant?)
+;
+; Deferred (full OceanBase Tenant Architecture):
+;   - real ObTenant with full resource accounting
+;   - real ObThWorker pool with CPU affinity + cgroup
+;   - real ObMultiLevelQueue with 3 levels (high/mid/low)
+;   - real tenant thread pool scheduling run1() every 10ms
+;   - real ObTenantConfigMgr with dynamic config reload
+;   - real ObTenantNodeBalancer with cross-node tenant
+;     rebalancing
+;   - real tenant isolation with cgroup + memory limit
+;   - real resource unit (Unit) with CPU/disk/memory
+;   - real sys tenant with __all_* system tables
+;   - real user tenant with MySQL/Oracle compat
+;   - real tenant create/drop lifecycle with rootserver
+;     coordination
+
+(export
+  ; Tenant ID constants
+  TENANT-ID-INVALID
+  TENANT-ID-SYS
+  TENANT-ID-SERVER
+  TENANT-ID-DTL
+  TENANT-ID-DATA
+  TENANT-ID-MAX-RESERVED
+  TENANT-ID-USER
+  ; CompatMode constants
+  COMPAT-MODE-MYSQL
+  COMPAT-MODE-ORACLE
+  ; TenantStatus constants
+  TENANT-STATUS-CREATING
+  TENANT-STATUS-NORMAL
+  TENANT-STATUS-DROPPING
+  ; TenantMeta
+  make-tenant-meta
+  tenant-meta?
+  tenant-meta-get-unit-cpu
+  tenant-meta-get-unit-mem
+  tenant-meta-get-create-status
+  tenant-meta-get-epoch
+  tenant-meta-set-create-status!
+  tenant-meta-set-epoch!
+  ; TenantConfig
+  make-tenant-config
+  tenant-config?
+  tenant-config-get-name
+  tenant-config-get-compat
+  tenant-config-get-max-cpu
+  tenant-config-get-max-mem
+  tenant-config-set-max-cpu!
+  tenant-config-set-max-mem!
+  ; Tenant
+  make-tenant
+  tenant?
+  tenant-get-id
+  tenant-get-meta
+  tenant-get-config
+  tenant-get-worker
+  tenant-get-queue
+  tenant-get-status
+  tenant-set-status!
+  ; ThWorker
+  make-th-worker
+  th-worker?
+  th-worker-get-tenant-id
+  th-worker-get-thread-id
+  ; MultiLevelQueue
+  make-multi-level-queue
+  multi-level-queue?
+  multi-level-queue-get-total-count
+  multi-level-queue-push!
+  multi-level-queue-pop!
+  ; MultiTenant
+  make-multi-tenant
+  multi-tenant?
+  multi-tenant-get-tenant-count
+  multi-tenant-add-tenant!
+  multi-tenant-find-by-id
+  ; Tenant ID helpers
+  is-sys-tenant?
+  is-virtual-tenant?)
+
+; ----------------------------------------------------------------
+; Tenant ID constants
+; ----------------------------------------------------------------
+;
+; Per OB (deps/oblib/src/lib/ob_define.h):
+;   OB_INVALID_TENANT_ID = 0
+;   OB_SYS_TENANT_ID = 1
+;   OB_SERVER_TENANT_ID = 500
+;   OB_DTL_TENANT_ID = 508
+;   OB_DATA_TENANT_ID = 509
+;   OB_MAX_RESERVED_TENANT_ID = 1000
+;   OB_USER_TENANT_ID = 1000
+
+(define TENANT-ID-INVALID 0)
+(define TENANT-ID-SYS 1)
+(define TENANT-ID-SERVER 500)
+(define TENANT-ID-DTL 508)
+(define TENANT-ID-DATA 509)
+(define TENANT-ID-MAX-RESERVED 1000)
+(define TENANT-ID-USER 1000)
+
+; ----------------------------------------------------------------
+; CompatMode constants
+; ----------------------------------------------------------------
+
+(define COMPAT-MODE-MYSQL 0)
+(define COMPAT-MODE-ORACLE 1)
+
+; ----------------------------------------------------------------
+; TenantStatus constants
+; ----------------------------------------------------------------
+
+(define TENANT-STATUS-CREATING 0)
+(define TENANT-STATUS-NORMAL 1)
+(define TENANT-STATUS-DROPPING 2)
+
+; ----------------------------------------------------------------
+; ObTenantMeta — closure-based
+; ----------------------------------------------------------------
+
+; make-tenant-meta: create a tenant meta.
+; Args: unit-cpu (integer — CPU cores per unit),
+;       unit-mem (integer — memory per unit in bytes),
+;       create-status (integer), epoch (integer)
+; Returns: tenant_meta closure.
+(define (make-tenant-meta unit-cpu unit-mem create-status epoch)
+  (letrec ((set-create-status! (lambda (v) (set! create-status v) v))
+           (set-epoch! (lambda (v) (set! epoch v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'unit-cpu) unit-cpu)
+                     ((eq? msg 'unit-mem) unit-mem)
+                     ((eq? msg 'create-status) create-status)
+                     ((eq? msg 'epoch) epoch)
+                     ((eq? msg 'set-create-status!) set-create-status!)
+                     ((eq? msg 'set-epoch!) set-epoch!)
+                     (else #f)))))
+      self))
+
+; tenant-meta?: is the object a tenant meta?
+; Detected by querying 'unit-cpu — only metas return integer.
+(define (tenant-meta? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'unit-cpu)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; tenant-meta-get-unit-cpu: get unit CPU.
+(define (tenant-meta-get-unit-cpu m) (m 'unit-cpu))
+
+; tenant-meta-get-unit-mem: get unit memory.
+(define (tenant-meta-get-unit-mem m) (m 'unit-mem))
+
+; tenant-meta-get-create-status: get create status.
+(define (tenant-meta-get-create-status m) (m 'create-status))
+
+; tenant-meta-get-epoch: get epoch.
+(define (tenant-meta-get-epoch m) (m 'epoch))
+
+; tenant-meta-set-create-status!: set create status.
+; Returns the new status.
+(define (tenant-meta-set-create-status! m v)
+  ((m 'set-create-status!) v))
+
+; tenant-meta-set-epoch!: set epoch.
+; Returns the new epoch.
+(define (tenant-meta-set-epoch! m v) ((m 'set-epoch!) v))
+
+; ----------------------------------------------------------------
+; ObTenantConfig — closure-based
+; ----------------------------------------------------------------
+
+; make-tenant-config: create a tenant config.
+; Args: name (symbol), compat (integer),
+;       max-cpu (integer), max-mem (integer)
+; Returns: tenant_config closure.
+(define (make-tenant-config name compat max-cpu max-mem)
+  (letrec ((set-max-cpu! (lambda (v) (set! max-cpu v) v))
+           (set-max-mem! (lambda (v) (set! max-mem v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'compat) compat)
+                     ((eq? msg 'max-cpu) max-cpu)
+                     ((eq? msg 'max-mem) max-mem)
+                     ((eq? msg 'set-max-cpu!) set-max-cpu!)
+                     ((eq? msg 'set-max-mem!) set-max-mem!)
+                     (else #f)))))
+      self))
+
+; tenant-config?: is the object a tenant config?
+; Detected by querying 'name — only configs return symbol.
+(define (tenant-config? obj)
+  (if (procedure? obj)
+      (if (symbol? (obj 'name)) #t #f)
+      #f))
+
+; tenant-config-get-name: get name.
+(define (tenant-config-get-name c) (c 'name))
+
+; tenant-config-get-compat: get compat mode.
+(define (tenant-config-get-compat c) (c 'compat))
+
+; tenant-config-get-max-cpu: get max CPU.
+(define (tenant-config-get-max-cpu c) (c 'max-cpu))
+
+; tenant-config-get-max-mem: get max memory.
+(define (tenant-config-get-max-mem c) (c 'max-mem))
+
+; tenant-config-set-max-cpu!: set max CPU.
+; Returns the new max CPU.
+(define (tenant-config-set-max-cpu! c v) ((c 'set-max-cpu!) v))
+
+; tenant-config-set-max-mem!: set max memory.
+; Returns the new max memory.
+(define (tenant-config-set-max-mem! c v) ((c 'set-max-mem!) v))
+
+; ----------------------------------------------------------------
+; ObTenant — closure-based (resource container)
+; ----------------------------------------------------------------
+
+; make-tenant: create a tenant.
+; Args: id (integer), meta (tenant_meta or #f),
+;       config (tenant_config or #f),
+;       worker (th_worker or #f),
+;       queue (multi_level_queue or #f)
+; Returns: tenant closure (initial: status=NORMAL).
+(define (make-tenant id meta config worker queue)
+  (let ((status TENANT-STATUS-NORMAL))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'meta) meta)
+                       ((eq? msg 'config) config)
+                       ((eq? msg 'worker) worker)
+                       ((eq? msg 'queue) queue)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'set-status!) set-status!)
+                       (else #f)))))
+      self)))
+
+; tenant?: is the object a tenant?
+; Detected by querying 'id — only tenants return integer.
+(define (tenant? obj)
+  (if (procedure? obj)
+      (let ((i (obj 'id)))
+        (if (and (integer? i) (>= i 0)) #t #f))
+      #f))
+
+; tenant-get-id: get tenant id.
+(define (tenant-get-id t) (t 'id))
+
+; tenant-get-meta: get meta.
+(define (tenant-get-meta t) (t 'meta))
+
+; tenant-get-config: get config.
+(define (tenant-get-config t) (t 'config))
+
+; tenant-get-worker: get worker.
+(define (tenant-get-worker t) (t 'worker))
+
+; tenant-get-queue: get queue.
+(define (tenant-get-queue t) (t 'queue))
+
+; tenant-get-status: get status.
+(define (tenant-get-status t) (t 'status))
+
+; tenant-set-status!: set status.
+; Returns the new status.
+(define (tenant-set-status! t v) ((t 'set-status!) v))
+
+; ----------------------------------------------------------------
+; ObThWorker — closure-based
+; ----------------------------------------------------------------
+
+; make-th-worker: create a thread worker.
+; Args: tenant-id (integer), thread-id (integer)
+; Returns: th_worker closure.
+(define (make-th-worker tenant-id thread-id)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'tenant-id) tenant-id)
+                     ((eq? msg 'thread-id) thread-id)
+                     (else #f)))))
+      self))
+
+; th-worker?: is the object a thread worker?
+; Detected by querying 'thread-id — only workers return integer.
+(define (th-worker? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'thread-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; th-worker-get-tenant-id: get tenant id.
+(define (th-worker-get-tenant-id w) (w 'tenant-id))
+
+; th-worker-get-thread-id: get thread id.
+(define (th-worker-get-thread-id w) (w 'thread-id))
+
+; ----------------------------------------------------------------
+; ObMultiLevelQueue — closure-based
+; ----------------------------------------------------------------
+
+; make-multi-level-queue: create a multi-level queue.
+; Args: levels (integer — number of priority levels)
+; Returns: multi_level_queue closure (initial: empty buckets).
+(define (make-multi-level-queue levels)
+  (let ((buckets (make-list levels '())))
+    (letrec ((set-buckets! (lambda (v) (set! buckets v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'levels) levels)
+                       ((eq? msg 'buckets) buckets)
+                       ((eq? msg 'set-buckets!) set-buckets!)
+                       (else #f)))))
+      self)))
+
+; helper: make-list (creates a list of n elements all = elem).
+(define (make-list n elem)
+  (let loop ((i 0) (acc '()))
+    (cond
+      ((= i n) acc)
+      (#t (loop (+ i 1) (cons elem acc))))))
+
+; multi-level-queue?: is the object a multi-level queue?
+; Detected by querying 'levels — only queues return integer.
+(define (multi-level-queue? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'levels)))
+        (if (and (integer? l) (> l 0)) #t #f))
+      #f))
+
+; multi-level-queue-get-total-count: total items across levels.
+(define (multi-level-queue-get-total-count q)
+  (let loop ((rest (q 'buckets)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n (list-length (car rest))))))))
+
+; multi-level-queue-push!: push item onto level.
+; Returns the new total count.
+(define (multi-level-queue-push! q level item)
+  (let ((existing (q 'buckets))
+        (levels-count (q 'levels)))
+    (if (and (>= level 0) (< level levels-count))
+      (let ((new-buckets
+              (let loop ((rest existing) (i 0) (acc '()))
+                (cond
+                  ((null? rest) acc)
+                  ((= i level)
+                    (loop (cdr rest) (+ i 1)
+                      (cons (cons item (car rest)) acc)))
+                  (#t (loop (cdr rest) (+ i 1)
+                       (cons (car rest) acc)))))))
+        ((q 'set-buckets!) (reverse new-buckets)))
+      0)))
+
+; helper: reverse a list.
+(define (reverse lst)
+  (let loop ((rest lst) (acc '()))
+    (cond
+      ((null? rest) acc)
+      (#t (loop (cdr rest) (cons (car rest) acc))))))
+
+; multi-level-queue-pop!: pop from level.
+; Returns the popped item or '().
+(define (multi-level-queue-pop! q level)
+  (let ((existing (q 'buckets))
+        (levels-count (q 'levels)))
+    (if (and (>= level 0) (< level levels-count))
+      (let ((new-buckets
+              (let loop ((rest existing) (i 0) (acc '()) (popped '()))
+                (cond
+                  ((null? rest)
+                    (set! popped popped)
+                    (reverse acc))
+                  ((= i level)
+                    (if (null? (car rest))
+                      (loop (cdr rest) (+ i 1) acc popped)
+                      (loop (cdr rest) (+ i 1) acc (car (car rest)))))
+                  (#t (loop (cdr rest) (+ i 1)
+                       (cons (car rest) acc) popped))))))
+        ((q 'set-buckets!) new-buckets)
+        (let ((p popped)) p))
+      '())))
+
+; ----------------------------------------------------------------
+; ObMultiTenant — closure-based (manager)
+; ----------------------------------------------------------------
+
+; make-multi-tenant: create a multi-tenant manager.
+; Returns: multi_tenant closure (initial: empty tenants).
+(define (make-multi-tenant)
+  (let ((tenants '()))
+    (letrec ((set-tenants! (lambda (v) (set! tenants v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tenants) tenants)
+                       ((eq? msg 'set-tenants!) set-tenants!)
+                       (else #f)))))
+      self)))
+
+; multi-tenant?: is the object a multi-tenant manager?
+; Detected by querying 'tenants — only managers return a cons.
+(define (multi-tenant? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'tenants)) #t #f)
+      #f))
+
+; multi-tenant-get-tenant-count: get tenant count.
+(define (multi-tenant-get-tenant-count mgr)
+  (let loop ((rest (mgr 'tenants)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; multi-tenant-add-tenant!: add a tenant.
+; Returns the new count.
+(define (multi-tenant-add-tenant! mgr tenant)
+  (let ((existing (mgr 'tenants)))
+    ((mgr 'set-tenants!) (cons tenant existing))))
+
+; multi-tenant-find-by-id: find tenant by id.
+; Returns the tenant or #f.
+(define (multi-tenant-find-by-id mgr id)
+  (let loop ((rest (mgr 'tenants)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'id) id) (car rest))
+      (#t (loop (cdr rest))))))
+
+; ----------------------------------------------------------------
+; Tenant ID helpers
+; ----------------------------------------------------------------
+
+; is-sys-tenant?: is this the sys tenant (id == 1)?
+(define (is-sys-tenant? id) (= id TENANT-ID-SYS))
+
+; is-virtual-tenant?: is this an internal virtual tenant
+; (id in (1, 1000])?
+(define (is-virtual-tenant? id)
+  (if (and (> id TENANT-ID-SYS) (<= id TENANT-ID-MAX-RESERVED))
+    #t #f))
