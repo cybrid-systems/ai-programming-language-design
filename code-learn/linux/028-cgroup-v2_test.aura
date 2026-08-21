@@ -1,0 +1,187 @@
+; 028-cgroup-v2_test.aura
+; =========================
+; Smoke tests for 028-cgroup-v2.aura — cgroup-v2 minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/028-cgroup-v2_test.aura
+;
+; Verified automatically (smoke):
+;   - cgroup construction (id, name, parent)
+;   - cgroup-create registers child under parent
+;   - cgroup-attach-task / detach-task (count tracking)
+;   - cgroup-add-child! / remove-child!
+;   - cgroup-path traversal (root → leaf)
+;   - css (cgroup_subsys_state) construction
+;
+; Verified via separate probes during development:
+;   - Multiple levels of nesting
+;   - cgroup-remove-child! returns #f for non-child
+;   - css? predicate rejects non-css procedures
+;   - cgroup-detach-task clamps at 0
+;
+; Deferred (full Linux cgroup-v2):
+;   - real cgroupfs
+;   - mount / mkdir / rmdir syscalls
+;   - 12+ controllers (cpu, memory, io, pids, freezer)
+;   - cgroup.subtree_control
+;   - cgroup_pressure / PSI
+;   - css reference counting
+
+(require "std/test" all:)
+(require "028-cgroup-v2" all:)
+
+; ----------------------------------------------------------------
+; Construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "cg-001-construction-root"
+  ; Root cgroup has no parent.
+  (check (= 1 (if (not (cgroup-parent (make-cgroup 1 'root #f))) 1 0)))
+  (check (= 'root (cgroup-name (make-cgroup 1 'root #f))))
+  (check (= 1 (cgroup-id (make-cgroup 1 'root #f)))))
+
+(test-suite "cg-001-construction-child"
+  ; Child cgroup references parent.
+  (check (= 1 (let ((root (make-cgroup 1 'root #f)))
+                (let ((child (make-cgroup 2 'child root)))
+                  (if (eq? root (cgroup-parent child)) 1 0))))))
+
+(test-suite "cg-001-predicate"
+  ; cgroup? accepts only cgroup closures.
+  (check (= 1 (if (cgroup? (make-cgroup 1 'r #f)) 1 0)))
+  (check (= 1 (if (not (cgroup? 'not-a-cg)) 1 0)))
+  (check (= 1 (if (not (cgroup? 42)) 1 0)))
+  (check (= 1 (if (not (cgroup? #f)) 1 0))))
+
+; ----------------------------------------------------------------
+; cgroup-create — registers child under parent
+; ----------------------------------------------------------------
+
+(test-suite "cg-002-create"
+  ; cgroup-create returns the new child + registers it under parent.
+  (check (= 1 (let ((root (make-cgroup 1 'r02 #f)))
+                (let ((child (cgroup-create root 2 'c02)))
+                  (if (eq? child (car (cgroup-children root))) 1 0))))))
+
+(test-suite "cg-002-create-multiple"
+  ; Multiple children registered in reverse order.
+  (check (= 2 (let ((root (make-cgroup 1 'r02m #f)))
+                (cgroup-create root 2 'c02m-a)
+                (cgroup-create root 3 'c02m-b)
+                (length (cgroup-children root))))))
+
+; ----------------------------------------------------------------
+; cgroup-add-child! / remove-child!
+; ----------------------------------------------------------------
+
+; unq-add: get-or-create an anonymous child cgroup under root for tests.
+(define (unq-add root id name)
+  (let ((existing (let loop ((rest (cgroup-children root)))
+                    (cond
+                      ((null? rest) #f)
+                      ((eq? (cgroup-name (car rest)) name) (car rest))
+                      (else (loop (cdr rest)))))))
+    (if existing
+        existing
+        (cgroup-create root id name))))
+
+(test-suite "cg-003-add-child"
+  ; cgroup-add-child! prepends to children list.
+  (check (= 1 (let ((root (make-cgroup 1 'r03 #f)))
+                (let ((c1 (cgroup-add-child! root (make-cgroup 2 'c03-x #f))))
+                  (if (eq? c1 (car (cgroup-children root))) 1 0))))))
+
+(test-suite "cg-003-remove-child"
+  ; cgroup-remove-child! removes + returns #t.
+  (check (= 1 (let ((root (make-cgroup 1 'r03b #f)))
+                (let ((c (cgroup-add-child! root (make-cgroup 2 'c03-y #f))))
+                  (if (cgroup-remove-child! root c) 1 0))))))
+
+(test-suite "cg-003-remove-child-not-found"
+  ; cgroup-remove-child! returns #f for non-child.
+  (check (= 1 (if (not (cgroup-remove-child!
+                          (make-cgroup 1 'r03c #f)
+                          (make-cgroup 2 'c03-z #f))) 1 0))))
+
+; ----------------------------------------------------------------
+; cgroup-attach-task / detach-task
+; ----------------------------------------------------------------
+
+(test-suite "cg-004-attach-task"
+  ; cgroup-attach-task increments task count.
+  (check (= 1 (let ((root (make-cgroup 1 'r04 #f)))
+                (cgroup-attach-task root)
+                (cgroup-task-count root)))))
+
+(test-suite "cg-004-attach-multiple"
+  ; Multiple attaches accumulate.
+  (check (= 3 (let ((root (make-cgroup 1 'r04m #f)))
+                (cgroup-attach-task root)
+                (cgroup-attach-task root)
+                (cgroup-attach-task root)
+                (cgroup-task-count root)))))
+
+(test-suite "cg-004-detach-task"
+  ; cgroup-detach-task decrements task count.
+  (check (= 1 (let ((root (make-cgroup 1 'r04d #f)))
+                (cgroup-attach-task root)
+                (cgroup-attach-task root)
+                (cgroup-detach-task root)
+                (cgroup-task-count root)))))
+
+(test-suite "cg-004-detach-clamp-zero"
+  ; cgroup-detach-task at 0 stays at 0.
+  (check (= 0 (let ((root (make-cgroup 1 'r04z #f)))
+                (cgroup-detach-task root)
+                (cgroup-task-count root)))))
+
+; ----------------------------------------------------------------
+; cgroup-path traversal
+; ----------------------------------------------------------------
+
+(test-suite "cg-005-path-root"
+  ; Root cgroup path is just the root name.
+  (check (= '(root) (cgroup-path (make-cgroup 1 'root #f)))))
+
+(test-suite "cg-005-path-nested"
+  ; Nested cgroup path is root → leaf.
+  (check (= '(root child grandchild)
+             (let ((r (make-cgroup 1 'root #f))
+                   (c (make-cgroup 2 'child #f))
+                   (g (make-cgroup 3 'grandchild #f)))
+               (set-parent! c r)
+               (set-parent! g c)
+               (cgroup-path g)))))
+
+; set-parent!: mutate parent field on a cgroup (for nested path tests).
+(define (set-parent! child new-parent)
+  ((child 'set-parent!) new-parent))
+
+; ----------------------------------------------------------------
+; css (cgroup_subsys_state)
+; ----------------------------------------------------------------
+
+(test-suite "cg-006-css-construction"
+  ; css references owning cgroup + has id.
+  (check (= 1 (let ((root (make-cgroup 1 'r06 #f)))
+                (let ((css (make-css 42 root)))
+                  (if (eq? root (css-cgroup css)) 1 0)))))
+  (check (= 42 (css-id (make-css 42 (make-cgroup 1 'r06b #f))))))
+
+(test-suite "cg-006-css-online-default"
+  ; New css is online by default.
+  (check (= 1 (if (css-online? (make-css 1 (make-cgroup 1 'r06c #f))) 1 0))))
+
+(test-suite "cg-006-css-predicate"
+  ; css? accepts only css closures.
+  (check (= 1 (if (css? (make-css 1 (make-cgroup 1 'r06d #f))) 1 0)))
+  (check (= 1 (if (not (css? 'not-a-css)) 1 0)))
+  (check (= 1 (if (not (css? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

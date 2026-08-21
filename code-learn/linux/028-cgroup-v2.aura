@@ -1,0 +1,216 @@
+; 028-cgroup-v2.aura
+; =====================
+; cgroup-v2 (unified hierarchy) — minimal capability port to aura.
+;
+; Maps to: Linux kernel cgroup v2 (unified hierarchy)
+; Source: kernel/cgroup/ + include/linux/cgroup-defs.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux cgroup-v2 is the unified hierarchy control group subsystem
+; providing resource accounting + control + isolation per process tree:
+;   - struct cgroup (id, name, parent, children, nr_tasks)
+;   - struct cgroup_subsys_state (css) — per-subsystem state in a cgroup
+;   - struct cgroup_root — root of the hierarchy
+;   - cgroup_create / cgroup_destroy / cgroup_mkdir / cgroup_rmdir
+;   - cgroup_attach_task / cgroup_detach_task
+;   - css_get / css_put
+;   - cgroup_path() — build full path string
+;   - cgroup_kn_lock / cgroup_file (file-based control)
+;   - cgroup_seqfile_print — /sys/fs/cgroup/* output
+;
+; aura has no filesystem, no mounts, no real processes. v1 ships:
+;   - make-cgroup (factory: id, name, parent, children, task count)
+;   - cgroup-create (factory that registers child under parent)
+;   - cgroup-add-child! / cgroup-remove-child!
+;   - cgroup-attach-task / cgroup-detach-task
+;   - make-css (subsystem state attached to a cgroup)
+;   - cgroup? / css? predicates
+;   - cgroup-id / cgroup-name / cgroup-parent / cgroup-children /
+;     cgroup-task-count
+;   - css-cgroup / css-id / css-online?
+;
+; Deferred (full Linux cgroup-v2):
+;   - real cgroup filesystem (cgroupfs)
+;   - mount / umount / bind mount
+;   - cgroup_{mkdir,rmdir} syscalls
+;   - cgroup_attach_task_pid() with real process migration
+;   - 12+ controllers (cpu, memory, io, pids, freezer, etc.)
+;   - cgroup.procs / cgroup.threads / cgroup.events / cgroup.stat
+;   - cgroup.subtree_control enable/disable
+;   - cgroup_pressure / PSI
+;   - cgroup eBPF integration
+;   - css_get / css_put reference counting
+;   - cgroup_path() formatting
+
+(export
+  make-cgroup
+  cgroup?
+  cgroup-id
+  cgroup-name
+  cgroup-parent
+  cgroup-children
+  cgroup-task-count
+  cgroup-add-child!
+  cgroup-remove-child!
+  cgroup-create
+  cgroup-attach-task
+  cgroup-detach-task
+  cgroup-path
+  ; css (cgroup_subsys_state)
+  make-css
+  css?
+  css-cgroup
+  css-id
+  css-online?)
+
+; ----------------------------------------------------------------
+; cgroup (closure-based, mutable state via letrec setters)
+; ----------------------------------------------------------------
+
+; make-cgroup: create a cgroup.
+; Args: id (integer), name (symbol), parent (cgroup or #f for root)
+; Returns: cgroup closure.
+(define (make-cgroup id name parent)
+  (let ((children '())
+        (nr-tasks 0))
+    (letrec ((set-children! (lambda (v) (set! children v) v))
+             (set-nr-tasks! (lambda (v) (set! nr-tasks v) v))
+             (inc-nr-tasks! (lambda () (set! nr-tasks (+ nr-tasks 1)) nr-tasks))
+             (dec-nr-tasks! (lambda () (set! nr-tasks (- nr-tasks 1)) nr-tasks))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'name) name)
+                       ((eq? msg 'parent) parent)
+                       ((eq? msg 'children) children)
+                       ((eq? msg 'nr-tasks) nr-tasks)
+                       ((eq? msg 'set-children!) set-children!)
+                       ((eq? msg 'set-nr-tasks!) set-nr-tasks!)
+                       ((eq? msg 'inc-nr-tasks!) inc-nr-tasks!)
+                       ((eq? msg 'dec-nr-tasks!) dec-nr-tasks!)
+                       (else #f)))))
+      self)))
+
+; cgroup?: is the object a cgroup?
+; Detected by querying 'children — only cgroup closures return a list.
+(define (cgroup? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'children)) #t #f)
+      #f))
+
+; cgroup-id: get cgroup id (integer)
+(define (cgroup-id cg) (cg 'id))
+
+; cgroup-name: get cgroup name (symbol)
+(define (cgroup-name cg) (cg 'name))
+
+; cgroup-parent: get parent cgroup (or #f for root)
+(define (cgroup-parent cg) (cg 'parent))
+
+; cgroup-children: get children list
+(define (cgroup-children cg) (cg 'children))
+
+; cgroup-task-count: get number of attached tasks
+(define (cgroup-task-count cg) (cg 'nr-tasks))
+
+; cgroup-add-child!: add a child cgroup to this cgroup's children list.
+; Returns the new children list.
+(define (cgroup-add-child! parent-cg child-cg)
+  ((parent-cg 'set-children!)
+   (cons child-cg (parent-cg 'children))))
+
+; cgroup-remove-child!: remove a child cgroup from children list.
+; Returns #t if removed, #f otherwise.
+(define (cgroup-remove-child! parent-cg child-cg)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((parent-cg 'set-children!)
+                             (cons-rev acc '()))
+                            ((parent-cg 'set-children!) acc))
+                        found?)
+                       ((eq? (car rest) child-cg)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (parent-cg 'children) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; cgroup-create: create a child cgroup and register it under parent.
+; Args: parent-cg (or #f for root), id (integer), name (symbol)
+; Returns: new child cgroup.
+(define (cgroup-create parent-cg id name)
+  (let ((new-cg (make-cgroup id name parent-cg)))
+    (if parent-cg (cgroup-add-child! parent-cg new-cg))
+    new-cg))
+
+; cgroup-attach-task: increment task count on this cgroup.
+; Returns the new task count.
+(define (cgroup-attach-task cg)
+  ((cg 'inc-nr-tasks!)))
+
+; cgroup-detach-task: decrement task count on this cgroup.
+; Returns the new task count (clamped at 0).
+(define (cgroup-detach-task cg)
+  (let ((current (cg 'nr-tasks)))
+    (if (= current 0)
+        0
+        ((cg 'dec-nr-tasks!)))))
+
+; cgroup-path: build full path string from root to this cgroup.
+; Format: "root/child1/child2/.../this"
+; Returns a list of symbols (root → leaf), since aura has no string ops.
+(define (cgroup-path cg)
+  (let loop ((current cg) (acc '()))
+    (cond
+      ((eq? current #f) acc)
+      (else
+       (loop (cgroup-parent current)
+             (cons (cgroup-name current) acc))))))
+
+; ----------------------------------------------------------------
+; css (cgroup_subsys_state) — per-subsystem state in a cgroup
+; ----------------------------------------------------------------
+
+; make-css: create a cgroup_subsys_state.
+; Args: id (integer), cgroup (the owning cgroup)
+; Returns: css closure.
+(define (make-css id cgroup)
+  (let ((online #t))
+    (letrec ((set-online! (lambda (v) (set! online v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'id) id)
+                       ((eq? msg 'cgroup) cgroup)
+                       ((eq? msg 'online) online)
+                       ((eq? msg 'set-online!) set-online!)
+                       (else #f)))))
+      self)))
+
+; css?: is the object a css?
+; Detected by querying 'cgroup — only css closures return a value
+; that satisfies cgroup? predicate (or #f for detached css).
+(define (css? obj)
+  (if (procedure? obj)
+      (let ((cg (obj 'cgroup)))
+        (if (or (cgroup? cg) (eq? cg #f)) #t #f))
+      #f))
+
+; css-cgroup: get owning cgroup (or #f if detached)
+(define (css-cgroup css) (css 'cgroup))
+
+; css-id: get css id (integer)
+(define (css-id css) (css 'id))
+
+; css-online?: is css online (active)?
+(define (css-online? css)
+  (if (eq? (css 'online) #t) #t #f))
