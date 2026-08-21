@@ -1,0 +1,245 @@
+; 033-fanotify.aura
+; =====================
+; fanotify — minimal capability port to aura.
+;
+; Maps to: Linux kernel fanotify subsystem
+; Source: fs/notify/fanotify/ + include/linux/fanotify.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux fanotify is the filesystem notification subsystem providing:
+;   - struct fanotify_event (event metadata: mask, pid, fd)
+;   - struct fanotify_mark (filesystem watch: type, inode, flags)
+;   - struct fsnotify_group (notification group)
+;   - fanotify_init syscall (create group)
+;   - fanotify_mark syscall (add/remove mark)
+;   - Event types: FAN_ACCESS, FAN_MODIFY, FAN_OPEN, FAN_CLOSE,
+;     FAN_OPEN_PERM, FAN_ACCESS_PERM, FAN_CREATE, FAN_DELETE, etc.
+;   - Mark types: FAN_MARK_INODE, FAN_MARK_MOUNT, FAN_MARK_FILESYSTEM
+;   - Notification classes: FAN_CLASS_NOTIF, _CONTENT, _PRE_CONTENT
+;   - Marks flags: FAN_MARK_ADD, FAN_MARK_REMOVE, FAN_MARK_ONLYDIR
+;
+; aura has no filesystem, no inodes. v1 ships:
+;   - make-fanotify-group (factory: flags, event-fd, marks)
+;   - make-fanotify-mark (factory: type, inode, flags)
+;   - make-fanotify-event (factory: mask, pid, fd)
+;   - fanotify-add-mark / fanotify-remove-mark
+;   - fanotify-count / fanotify-find-mark
+;   - Event symbols: 'access / 'modify / 'open / 'close /
+;     'open-perm / 'access-perm / 'create / 'delete
+;   - Mark type symbols: 'inode / 'mount / 'filesystem
+;   - Class symbols: 'notif / 'content / 'pre-content
+;
+; Deferred (full Linux fanotify):
+;   - real fsnotify event delivery
+;   - permission events with userspace response
+;   - inode / mount / filesystem mark resolution
+;   - FAN_DIR_EVENT / FAN_PATH events
+;   - fanotify_init flags (FAN_CLOEXEC, FAN_NONBLOCK)
+;   - event fd multiplexing
+;   - FAN_MARK_FILESYSTEM mark types
+
+(export
+  make-fanotify-group
+  fanotify-group?
+  fanotify-group-flags
+  fanotify-group-event-fd
+  fanotify-group-marks
+  fanotify-add-mark
+  fanotify-remove-mark
+  fanotify-find-mark
+  fanotify-count
+  make-fanotify-mark
+  fanotify-mark?
+  fanotify-mark-type
+  fanotify-mark-inode
+  fanotify-mark-flags
+  make-fanotify-event
+  fanotify-event?
+  fanotify-event-mask
+  fanotify-event-pid
+  fanotify-event-fd
+  'access
+  'modify
+  'open
+  'close
+  'open-perm
+  'access-perm
+  'create
+  'delete
+  'inode
+  'mount
+  'filesystem
+  'notif
+  'content
+  'pre-content)
+
+; ----------------------------------------------------------------
+; fanotify_event — closure-based
+; ----------------------------------------------------------------
+
+; make-fanotify-event: create an event record.
+; Args: mask (symbol), pid (integer), fd (integer)
+; Returns: fanotify_event closure.
+(define (make-fanotify-event mask pid fd)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'mask) mask)
+                     ((eq? msg 'pid) pid)
+                     ((eq? msg 'fd) fd)
+                     (else #f)))))
+    self))
+
+; fanotify-event?: is the object a fanotify event?
+; Detected by querying 'mask — only fanotify_event closures return
+; one of the known event symbols.
+(define (fanotify-event? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'mask)))
+        (if (or (eq? m 'access) (eq? m 'modify) (eq? m 'open)
+                (eq? m 'close) (eq? m 'open-perm) (eq? m 'access-perm)
+                (eq? m 'create) (eq? m 'delete))
+            #t #f))
+      #f))
+
+; fanotify-event-mask: get event mask symbol
+(define (fanotify-event-mask ev) (ev 'mask))
+
+; fanotify-event-pid: get triggering pid
+(define (fanotify-event-pid ev) (ev 'pid))
+
+; fanotify-event-fd: get affected fd (-1 if none)
+(define (fanotify-event-fd ev) (ev 'fd))
+
+; ----------------------------------------------------------------
+; fanotify_mark — closure-based
+; ----------------------------------------------------------------
+
+; make-fanotify-mark: create a filesystem mark.
+; Args: type (one of 'inode / 'mount / 'filesystem),
+;       inode (integer — fake inode id), flags (integer)
+; Returns: fanotify_mark closure.
+(define (make-fanotify-mark type inode flags)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'type) type)
+                     ((eq? msg 'inode) inode)
+                     ((eq? msg 'flags) flags)
+                     (else #f)))))
+    self))
+
+; fanotify-mark?: is the object a fanotify mark?
+; Detected by querying 'type — only fanotify_mark closures return
+; one of the known type symbols.
+(define (fanotify-mark? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'type)))
+        (if (or (eq? t 'inode) (eq? t 'mount) (eq? t 'filesystem))
+            #t #f))
+      #f))
+
+; fanotify-mark-type: get mark type symbol
+(define (fanotify-mark-type m) (m 'type))
+
+; fanotify-mark-inode: get mark inode (fake)
+(define (fanotify-mark-inode m) (m 'inode))
+
+; fanotify-mark-flags: get mark flags
+(define (fanotify-mark-flags m) (m 'flags))
+
+; ----------------------------------------------------------------
+; fanotify_group — closure-based, mutable marks list
+; ----------------------------------------------------------------
+
+; make-fanotify-group: create a notification group.
+; Args: flags (integer), event-fd (integer)
+; Returns: fanotify_group closure.
+(define (make-fanotify-group flags event-fd)
+  (let ((marks '()))
+    (letrec ((set-marks! (lambda (v) (set! marks v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'flags) flags)
+                       ((eq? msg 'event-fd) event-fd)
+                       ((eq? msg 'marks) marks)
+                       ((eq? msg 'set-marks!) set-marks!)
+                       (else #f)))))
+      self)))
+
+; fanotify-group?: is the object a fanotify group?
+; Detected by querying 'event-fd — only fanotify_group closures
+; return an integer.
+(define (fanotify-group? obj)
+  (if (procedure? obj)
+      (if (integer? (obj 'event-fd)) #t #f)
+      #f))
+
+; fanotify-group-flags: get group init flags
+(define (fanotify-group-flags g) (g 'flags))
+
+; fanotify-group-event-fd: get event fd
+(define (fanotify-group-event-fd g) (g 'event-fd))
+
+; fanotify-group-marks: get marks list
+(define (fanotify-group-marks g) (g 'marks))
+
+; ----------------------------------------------------------------
+; Mark registry — global, closure-based, mutable via letrec setter
+; ----------------------------------------------------------------
+
+; make-mark-registry: empty registry (per-group).
+(define (make-mark-registry)
+  (let ((marks '()))
+    (letrec ((set-marks! (lambda (v) (set! marks v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'list) marks)
+                       ((eq? msg 'set-marks!) set-marks!)
+                       (else #f)))))
+      self)))
+
+; fanotify-add-mark: add a mark to a group.
+; Returns the new marks list.
+(define (fanotify-add-mark group mark)
+  ((group 'set-marks!) (cons mark (group 'marks))))
+
+; fanotify-remove-mark: remove a mark from group.
+; Returns #t if removed, #f otherwise.
+(define (fanotify-remove-mark group mark)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((group 'set-marks!)
+                             (cons-rev acc '()))
+                            ((group 'set-marks!) acc))
+                        found?)
+                       ((eq? (car rest) mark)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (group 'marks) '())))
+
+; cons-rev: helper — (cons-rev acc rest) = (append (reverse acc) rest)
+(define (cons-rev acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev (cdr acc) (cons (car acc) rest))))
+
+; fanotify-find-mark: find a mark by inode.
+; Returns the mark or #f if not found.
+(define (fanotify-find-mark group inode)
+  (let loop ((rest (group 'marks)))
+    (cond
+      ((null? rest) #f)
+      ((= (fanotify-mark-inode (car rest)) inode) (car rest))
+      (else (loop (cdr rest))))))
+
+; fanotify-count: count of marks in group
+(define (fanotify-count group)
+  (let loop ((rest (group 'marks)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))

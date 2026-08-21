@@ -1,0 +1,131 @@
+; 033-fanotify_test.aura
+; =========================
+; Smoke tests for 033-fanotify.aura — fanotify minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/033-fanotify_test.aura
+;
+; Verified automatically (smoke):
+;   - fanotify_event / fanotify_mark / fanotify_group construction
+;   - fanotify-event? / fanotify-mark? / fanotify-group? predicates
+;   - fanotify-add-mark / fanotify-remove-mark
+;   - fanotify-find-mark / fanotify-count
+;
+; Verified via separate probes during development:
+;   - Multiple marks coexist in group
+;   - fanotify-remove-mark returns #f for non-registered mark
+;   - Mark type discrimination (inode / mount / filesystem)
+;
+; Deferred (full Linux fanotify):
+;   - real fsnotify event delivery
+;   - permission events with userspace response
+;   - event fd multiplexing
+
+(require "std/test" all:)
+(require "033-fanotify" all:)
+
+; ----------------------------------------------------------------
+; fanotify_event construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "fan-001-event-construction"
+  ; fanotify_event preserves mask, pid, fd.
+  (check (= 'access (fanotify-event-mask (make-fanotify-event 'access 1234 5))))
+  (check (= 1234 (fanotify-event-pid (make-fanotify-event 'access 1234 5))))
+  (check (= 5 (fanotify-event-fd (make-fanotify-event 'access 1234 5)))))
+
+(test-suite "fan-001-event-predicate"
+  ; fanotify-event? accepts only fanotify_event closures.
+  (check (= 1 (if (fanotify-event? (make-fanotify-event 'access 1 1)) 1 0)))
+  (check (= 1 (if (not (fanotify-event? 'not-an-event)) 1 0)))
+  (check (= 1 (if (not (fanotify-event? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; fanotify_mark construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "fan-002-mark-construction"
+  ; fanotify_mark preserves type, inode, flags.
+  (check (= 'inode (fanotify-mark-type (make-fanotify-mark 'inode 100 1))))
+  (check (= 100 (fanotify-mark-inode (make-fanotify-mark 'inode 100 1))))
+  (check (= 1 (fanotify-mark-flags (make-fanotify-mark 'inode 100 1)))))
+
+(test-suite "fan-002-mark-predicate"
+  ; fanotify-mark? accepts only fanotify_mark closures.
+  (check (= 1 (if (fanotify-mark? (make-fanotify-mark 'inode 100 1)) 1 0)))
+  (check (= 1 (if (fanotify-mark? (make-fanotify-mark 'mount 100 1)) 1 0)))
+  (check (= 1 (if (fanotify-mark? (make-fanotify-mark 'filesystem 100 1)) 1 0)))
+  (check (= 1 (if (not (fanotify-mark? 'not-a-mark)) 1 0))))
+
+; ----------------------------------------------------------------
+; fanotify_group construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "fan-003-group-construction"
+  ; fanotify_group preserves flags, event-fd, empty marks.
+  (check (= 1 (fanotify-group-flags (make-fanotify-group 1 7))))
+  (check (= 7 (fanotify-group-event-fd (make-fanotify-group 1 7))))
+  (check (= 1 (if (null? (fanotify-group-marks
+                            (make-fanotify-group 1 7))) 1 0))))
+
+(test-suite "fan-003-group-predicate"
+  ; fanotify-group? accepts only fanotify_group closures.
+  (check (= 1 (if (fanotify-group? (make-fanotify-group 1 7)) 1 0)))
+  (check (= 1 (if (not (fanotify-group? 'not-a-group)) 1 0)))
+  (check (= 1 (if (not (fanotify-group? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; Add / remove / find / count
+; ----------------------------------------------------------------
+
+(test-suite "fan-004-add-mark"
+  ; fanotify-add-mark prepends mark to group's marks list.
+  (check (= 1 (let ((g (make-fanotify-group 1 7)))
+                (let ((m (fanotify-add-mark g
+                          (make-fanotify-mark 'inode 100 1))))
+                  (if (eq? m (car (fanotify-group-marks g))) 1 0))))))
+
+(test-suite "fan-004-find-mark"
+  ; fanotify-find-mark returns mark by inode.
+  (check (= 1 (let ((g (make-fanotify-group 1 7)))
+                (let ((m (make-fanotify-mark 'inode 100 1)))
+                  (fanotify-add-mark g m)
+                  (if (eq? m (fanotify-find-mark g 100)) 1 0))))))
+
+(test-suite "fan-004-find-mark-missing"
+  ; fanotify-find-mark returns #f for unknown inode.
+  (check (= 1 (if (not (fanotify-find-mark
+                          (make-fanotify-group 1 7)
+                          999)) 1 0))))
+
+(test-suite "fan-004-remove-mark"
+  ; fanotify-remove-mark removes + find returns #f.
+  (check (= 1 (let ((g (make-fanotify-group 1 7)))
+                (let ((m (make-fanotify-mark 'inode 100 1)))
+                  (fanotify-add-mark g m)
+                  (fanotify-remove-mark g m)
+                  (if (not (fanotify-find-mark g 100)) 1 0))))))
+
+(test-suite "fan-004-remove-mark-not-found"
+  ; fanotify-remove-mark returns #f for non-registered mark.
+  (check (= 1 (if (not (fanotify-remove-mark
+                          (make-fanotify-group 1 7)
+                          (make-fanotify-mark 'inode 100 1))) 1 0))))
+
+(test-suite "fan-004-count"
+  ; fanotify-count tracks marks.
+  (check (= 1 (let ((g (make-fanotify-group 1 7)))
+                (fanotify-add-mark g (make-fanotify-mark 'inode 100 1))
+                (fanotify-count g)))))
+
+(test-suite "fan-004-count-empty"
+  ; Empty group has count 0.
+  (check (= 0 (fanotify-count (make-fanotify-group 1 7)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
