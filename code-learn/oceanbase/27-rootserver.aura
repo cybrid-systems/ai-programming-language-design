@@ -1,0 +1,472 @@
+; 27-rootserver.aura
+; ======================
+; rootserver — minimal capability port to aura.
+;
+; Maps to: OceanBase RootServer (cluster coordination + metadata)
+; Source: src/rootserver/ob_root_service.{h,cpp}
+;         + src/rootserver/ob_server_manager.{h,cpp}
+;         + src/rootserver/ob_zone_manager.{h,cpp}
+;         + src/rootserver/ob_unit_manager.{h,cpp}
+;         + src/rootserver/ob_root_balancer.{h,cpp}
+;         + src/rootserver/ob_tenant_ddl_service.{h,cpp}
+;         + src/rootserver/ob_ddl_service.{h,cpp}
+;         + src/rootserver/freeze/ob_major_freeze_service.{h,cpp}
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase RootServer:
+;   - ObRootService: main entry (aggregate sub-managers)
+;   - ObServerManager: server heartbeat / up-down
+;   - ObZoneManager: zone management
+;   - ObUnitManager: unit (resource pool) management
+;   - ObRootBalancer: load balancer
+;   - ObDDLService / ObTenantDDLService: DDL service
+;   - ObMajorFreezeService: major freeze orchestration
+;   - 200+ files, hundreds of thousands of lines
+;   - Internal __all_* tables for metadata
+;   - RPC framework via ObSrvRpcProxy / ObCommonRpcProxy
+;
+; aura v1 ships:
+;   - 5 RS-STATUS constants (INIT, STARTING, RUNNING, STOPPING,
+;     STOPPED)
+;   - 4 SERVER-STATUS constants (ALIVE, DEAD, INIT, UNKNOWN)
+;   - 4 ZONE-STATUS constants (ACTIVE, INACTIVE, INIT, UNKNOWN)
+;   - 4 UNIT-STATUS constants (ACTIVE, INACTIVE, INIT, DELETING)
+;   - 5 DDL-STATUS constants (PENDING, RUNNING, SUCCESS, FAILED,
+;     CANCELED)
+;   - make-root-service (factory: rs-id + tenant-id + state)
+;   - root-service-get-rs-id / get-tenant-id / get-state
+;   - root-service-set-state!
+;   - root-service-get-stats-...
+;   - make-server-manager (factory: server-count + active-count)
+;   - server-manager-get-server-count / get-active-count
+;   - server-manager-set-active-count! / inc-stats-heartbeat!
+;   - make-zone (factory: zone-id + name + state)
+;   - zone-get-id / get-name / get-state
+;   - zone-set-state!
+;   - make-unit (factory: unit-id + zone-id + server-id + state)
+;   - unit-get-id / get-state / get-zone-id / get-server-id
+;   - unit-set-state!
+;   - make-root-balancer (factory: last-balance-time + balance-count)
+;   - root-balancer-get-last-balance-time / get-balance-count
+;   - root-balancer-set-last-balance-time!
+;   - root-balancer-inc-balance-count!
+;   - make-ddl-task (factory: task-id + stmt + status)
+;   - ddl-task-get-task-id / get-stmt / get-status
+;   - ddl-task-set-status!
+;
+; Deferred (full OceanBase RootServer):
+;   - real ObRootService with 200+ files
+;   - real ObServerManager with heartbeat protocol
+;   - real ObZoneManager with multi-zone coordination
+;   - real ObUnitManager with pool placement
+;   - real ObRootBalancer with load balancing algorithms
+;   - real ObDDLService with internal table schema management
+;   - real ObMajorFreezeService with daily freeze
+;   - real internal __all_* tables (200+ tables)
+;   - real RPC framework (ObSrvRpcProxy, ObCommonRpcProxy)
+;   - real schema versioning (ObMultiVersionSchemaService)
+;   - real resource unit placement (point-product greedy)
+;   - real ObRestoreCtx for backup/restore coordination
+
+(export
+  ; RS status constants
+  RS-STATUS-INIT
+  RS-STATUS-STARTING
+  RS-STATUS-RUNNING
+  RS-STATUS-STOPPING
+  RS-STATUS-STOPPED
+  ; Server status constants
+  SERVER-STATUS-ALIVE
+  SERVER-STATUS-DEAD
+  SERVER-STATUS-INIT
+  SERVER-STATUS-UNKNOWN
+  ; Zone status constants
+  ZONE-STATUS-ACTIVE
+  ZONE-STATUS-INACTIVE
+  ZONE-STATUS-INIT
+  ZONE-STATUS-UNKNOWN
+  ; Unit status constants
+  UNIT-STATUS-ACTIVE
+  UNIT-STATUS-INACTIVE
+  UNIT-STATUS-INIT
+  UNIT-STATUS-DELETING
+  ; DDL status constants
+  DDL-STATUS-PENDING
+  DDL-STATUS-RUNNING
+  DDL-STATUS-SUCCESS
+  DDL-STATUS-FAILED
+  DDL-STATUS-CANCELED
+  ; ObRootService
+  make-root-service root-service?
+  root-service-get-rs-id
+  root-service-get-tenant-id
+  root-service-get-state
+  root-service-set-state!
+  root-service-get-stats-heartbeat
+  root-service-get-stats-ddl
+  root-service-get-stats-balance
+  root-service-inc-stats-ddl!
+  root-service-inc-stats-balance!
+  ; ObServerManager
+  make-server-manager server-manager?
+  server-manager-get-server-count
+  server-manager-get-active-count
+  server-manager-set-active-count!
+  server-manager-inc-stats-heartbeat!
+  ; ObZone
+  make-zone zone?
+  zone-get-id
+  zone-get-name
+  zone-get-state
+  zone-set-state!
+  ; ObUnit
+  make-unit unit?
+  unit-get-id
+  unit-get-state
+  unit-get-zone-id
+  unit-get-server-id
+  unit-set-state!
+  ; ObRootBalancer
+  make-root-balancer root-balancer?
+  root-balancer-get-last-balance-time
+  root-balancer-get-balance-count
+  root-balancer-set-last-balance-time!
+  root-balancer-inc-balance-count!
+  ; ObDDLTask
+  make-ddl-task ddl-task?
+  ddl-task-get-task-id
+  ddl-task-get-stmt
+  ddl-task-get-status
+  ddl-task-set-status!)
+
+; ----------------------------------------------------------------
+; RS status constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_root_service.h ObRsStatus):
+;   INIT → STARTING → RUNNING → STOPPING → STOPPED
+
+(define RS-STATUS-INIT 0)
+(define RS-STATUS-STARTING 1)
+(define RS-STATUS-RUNNING 2)
+(define RS-STATUS-STOPPING 3)
+(define RS-STATUS-STOPPED 4)
+
+; ----------------------------------------------------------------
+; Server status constants
+; ----------------------------------------------------------------
+
+(define SERVER-STATUS-ALIVE 0)
+(define SERVER-STATUS-DEAD 1)
+(define SERVER-STATUS-INIT 2)
+(define SERVER-STATUS-UNKNOWN 3)
+
+; ----------------------------------------------------------------
+; Zone status constants
+; ----------------------------------------------------------------
+
+(define ZONE-STATUS-ACTIVE 0)
+(define ZONE-STATUS-INACTIVE 1)
+(define ZONE-STATUS-INIT 2)
+(define ZONE-STATUS-UNKNOWN 3)
+
+; ----------------------------------------------------------------
+; Unit status constants
+; ----------------------------------------------------------------
+
+(define UNIT-STATUS-ACTIVE 0)
+(define UNIT-STATUS-INACTIVE 1)
+(define UNIT-STATUS-INIT 2)
+(define UNIT-STATUS-DELETING 3)
+
+; ----------------------------------------------------------------
+; DDL status constants
+; ----------------------------------------------------------------
+
+(define DDL-STATUS-PENDING 0)
+(define DDL-STATUS-RUNNING 1)
+(define DDL-STATUS-SUCCESS 2)
+(define DDL-STATUS-FAILED 3)
+(define DDL-STATUS-CANCELED 4)
+
+; ----------------------------------------------------------------
+; ObRootService — closure-based
+; ----------------------------------------------------------------
+
+; make-root-service: create an ObRootService.
+; Args: rs-id (integer), tenant-id (integer), state (integer)
+; Returns: root_service closure (initial: stats=0).
+(define (make-root-service rs-id tenant-id state)
+  (let ((stats-heartbeat 0)
+        (stats-ddl 0)
+        (stats-balance 0))
+    (letrec ((set-state! (lambda (v) (set! state v) v))
+             (set-stats-heartbeat! (lambda (v) (set! stats-heartbeat v) v))
+             (set-stats-ddl! (lambda (v) (set! stats-ddl v) v))
+             (set-stats-balance! (lambda (v) (set! stats-balance v) v))
+             (inc-stats-ddl! (lambda () (set! stats-ddl (+ stats-ddl 1)) stats-ddl))
+             (inc-stats-balance! (lambda () (set! stats-balance (+ stats-balance 1)) stats-balance))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'rs-id) rs-id)
+                       ((eq? msg 'tenant-id) tenant-id)
+                       ((eq? msg 'state) state)
+                       ((eq? msg 'stats-heartbeat) stats-heartbeat)
+                       ((eq? msg 'stats-ddl) stats-ddl)
+                       ((eq? msg 'stats-balance) stats-balance)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'set-stats-heartbeat!) set-stats-heartbeat!)
+                       ((eq? msg 'set-stats-ddl!) set-stats-ddl!)
+                       ((eq? msg 'set-stats-balance!) set-stats-balance!)
+                       ((eq? msg 'inc-stats-ddl!) inc-stats-ddl!)
+                       ((eq? msg 'inc-stats-balance!) inc-stats-balance!)
+                       (else #f)))))
+      self))
+
+; root-service?: is the object a root service?
+; Detected by querying 'rs-id — only root services return integer.
+(define (root-service? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'rs-id)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; root-service-get-rs-id: get RS id.
+(define (root-service-get-rs-id rs) (rs 'rs-id))
+
+; root-service-get-tenant-id: get sys tenant id.
+(define (root-service-get-tenant-id rs) (rs 'tenant-id))
+
+; root-service-get-state: get current state.
+(define (root-service-get-state rs) (rs 'state))
+
+; root-service-set-state!: set state.
+; Returns the new state.
+(define (root-service-set-state! rs v) ((rs 'set-state!) v))
+
+; root-service-get-stats-heartbeat: get heartbeat count.
+(define (root-service-get-stats-heartbeat rs) (rs 'stats-heartbeat))
+
+; root-service-get-stats-ddl: get DDL count.
+(define (root-service-get-stats-ddl rs) (rs 'stats-ddl))
+
+; root-service-get-stats-balance: get balance count.
+(define (root-service-get-stats-balance rs) (rs 'stats-balance))
+
+; root-service-inc-stats-ddl!: increment DDL count.
+(define (root-service-inc-stats-ddl! rs) ((rs 'inc-stats-ddl!)))
+
+; root-service-inc-stats-balance!: increment balance count.
+(define (root-service-inc-stats-balance! rs) ((rs 'inc-stats-balance!)))
+
+; ----------------------------------------------------------------
+; ObServerManager — closure-based
+; ----------------------------------------------------------------
+
+; make-server-manager: create a server manager.
+; Args: server-count (integer), active-count (integer),
+;       heartbeat-count (integer)
+; Returns: server_manager closure.
+(define (make-server-manager server-count active-count heartbeat-count)
+  (letrec ((set-active-count!
+              (lambda (v) (set! active-count v) v))
+           (set-heartbeat-count!
+              (lambda (v) (set! heartbeat-count v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'server-count) server-count)
+                     ((eq? msg 'active-count) active-count)
+                     ((eq? msg 'heartbeat-count) heartbeat-count)
+                     ((eq? msg 'set-active-count!) set-active-count!)
+                     ((eq? msg 'set-heartbeat-count!) set-heartbeat-count!)
+                     (else #f)))))
+      self))
+
+; server-manager?: is the object a server manager?
+; Detected by querying 'server-count — only managers return integer.
+(define (server-manager? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'server-count)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; server-manager-get-server-count: get total server count.
+(define (server-manager-get-server-count sm) (sm 'server-count))
+
+; server-manager-get-active-count: get active server count.
+(define (server-manager-get-active-count sm) (sm 'active-count))
+
+; server-manager-set-active-count!: set active count.
+(define (server-manager-set-active-count! sm v)
+  ((sm 'set-active-count!) v))
+
+; server-manager-inc-stats-heartbeat!: increment heartbeat count.
+(define (server-manager-inc-stats-heartbeat! sm)
+  ((sm 'set-heartbeat-count!) (+ (sm 'heartbeat-count) 1)))
+
+; ----------------------------------------------------------------
+; ObZone — closure-based
+; ----------------------------------------------------------------
+
+; make-zone: create an ObZone.
+; Args: zone-id (integer), name (symbol), state (integer)
+; Returns: zone closure.
+(define (make-zone zone-id name state)
+  (letrec ((set-state! (lambda (v) (set! state v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'id) zone-id)
+                     ((eq? msg 'name) name)
+                     ((eq? msg 'state) state)
+                     ((eq? msg 'set-state!) set-state!)
+                     (else #f)))))
+      self))
+
+; zone?: is the object a zone?
+; Detected by querying 'id — only zones return integer.
+(define (zone? obj)
+  (if (procedure? obj)
+      (let ((i (obj 'id)))
+        (if (and (integer? i) (>= i 0)) #t #f))
+      #f))
+
+; zone-get-id: get zone id.
+(define (zone-get-id z) (z 'id))
+
+; zone-get-name: get zone name.
+(define (zone-get-name z) (z 'name))
+
+; zone-get-state: get zone state.
+(define (zone-get-state z) (z 'state))
+
+; zone-set-state!: set zone state.
+(define (zone-set-state! z v) ((z 'set-state!) v))
+
+; ----------------------------------------------------------------
+; ObUnit — closure-based
+; ----------------------------------------------------------------
+
+; make-unit: create an ObUnit.
+; Args: unit-id (integer), zone-id (integer), server-id (integer),
+;       state (integer)
+; Returns: unit closure.
+(define (make-unit unit-id zone-id server-id state)
+  (letrec ((set-state! (lambda (v) (set! state v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'id) unit-id)
+                     ((eq? msg 'zone-id) zone-id)
+                     ((eq? msg 'server-id) server-id)
+                     ((eq? msg 'state) state)
+                     ((eq? msg 'set-state!) set-state!)
+                     (else #f)))))
+      self))
+
+; unit?: is the object a unit?
+; Detected by querying 'id — only units return integer.
+(define (unit? obj)
+  (if (procedure? obj)
+      (let ((i (obj 'id)))
+        (if (and (integer? i) (>= i 0)) #t #f))
+      #f))
+
+; unit-get-id: get unit id.
+(define (unit-get-id u) (u 'id))
+
+; unit-get-state: get unit state.
+(define (unit-get-state u) (u 'state))
+
+; unit-get-zone-id: get zone id.
+(define (unit-get-zone-id u) (u 'zone-id))
+
+; unit-get-server-id: get server id.
+(define (unit-get-server-id u) (u 'server-id))
+
+; unit-set-state!: set unit state.
+(define (unit-set-state! u v) ((u 'set-state!) v))
+
+; ----------------------------------------------------------------
+; ObRootBalancer — closure-based
+; ----------------------------------------------------------------
+
+; make-root-balancer: create a root balancer.
+; Args: last-balance-time (integer), balance-count (integer)
+; Returns: root_balancer closure.
+(define (make-root-balancer last-balance-time balance-count)
+  (letrec ((set-last-balance-time!
+              (lambda (v) (set! last-balance-time v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'last-balance-time) last-balance-time)
+                     ((eq? msg 'balance-count) balance-count)
+                     ((eq? msg 'set-last-balance-time!)
+                      set-last-balance-time!)
+                     (else #f)))))
+      self))
+
+; root-balancer?: is the object a root balancer?
+; Detected by querying 'last-balance-time — only balancers return
+; integer.
+(define (root-balancer? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'last-balance-time)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; root-balancer-get-last-balance-time: get last balance time.
+(define (root-balancer-get-last-balance-time rb) (rb 'last-balance-time))
+
+; root-balancer-get-balance-count: get total balance count.
+(define (root-balancer-get-balance-count rb) (rb 'balance-count))
+
+; root-balancer-set-last-balance-time!: set last balance time.
+(define (root-balancer-set-last-balance-time! rb v)
+  ((rb 'set-last-balance-time!) v))
+
+; root-balancer-inc-balance-count!: increment balance count.
+; Returns the new count.
+(define (root-balancer-inc-balance-count! rb)
+  (let ((cur (rb 'balance-count)))
+    ((rb 'set-last-balance-time!) cur)
+    cur))
+
+; ----------------------------------------------------------------
+; ObDDLTask — closure-based
+; ----------------------------------------------------------------
+
+; make-ddl-task: create a DDL task.
+; Args: task-id (integer), stmt (symbol — DDL statement),
+;       status (integer — DDL-STATUS-*)
+; Returns: ddl_task closure.
+(define (make-ddl-task task-id stmt status)
+  (letrec ((set-status! (lambda (v) (set! status v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'task-id) task-id)
+                     ((eq? msg 'stmt) stmt)
+                     ((eq? msg 'status) status)
+                     ((eq? msg 'set-status!) set-status!)
+                     (else #f)))))
+      self))
+
+; ddl-task?: is the object a DDL task?
+; Detected by querying 'stmt — only tasks return a symbol.
+(define (ddl-task? obj)
+  (if (procedure? obj)
+      (if (symbol? (obj 'stmt)) #t #f)
+      #f))
+
+; ddl-task-get-task-id: get task id.
+(define (ddl-task-get-task-id t) (t 'task-id))
+
+; ddl-task-get-stmt: get DDL statement.
+(define (ddl-task-get-stmt t) (t 'stmt))
+
+; ddl-task-get-status: get current status.
+(define (ddl-task-get-status t) (t 'status))
+
+; ddl-task-set-status!: set status.
+; Returns the new status.
+(define (ddl-task-set-status! t v) ((t 'set-status!) v))
