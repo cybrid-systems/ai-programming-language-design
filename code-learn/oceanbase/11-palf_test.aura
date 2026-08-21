@@ -1,0 +1,286 @@
+; 11-palf_test.aura
+; ======================
+; Smoke tests for 11-palf.aura — PALF (Paxos Log Framework) minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/11-palf_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 LOG-ROLE constants distinct
+;   - 3 LOG-ENTRY-TYPE constants distinct
+;   - 3 LOG-MODE constants distinct
+;   - make-log-entry + accessors
+;   - make-log-group-entry + accessors + entries-count
+;   - make-log-sliding-window + advance-committed + reset
+;   - make-palf-handle + accessors + setters + append-entry!
+;   - make-palf-instance + add/find/count/remove
+;   - palf-instance-advance-handle-committed!
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - State transitions correct
+;
+; Deferred (full OceanBase PALF):
+;   - real PalfHandleImpl with full Paxos state machine
+;   - real LogSlidingWindow with majority tracking + member lists
+;   - real LogConfigMgr (member add / remove / joint consensus)
+;   - real Election (priority / lease / vote logic)
+;   - real LogEngine storage + async I/O worker
+;   - real LogGroupEntryHeader (binary format + checksum)
+;   - real FetchLogEngine (log pulling)
+;   - real LogCache KV cache
+;   - real LogLearner (tree-based learner sync)
+
+(require "std/test" all:)
+(require "11-palf" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "11-001-log-role-distinct"
+  ; 3 LOG-ROLE constants are distinct.
+  (check (= 1 (if (not (= LOG-ROLE-LEADER LOG-ROLE-FOLLOWER)) 1 0)))
+  (check (= 1 (if (not (= LOG-ROLE-FOLLOWER LOG-ROLE-LEARNER)) 1 0))))
+
+(test-suite "11-001-log-entry-type-distinct"
+  ; 3 LOG-ENTRY-TYPE constants are distinct.
+  (check (= 1 (if (not (= LOG-ENTRY-TYPE-DATA LOG-ENTRY-TYPE-COMMIT)) 1 0)))
+  (check (= 1 (if (not (= LOG-ENTRY-TYPE-COMMIT LOG-ENTRY-TYPE-CHECKPOINT)) 1 0))))
+
+(test-suite "11-001-log-mode-distinct"
+  ; 3 LOG-MODE constants are distinct.
+  (check (= 1 (if (not (= LOG-MODE-APPEND LOG-MODE-RAW-WRITE)) 1 0)))
+  (check (= 1 (if (not (= LOG-MODE-RAW-WRITE LOG-MODE-READONLY)) 1 0))))
+
+; ----------------------------------------------------------------
+; LogEntry
+; ----------------------------------------------------------------
+
+(test-suite "11-002-log-entry-construction"
+  ; log-entry preserves fields.
+  (check (= 100 (log-entry-get-lsn (make-log-entry 100 LOG-ENTRY-TYPE-DATA 'data 1))))
+  (check (= LOG-ENTRY-TYPE-DATA
+             (log-entry-get-entry-type (make-log-entry 100 LOG-ENTRY-TYPE-DATA 'data 1))))
+  (check (= #t (eq? 'data
+                   (log-entry-get-data
+                     (make-log-entry 100 LOG-ENTRY-TYPE-DATA 'data 1)))))
+  (check (= 1 (log-entry-get-proposals
+               (make-log-entry 100 LOG-ENTRY-TYPE-DATA 'data 1))))
+
+(test-suite "11-002-log-entry-predicate"
+  ; log-entry? accepts only log_entries.
+  (check (= #t (log-entry? (make-log-entry 1 LOG-ENTRY-TYPE-DATA 'd 1))))
+  (check (= #f (log-entry? 'not-an-entry)))
+  (check (= #f (log-entry? 42))))
+
+; ----------------------------------------------------------------
+; LogGroupEntry
+; ----------------------------------------------------------------
+
+; log-group-entry-get-entries-count is defined in 11-palf.aura; refer to it.
+
+(test-suite "11-003-log-group-entry-construction"
+  ; log-group-entry preserves header-flags, header-data-size, entries.
+  (check (= 5 (log-group-entry-get-header-flags
+               (make-log-group-entry 5 1024
+                 (list (make-log-entry 1 LOG-ENTRY-TYPE-DATA 'd 1)))))
+  (check (= 1024 (log-group-entry-get-header-data-size
+                   (make-log-group-entry 5 1024
+                     (list (make-log-entry 1 LOG-ENTRY-TYPE-DATA 'd 1)))))
+  (check (= 1 (log-group-entry-get-entries-count
+              (make-log-group-entry 5 1024
+                (list (make-log-entry 1 LOG-ENTRY-TYPE-DATA 'd 1)))))
+
+(test-suite "11-003-log-group-entry-predicate"
+  ; log-group-entry? accepts only log_group_entries.
+  (check (= #t (log-group-entry?
+                 (make-log-group-entry 0 0 '()))))
+  (check (= #f (log-group-entry? 'not-a-lge)))
+  (check (= #f (log-group-entry? 42))))
+
+(test-suite "11-003-log-group-entry-multi-entries"
+  ; log-group-entry-get-entries-count for multiple entries.
+  (check (= 3 (log-group-entry-get-entries-count
+               (make-log-group-entry 0 0
+                 (list (make-log-entry 1 LOG-ENTRY-TYPE-DATA 'a 1)
+                       (make-log-entry 2 LOG-ENTRY-TYPE-DATA 'b 1)
+                       (make-log-entry 3 LOG-ENTRY-TYPE-COMMIT 'c 1))))))
+
+(test-suite "11-003-log-group-entry-set-entries"
+  ; log-group-entry-set-entries! updates.
+  (check (= 2 (let ((lge (make-log-group-entry 0 0 '())))
+                 (log-group-entry-set-entries! lge
+                   (list (make-log-entry 1 LOG-ENTRY-TYPE-DATA 'x 1)
+                         (make-log-entry 2 LOG-ENTRY-TYPE-DATA 'y 1)))
+                 (log-group-entry-get-entries-count lge))))
+
+; ----------------------------------------------------------------
+; LogSlidingWindow
+; ----------------------------------------------------------------
+
+(test-suite "11-004-sliding-window-init"
+  ; new sliding window starts at 0/0.
+  (check (= 0 (log-sliding-window-get-max-applied-lsn
+               (make-log-sliding-window))))
+  (check (= 0 (log-sliding-window-get-committed-lsn
+               (make-log-sliding-window))))
+
+(test-suite "11-004-sliding-window-predicate"
+  ; log-sliding-window? accepts only sliding_windows.
+  (check (= #t (log-sliding-window? (make-log-sliding-window))))
+  (check (= #f (log-sliding-window? 'not-a-sw)))
+  (check (= #f (log-sliding-window? 42))))
+
+(test-suite "11-004-sliding-window-setters"
+  ; sliding-window setters update fields.
+  (check (= 50 (let ((sw (make-log-sliding-window)))
+                 (log-sliding-window-set-max-applied-lsn! sw 50)
+                 (log-sliding-window-get-max-applied-lsn sw))))
+  (check (= 30 (let ((sw (make-log-sliding-window)))
+                 (log-sliding-window-set-committed-lsn! sw 30)
+                 (log-sliding-window-get-committed-lsn sw))))
+
+(test-suite "11-005-advance-committed-no-change"
+  ; advance-committed! is no-op when committed >= max-applied.
+  (check (= 10 (let ((sw (make-log-sliding-window)))
+                 (log-sliding-window-set-committed-lsn! sw 10)
+                 (log-sliding-window-set-max-applied-lsn! sw 5)
+                 (log-sliding-window-advance-committed! sw)
+                 (log-sliding-window-get-committed-lsn sw))))
+
+(test-suite "11-005-advance-committed-updates"
+  ; advance-committed! advances to max-applied.
+  (check (= 100 (let ((sw (make-log-sliding-window)))
+                 (log-sliding-window-set-max-applied-lsn! sw 100)
+                 (log-sliding-window-advance-committed! sw)
+                 (log-sliding-window-get-committed-lsn sw))))
+
+(test-suite "11-005-advance-committed-after-set"
+  ; advance-committed! after setting max-applied.
+  (check (= #t (let ((sw (make-log-sliding-window)))
+                 (log-sliding-window-set-max-applied-lsn! sw 200)
+                 (log-sliding-window-advance-committed! sw)
+                 (and (= 200 (log-sliding-window-get-max-applied-lsn sw))
+                      (= 200 (log-sliding-window-get-committed-lsn sw))))))
+
+(test-suite "11-005-reset"
+  ; reset! zeros both pointers.
+  (check (= #t (let ((sw (make-log-sliding-window)))
+                 (log-sliding-window-set-max-applied-lsn! sw 100)
+                 (log-sliding-window-set-committed-lsn! sw 50)
+                 (log-sliding-window-reset! sw)
+                 (and (= 0 (log-sliding-window-get-max-applied-lsn sw))
+                      (= 0 (log-sliding-window-get-committed-lsn sw))))))
+
+; ----------------------------------------------------------------
+; PalfHandle
+; ----------------------------------------------------------------
+
+(test-suite "11-006-palf-handle-construction"
+  ; palf-handle preserves palf-id, initial-max-lsn.
+  (check (= 1 (palf-handle-get-palf-id (make-palf-handle 1 0))))
+  (check (= 100 (palf-handle-get-max-lsn (make-palf-handle 1 100))))
+  (check (= LOG-ROLE-FOLLOWER (palf-handle-get-role (make-palf-handle 1 0))))
+
+(test-suite "11-006-palf-handle-predicate"
+  ; palf-handle? accepts only palf_handles.
+  (check (= #t (palf-handle? (make-palf-handle 1 0))))
+  (check (= #f (palf-handle? 'not-a-handle)))
+  (check (= #f (palf-handle? 42))))
+
+(test-suite "11-007-palf-handle-setters"
+  ; palf-handle setters update fields.
+  (check (= LOG-ROLE-LEADER
+             (let ((h (make-palf-handle 1 0)))
+               (palf-handle-set-role! h LOG-ROLE-LEADER)
+               (palf-handle-get-role h))))
+  (check (= 50 (let ((h (make-palf-handle 1 0)))
+                 (palf-handle-set-max-lsn! h 50)
+                 (palf-handle-get-max-lsn h))))
+  (check (= 99 (let ((h (make-palf-handle 1 0)))
+                 (palf-handle-set-state! h 99)
+                 (palf-handle-get-state h))))
+
+(test-suite "11-007-append-entry"
+  ; append-entry! increments max-lsn.
+  (check (= 1 (let ((h (make-palf-handle 1 0)))
+                 (palf-handle-append-entry! h))))
+  (check (= 5 (let ((h (make-palf-handle 1 0)))
+                 (palf-handle-append-entry! h)
+                 (palf-handle-append-entry! h)
+                 (palf-handle-append-entry! h)
+                 (palf-handle-append-entry! h)
+                 (palf-handle-append-entry! h))))
+
+; ----------------------------------------------------------------
+; PalfInstance
+; ----------------------------------------------------------------
+
+(test-suite "11-008-palf-instance-construction"
+  ; new instance starts empty with 0 total-lsn.
+  (check (= 0 (palf-instance-count-handles (make-palf-instance))))
+  (check (= 0 (palf-instance-get-total-lsn (make-palf-instance))))
+
+(test-suite "11-008-palf-instance-predicate"
+  ; palf-instance? accepts only instances.
+  (check (= #t (palf-instance? (make-palf-instance))))
+  (check (= #f (palf-instance? 'not-an-inst)))
+  (check (= #f (palf-instance? 42))))
+
+(test-suite "11-008-palf-instance-add-handle"
+  ; add-handle! increments count + total-lsn.
+  (check (= 1 (let ((inst (make-palf-instance))
+                    (h (make-palf-handle 1 0)))
+                (palf-instance-add-handle! inst h)
+                (palf-instance-count-handles inst))))
+  (check (= 1 (let ((inst (make-palf-instance))
+                    (h (make-palf-handle 1 0)))
+                (palf-instance-add-handle! inst h)
+                (palf-instance-get-total-lsn inst))))
+
+(test-suite "11-008-palf-instance-find-handle"
+  ; find-handle returns the registered handle.
+  (check (= #t (let ((inst (make-palf-instance))
+                    (h (make-palf-handle 42 0)))
+                (palf-instance-add-handle! inst h)
+                (eq? h (palf-instance-find-handle inst 42)))))
+
+(test-suite "11-008-palf-instance-find-missing"
+  ; find-handle returns #f for unknown palf-id.
+  (check (= #f (palf-instance-find-handle (make-palf-instance) 99))))
+
+(test-suite "11-008-palf-instance-remove-handle"
+  ; remove-handle! removes + find returns #f.
+  (check (= #t (let ((inst (make-palf-instance))
+                    (h (make-palf-handle 42 0)))
+                (palf-instance-add-handle! inst h)
+                (palf-instance-remove-handle! inst 42)
+                (eq? #f (palf-instance-find-handle inst 42)))))
+
+(test-suite "11-008-palf-instance-remove-not-found"
+  ; remove-handle! returns #f for non-existing.
+  (check (= #f (palf-instance-remove-handle!
+                 (make-palf-instance) 99))))
+
+(test-suite "11-009-advance-handle-committed"
+  ; advance-handle-committed! syncs sliding window with handle's
+  ; max-lsn, then advances committed.
+  (check (= 100 (let ((inst (make-palf-instance))
+                    (h (make-palf-handle 1 0))
+                    (sw (make-log-sliding-window)))
+                (palf-handle-append-entry! h)  ; max-lsn = 1
+                (palf-handle-append-entry! h)  ; max-lsn = 2
+                ; manually set max-lsn = 100 for testing
+                (palf-handle-set-max-lsn! h 100)
+                (palf-instance-add-handle! inst h)
+                (palf-instance-advance-handle-committed! inst 1 sw)
+                (log-sliding-window-get-committed-lsn sw))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

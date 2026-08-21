@@ -1,0 +1,435 @@
+; 11-palf.aura
+; =====================
+; palf — minimal capability port to aura.
+;
+; Maps to: OceanBase PALF (Paxos-Structured Log Framework)
+; Source: src/logservice/palf/palf_handle_impl.h
+;         + src/logservice/palf/log_engine.h
+;         + src/logservice/palf/log_entry.h + log_group_entry.h
+;         + src/logservice/palf/log_sliding_window.h
+;         + src/logservice/palf/log_state_mgr.h
+;         + src/logservice/palf/log_learner.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase PALF (Paxos-Structured Log Framework):
+;   - IPalfHandle (public API): append / read / truncate / ack
+;   - PalfHandleImpl (Paxos state machine core)
+;   - LogSlidingWindow (majority tracking per LSN)
+;   - LogStateMgr (role state machine: LEADER / FOLLOWER / LEARNER)
+;   - LogEntry (single log entry: lsn + type + data)
+;   - LogGroupEntry (batch of LogEntry with header)
+;   - LogEngine (storage engine — block mgr + cache + IO worker)
+;   - Election (leader election module)
+;   - LogConfigMgr (member list + replica count)
+;
+; aura has no Paxos, no consensus, no leader election. v1 ships:
+;   - 3 LOG-ROLE constants (LEADER, FOLLOWER, LEARNER)
+;   - 3 LOG-ENTRY-TYPE constants (DATA, COMMIT, CHECKPOINT)
+;   - 3 LOG-MODE constants (APPEND, RAW_WRITE, READONLY)
+;   - make-log-entry (factory: lsn + type + data + proposals)
+;   - log-entry accessors
+;   - log-entry-proposals (number of Paxos proposals for this entry)
+;   - make-log-group-entry (factory: header + entries list)
+;   - log-group-entry accessors
+;   - make-log-sliding-window (factory: max-applied-lsn + committed-lsn)
+;   - log-sliding-window-get-max-applied-lsn
+;   - log-sliding-window-get-committed-lsn
+;   - log-sliding-window-set-committed-lsn!
+;   - log-sliding-window-advance-committed! (mimic majority)
+;   - log-sliding-window-reset!
+;   - make-palf-handle (factory: palf-id + max-lsn + state)
+;   - palf-handle-get-palf-id / max-lsn / state / role
+;   - palf-handle-set-role! / set-state! / set-max-lsn!
+;   - palf-handle-append-entry! (advance max-lsn)
+;   - make-palf-instance (registry of handles)
+;   - palf-instance-add-handle! / find-handle / count-handles
+;   - palf-instance-advance-handle-committed! (simulate consensus)
+;
+; Deferred (full OceanBase PALF):
+;   - real PalfHandleImpl with full Paxos state machine
+;   - real LogSlidingWindow with majority tracking + member lists
+;   - real LogConfigMgr (member add / remove / joint consensus)
+;   - real Election (priority / lease / vote logic)
+;   - real LogEngine storage + async I/O worker
+;   - real LogGroupEntryHeader (binary format + checksum)
+;   - real FetchLogEngine (log pulling)
+;   - real LogCache KV cache
+;   - real LogLearner (tree-based learner sync)
+
+(export
+  ; Log role constants
+  LOG-ROLE-LEADER LOG-ROLE-FOLLOWER LOG-ROLE-LEARNER
+  ; Log entry type constants
+  LOG-ENTRY-TYPE-DATA LOG-ENTRY-TYPE-COMMIT
+  LOG-ENTRY-TYPE-CHECKPOINT
+  ; Log mode constants
+  LOG-MODE-APPEND LOG-MODE-RAW-WRITE LOG-MODE-READONLY
+  ; LogEntry
+  make-log-entry log-entry?
+  log-entry-get-lsn log-entry-get-entry-type
+  log-entry-get-data log-entry-get-proposals
+  ; LogGroupEntry
+  make-log-group-entry log-group-entry?
+  log-group-entry-get-header-flags log-entry-get-header-data-size
+  log-group-entry-get-entries log-group-entry-get-entries-count
+  log-group-entry-set-entries!
+  ; LogSlidingWindow
+  make-log-sliding-window log-sliding-window?
+  log-sliding-window-get-max-applied-lsn
+  log-sliding-window-get-committed-lsn
+  log-sliding-window-set-max-applied-lsn!
+  log-sliding-window-set-committed-lsn!
+  log-sliding-window-advance-committed!
+  log-sliding-window-reset!
+  ; PalfHandle
+  make-palf-handle palf-handle?
+  palf-handle-get-palf-id palf-handle-get-max-lsn
+  palf-handle-get-state palf-handle-get-role
+  palf-handle-set-role! palf-handle-set-state!
+  palf-handle-set-max-lsn!
+  palf-handle-append-entry!
+  ; PalfInstance (registry)
+  make-palf-instance palf-instance?
+  palf-instance-add-handle!
+  palf-instance-find-handle
+  palf-instance-count-handles
+  palf-instance-remove-handle!
+  palf-instance-advance-handle-committed!
+  palf-instance-get-total-lsn)
+
+; ----------------------------------------------------------------
+; Log role constants (per log_state_mgr.h)
+; ----------------------------------------------------------------
+
+(define LOG-ROLE-LEADER 1)
+(define LOG-ROLE-FOLLOWER 2)
+(define LOG-ROLE-LEARNER 4)
+
+; ----------------------------------------------------------------
+; Log entry type constants (per log_entry.h)
+; ----------------------------------------------------------------
+
+(define LOG-ENTRY-TYPE-DATA 1)
+(define LOG-ENTRY-TYPE-COMMIT 2)
+(define LOG-ENTRY-TYPE-CHECKPOINT 4)
+
+; ----------------------------------------------------------------
+; Log mode constants (per palf_env.h)
+; ----------------------------------------------------------------
+
+(define LOG-MODE-APPEND 1)
+(define LOG-MODE-RAW-WRITE 2)
+(define LOG-MODE-READONLY 4)
+
+; ----------------------------------------------------------------
+; LogEntry — closure-based
+; ----------------------------------------------------------------
+
+; make-log-entry: create a LogEntry.
+; Args: lsn (integer — Log Sequence Number), entry-type (integer),
+;       data (any — log payload), proposals (integer — Paxos proposals)
+; Returns: log_entry closure.
+(define (make-log-entry lsn entry-type data proposals)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'lsn) lsn)
+                     ((eq? msg 'entry-type) entry-type)
+                     ((eq? msg 'data) data)
+                     ((eq? msg 'proposals) proposals)
+                     (else #f)))))
+      self)))
+
+; log-entry?: is the object a log entry?
+; Detected by querying 'lsn — only log_entries return an integer.
+(define (log-entry? obj)
+  (if (procedure? obj)
+      (let ((l (obj 'lsn)))
+        (if (and (integer? l) (>= l 0)) #t #f))
+      #f))
+
+; log-entry-get-lsn: get Log Sequence Number.
+(define (log-entry-get-lsn e) (e 'lsn))
+
+; log-entry-get-entry-type: get entry type.
+(define (log-entry-get-entry-type e) (e 'entry-type))
+
+; log-entry-get-data: get payload data.
+(define (log-entry-get-data e) (e 'data))
+
+; log-entry-get-proposals: get number of Paxos proposals for this entry.
+; (Higher proposals = older entry that needs more confirmations.)
+(define (log-entry-get-proposals e) (e 'proposals))
+
+; ----------------------------------------------------------------
+; LogGroupEntry — closure-based (batch wrapper)
+; ----------------------------------------------------------------
+;
+; Per OB (log_group_entry.h):
+;   LogGroupEntryHeader + multiple LogEntry records (batched)
+
+; make-log-group-entry: create a LogGroupEntry.
+; Args: header-flags (integer), header-data-size (integer),
+;       entries (list of log_entry closures)
+; Returns: log_group_entry closure.
+(define (make-log-group-entry header-flags header-data-size entries)
+  (let ((e entries))
+    (letrec ((set-entries! (lambda (v) (set! e v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'header-flags) header-flags)
+                       ((eq? msg 'header-data-size) header-data-size)
+                       ((eq? msg 'entries) e)
+                       ((eq? msg 'set-entries!) set-entries!)
+                       (else #f)))))
+      self)))
+
+; log-group-entry?: is the object a log group entry?
+; Detected by querying 'header-flags — only log_group_entries return integer.
+(define (log-group-entry? obj)
+  (if (procedure? obj)
+      (let ((f (obj 'header-flags)))
+        (if (integer? f) #t #f))
+      #f))
+
+; log-entry-get-header-flags: get header flags.
+; (Note: name clash with log-entry-get-entry-type — this is for group
+; header. For clarity we expose as log-group-entry-get-header-flags.)
+(define (log-group-entry-get-header-flags ge) (ge 'header-flags))
+
+; log-entry-get-header-data-size: get header data size.
+(define (log-group-entry-get-header-data-size ge) (ge 'header-data-size))
+
+; log-group-entry-get-entries: get entries list.
+(define (log-group-entry-get-entries ge) (ge 'entries))
+
+; log-group-entry-get-entries-count: get count of entries.
+(define (log-group-entry-get-entries-count ge)
+  (let loop ((rest (ge 'entries)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; log-group-entry-set-entries!: set entries list.
+(define (log-group-entry-set-entries! ge v)
+  ((ge 'set-entries!) v))
+
+; ----------------------------------------------------------------
+; LogSlidingWindow — closure-based
+; ----------------------------------------------------------------
+;
+; Per OB (log_sliding_window.h):
+;   - Tracks max_applied_lsn + committed_lsn
+;   - committed_lsn advances when majority of replicas confirm
+
+; make-log-sliding-window: create an empty sliding window.
+; Returns: sliding_window closure (initial: max-applied=0, committed=0).
+(define (make-log-sliding-window)
+  (let ((max-applied-lsn 0)
+        (committed-lsn 0))
+    (letrec ((set-max-applied! (lambda (v) (set! max-applied-lsn v) v))
+             (set-committed! (lambda (v) (set! committed-lsn v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'max-applied-lsn) max-applied-lsn)
+                       ((eq? msg 'committed-lsn) committed-lsn)
+                       ((eq? msg 'set-max-applied!) set-max-applied!)
+                       ((eq? msg 'set-committed!) set-committed!)
+                       (else #f)))))
+      self)))
+
+; log-sliding-window?: is the object a sliding window?
+; Detected by querying 'max-applied-lsn — only sliding_windows return integer.
+(define (log-sliding-window? obj)
+  (if (procedure? obj)
+      (let ((m (obj 'max-applied-lsn)))
+        (if (and (integer? m) (>= m 0)) #t #f))
+      #f))
+
+; log-sliding-window-get-max-applied-lsn: get max applied LSN.
+(define (log-sliding-window-get-max-applied-lsn sw) (sw 'max-applied-lsn))
+
+; log-sliding-window-get-committed-lsn: get committed LSN.
+(define (log-sliding-window-get-committed-lsn sw) (sw 'committed-lsn))
+
+; log-sliding-window-set-max-applied-lsn!: set max applied LSN.
+; Returns the new value.
+(define (log-sliding-window-set-max-applied-lsn! sw v)
+  ((sw 'set-max-applied!) v))
+
+; log-sliding-window-set-committed-lsn!: set committed LSN.
+; Returns the new value.
+(define (log-sliding-window-set-committed-lsn! sw v)
+  ((sw 'set-committed!) v))
+
+; log-sliding-window-advance-committed!: advance committed-lsn
+; to max(max, max-applied) (when majority confirms).
+; Returns the new committed-lsn.
+(define (log-sliding-window-advance-committed! sw)
+  (let ((max-applied (sw 'max-applied-lsn))
+        (committed (sw 'committed-lsn)))
+    (if (> max-applied committed)
+        (begin
+          ((sw 'set-committed!) max-applied)
+          max-applied)
+        committed)))
+
+; log-sliding-window-reset!: reset both pointers to 0.
+(define (log-sliding-window-reset! sw)
+  ((sw 'set-max-applied!) 0)
+  ((sw 'set-committed!) 0))
+
+; ----------------------------------------------------------------
+; PalfHandle — closure-based (PalfHandleImpl v1 minimal)
+; ----------------------------------------------------------------
+
+; make-palf-handle: create a PalfHandle.
+; Args: palf-id (integer), initial-max-lsn (integer)
+; Returns: palf_handle closure.
+(define (make-palf-handle palf-id initial-max-lsn)
+  (let ((max-lsn initial-max-lsn)
+        (state 0)
+        (role LOG-ROLE-FOLLOWER))
+    (letrec ((set-max-lsn! (lambda (v) (set! max-lsn v) v))
+             (set-state! (lambda (v) (set! state v) v))
+             (set-role! (lambda (v) (set! role v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'palf-id) palf-id)
+                       ((eq? msg 'max-lsn) max-lsn)
+                       ((eq? msg 'state) state)
+                       ((eq? msg 'role) role)
+                       ((eq? msg 'set-max-lsn!) set-max-lsn!)
+                       ((eq? msg 'set-state!) set-state!)
+                       ((eq? msg 'set-role!) set-role!)
+                       (else #f)))))
+      self)))
+
+; palf-handle?: is the object a PalfHandle?
+; Detected by querying 'palf-id — only palf_handles return integer.
+(define (palf-handle? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'palf-id)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; palf-handle-get-palf-id: get PALF id.
+(define (palf-handle-get-palf-id h) (h 'palf-id))
+
+; palf-handle-get-max-lsn: get max LSN.
+(define (palf-handle-get-max-lsn h) (h 'max-lsn))
+
+; palf-handle-get-state: get state (opaque).
+(define (palf-handle-get-state h) (h 'state))
+
+; palf-handle-get-role: get current role (LEADER/FOLLOWER/LEARNER).
+(define (palf-handle-get-role h) (h 'role))
+
+; palf-handle-set-role!: set role.
+(define (palf-handle-set-role! h v) ((h 'set-role!) v))
+
+; palf-handle-set-state!: set state.
+(define (palf-handle-set-state! h v) ((h 'set-state!) v))
+
+; palf-handle-set-max-lsn!: set max-lsn.
+(define (palf-handle-set-max-lsn! h v) ((h 'set-max-lsn!) v))
+
+; palf-handle-append-entry!: advance max-lsn by 1 (simulate leader
+; appending an entry). Returns the new max-lsn.
+; (In real OB, this would also persist to disk + wait for majority.)
+(define (palf-handle-append-entry! h)
+  (let ((new-max (+ (h 'max-lsn) 1)))
+    ((h 'set-max-lsn!) new-max)
+    new-max))
+
+; ----------------------------------------------------------------
+; PalfInstance — closure-based registry of handles
+; ----------------------------------------------------------------
+
+; make-palf-instance: create an empty PalfInstance registry.
+; Returns: palf_instance closure.
+(define (make-palf-instance)
+  (let ((handles '())
+        (total-lsn 0))
+    (letrec ((set-handles! (lambda (v) (set! handles v) v))
+             (set-total-lsn! (lambda (v) (set! total-lsn v) v))
+             (inc-total-lsn! (lambda () (set! total-lsn (+ total-lsn 1)) total-lsn))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'handles) handles)
+                       ((eq? msg 'total-lsn) total-lsn)
+                       ((eq? msg 'set-handles!) set-handles!)
+                       ((eq? msg 'set-total-lsn!) set-total-lsn!)
+                       ((eq? msg 'inc-total-lsn!) inc-total-lsn!)
+                       (else #f)))))
+      self)))
+
+; palf-instance?: is the object a PalfInstance?
+; Detected by querying 'total-lsn — only instances return integer.
+(define (palf-instance? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'total-lsn)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; palf-instance-add-handle!: register a PalfHandle.
+; Returns the new total-lsn counter.
+(define (palf-instance-add-handle! inst handle)
+  ((inst 'set-handles!) (cons handle (inst 'handles)))
+  ((inst 'inc-total-lsn!)))
+
+; palf-instance-find-handle: find handle by palf-id.
+; Returns the handle or #f.
+(define (palf-instance-find-handle inst palf-id)
+  (let loop ((rest (inst 'handles)))
+    (cond
+      ((null? rest) #f)
+      ((= ((car rest) 'palf-id) palf-id) (car rest))
+      (else (loop (cdr rest))))))
+
+; palf-instance-count-handles: count of registered handles.
+(define (palf-instance-count-handles inst)
+  (let loop ((rest (inst 'handles)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; palf-instance-remove-handle!: remove handle by palf-id.
+; Returns #t if removed, #f if not found.
+(define (palf-instance-remove-handle! inst palf-id)
+  (letrec ((found? #f)
+           (search (lambda (rest acc)
+                     (cond
+                       ((null? rest)
+                        (if found?
+                            ((inst 'set-handles!) (cons-rev-palf acc '()))
+                            ((inst 'set-handles!) acc))
+                        found?)
+                       ((= ((car rest) 'palf-id) palf-id)
+                        (set! found? #t)
+                        (search (cdr rest) acc))
+                       (else
+                        (search (cdr rest) (cons (car rest) acc)))))))
+    (search (inst 'handles) '())))
+
+; cons-rev-palf: helper — (cons-rev-palf acc rest) = (append (reverse acc) rest)
+(define (cons-rev-palf acc rest)
+  (if (null? acc)
+      rest
+      (cons-rev-palf (cdr acc) (cons (car acc) rest))))
+
+; palf-instance-advance-handle-committed!: find handle, advance its
+; sliding window's committed-lsn to its max-applied-lsn.
+; Returns the new committed-lsn, or #f if handle not found.
+(define (palf-instance-advance-handle-committed! inst palf-id sw)
+  (let ((handle (palf-instance-find-handle inst palf-id)))
+    (if handle
+        (let ((new-max (handle 'max-lsn)))
+          ((sw 'set-max-applied!) new-max)
+          (log-sliding-window-advance-committed! sw))
+        #f)))
+
+; palf-instance-get-total-lsn: get total accumulated LSN counter.
+(define (palf-instance-get-total-lsn inst)
+  (inst 'total-lsn))
