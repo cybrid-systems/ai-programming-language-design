@@ -1,0 +1,345 @@
+; 44-io-subsystem.aura
+; ======================
+; io subsystem — minimal capability port to aura.
+;
+; Maps to: OceanBase IOManager + IO Scheduler + mClock
+; Source: src/share/io/ob_io_manager.h
+;         + src/share/io/ob_io_define.h
+;         + src/share/io/ob_io_struct.h
+;         + src/share/io/io_schedule/ob_io_mclock.h
+;         + src/share/io/ob_io_calibration.h
+;         + deps/oblib/src/common/storage/ob_io_device.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase IO Subsystem:
+;   - 2 IO-MODE constants: READ / WRITE
+;   - 4 IO-PRIORITY constants: EMERGENT / HIGH / MIDDLE / LOW
+;   - 3 MCLK-QUEUE constants: HOT / WARM / COLD
+;   - 2 MCLK-RES-TYPE constants: IOPS / BW
+;   - ObIOInfo: IO request info (tenant, fd, offset, size, ...)
+;   - ObIORequest: IO request with retry count
+;   - ObIOHandle: IO result handle (data-size, status, buf)
+;   - ObMClockEntry: mClock scheduler entry
+;   - ObIOScheduler: V1 IO scheduler (mClock)
+;
+; aura v1 ships:
+;   - 2 IO-MODE constants
+;   - 4 IO-PRIORITY constants
+;   - 3 MCLK-QUEUE constants
+;   - 2 MCLK-RES-TYPE constants
+;   - make-io-info (factory: tenant-id + fd + offset + size +
+;     timeout-us + priority)
+;   - io-info accessors + set-priority!
+;   - make-io-request (factory: io-info + retry-count)
+;   - io-request accessors + set-retry-count!
+;   - make-io-handle (factory: data-size + status + buf-ptr)
+;   - io-handle accessors + set-status!
+;   - make-mclock-entry (factory: queue + res-type + weight)
+;   - mclock-entry accessors
+;   - make-io-scheduler (factory: sender-count + queue-depth)
+;   - io-scheduler accessors + set-running!
+;
+; Deferred (full OceanBase IO Subsystem):
+;   - real ObIOManager singleton with init/destroy/start/stop
+;   - real ObTenantIOManager with tenant config + usage + tracer
+;   - real ObIORequest lifecycle (init/prepare/submit/complete/callback)
+;   - real ObIOHandle wait/notify with ObThreadCond
+;   - real ObIOResult with 9-stage ObIOTimeLog timeline
+;   - real ObIOFlag bit-field (mode/read_mode/func_type/wait_event_id/...)
+;   - real ObIOSender thread with pop_and_submit loop
+;   - real ObDeviceChannel with AsyncChannel + SyncChannel
+;   - real ObMClock queue with reverse priority sort
+;   - real V2 scheduler (ObIOManagerV2 + qdisc + ObPhyQueue)
+;   - real ObTenantIOClock with per-tenant mClock state
+;   - real ObIOCalibration auto-iops/latency measurement
+;   - real ObIODevice vtable (pread/pwrite/aio_read/aio_write)
+;   - real ObIOFaultDetector device health check
+;   - real ObTrafficControl shared-storage bandwidth limiting
+
+(export
+  ; IO-MODE constants
+  IO-MODE-READ
+  IO-MODE-WRITE
+  ; IO-PRIORITY constants
+  IO-PRIORITY-EMERGENT
+  IO-PRIORITY-HIGH
+  IO-PRIORITY-MIDDLE
+  IO-PRIORITY-LOW
+  ; MCLK-QUEUE constants
+  MCLK-QUEUE-HOT
+  MCLK-QUEUE-WARM
+  MCLK-QUEUE-COLD
+  ; MCLK-RES-TYPE constants
+  MCLK-RES-TYPE-IOPS
+  MCLK-RES-TYPE-BW
+  ; IOInfo
+  make-io-info
+  io-info?
+  io-info-get-tenant-id
+  io-info-get-fd
+  io-info-get-offset
+  io-info-get-size
+  io-info-get-timeout-us
+  io-info-get-priority
+  io-info-set-priority!
+  ; IORequest
+  make-io-request
+  io-request?
+  io-request-get-io-info
+  io-request-get-retry-count
+  io-request-set-retry-count!
+  ; IOHandle
+  make-io-handle
+  io-handle?
+  io-handle-get-data-size
+  io-handle-get-status
+  io-handle-get-buf-ptr
+  io-handle-set-status!
+  ; MClockEntry
+  make-mclock-entry
+  mclock-entry?
+  mclock-entry-get-queue
+  mclock-entry-get-res-type
+  mclock-entry-get-weight
+  ; IOScheduler
+  make-io-scheduler
+  io-scheduler?
+  io-scheduler-get-sender-count
+  io-scheduler-get-queue-depth
+  io-scheduler-is-running?
+  io-scheduler-set-running!)
+
+; ----------------------------------------------------------------
+; IO-MODE constants
+; ----------------------------------------------------------------
+
+(define IO-MODE-READ 0)
+(define IO-MODE-WRITE 1)
+
+; ----------------------------------------------------------------
+; IO-PRIORITY constants
+; ----------------------------------------------------------------
+
+(define IO-PRIORITY-EMERGENT 0)
+(define IO-PRIORITY-HIGH 1)
+(define IO-PRIORITY-MIDDLE 2)
+(define IO-PRIORITY-LOW 3)
+
+; ----------------------------------------------------------------
+; MCLK-QUEUE constants
+; ----------------------------------------------------------------
+
+(define MCLK-QUEUE-HOT 0)
+(define MCLK-QUEUE-WARM 1)
+(define MCLK-QUEUE-COLD 2)
+
+; ----------------------------------------------------------------
+; MCLK-RES-TYPE constants
+; ----------------------------------------------------------------
+
+(define MCLK-RES-TYPE-IOPS 0)
+(define MCLK-RES-TYPE-BW 1)
+
+; ----------------------------------------------------------------
+; ObIOInfo — closure-based
+; ----------------------------------------------------------------
+
+; make-io-info: create an IO info.
+; Args: tenant-id (integer), fd (integer),
+;       offset (integer), size (integer),
+;       timeout-us (integer), priority (integer)
+; Returns: io_info closure (initial: priority mutable).
+(define (make-io-info tenant-id fd offset size timeout-us priority)
+  (let ((set-priority! (lambda (v) (set! priority v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'tenant-id) tenant-id)
+                  ((eq? msg 'fd) fd)
+                  ((eq? msg 'offset) offset)
+                  ((eq? msg 'size) size)
+                  ((eq? msg 'timeout-us) timeout-us)
+                  ((eq? msg 'priority) priority)
+                  ((eq? msg 'set-priority!) set-priority!)
+                  (else #f)))))
+    self))
+
+; io-info?: is the object an IO info?
+; Detected by querying 'tenant-id — only infos return integer.
+(define (io-info? obj)
+  (if (procedure? obj)
+      (let ((t (obj 'tenant-id)))
+        (if (and (integer? t) (>= t 0)) #t #f))
+      #f))
+
+; io-info-get-tenant-id: get tenant id.
+(define (io-info-get-tenant-id i) (i 'tenant-id))
+
+; io-info-get-fd: get file descriptor.
+(define (io-info-get-fd i) (i 'fd))
+
+; io-info-get-offset: get byte offset.
+(define (io-info-get-offset i) (i 'offset))
+
+; io-info-get-size: get byte size.
+(define (io-info-get-size i) (i 'size))
+
+; io-info-get-timeout-us: get timeout in microseconds.
+(define (io-info-get-timeout-us i) (i 'timeout-us))
+
+; io-info-get-priority: get priority.
+(define (io-info-get-priority i) (i 'priority))
+
+; io-info-set-priority!: set priority.
+; Returns the new priority.
+(define (io-info-set-priority! i v) ((i 'set-priority!) v))
+
+; ----------------------------------------------------------------
+; ObIORequest — closure-based
+; ----------------------------------------------------------------
+
+; make-io-request: create an IO request.
+; Args: io-info (io_info closure), retry-count (integer)
+; Returns: io_request closure (initial: retry-count mutable).
+(define (make-io-request io-info retry-count)
+  (let ((set-retry-count! (lambda (v) (set! retry-count v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'io-info) io-info)
+                  ((eq? msg 'retry-count) retry-count)
+                  ((eq? msg 'set-retry-count!) set-retry-count!)
+                  (else #f)))))
+    self))
+
+; io-request?: is the object an IO request?
+; Detected by querying 'retry-count — only requests return integer.
+(define (io-request? obj)
+  (if (procedure? obj)
+      (let ((r (obj 'retry-count)))
+        (if (and (integer? r) (>= r 0)) #t #f))
+      #f))
+
+; io-request-get-io-info: get io-info.
+(define (io-request-get-io-info r) (r 'io-info))
+
+; io-request-get-retry-count: get retry count.
+(define (io-request-get-retry-count r) (r 'retry-count))
+
+; io-request-set-retry-count!: set retry count.
+; Returns the new count.
+(define (io-request-set-retry-count! r v)
+  ((r 'set-retry-count!) v))
+
+; ----------------------------------------------------------------
+; ObIOHandle — closure-based
+; ----------------------------------------------------------------
+
+; make-io-handle: create an IO handle.
+; Args: data-size (integer), status (integer), buf-ptr (integer)
+; Returns: io_handle closure (initial: status mutable).
+(define (make-io-handle data-size status buf-ptr)
+  (let ((set-status! (lambda (v) (set! status v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'data-size) data-size)
+                  ((eq? msg 'status) status)
+                  ((eq? msg 'buf-ptr) buf-ptr)
+                  ((eq? msg 'set-status!) set-status!)
+                  (else #f)))))
+    self))
+
+; io-handle?: is the object an IO handle?
+; Detected by querying 'data-size — only handles return integer.
+(define (io-handle? obj)
+  (if (procedure? obj)
+      (let ((d (obj 'data-size)))
+        (if (and (integer? d) (>= d 0)) #t #f))
+      #f))
+
+; io-handle-get-data-size: get data size.
+(define (io-handle-get-data-size h) (h 'data-size))
+
+; io-handle-get-status: get status code.
+(define (io-handle-get-status h) (h 'status))
+
+; io-handle-get-buf-ptr: get buffer pointer.
+(define (io-handle-get-buf-ptr h) (h 'buf-ptr))
+
+; io-handle-set-status!: set status.
+; Returns the new status.
+(define (io-handle-set-status! h v) ((h 'set-status!) v))
+
+; ----------------------------------------------------------------
+; ObMClockEntry — closure-based
+; ----------------------------------------------------------------
+
+; make-mclock-entry: create a mClock entry.
+; Args: queue (integer), res-type (integer), weight (integer)
+; Returns: mclock_entry closure.
+(define (make-mclock-entry queue res-type weight)
+  (let ((self (lambda (msg)
+                (cond
+                  ((eq? msg 'queue) queue)
+                  ((eq? msg 'res-type) res-type)
+                  ((eq? msg 'weight) weight)
+                  (else #f)))))
+    self))
+
+; mclock-entry?: is the object a mClock entry?
+; Detected by querying 'queue — only entries return integer.
+(define (mclock-entry? obj)
+  (if (procedure? obj)
+      (let ((q (obj 'queue)))
+        (if (and (integer? q) (>= q 0)
+                 (<= q MCLK-QUEUE-COLD)) #t #f))
+      #f))
+
+; mclock-entry-get-queue: get mClock queue id.
+(define (mclock-entry-get-queue e) (e 'queue))
+
+; mclock-entry-get-res-type: get resource type.
+(define (mclock-entry-get-res-type e) (e 'res-type))
+
+; mclock-entry-get-weight: get weight.
+(define (mclock-entry-get-weight e) (e 'weight))
+
+; ----------------------------------------------------------------
+; ObIOScheduler — closure-based
+; ----------------------------------------------------------------
+
+; make-io-scheduler: create an IO scheduler.
+; Args: sender-count (integer), queue-depth (integer)
+; Returns: io_scheduler closure (initial: running=#f).
+(define (make-io-scheduler sender-count queue-depth)
+  (let ((running #f)
+        (set-running! (lambda (v) (set! running v) v))
+        (self (lambda (msg)
+                (cond
+                  ((eq? msg 'sender-count) sender-count)
+                  ((eq? msg 'queue-depth) queue-depth)
+                  ((eq? msg 'running) running)
+                  ((eq? msg 'set-running!) set-running!)
+                  (else #f)))))
+    self))
+
+; io-scheduler?: is the object an IO scheduler?
+; Detected by querying 'sender-count — only schedulers return int.
+(define (io-scheduler? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'sender-count)))
+        (if (and (integer? s) (> s 0)) #t #f))
+      #f))
+
+; io-scheduler-get-sender-count: get sender thread count.
+(define (io-scheduler-get-sender-count s) (s 'sender-count))
+
+; io-scheduler-get-queue-depth: get queue depth.
+(define (io-scheduler-get-queue-depth s) (s 'queue-depth))
+
+; io-scheduler-is-running?: is the scheduler running?
+(define (io-scheduler-is-running? s) (s 'running))
+
+; io-scheduler-set-running!: set running flag.
+; Returns the new flag.
+(define (io-scheduler-set-running! s v) ((s 'set-running!) v))

@@ -1,0 +1,195 @@
+; 44-io-subsystem_test.aura
+; ======================
+; Smoke tests for 44-io-subsystem.aura — IO Subsystem + mClock
+; minimal.
+
+(require "std/test" all:)
+(require "44-io-subsystem" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "44-001-io-mode-distinct"
+  (check (= 1 (if (not (= IO-MODE-READ IO-MODE-WRITE)) 1 0))))
+
+(test-suite "44-001-io-priority-distinct"
+  (check (= 1 (if (not (= IO-PRIORITY-EMERGENT
+                          IO-PRIORITY-HIGH)) 1 0)))
+  (check (= 1 (if (not (= IO-PRIORITY-HIGH
+                          IO-PRIORITY-MIDDLE)) 1 0)))
+  (check (= 1 (if (not (= IO-PRIORITY-MIDDLE
+                          IO-PRIORITY-LOW)) 1 0)))
+  (check (= 1 (if (not (= IO-PRIORITY-EMERGENT
+                          IO-PRIORITY-LOW)) 1 0))))
+
+(test-suite "44-001-mclk-queue-distinct"
+  (check (= 1 (if (not (= MCLK-QUEUE-HOT MCLK-QUEUE-WARM)) 1 0)))
+  (check (= 1 (if (not (= MCLK-QUEUE-WARM MCLK-QUEUE-COLD)) 1 0)))
+  (check (= 1 (if (not (= MCLK-QUEUE-HOT MCLK-QUEUE-COLD)) 1 0))))
+
+(test-suite "44-001-mclk-res-type-distinct"
+  (check (= 1 (if (not (= MCLK-RES-TYPE-IOPS
+                          MCLK-RES-TYPE-BW)) 1 0))))
+
+; ----------------------------------------------------------------
+; IOInfo
+; ----------------------------------------------------------------
+
+(test-suite "44-002-info-construction"
+  (check (= 1001 (io-info-get-tenant-id
+                  (make-io-info 1001 42 0 4096 1000000
+                    IO-PRIORITY-MIDDLE))))
+  (check (= 42 (io-info-get-fd
+                 (make-io-info 1001 42 0 4096 1000000
+                   IO-PRIORITY-MIDDLE))))
+  (check (= 0 (io-info-get-offset
+               (make-io-info 1001 42 0 4096 1000000
+                 IO-PRIORITY-MIDDLE))))
+  (check (= 4096 (io-info-get-size
+                  (make-io-info 1001 42 0 4096 1000000
+                    IO-PRIORITY-MIDDLE))))
+  (check (= 1000000 (io-info-get-timeout-us
+                      (make-io-info 1001 42 0 4096 1000000
+                        IO-PRIORITY-MIDDLE))))
+  (check (= IO-PRIORITY-MIDDLE
+            (io-info-get-priority
+              (make-io-info 1001 42 0 4096 1000000
+                IO-PRIORITY-MIDDLE)))))
+
+(test-suite "44-002-info-predicate"
+  (check (= #t (io-info?
+                 (make-io-info 0 0 0 0 0 IO-PRIORITY-LOW))))
+  (check (= #f (io-info? 'not-info)))
+  (check (= #f (io-info? 42))))
+
+(test-suite "44-002-info-set-priority"
+  (check (= IO-PRIORITY-EMERGENT
+            (io-info-get-priority
+              (io-info-set-priority!
+                (make-io-info 1001 42 0 4096 1000000
+                  IO-PRIORITY-MIDDLE)
+                IO-PRIORITY-EMERGENT))))
+  (check (= IO-PRIORITY-LOW
+            (io-info-get-priority
+              (io-info-set-priority!
+                (make-io-info 1001 42 0 4096 1000000
+                  IO-PRIORITY-MIDDLE)
+                IO-PRIORITY-LOW)))))
+
+; ----------------------------------------------------------------
+; IORequest
+; ----------------------------------------------------------------
+
+(test-suite "44-003-request-construction"
+  (check (= 0 (let ((info (make-io-info 1001 42 0 4096 1000000
+                                          IO-PRIORITY-MIDDLE))
+                     (req (make-io-request info 0)))
+                 (io-request-get-retry-count req)))
+        0)
+  (check (= 3 (io-request-get-retry-count
+               (make-io-request
+                 (make-io-info 1001 42 0 4096 1000000
+                   IO-PRIORITY-MIDDLE)
+                 3))))
+
+(test-suite "44-003-request-predicate"
+  (check (= #t (io-request?
+                 (make-io-request
+                   (make-io-info 0 0 0 0 0 IO-PRIORITY-LOW)
+                   0))))
+  (check (= #f (io-request? 'not-req)))
+  (check (= #f (io-request? 42))))
+
+(test-suite "44-003-request-set-retry-count"
+  (check (= 5 (io-request-get-retry-count
+                (io-request-set-retry-count!
+                  (make-io-request
+                    (make-io-info 1001 42 0 4096 1000000
+                      IO-PRIORITY-MIDDLE)
+                    0)
+                  5))))
+  (check (= 0 (io-request-get-retry-count
+                (io-request-set-retry-count!
+                  (make-io-request
+                    (make-io-info 1001 42 0 4096 1000000
+                      IO-PRIORITY-MIDDLE)
+                    5)
+                  0)))))
+
+; ----------------------------------------------------------------
+; IOHandle
+; ----------------------------------------------------------------
+
+(test-suite "44-004-handle-construction"
+  (check (= 4096 (io-handle-get-data-size
+                  (make-io-handle 4096 0 0x1000))))
+  (check (= 0 (io-handle-get-status
+               (make-io-handle 4096 0 0x1000))))
+  (check (= 4096 (io-handle-get-buf-ptr
+                  (make-io-handle 0 0 4096)))))
+
+(test-suite "44-004-handle-predicate"
+  (check (= #t (io-handle? (make-io-handle 0 0 0))))
+  (check (= #f (io-handle? 'not-handle)))
+  (check (= #f (io-handle? 42))))
+
+(test-suite "44-004-handle-set-status"
+  (check (= 0 (io-handle-get-status
+                (io-handle-set-status!
+                  (make-io-handle 4096 -1 0x1000)
+                  0))))
+  (check (= -1 (io-handle-get-status
+                 (io-handle-set-status!
+                   (make-io-handle 4096 0 0x1000)
+                   -1)))))
+
+; ----------------------------------------------------------------
+; MClockEntry
+; ----------------------------------------------------------------
+
+(test-suite "44-005-mclock-construction"
+  (check (= MCLK-QUEUE-HOT (mclock-entry-get-queue
+                             (make-mclock-entry MCLK-QUEUE-HOT
+                               MCLK-RES-TYPE-IOPS 100))))
+  (check (= MCLK-RES-TYPE-BW (mclock-entry-get-res-type
+                                (make-mclock-entry MCLK-QUEUE-WARM
+                                  MCLK-RES-TYPE-BW 50))))
+  (check (= 100 (mclock-entry-get-weight
+                  (make-mclock-entry MCLK-QUEUE-HOT
+                    MCLK-RES-TYPE-IOPS 100))))
+  (check (= 50 (mclock-entry-get-weight
+                 (make-mclock-entry MCLK-QUEUE-COLD
+                   MCLK-RES-TYPE-BW 50)))))
+
+(test-suite "44-005-mclock-predicate"
+  (check (= #t (mclock-entry?
+                 (make-mclock-entry MCLK-QUEUE-HOT
+                   MCLK-RES-TYPE-IOPS 1))))
+  (check (= #f (mclock-entry? 'not-mclock)))
+  (check (= #f (mclock-entry? 42))))
+
+; ----------------------------------------------------------------
+; IOScheduler
+; ----------------------------------------------------------------
+
+(test-suite "44-006-scheduler-construction"
+  (check (= 4 (io-scheduler-get-sender-count
+               (make-io-scheduler 4 10000))))
+  (check (= 10000 (io-scheduler-get-queue-depth
+                    (make-io-scheduler 4 10000))))
+  (check (= #f (io-scheduler-is-running?
+                 (make-io-scheduler 4 10000)))))
+
+(test-suite "44-006-scheduler-predicate"
+  (check (= #t (io-scheduler? (make-io-scheduler 1 100))))
+  (check (= #f (io-scheduler? 'not-scheduler)))
+  (check (= #f (io-scheduler? 42))))
+
+(test-suite "44-006-scheduler-set-running"
+  (check (= #t (io-scheduler-is-running?
+                 (io-scheduler-set-running!
+                   (make-io-scheduler 4 10000) #t))))
+  (check (= #f (io-scheduler-is-running?
+                 (io-scheduler-set-running!
+                   (make-io-scheduler 4 10000) #f)))))
