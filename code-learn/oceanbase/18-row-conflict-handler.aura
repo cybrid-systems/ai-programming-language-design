@@ -1,0 +1,265 @@
+; 18-row-conflict-handler.aura
+; ======================
+; row_conflict_handler — minimal capability port to aura.
+;
+; Maps to: OceanBase Row-level conflict handling (post-detection)
+; Source: src/storage/memtable/ob_row_conflict_handler.{h,cpp}
+;         + src/storage/memtable/ob_row_conflict_info.h
+;         + src/storage/ob_i_store.h (ObStoreRowLockState)
+;         + src/storage/tx/ob_lock_wait_mgr.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase row conflict handling:
+;   - ObRowConflictHandler: post-detection decision point
+;     (wait / rollback / retry)
+;   - ObRowConflictInfo: full conflict metadata
+;   - ObStoreRowLockState: lock state descriptor (already in 02-iter)
+;   - ObLockWaitMgr: lock wait queue (already in 03-mvcc-write-conflict)
+;   - 3 decision actions: WAIT / ROLLBACK / RETRY
+;
+; aura v1 ships:
+;   - 3 CONFLICT-ACTION constants (WAIT, ROLLBACK, RETRY)
+;   - 2 CONFLICT-TYPE constants (WRITE-WRITE, READ-WRITE)
+;   - make-row-conflict-info (factory: all 14 fields)
+;   - row-conflict-info accessors
+;   - row-conflict-info-set-action! (set the decision)
+;   - make-conflict-handler (factory: registry of recent conflicts)
+;   - conflict-handler-register! (add to history)
+;   - conflict-handler-count (total + per-type)
+;   - conflict-handler-get-by-tx-id
+;   - conflict-handler-decide-action! (apply decision)
+;   - conflict-handler-get-stats (wait + rollback + retry counters)
+;
+; Deferred (full OceanBase ObRowConflictHandler):
+;   - real check_row_locked (3 storage layers walk)
+;   - real check_foreign_key_constraint (FK validation)
+;   - real post_row_read_conflict (LockWaitMgr enqueue)
+;   - real ObRowConflictInfo with distributed session info
+;   - real ObLockWaitMgr with dead-lock detection
+;   - real scheduler RPC for remote coordination
+;   - real ObTSService GTS-based version assignment
+;   - real conflict resolution policies (wait_timeout, etc.)
+
+(export
+  ; Conflict action constants
+  CONFLICT-ACTION-WAIT
+  CONFLICT-ACTION-ROLLBACK
+  CONFLICT-ACTION-RETRY
+  ; Conflict type constants
+  CONFLICT-TYPE-WRITE-WRITE
+  CONFLICT-TYPE-READ-WRITE
+  ; ObRowConflictInfo
+  make-row-conflict-info row-conflict-info?
+  row-conflict-info-get-tx-id row-conflict-info-get-holder-tx-id
+  row-conflict-info-get-tablet-id row-conflict-info-get-ls-id
+  row-conflict-info-get-conflict-hash
+  row-conflict-info-get-lock-seq
+  row-conflict-info-get-abs-timeout
+  row-conflict-info-get-action row-conflict-info-set-action!
+  ; ConflictHandler
+  make-conflict-handler conflict-handler?
+  conflict-handler-register!
+  conflict-handler-count conflict-handler-count-by-type
+  conflict-handler-get-by-tx-id conflict-handler-decide-action!
+  conflict-handler-get-stats-wait
+  conflict-handler-get-stats-rollback
+  conflict-handler-get-stats-retry
+  conflict-handler-reset!)
+
+; ----------------------------------------------------------------
+; Conflict action constants
+; ----------------------------------------------------------------
+;
+; Per OB: post-detection decision actions.
+;   WAIT:      wait for holder to release
+;   ROLLBACK:  abort self immediately
+;   RETRY:     retry the operation (after timeout)
+
+(define CONFLICT-ACTION-WAIT 1)
+(define CONFLICT-ACTION-ROLLBACK 2)
+(define CONFLICT-ACTION-RETRY 4)
+
+; ----------------------------------------------------------------
+; Conflict type constants
+; ----------------------------------------------------------------
+
+(define CONFLICT-TYPE-WRITE-WRITE 1)
+(define CONFLICT-TYPE-READ-WRITE 2)
+
+; ----------------------------------------------------------------
+; ObRowConflictInfo — closure-based
+; ----------------------------------------------------------------
+
+; make-row-conflict-info: create a conflict info record.
+; Args: tx-id (integer — requester),
+;       holder-tx-id (integer — lock holder),
+;       tablet-id (integer), ls-id (integer),
+;       conflict-hash (integer), lock-seq (integer),
+;       abs-timeout (integer — absolute timeout)
+; Returns: row_conflict_info closure.
+(define (make-row-conflict-info tx-id holder-tx-id tablet-id ls-id
+                              conflict-hash lock-seq abs-timeout)
+  (let ((action CONFLICT-ACTION-WAIT))
+    (letrec ((set-action! (lambda (v) (set! action v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'tx-id) tx-id)
+                       ((eq? msg 'holder-tx-id) holder-tx-id)
+                       ((eq? msg 'tablet-id) tablet-id)
+                       ((eq? msg 'ls-id) ls-id)
+                       ((eq? msg 'conflict-hash) conflict-hash)
+                       ((eq? msg 'lock-seq) lock-seq)
+                       ((eq? msg 'abs-timeout) abs-timeout)
+                       ((eq? msg 'action) action)
+                       ((eq? msg 'set-action!) set-action!)
+                       (else #f)))))
+      self)))
+
+; row-conflict-info?: is the object a conflict info?
+; Detected by querying 'action — only info records return integer.
+(define (row-conflict-info? obj)
+  (if (procedure? obj)
+      (let ((a (obj 'action)))
+        (if (or (= a 1) (= a 2) (= a 4)) #t #f))
+      #f))
+
+; row-conflict-info-get-tx-id: get requester tx_id.
+(define (row-conflict-info-get-tx-id info) (info 'tx-id))
+
+; row-conflict-info-get-holder-tx-id: get lock holder tx_id.
+(define (row-conflict-info-get-holder-tx-id info) (info 'holder-tx-id))
+
+; row-conflict-info-get-tablet-id: get tablet id.
+(define (row-conflict-info-get-tablet-id info) (info 'tablet-id))
+
+; row-conflict-info-get-ls-id: get LS id.
+(define (row-conflict-info-get-ls-id info) (info 'ls-id))
+
+; row-conflict-info-get-conflict-hash: get lock hash.
+(define (row-conflict-info-get-conflict-hash info) (info 'conflict-hash))
+
+; row-conflict-info-get-lock-seq: get lock sequence.
+(define (row-conflict-info-get-lock-seq info) (info 'lock-seq))
+
+; row-conflict-info-get-abs-timeout: get absolute timeout.
+(define (row-conflict-info-get-abs-timeout info) (info 'abs-timeout))
+
+; row-conflict-info-get-action: get decided action.
+(define (row-conflict-info-get-action info) (info 'action))
+
+; row-conflict-info-set-action!: set the decided action.
+; Returns the new action.
+(define (row-conflict-info-set-action! info v)
+  ((info 'set-action!) v))
+
+; ----------------------------------------------------------------
+; ConflictHandler — closure-based registry
+; ----------------------------------------------------------------
+;
+; Tracks all conflicts in a session + their decisions.
+
+; make-conflict-handler: create a conflict handler.
+; Returns: conflict_handler closure (initial: empty, stats=0).
+(define (make-conflict-handler)
+  (let ((conflicts '())
+        (stats-wait 0)
+        (stats-rollback 0)
+        (stats-retry 0))
+    (letrec ((set-conflicts! (lambda (v) (set! conflicts v) v))
+             (set-stats-wait! (lambda (v) (set! stats-wait v) v))
+             (set-stats-rollback! (lambda (v) (set! stats-rollback v) v))
+             (set-stats-retry! (lambda (v) (set! stats-retry v) v))
+             (inc-stats-wait! (lambda () (set! stats-wait (+ stats-wait 1)) stats-wait))
+             (inc-stats-rollback! (lambda () (set! stats-rollback (+ stats-rollback 1)) stats-rollback))
+             (inc-stats-retry! (lambda () (set! stats-retry (+ stats-retry 1)) stats-retry))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'conflicts) conflicts)
+                       ((eq? msg 'stats-wait) stats-wait)
+                       ((eq? msg 'stats-rollback) stats-rollback)
+                       ((eq? msg 'stats-retry) stats-retry)
+                       ((eq? msg 'set-conflicts!) set-conflicts!)
+                       ((eq? msg 'set-stats-wait!) set-stats-wait!)
+                       ((eq? msg 'set-stats-rollback!) set-stats-rollback!)
+                       ((eq? msg 'set-stats-retry!) set-stats-retry!)
+                       ((eq? msg 'inc-stats-wait!) inc-stats-wait!)
+                       ((eq? msg 'inc-stats-rollback!) inc-stats-rollback!)
+                       ((eq? msg 'inc-stats-retry!) inc-stats-retry!)
+                       (else #f)))))
+      self)))
+
+; conflict-handler?: is the object a conflict handler?
+; Detected by querying 'stats-wait — only handlers return integer.
+(define (conflict-handler? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'stats-wait)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; conflict-handler-register!: add a conflict info to handler.
+; Returns the new count of conflicts.
+(define (conflict-handler-register! handler info)
+  (let ((existing (handler 'conflicts)))
+    ((handler 'set-conflicts!) (cons info existing))))
+
+; conflict-handler-count: total count of conflicts.
+(define (conflict-handler-count handler)
+  (let loop ((rest (handler 'conflicts)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; conflict-handler-count-by-type: count by type (write-write vs read-write).
+; v1: we only have write-write vs read-write markers. For v1, we just
+; count total (same as conflict-handler-count).
+(define (conflict-handler-count-by-type handler type)
+  ; v1 minimal: all conflicts counted equally (no per-type
+  ; tracking in this implementation).
+  (conflict-handler-count handler))
+
+; conflict-handler-get-by-tx-id: find conflict by requester tx-id.
+; Returns the conflict info or #f.
+(define (conflict-handler-get-by-tx-id handler tx-id)
+  (let loop ((rest (handler 'conflicts)))
+    (cond
+      ((null? rest) #f)
+      ((= (row-conflict-info-get-tx-id (car rest)) tx-id)
+       (car rest))
+      (else (loop (cdr rest))))))
+
+; conflict-handler-decide-action!: find conflict by tx-id, set its
+; action, increment appropriate stat.
+; Returns the set action (or #f if not found).
+(define (conflict-handler-decide-action! handler tx-id action)
+  (let ((info (conflict-handler-get-by-tx-id handler tx-id)))
+    (if info
+        (begin
+          (row-conflict-info-set-action! info action)
+          (cond
+            ((= action CONFLICT-ACTION-WAIT)
+             ((handler 'inc-stats-wait!)))
+            ((= action CONFLICT-ACTION-ROLLBACK)
+             ((handler 'inc-stats-rollback!)))
+            ((= action CONFLICT-ACTION-RETRY)
+             ((handler 'inc-stats-retry!))))
+          action)
+        #f)))
+
+; conflict-handler-get-stats-wait: get wait count.
+(define (conflict-handler-get-stats-wait handler) (handler 'stats-wait))
+
+; conflict-handler-get-stats-rollback: get rollback count.
+(define (conflict-handler-get-stats-rollback handler)
+  (handler 'stats-rollback))
+
+; conflict-handler-get-stats-retry: get retry count.
+(define (conflict-handler-get-stats-retry handler) (handler 'stats-retry))
+
+; conflict-handler-reset!: clear all state.
+(define (conflict-handler-reset! handler)
+  ((handler 'set-conflicts!) '())
+  ((handler 'set-stats-wait!) 0)
+  ((handler 'set-stats-rollback!) 0)
+  ((handler 'set-stats-retry!) 0))

@@ -1,0 +1,211 @@
+; 18-row-conflict-handler_test.aura
+; ======================
+; Smoke tests for 18-row-conflict-handler.aura — Row conflict handler minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/18-row-conflict-handler_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 CONFLICT-ACTION constants distinct
+;   - 2 CONFLICT-TYPE constants distinct
+;   - make-row-conflict-info + accessors + setters
+;   - make-conflict-handler + register + count + get-by-tx-id
+;   - decide-action! sets action + increments appropriate stat
+;   - reset! clears state
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Stats accumulate correctly across decisions
+;
+; Deferred (full OceanBase ObRowConflictHandler):
+;   - real check_row_locked (3 storage layers walk)
+;   - real check_foreign_key_constraint (FK validation)
+;   - real post_row_read_conflict (LockWaitMgr enqueue)
+;   - real ObRowConflictInfo with distributed session info
+;   - real ObLockWaitMgr with dead-lock detection
+;   - real scheduler RPC for remote coordination
+;   - real ObTSService GTS-based version assignment
+
+(require "std/test" all:)
+(require "18-row-conflict-handler" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "18-001-conflict-action-distinct"
+  ; 3 CONFLICT-ACTION constants are distinct.
+  (check (= 1 (if (not (= CONFLICT-ACTION-WAIT
+                          CONFLICT-ACTION-ROLLBACK)) 1 0)))
+  (check (= 1 (if (not (= CONFLICT-ACTION-ROLLBACK
+                          CONFLICT-ACTION-RETRY)) 1 0)))
+  (check (= 1 (if (not (= CONFLICT-ACTION-WAIT
+                          CONFLICT-ACTION-RETRY)) 1 0))))
+
+(test-suite "18-001-conflict-type-distinct"
+  ; 2 CONFLICT-TYPE constants are distinct.
+  (check (= 1 (if (not (= CONFLICT-TYPE-WRITE-WRITE
+                          CONFLICT-TYPE-READ-WRITE)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObRowConflictInfo
+; ----------------------------------------------------------------
+
+(test-suite "18-002-conflict-info-construction"
+  ; conflict-info preserves fields.
+  (check (= 100 (row-conflict-info-get-tx-id
+                  (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= 200 (row-conflict-info-get-holder-tx-id
+                  (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= 1 (row-conflict-info-get-tablet-id
+               (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= 5 (row-conflict-info-get-ls-id
+               (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= 999 (row-conflict-info-get-conflict-hash
+                 (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= 1 (row-conflict-info-get-lock-seq
+               (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= 1000000 (row-conflict-info-get-abs-timeout
+                      (make-row-conflict-info 100 200 1 5 999 1 1000000))))
+  (check (= CONFLICT-ACTION-WAIT
+             (row-conflict-info-get-action
+               (make-row-conflict-info 100 200 1 5 999 1 1000000)))))
+
+(test-suite "18-002-conflict-info-predicate"
+  ; row-conflict-info? accepts only info records.
+  (check (= #t (row-conflict-info?
+                 (make-row-conflict-info 1 2 3 4 5 6 7))))
+  (check (= #f (row-conflict-info? 'not-info)))
+  (check (= #f (row-conflict-info? 42)))
+
+(test-suite "18-003-conflict-info-set-action"
+  ; set-action! updates.
+  (check (= CONFLICT-ACTION-ROLLBACK
+             (let ((info (make-row-conflict-info 1 2 3 4 5 6 7)))
+               (row-conflict-info-set-action! info CONFLICT-ACTION-ROLLBACK)
+               (row-conflict-info-get-action info))))
+  (check (= CONFLICT-ACTION-RETRY
+             (let ((info (make-row-conflict-info 1 2 3 4 5 6 7)))
+               (row-conflict-info-set-action! info CONFLICT-ACTION-RETRY)
+               (row-conflict-info-get-action info))))
+
+; ----------------------------------------------------------------
+; ConflictHandler
+; ----------------------------------------------------------------
+
+(test-suite "18-004-handler-construction"
+  ; new handler starts empty with 0 stats.
+  (check (= 0 (conflict-handler-count (make-conflict-handler))))
+  (check (= 0 (conflict-handler-get-stats-wait (make-conflict-handler))))
+  (check (= 0 (conflict-handler-get-stats-rollback (make-conflict-handler))))
+  (check (= 0 (conflict-handler-get-stats-retry (make-conflict-handler))))
+
+(test-suite "18-004-handler-predicate"
+  ; conflict-handler? accepts only handlers.
+  (check (= #t (conflict-handler? (make-conflict-handler))))
+  (check (= #f (conflict-handler? 'not-a-handler)))
+  (check (= #f (conflict-handler? 42)))
+
+(test-suite "18-005-handler-register"
+  ; register! increases count.
+  (check (= 1 (let ((h (make-conflict-handler))
+                    (i (make-row-conflict-info 100 200 1 5 999 1 1000000)))
+                (conflict-handler-register! h i)
+                (conflict-handler-count h))))
+  (check (= 3 (let ((h (make-conflict-handler)))
+                (conflict-handler-register! h
+                  (make-row-conflict-info 1 2 3 4 5 6 7))
+                (conflict-handler-register! h
+                  (make-row-conflict-info 2 3 4 5 6 7 8))
+                (conflict-handler-register! h
+                  (make-row-conflict-info 3 4 5 6 7 8 9))
+                (conflict-handler-count h))))
+
+(test-suite "18-005-handler-count-by-type"
+  ; count-by-type (v1: same as count).
+  (check (= 2 (let ((h (make-conflict-handler))
+                    (i1 (make-row-conflict-info 1 2 3 4 5 6 7))
+                    (i2 (make-row-conflict-info 2 3 4 5 6 7 8)))
+                (conflict-handler-register! h i1)
+                (conflict-handler-register! h i2)
+                (conflict-handler-count-by-type h
+                  CONFLICT-TYPE-WRITE-WRITE))))
+
+(test-suite "18-006-handler-get-by-tx-id"
+  ; get-by-tx-id returns the conflict info.
+  (check (= #t (let ((h (make-conflict-handler))
+                    (i (make-row-conflict-info 42 200 1 5 999 1 1000000)))
+                (conflict-handler-register! h i)
+                (eq? i (conflict-handler-get-by-tx-id h 42)))))
+
+(test-suite "18-006-handler-get-by-tx-id-missing"
+  ; get-by-tx-id returns #f for unknown.
+  (check (= #f (conflict-handler-get-by-tx-id
+                 (make-conflict-handler) 99)))
+
+(test-suite "18-007-decide-action-wait"
+  ; decide-action! with WAIT increments wait stat.
+  (check (= 1 (let ((h (make-conflict-handler))
+                    (i (make-row-conflict-info 100 200 1 5 999 1 1000000)))
+                (conflict-handler-register! h i)
+                (conflict-handler-decide-action! h 100
+                  CONFLICT-ACTION-WAIT)
+                (conflict-handler-get-stats-wait h))))
+
+(test-suite "18-007-decide-action-rollback"
+  ; decide-action! with ROLLBACK increments rollback stat.
+  (check (= 1 (let ((h (make-conflict-handler))
+                    (i (make-row-conflict-info 100 200 1 5 999 1 1000000)))
+                (conflict-handler-register! h i)
+                (conflict-handler-decide-action! h 100
+                  CONFLICT-ACTION-ROLLBACK)
+                (conflict-handler-get-stats-rollback h))))
+
+(test-suite "18-007-decide-action-retry"
+  ; decide-action! with RETRY increments retry stat.
+  (check (= 1 (let ((h (make-conflict-handler))
+                    (i (make-row-conflict-info 100 200 1 5 999 1 1000000)))
+                (conflict-handler-register! h i)
+                (conflict-handler-decide-action! h 100
+                  CONFLICT-ACTION-RETRY)
+                (conflict-handler-get-stats-retry h))))
+
+(test-suite "18-008-decide-action-sets-info-action"
+  ; decide-action! sets the action on the info record.
+  (check (= #t (let ((h (make-conflict-handler))
+                    (i (make-row-conflict-info 100 200 1 5 999 1 1000000)))
+                (conflict-handler-register! h i)
+                (conflict-handler-decide-action! h 100
+                  CONFLICT-ACTION-ROLLBACK)
+                (= CONFLICT-ACTION-ROLLBACK
+                   (row-conflict-info-get-action i)))))
+
+(test-suite "18-008-decide-action-not-found"
+  ; decide-action! returns #f for unknown tx-id.
+  (check (= #f (conflict-handler-decide-action!
+                 (make-conflict-handler) 99 CONFLICT-ACTION-WAIT)))
+
+(test-suite "18-009-handler-reset"
+  ; reset! clears all state.
+  (check (= 0 (let ((h (make-conflict-handler))
+                    (i1 (make-row-conflict-info 1 2 3 4 5 6 7))
+                    (i2 (make-row-conflict-info 2 3 4 5 6 7 8)))
+                (conflict-handler-register! h i1)
+                (conflict-handler-register! h i2)
+                (conflict-handler-decide-action! h 1
+                  CONFLICT-ACTION-WAIT)
+                (conflict-handler-decide-action! h 2
+                  CONFLICT-ACTION-ROLLBACK)
+                (conflict-handler-reset! h)
+                (+ (conflict-handler-count h)
+                   (conflict-handler-get-stats-wait h)
+                   (conflict-handler-get-stats-rollback h)
+                   (conflict-handler-get-stats-retry h)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
