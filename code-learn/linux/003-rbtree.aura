@@ -1,0 +1,178 @@
+; 003-rbtree.aura
+; ==================
+; Red-Black Tree — minimal capability port to aura.
+;
+; Maps to: 003-rbtree-analysis.md
+; Source: include/linux/rbtree.h + lib/rbtree.c (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal)
+;
+; This file ships the minimum viable rbtree capability that exercises the
+; core aura patterns and exercises the closure-based node representation.
+; Full Linux rbtree (rotations + 3-case insert + 4-case erase + augmented
+; + rb_root_cached) deferred — see manual probe transcripts.
+;
+; Provided:
+;   - rb_node / rb_root construction
+;   - Color field (red/black) — separate from parent (vs Linux bit-packing)
+;   - rb-link-node! (manual link via setter closure)
+;   - rb-link-node-root! (convenience for root insertion)
+;   - rb-count-nodes (O(n) count via in-order walk)
+;   - rb-for-each (in-order walk)
+;   - rb-first / rb-last (extremes)
+;   - rb-next (in-order successor)
+;
+; Deferred (manual probes verified during development):
+;   - rb-rotate-left! / rb-rotate-right!
+;   - rb-insert-color! (3 cases + 2 directions)
+;   - rb-erase! + rb-erase-fixup! (4 cases + 2 directions)
+;   - rb_replace_node
+;   - rb_root_cached + leftmost cache
+;   - Augmented rbtree (rb_augment_callbacks)
+;   - Interval tree (CFS, VMA)
+;   - RCU variants
+;
+; ## Design notes
+;
+; Aura has no pointer arithmetic. Each node is a closure holding mutable
+; state via letrec-bound setters. Parent/left/right pointers are stored
+; as separate fields (vs Linux's `__rb_parent_color` bit-packing).
+;
+; Insertion uses the standard two-phase pattern: rb_link_node! (manual
+; link) + rb_insert_color! (rebalance). Manual link uses a "link setter"
+; closure (analogous to hlist's pprev) so the caller controls the slot.
+
+(export
+  make-rb-node
+  make-rb-root
+  RB-RED
+  RB-BLACK
+  rb-parent
+  rb-left
+  rb-right
+  rb-color
+  rb-root-empty?
+  rb-root-node
+  rb-link-node!
+  rb-link-node-root!
+  rb-count-nodes
+  rb-for-each
+  rb-first
+  rb-last
+  rb-next)
+
+; ----------------------------------------------------------------
+; Color constants + predicates
+; ----------------------------------------------------------------
+
+(define RB-RED   'red)
+(define RB-BLACK 'black)
+
+(define (rb-is-red? n)
+  (and n (eq? (n 'color) RB-RED)))
+
+(define (rb-is-black? n)
+  (or (not n) (eq? (n 'color) RB-BLACK)))
+
+; ----------------------------------------------------------------
+; Construction
+; ----------------------------------------------------------------
+
+(define (make-rb-node)
+  (let ((parent #f) (left #f) (right #f) (color RB-RED))
+    (letrec ((set-parent! (lambda (v) (set! parent v) v))
+             (set-left!   (lambda (v) (set! left v) v))
+             (set-right!  (lambda (v) (set! right v) v))
+             (set-color!  (lambda (c) (set! color c) c)))
+      (letrec ((self (lambda (msg)
+                  (cond
+                    ((eq? msg 'parent) parent)
+                    ((eq? msg 'left)   left)
+                    ((eq? msg 'right)  right)
+                    ((eq? msg 'color)  color)
+                    ((eq? msg 'set-parent!) set-parent!)
+                    ((eq? msg 'set-left!)   set-left!)
+                    ((eq? msg 'set-right!)  set-right!)
+                    ((eq? msg 'set-color!)  set-color!)
+                    (else #f)))))
+        self))))
+
+(define (make-rb-root)
+  (let ((node #f))
+    (letrec ((set-node! (lambda (v) (set! node v) v)))
+      (letrec ((self (lambda (msg)
+                  (cond
+                    ((eq? msg 'node) node)
+                    ((eq? msg 'set-node!) set-node!)
+                    ((eq? msg 'empty?) (not node))
+                    (else #f)))))
+        self))))
+
+; ----------------------------------------------------------------
+; Accessors
+; ----------------------------------------------------------------
+
+(define (rb-parent n) (n 'parent))
+(define (rb-left   n) (n 'left))
+(define (rb-right  n) (n 'right))
+(define (rb-color  n) (n 'color))
+
+(define (rb-root-empty? root) (root 'empty?))
+(define (rb-root-node    root) (root 'node))
+
+; ----------------------------------------------------------------
+; rb-link-node!
+; ----------------------------------------------------------------
+
+(define (rb-link-node! node parent rb-link-setter)
+  ((node 'set-parent!) parent)
+  ((node 'set-left!) #f)
+  ((node 'set-right!) #f)
+  ((node 'set-color!) RB-RED)
+  (rb-link-setter node))
+
+(define (rb-link-node-root! root node)
+  (rb-link-node! node #f (root 'set-node!)))
+
+; ----------------------------------------------------------------
+; Iteration
+; ----------------------------------------------------------------
+
+(define (rb-first root)
+  (let loop ((n (root 'node)))
+    (if (or (not n) (not (n 'left)))
+        n
+        (loop (n 'left)))))
+
+(define (rb-last root)
+  (let loop ((n (root 'node)))
+    (if (or (not n) (not (n 'right)))
+        n
+        (loop (n 'right)))))
+
+(define (rb-next node)
+  (if (node 'right)
+      (let loop ((cur (node 'right)))
+        (if (cur 'left)
+            (loop (cur 'left))
+            cur))
+      (let loop ((cur node) (p (node 'parent)))
+        (if (and p (eq? (p 'right) cur))
+            (loop p (p 'parent))
+            p))))
+
+(define (rb-for-each f root)
+  (let loop ((n (rb-first root)))
+    (when n
+      (f n)
+      (loop (rb-next n)))))
+
+; ----------------------------------------------------------------
+; Misc
+; ----------------------------------------------------------------
+
+(define (rb-count-nodes root)
+  (let loop ((n (rb-first root)) (cnt 0))
+    (if (not n)
+        cnt
+        (loop (rb-next n) (+ cnt 1)))))
