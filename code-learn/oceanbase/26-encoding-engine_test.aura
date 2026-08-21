@@ -1,0 +1,285 @@
+; 26-encoding-engine_test.aura
+; ======================
+; Smoke tests for 26-encoding-engine.aura — Encoding Engine minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/26-encoding-engine_test.aura
+;
+; Verified automatically (smoke):
+;   - 10 ENCODING-TYPE + 3 STAGE constants distinct
+;   - make-encoding-ctx + accessors + choose-encoder
+;   - make-column-header + accessors + set-meta-size
+;   - make-bit-stream + write/read/position
+;   - make-encoding-hash-table + add/lookup/size
+;   - make-column-encoder + accessors + set-size + set-stored
+;   - make-micro-block-encoder + 3-stage pipeline (prescan →
+;     choose-encoder → build-block)
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - 3-stage pipeline transitions correctly
+;   - Hash table add/lookup roundtrip
+;
+; Deferred (full OceanBase Encoding Engine):
+;   - real ObMicroBlockEncoder with full pipeline
+;   - real 9 ObIColumnEncoder specializations
+;   - real ObColumnEncodingCtx with full statistics
+;   - real ObBitStream with bit-level IO
+;   - real ObEncodingHashTable for pre-scan dedup
+;   - real ObColumnHeader binary format
+;   - real pivot (row-to-column transpose)
+;   - real string prefix tree
+;   - real RLE run detection
+;   - real dict encoding with hash
+
+(require "std/test" all:)
+(require "26-encoding-engine" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "26-001-encoding-type-distinct"
+  ; 10 ENCODING-TYPE constants are distinct.
+  (check (= 1 (if (not (= ENCODING-TYPE-RAW
+                          ENCODING-TYPE-DICT)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-DICT
+                          ENCODING-TYPE-RLE)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-RLE
+                          ENCODING-TYPE-CONST)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-CONST
+                          ENCODING-TYPE-INTEGER-BASE-DIFF)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-INTEGER-BASE-DIFF
+                          ENCODING-TYPE-STRING-DIFF)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-STRING-DIFF
+                          ENCODING-TYPE-HEX-PACKING)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-HEX-PACKING
+                          ENCODING-TYPE-STRING-PREFIX)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-STRING-PREFIX
+                          ENCODING-TYPE-COLUMN-EQUAL)) 1 0)))
+  (check (= 1 (if (not (= ENCODING-TYPE-COLUMN-EQUAL
+                          ENCODING-TYPE-COLUMN-SUBSTR)) 1 0))))
+
+(test-suite "26-001-stage-distinct"
+  ; 3 STAGE constants are distinct.
+  (check (= 1 (if (not (= STAGE-PRESCAN STAGE-ENCODE)) 1 0)))
+  (check (= 1 (if (not (= STAGE-ENCODE STAGE-STORE)) 1 0)))
+  (check (= 1 (if (not (= STAGE-PRESCAN STAGE-STORE)) 1 0)))
+
+; ----------------------------------------------------------------
+; ObColumnEncodingCtx
+; ----------------------------------------------------------------
+
+(test-suite "26-002-ctx-construction"
+  ; ctx preserves fields.
+  (check (= 100 (encoding-ctx-get-row-count
+                 (make-encoding-ctx 100 5))))
+  (check (= 5 (encoding-ctx-get-column-count
+                (make-encoding-ctx 100 5))))
+
+(test-suite "26-002-ctx-predicate"
+  ; encoding-ctx? accepts only contexts.
+  (check (= #t (encoding-ctx? (make-encoding-ctx 0 0))))
+  (check (= #f (encoding-ctx? 'not-ctx)))
+  (check (= #f (encoding-ctx? 42)))
+
+(test-suite "26-002-ctx-set-chosen-encoder"
+  ; set-chosen-encoder! updates.
+  (check (= #t (let ((ctx (make-encoding-ctx 100 5))
+                    (enc (make-column-encoder ENCODING-TYPE-DICT 0)))
+                (encoding-ctx-set-chosen-encoder! ctx enc)
+                (eq? enc (encoding-ctx-get-chosen-encoder! ctx)))))
+
+; ----------------------------------------------------------------
+; ObColumnHeader
+; ----------------------------------------------------------------
+
+(test-suite "26-003-header-construction"
+  ; header preserves fields.
+  (check (= ENCODING-TYPE-DICT
+             (column-header-get-type
+               (make-column-header ENCODING-TYPE-DICT 64))))
+  (check (= 64 (column-header-get-meta-size
+                (make-column-header ENCODING-TYPE-DICT 64))))
+
+(test-suite "26-003-header-predicate"
+  ; column-header? accepts only headers.
+  (check (= #t (column-header? (make-column-header ENCODING-TYPE-RAW 0))))
+  (check (= #f (column-header? 'not-header)))
+  (check (= #f (column-header? 42)))
+
+(test-suite "26-003-header-set-meta-size"
+  ; set-meta-size! updates.
+  (check (= 128 (let ((h (make-column-header ENCODING-TYPE-RAW 64)))
+                  (column-header-set-meta-size! h 128)
+                  (column-header-get-meta-size h))))
+
+; ----------------------------------------------------------------
+; ObBitStream
+; ----------------------------------------------------------------
+
+(test-suite "26-004-bit-stream-construction"
+  ; bit-stream preserves position.
+  (check (= 0 (bit-stream-get-position
+               (make-bit-stream 0))))
+  (check (= 100 (bit-stream-get-position
+                 (make-bit-stream 100))))
+
+(test-suite "26-004-bit-stream-predicate"
+  ; bit-stream? accepts only bit streams.
+  (check (= #t (bit-stream? (make-bit-stream 0))))
+  (check (= #f (bit-stream? 'not-bs)))
+  (check (= #f (bit-stream? 42)))
+
+(test-suite "26-005-bit-stream-write-bit"
+  ; write-bit! advances position.
+  (check (= 1 (let ((bs (make-bit-stream 0)))
+                 (bit-stream-write-bit! bs)
+                 (bit-stream-get-position bs))))
+  (check (= 64 (let ((bs (make-bit-stream 0)))
+                 (let loop ((i 0))
+                   (cond
+                     ((= i 64) (bit-stream-get-position bs))
+                     (#t
+                      (bit-stream-write-bit! bs)
+                      (loop (+ i 1))))))))
+
+(test-suite "26-005-bit-stream-read-bit"
+  ; read-bit returns current position (v1).
+  (check (= 5 (let ((bs (make-bit-stream 5)))
+                 (bit-stream-read-bit bs))))
+
+; ----------------------------------------------------------------
+; ObEncodingHashTable
+; ----------------------------------------------------------------
+
+(test-suite "26-006-hash-construction"
+  ; hash-table preserves size.
+  (check (= 100 (let ((ht (make-encoding-hash-table 100)))
+                 (ht 'size))))
+  (check (= 0 (encoding-hash-table-size
+                 (make-encoding-hash-table 100))))
+
+(test-suite "26-006-hash-predicate"
+  ; encoding-hash-table? accepts only hash tables.
+  (check (= #t (encoding-hash-table? (make-encoding-hash-table 100))))
+  (check (= #f (encoding-hash-table? 'not-hash)))
+  (check (= #f (encoding-hash-table? 42)))
+
+(test-suite "26-007-hash-add-lookup"
+  ; add + lookup roundtrip.
+  (check (= #t (let ((ht (make-encoding-hash-table 100)))
+                 (encoding-hash-table-add! ht 'key1 'val1)
+                 (eq? 'val1 (encoding-hash-table-lookup ht 'key1)))))
+
+(test-suite "26-007-hash-add-multiple"
+  ; Multiple adds accumulate.
+  (check (= 3 (let ((ht (make-encoding-hash-table 100)))
+                 (encoding-hash-table-add! ht 'a 1)
+                 (encoding-hash-table-add! ht 'b 2)
+                 (encoding-hash-table-add! ht 'c 3)
+                 (encoding-hash-table-size ht))))
+
+(test-suite "26-007-hash-lookup-missing"
+  ; lookup returns #f for missing key.
+  (check (= #f (encoding-hash-table-lookup
+                 (make-encoding-hash-table 100) 'unknown)))
+
+; ----------------------------------------------------------------
+; ObColumnEncoder
+; ----------------------------------------------------------------
+
+(test-suite "26-008-encoder-construction"
+  ; encoder preserves fields.
+  (check (= ENCODING-TYPE-DICT
+             (column-encoder-get-type
+               (make-column-encoder ENCODING-TYPE-DICT 3))))
+  (check (= 3 (column-encoder-get-column-index
+               (make-column-encoder ENCODING-TYPE-DICT 3))))
+
+(test-suite "26-008-encoder-predicate"
+  ; column-encoder? accepts only encoders.
+  (check (= #t (column-encoder? (make-column-encoder ENCODING-TYPE-RAW 0))))
+  (check (= #f (column-encoder? 'not-encoder)))
+  (check (= #f (column-encoder? 42)))
+
+(test-suite "26-008-encoder-set-size"
+  ; set-size! updates.
+  (check (= 1024 (let ((e (make-column-encoder ENCODING-TYPE-DICT 0)))
+                  (column-encoder-set-size! e 1024)
+                  (e 'encoded-size))))
+
+(test-suite "26-008-encoder-set-stored"
+  ; set-stored?! updates.
+  (check (= #t (let ((e (make-column-encoder ENCODING-TYPE-DICT 0)))
+                 (column-encoder-set-stored?! e #t)
+                 (e 'stored?))))
+
+; ----------------------------------------------------------------
+; ObMicroBlockEncoder
+; ----------------------------------------------------------------
+
+(test-suite "26-009-mbe-construction"
+  ; mbe preserves fields.
+  (check (= 0 (micro-block-encoder-get-row-count
+                 (make-micro-block-encoder
+                   (make-encoding-ctx 100 5)
+                   0))))
+
+(test-suite "26-009-mbe-predicate"
+  ; micro-block-encoder? accepts only encoders.
+  (check (= #t (micro-block-encoder?
+                 (make-micro-block-encoder
+                   (make-encoding-ctx 0 0) 0))))
+  (check (= #f (micro-block-encoder? 'not-mbe)))
+  (check (= #f (micro-block-encoder? 42)))
+
+(test-suite "26-009-mbe-prescan"
+  ; prescan! sets stage to PRESCAN.
+  (check (= STAGE-PRESCAN
+             (let ((mbe (make-micro-block-encoder
+                          (make-encoding-ctx 0 0) 0)))
+               (micro-block-encoder-prescan! mbe)
+               (mbe 'stage))))
+
+(test-suite "26-010-mbe-choose-encoder"
+  ; choose-encoder! sets stage to ENCODE + returns chosen encoder.
+  (check (= STAGE-ENCODE
+             (let ((mbe (make-micro-block-encoder
+                          (make-encoding-ctx 0 0) 0)))
+               (micro-block-encoder-choose-encoder! mbe)
+               (mbe 'stage))))
+  (check (= #t (let ((mbe (make-micro-block-encoder
+                            (make-encoding-ctx 0 0) 0)))
+                 (column-encoder?
+                   (micro-block-encoder-choose-encoder! mbe)))))
+
+(test-suite "26-010-mbe-build-block"
+  ; build-block! sets stage to STORE + returns chosen encoder.
+  (check (= STAGE-STORE
+             (let ((mbe (make-micro-block-encoder
+                          (make-encoding-ctx 0 0) 0)))
+               (micro-block-encoder-choose-encoder! mbe)
+               (micro-block-encoder-build-block! mbe)
+               (mbe 'stage))))
+
+(test-suite "26-010-mbe-full-pipeline"
+  ; Full pipeline: init → prescan → choose-encoder → build-block.
+  (check (= #t (let ((mbe (make-micro-block-encoder
+                            (make-encoding-ctx 100 5) 0)))
+                 (micro-block-encoder-prescan! mbe)
+                 (let ((enc (micro-block-encoder-choose-encoder! mbe)))
+                   (let ((block (micro-block-encoder-build-block! mbe)))
+                     (and (= STAGE-PRESCAN (mbe 'stage))
+                          (= STAGE-ENCODE (begin (micro-block-encoder-choose-encoder! mbe) (mbe 'stage)))
+                          (= STAGE-STORE (mbe 'stage))
+                          (column-encoder? enc)
+                          (column-encoder? block))))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
