@@ -1,0 +1,376 @@
+; 17-query-optimizer.aura
+; ======================
+; query_optimizer — minimal capability port to aura.
+;
+; Maps to: OceanBase Query Optimizer
+; Source: src/sql/optimizer/ob_optimizer.{h,cpp}
+;         + src/sql/optimizer/ob_log_plan.{h,cpp}
+;         + src/sql/optimizer/ob_physical_plan.{h,cpp}
+;         + src/sql/optimizer/ob_log_plan.h (plan operators)
+;         + src/sql/optimizer/ob_opt_est_cost.h (cost model)
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase Query Optimizer:
+;   - ObOptimizer: entry point (init_env_info, generate_plan,
+;     plan_traverse_loop)
+;   - ObLogPlan: logical plan container (operator tree)
+;   - ObPhysicalPlan: physical plan (post-rewriter)
+;   - Candidate plan enumeration (join orders, group-by, etc.)
+;   - Plan rewriter (PX rescan, runtime filter, op alloc, etc.)
+;   - Cost model: CPU/IO/Network cost components
+;   - Plan operators: SCAN/JOIN/GROUP/SORT/LIMIT/etc.
+;
+; aura has no real SQL parser, no cost estimator. v1 ships:
+;   - 14 PLAN-OPERATOR constants (SCAN, JOIN, GROUP-BY, SORT, LIMIT,
+;     FILTER, PROJECT, AGGREGATE, WINDOW-FUNCTION, DISTINCT, SUBPLAN-FILTER,
+;     MATERIAL, EXCHANGE, TABLE-FUNCTION)
+;   - 8 OPT-PHASE constants (PX-RESCAN, RUNTIME-FILTER, ALLOC-GI,
+;     ALLOC-OP, OPERATOR-NUMBERING, EXCHANGE-NUMBERING, ALLOC-EXPR,
+;     PROJECT-PRUNING)
+;   - 3 COST-TYPE constants (CPU, IO, NETWORK)
+;   - make-log-plan (factory: stmt-type + operator-type)
+;   - log-plan accessors
+;   - log-plan-set-operator-type! / set-cost!
+;   - make-physical-plan (factory: log-plan + cost)
+;   - physical-plan-get-cost / get-log-plan
+;   - make-optimizer (factory: session-id + cost-budget)
+;   - optimizer-optimize (entry point: returns logical plan)
+;   - optimizer-add-candidate-plan! (add to candidate set)
+;   - optimizer-get-candidate-count
+;   - optimizer-get-best-plan (picks lowest-cost plan)
+;   - make-candidate-plan (factory: plan + cost)
+;   - candidate-plan-get-plan / get-cost
+;
+; Deferred (full OceanBase Query Optimizer):
+;   - real ObOptimizer with stat info, hint handling
+;   - real Cascades-style search with memo + cost
+;   - real join order enumeration (DP-based)
+;   - real predicate pushdown, subquery decorrelation
+;   - real cost model (CPU/IO/Network formulas)
+;   - real plan rewriter with 20+ phases
+;   - real PX (parallel execution) coordination
+;   - real runtime filter pushdown
+;   - real ObSelectLogPlan, ObInsertLogPlan, etc.
+
+(export
+  ; Plan operator constants
+  PLAN-OP-SCAN PLAN-OP-JOIN PLAN-OP-GROUP-BY
+  PLAN-OP-SORT PLAN-OP-LIMIT PLAN-OP-FILTER
+  PLAN-OP-PROJECT PLAN-OP-AGGREGATE
+  PLAN-OP-WINDOW-FUNCTION PLAN-OP-DISTINCT
+  PLAN-OP-SUBPLAN-FILTER PLAN-OP-MATERIAL
+  PLAN-OP-EXCHANGE PLAN-OP-TABLE-FUNCTION
+  ; Optimization phase constants
+  OPT-PHASE-PX-RESCAN OPT-PHASE-RUNTIME-FILTER
+  OPT-PHASE-ALLOC-GI OPT-PHASE-ALLOC-OP
+  OPT-PHASE-OPERATOR-NUMBERING
+  OPT-PHASE-EXCHANGE-NUMBERING
+  OPT-PHASE-ALLOC-EXPR
+  OPT-PHASE-PROJECT-PRUNING
+  ; Cost type constants
+  COST-CPU COST-IO COST-NETWORK
+  ; ObLogPlan
+  make-log-plan log-plan?
+  log-plan-get-stmt-type log-plan-set-stmt-type!
+  log-plan-get-operator-type log-plan-set-operator-type!
+  log-plan-get-cost log-plan-set-cost!
+  log-plan-get-child
+  log-plan-set-child!
+  ; ObPhysicalPlan
+  make-physical-plan physical-plan?
+  physical-plan-get-cost physical-plan-get-log-plan
+  physical-plan-set-cost!
+  ; Candidate plan
+  make-candidate-plan candidate-plan?
+  candidate-plan-get-plan candidate-plan-get-cost
+  candidate-plan-set-cost!
+  ; ObOptimizer
+  make-optimizer optimizer?
+  optimizer-get-session-id optimizer-get-cost-budget
+  optimizer-get-stat
+  optimizer-inc-stat!
+  optimizer-optimize optimizer-add-candidate-plan!
+  optimizer-get-candidate-count optimizer-get-best-plan
+  optimizer-pick-best! optimizer-reset!)
+
+; ----------------------------------------------------------------
+; Plan operator constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_log_plan.h operator types).
+
+(define PLAN-OP-SCAN 1)
+(define PLAN-OP-JOIN 2)
+(define PLAN-OP-GROUP-BY 3)
+(define PLAN-OP-SORT 4)
+(define PLAN-OP-LIMIT 5)
+(define PLAN-OP-FILTER 6)
+(define PLAN-OP-PROJECT 7)
+(define PLAN-OP-AGGREGATE 8)
+(define PLAN-OP-WINDOW-FUNCTION 9)
+(define PLAN-OP-DISTINCT 10)
+(define PLAN-OP-SUBPLAN-FILTER 11)
+(define PLAN-OP-MATERIAL 12)
+(define PLAN-OP-EXCHANGE 13)
+(define PLAN-OP-TABLE-FUNCTION 14)
+
+; ----------------------------------------------------------------
+; Optimization phase constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_optimizer.h plan_traverse_loop).
+
+(define OPT-PHASE-PX-RESCAN 1)
+(define OPT-PHASE-RUNTIME-FILTER 2)
+(define OPT-PHASE-ALLOC-GI 3)
+(define OPT-PHASE-ALLOC-OP 4)
+(define OPT-PHASE-OPERATOR-NUMBERING 5)
+(define OPT-PHASE-EXCHANGE-NUMBERING 6)
+(define OPT-PHASE-ALLOC-EXPR 7)
+(define OPT-PHASE-PROJECT-PRUNING 8)
+
+; ----------------------------------------------------------------
+; Cost type constants
+; ----------------------------------------------------------------
+;
+; Per OB (ob_opt_est_cost.h).
+
+(define COST-CPU 1)
+(define COST-IO 2)
+(define COST-NETWORK 4)
+
+; ----------------------------------------------------------------
+; ObLogPlan — closure-based
+; ----------------------------------------------------------------
+
+; make-log-plan: create a logical plan.
+; Args: stmt-type (integer — SELECT/INSERT/UPDATE/DELETE),
+;       operator-type (integer — PLAN-OP-*)
+; Returns: log_plan closure (initial: cost=0, child=#f).
+(define (make-log-plan stmt-type operator-type)
+  (let ((cost 0)
+        (child #f))
+    (letrec ((set-cost! (lambda (v) (set! cost v) v))
+             (set-child! (lambda (v) (set! child v) v))
+             (set-operator-type! (lambda (v) (set! operator-type v) v))
+             (set-stmt-type! (lambda (v) (set! stmt-type v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'stmt-type) stmt-type)
+                       ((eq? msg 'operator-type) operator-type)
+                       ((eq? msg 'cost) cost)
+                       ((eq? msg 'child) child)
+                       ((eq? msg 'set-cost!) set-cost!)
+                       ((eq? msg 'set-child!) set-child!)
+                       ((eq? msg 'set-operator-type!) set-operator-type!)
+                       ((eq? msg 'set-stmt-type!) set-stmt-type!)
+                       (else #f)))))
+      self)))
+
+; log-plan?: is the object a logical plan?
+; Detected by querying 'cost — only plans return integer.
+(define (log-plan? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'cost)))
+        (if (and (integer? c) (>= c 0)) #t #f))
+      #f))
+
+; log-plan-get-stmt-type: get statement type.
+(define (log-plan-get-stmt-type lp) (lp 'stmt-type))
+
+; log-plan-set-stmt-type!: set statement type.
+(define (log-plan-set-stmt-type! lp v) ((lp 'set-stmt-type!) v))
+
+; log-plan-get-operator-type: get operator type.
+(define (log-plan-get-operator-type lp) (lp 'operator-type))
+
+; log-plan-set-operator-type!: set operator type.
+(define (log-plan-set-operator-type! lp v) ((lp 'set-operator-type!) v))
+
+; log-plan-get-cost: get cost.
+(define (log-plan-get-cost lp) (lp 'cost))
+
+; log-plan-set-cost!: set cost.
+(define (log-plan-set-cost! lp v) ((lp 'set-cost!) v))
+
+; log-plan-get-child: get child plan (or #f).
+(define (log-plan-get-child lp) (lp 'child))
+
+; log-plan-set-child!: set child plan.
+(define (log-plan-set-child! lp v) ((lp 'set-child!) v))
+
+; ----------------------------------------------------------------
+; ObPhysicalPlan — closure-based
+; ----------------------------------------------------------------
+
+; make-physical-plan: create a physical plan.
+; Args: log-plan (ObLogPlan), cost (integer)
+; Returns: physical_plan closure.
+(define (make-physical-plan log-plan cost)
+  (letrec ((set-cost! (lambda (v) (set! cost v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'log-plan) log-plan)
+                     ((eq? msg 'cost) cost)
+                     ((eq? msg 'set-cost!) set-cost!)
+                     (else #f)))))
+      self)))
+
+; physical-plan?: is the object a physical plan?
+; Detected by querying 'log-plan — only physical plans return a plan.
+(define (physical-plan? obj)
+  (if (procedure? obj)
+      (if (log-plan? (obj 'log-plan)) #t #f)
+      #f))
+
+; physical-plan-get-cost: get cost.
+(define (physical-plan-get-cost pp) (pp 'cost))
+
+; physical-plan-get-log-plan: get underlying logical plan.
+(define (physical-plan-get-log-plan pp) (pp 'log-plan))
+
+; physical-plan-set-cost!: set cost.
+(define (physical-plan-set-cost! pp v) ((pp 'set-cost!) v))
+
+; ----------------------------------------------------------------
+; CandidatePlan — closure-based
+; ----------------------------------------------------------------
+
+; make-candidate-plan: create a candidate plan entry.
+; Args: plan (physical_plan), cost (integer)
+; Returns: candidate_plan closure.
+(define (make-candidate-plan plan cost)
+  (letrec ((set-cost! (lambda (v) (set! cost v) v))
+           (self (lambda (msg)
+                   (cond
+                     ((eq? msg 'plan) plan)
+                     ((eq? msg 'cost) cost)
+                     ((eq? msg 'set-cost!) set-cost!)
+                     (else #f)))))
+      self)))
+
+; candidate-plan?: is the object a candidate plan?
+; Detected by querying 'plan — only candidates return a plan.
+(define (candidate-plan? obj)
+  (if (procedure? obj)
+      (if (physical-plan? (obj 'plan)) #t #f)
+      #f))
+
+; candidate-plan-get-plan: get physical plan.
+(define (candidate-plan-get-plan cp) (cp 'plan))
+
+; candidate-plan-get-cost: get cost.
+(define (candidate-plan-get-cost cp) (cp 'cost))
+
+; candidate-plan-set-cost!: set cost.
+(define (candidate-plan-set-cost! cp v) ((cp 'set-cost!) v))
+
+; ----------------------------------------------------------------
+; ObOptimizer — closure-based
+; ----------------------------------------------------------------
+
+; make-optimizer: create an ObOptimizer.
+; Args: session-id (integer), cost-budget (integer — max cost)
+; Returns: optimizer closure (initial: candidates empty, stat=0).
+(define (make-optimizer session-id cost-budget)
+  (let ((candidates '())
+        (stat 0)
+        (best-plan #f))
+    (letrec ((set-candidates! (lambda (v) (set! candidates v) v))
+             (set-stat! (lambda (v) (set! stat v) v))
+             (set-best-plan! (lambda (v) (set! best-plan v) v))
+             (inc-stat! (lambda () (set! stat (+ stat 1)) stat))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'session-id) session-id)
+                       ((eq? msg 'cost-budget) cost-budget)
+                       ((eq? msg 'candidates) candidates)
+                       ((eq? msg 'stat) stat)
+                       ((eq? msg 'best-plan) best-plan)
+                       ((eq? msg 'set-candidates!) set-candidates!)
+                       ((eq? msg 'set-stat!) set-stat!)
+                       ((eq? msg 'set-best-plan!) set-best-plan!)
+                       ((eq? msg 'inc-stat!) inc-stat!)
+                       (else #f)))))
+      self)))
+
+; optimizer?: is the object an optimizer?
+; Detected by querying 'stat — only optimizers return integer.
+(define (optimizer? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'stat)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; optimizer-get-session-id: get session id.
+(define (optimizer-get-session-id opt) (opt 'session-id))
+
+; optimizer-get-cost-budget: get max cost budget.
+(define (optimizer-get-cost-budget opt) (opt 'cost-budget))
+
+; optimizer-get-stat: get stat counter (call count).
+(define (optimizer-get-stat opt) (opt 'stat))
+
+; optimizer-inc-stat!: increment stat counter.
+(define (optimizer-inc-stat! opt) ((opt 'inc-stat!)))
+
+; optimizer-add-candidate-plan!: add a candidate plan.
+; Returns the new count.
+(define (optimizer-add-candidate-plan! opt cp)
+  (let ((existing (opt 'candidates)))
+    ((opt 'set-candidates!) (cons cp existing))))
+
+; optimizer-get-candidate-count: count of candidates.
+(define (optimizer-get-candidate-count opt)
+  (let loop ((rest (opt 'candidates)) (n 0))
+    (cond
+      ((null? rest) n)
+      (else (loop (cdr rest) (+ n 1))))))
+
+; optimizer-get-best-plan: get best plan (lowest cost).
+; Returns the best candidate-plan or #f.
+(define (optimizer-get-best-plan opt)
+  (let ((best (opt 'best-plan)))
+    (if (procedure? best)
+        best
+        (let loop ((rest (opt 'candidates)) (best #f))
+          (cond
+            ((null? rest) best)
+            ((eq? best #f)
+             (loop (cdr rest) (car rest)))
+            ((< (candidate-plan-get-cost (car rest))
+                (candidate-plan-get-cost best))
+             (loop (cdr rest) (car rest)))
+            (else (loop (cdr rest) best)))))))
+
+; optimizer-pick-best!: scan candidates and cache best plan.
+; Returns the best candidate-plan (or #f if no candidates).
+(define (optimizer-pick-best! opt)
+  (let ((best (optimizer-get-best-plan opt)))
+    (if best
+        ((opt 'set-best-plan!) best)
+        #f)))
+
+; optimizer-reset!: clear all candidates + best-plan + stat.
+(define (optimizer-reset! opt)
+  ((opt 'set-candidates!) '())
+  ((opt 'set-best-plan!) #f)
+  ((opt 'set-stat!) 0))
+
+; optimizer-optimize: main entry point (v1: returns a new empty
+; log plan with stat incremented).
+; v1 minimal: creates a SELECT log plan + increments stat.
+; Returns the new log plan (or #f if cost exceeds budget).
+(define (optimizer-optimize opt)
+  (optimizer-inc-stat! opt)
+  (let ((budget (opt 'cost-budget)))
+    (if (= budget 0)
+        #f
+        (let ((plan (make-log-plan 1 PLAN-OP-SCAN)))
+          (let ((new-cost (+ (log-plan-get-cost plan) 10)))
+            (log-plan-set-cost! plan new-cost)
+            (if (> new-cost budget)
+                #f
+                plan)))))

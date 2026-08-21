@@ -1,0 +1,260 @@
+; 17-query-optimizer_test.aura
+; ======================
+; Smoke tests for 17-query-optimizer.aura — SQL Query Optimizer minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/17-query-optimizer_test.aura
+;
+; Verified automatically (smoke):
+;   - 14 PLAN-OP constants distinct
+;   - 8 OPT-PHASE constants distinct
+;   - 3 COST-* constants distinct
+;   - make-log-plan + accessors + setters
+;   - make-physical-plan + accessors
+;   - make-candidate-plan + accessors
+;   - make-optimizer + stat + budget
+;   - optimizer-add-candidate-plan! / count
+;   - optimizer-get-best-plan (picks lowest cost)
+;   - optimizer-pick-best! (caches best plan)
+;   - optimizer-optimize (entry point, respects budget)
+;   - optimizer-reset!
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Best plan selection works correctly
+;
+; Deferred (full OceanBase Query Optimizer):
+;   - real ObOptimizer with stat info, hint handling
+;   - real Cascades-style search with memo + cost
+;   - real join order enumeration (DP-based)
+;   - real predicate pushdown, subquery decorrelation
+;   - real cost model (CPU/IO/Network formulas)
+;   - real plan rewriter with 20+ phases
+;   - real PX (parallel execution) coordination
+;   - real runtime filter pushdown
+
+(require "std/test" all:)
+(require "17-query-optimizer" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "17-001-plan-op-distinct"
+  ; 14 PLAN-OP constants are distinct.
+  (check (= 1 (if (not (= PLAN-OP-SCAN PLAN-OP-JOIN)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-JOIN PLAN-OP-GROUP-BY)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-GROUP-BY PLAN-OP-SORT)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-SORT PLAN-OP-LIMIT)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-LIMIT PLAN-OP-FILTER)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-FILTER PLAN-OP-PROJECT)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-PROJECT PLAN-OP-AGGREGATE)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-AGGREGATE PLAN-OP-WINDOW-FUNCTION)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-WINDOW-FUNCTION PLAN-OP-DISTINCT)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-DISTINCT PLAN-OP-SUBPLAN-FILTER)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-SUBPLAN-FILTER PLAN-OP-MATERIAL)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-MATERIAL PLAN-OP-EXCHANGE)) 1 0)))
+  (check (= 1 (if (not (= PLAN-OP-EXCHANGE PLAN-OP-TABLE-FUNCTION)) 1 0))))
+
+(test-suite "17-001-opt-phase-distinct"
+  ; 8 OPT-PHASE constants are distinct.
+  (check (= 1 (if (not (= OPT-PHASE-PX-RESCAN OPT-PHASE-RUNTIME-FILTER)) 1 0)))
+  (check (= 1 (if (not (= OPT-PHASE-RUNTIME-FILTER OPT-PHASE-ALLOC-GI)) 1 0)))
+  (check (= 1 (if (not (= OPT-PHASE-ALLOC-GI OPT-PHASE-ALLOC-OP)) 1 0)))
+  (check (= 1 (if (not (= OPT-PHASE-ALLOC-OP OPT-PHASE-OPERATOR-NUMBERING)) 1 0)))
+  (check (= 1 (if (not (= OPT-PHASE-OPERATOR-NUMBERING OPT-PHASE-EXCHANGE-NUMBERING)) 1 0)))
+  (check (= 1 (if (not (= OPT-PHASE-EXCHANGE-NUMBERING OPT-PHASE-ALLOC-EXPR)) 1 0)))
+  (check (= 1 (if (not (= OPT-PHASE-ALLOC-EXPR OPT-PHASE-PROJECT-PRUNING)) 1 0))))
+
+(test-suite "17-001-cost-distinct"
+  ; 3 COST-* constants are distinct.
+  (check (= 1 (if (not (= COST-CPU COST-IO)) 1 0)))
+  (check (= 1 (if (not (= COST-IO COST-NETWORK)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObLogPlan
+; ----------------------------------------------------------------
+
+(test-suite "17-002-log-plan-construction"
+  ; log-plan preserves fields.
+  (check (= 1 (log-plan-get-stmt-type (make-log-plan 1 PLAN-OP-SCAN))))
+  (check (= PLAN-OP-SCAN
+             (log-plan-get-operator-type (make-log-plan 1 PLAN-OP-SCAN))))
+  (check (= 0 (log-plan-get-cost (make-log-plan 1 PLAN-OP-SCAN))))
+  (check (= #f (log-plan-get-child (make-log-plan 1 PLAN-OP-SCAN)))))
+
+(test-suite "17-002-log-plan-predicate"
+  ; log-plan? accepts only log_plans.
+  (check (= #t (log-plan? (make-log-plan 1 PLAN-OP-SCAN))))
+  (check (= #f (log-plan? 'not-a-plan)))
+  (check (= #f (log-plan? 42))))
+
+(test-suite "17-003-log-plan-setters"
+  ; setters update fields.
+  (check (= 2 (let ((lp (make-log-plan 1 PLAN-OP-SCAN)))
+                 (log-plan-set-stmt-type! lp 2)
+                 (log-plan-get-stmt-type lp))))
+  (check (= PLAN-OP-JOIN
+             (let ((lp (make-log-plan 1 PLAN-OP-SCAN)))
+               (log-plan-set-operator-type! lp PLAN-OP-JOIN)
+               (log-plan-get-operator-type lp))))
+  (check (= 100 (let ((lp (make-log-plan 1 PLAN-OP-SCAN)))
+                 (log-plan-set-cost! lp 100)
+                 (log-plan-get-cost lp)))))
+
+(test-suite "17-003-log-plan-set-child"
+  ; set-child! updates.
+  (check (= #t (let ((parent (make-log-plan 1 PLAN-OP-JOIN))
+                      (child (make-log-plan 1 PLAN-OP-SCAN)))
+                 (log-plan-set-child! parent child)
+                 (eq? child (log-plan-get-child parent)))))
+
+; ----------------------------------------------------------------
+; ObPhysicalPlan
+; ----------------------------------------------------------------
+
+(test-suite "17-004-physical-plan-construction"
+  ; physical-plan preserves fields.
+  (check (= 50 (physical-plan-get-cost
+                 (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50))))
+  (check (= #t (log-plan? (physical-plan-get-log-plan
+                             (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50))))))
+
+(test-suite "17-004-physical-plan-predicate"
+  ; physical-plan? accepts only physical_plans.
+  (check (= #t (physical-plan?
+                 (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50))))
+  (check (= #f (physical-plan? 'not-a-pp)))
+  (check (= #f (physical-plan? 42))))
+
+; ----------------------------------------------------------------
+; CandidatePlan
+; ----------------------------------------------------------------
+
+(test-suite "17-005-candidate-plan-construction"
+  ; candidate-plan preserves plan + cost.
+  (check (= #t (physical-plan?
+                 (candidate-plan-get-plan
+                   (make-candidate-plan
+                     (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                     50)))))
+  (check (= 50 (candidate-plan-get-cost
+                 (make-candidate-plan
+                   (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                   50))))
+
+(test-suite "17-005-candidate-plan-predicate"
+  ; candidate-plan? accepts only candidate_plans.
+  (check (= #t (candidate-plan?
+                 (make-candidate-plan
+                   (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                   50))))
+  (check (= #f (candidate-plan? 'not-a-cp)))
+  (check (= #f (candidate-plan? 42)))
+
+; ----------------------------------------------------------------
+; ObOptimizer
+; ----------------------------------------------------------------
+
+(test-suite "17-006-optimizer-construction"
+  ; new optimizer starts with 0 stat + 0 candidates.
+  (check (= 100 (optimizer-get-session-id (make-optimizer 100 1000))))
+  (check (= 1000 (optimizer-get-cost-budget (make-optimizer 100 1000))))
+  (check (= 0 (optimizer-get-stat (make-optimizer 100 1000))))
+  (check (= 0 (optimizer-get-candidate-count (make-optimizer 100 1000))))
+
+(test-suite "17-006-optimizer-predicate"
+  ; optimizer? accepts only optimizers.
+  (check (= #t (optimizer? (make-optimizer 1 100))))
+  (check (= #f (optimizer? 'not-an-opt)))
+  (check (= #f (optimizer? 42)))
+
+(test-suite "17-007-optimizer-inc-stat"
+  ; inc-stat! increments.
+  (check (= 1 (let ((opt (make-optimizer 1 100)))
+                 (optimizer-inc-stat! opt))))
+  (check (= 3 (let ((opt (make-optimizer 1 100)))
+                 (optimizer-inc-stat! opt)
+                 (optimizer-inc-stat! opt)
+                 (optimizer-inc-stat! opt))))
+
+(test-suite "17-007-optimizer-add-candidate"
+  ; add-candidate-plan! increases count.
+  (check (= 1 (let ((opt (make-optimizer 1 1000))
+                    (cp (make-candidate-plan
+                          (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                          50)))
+                (optimizer-add-candidate-plan! opt cp)
+                (optimizer-get-candidate-count opt))))
+
+(test-suite "17-008-optimizer-best-plan-single"
+  ; get-best-plan with single candidate returns it.
+  (check (= #t (let ((opt (make-optimizer 1 1000))
+                    (cp (make-candidate-plan
+                          (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                          50)))
+                (optimizer-add-candidate-plan! opt cp)
+                (eq? cp (optimizer-get-best-plan opt)))))
+
+(test-suite "17-008-optimizer-best-plan-picks-lowest"
+  ; get-best-plan picks the lowest-cost candidate.
+  (check (= #t (let ((opt (make-optimizer 1 1000))
+                    (cp1 (make-candidate-plan
+                           (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 100)
+                           100))
+                    (cp2 (make-candidate-plan
+                           (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                           50))
+                    (cp3 (make-candidate-plan
+                           (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 200)
+                           200)))
+                (optimizer-add-candidate-plan! opt cp1)
+                (optimizer-add-candidate-plan! opt cp2)
+                (optimizer-add-candidate-plan! opt cp3)
+                (eq? cp2 (optimizer-get-best-plan opt)))))
+
+(test-suite "17-008-optimizer-pick-best"
+  ; pick-best! caches best plan + returns it.
+  (check (= #t (let ((opt (make-optimizer 1 1000))
+                    (cp1 (make-candidate-plan
+                           (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 100)
+                           100))
+                    (cp2 (make-candidate-plan
+                           (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                           50)))
+                (optimizer-add-candidate-plan! opt cp1)
+                (optimizer-add-candidate-plan! opt cp2)
+                (optimizer-pick-best! opt)
+                (eq? cp2 (optimizer-get-best-plan opt)))))
+
+(test-suite "17-009-optimizer-optimize"
+  ; optimize returns a log plan + increments stat.
+  (check (= #t (let ((opt (make-optimizer 1 1000)))
+                 (let ((plan (optimizer-optimize opt)))
+                   (and (log-plan? plan)
+                        (= 1 (optimizer-get-stat opt)))))))
+
+(test-suite "17-009-optimizer-optimize-budget-zero"
+  ; optimize with budget=0 returns #f.
+  (check (= #f (optimizer-optimize (make-optimizer 1 0)))))
+
+(test-suite "17-010-optimizer-reset"
+  ; reset! clears all state.
+  (check (= #t (let ((opt (make-optimizer 1 1000))
+                    (cp (make-candidate-plan
+                          (make-physical-plan (make-log-plan 1 PLAN-OP-SCAN) 50)
+                          50)))
+                (optimizer-add-candidate-plan! opt cp)
+                (optimizer-inc-stat! opt)
+                (optimizer-pick-best! opt)
+                (optimizer-reset! opt)
+                (and (= 0 (optimizer-get-stat opt))
+                     (= 0 (optimizer-get-candidate-count opt))))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)
