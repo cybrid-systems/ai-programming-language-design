@@ -1,0 +1,161 @@
+; 039-thp_test.aura
+; =====================
+; Smoke tests for 039-thp.aura — Transparent Huge Pages minimal capability.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/linux:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/linux/039-thp_test.aura
+;
+; Verified automatically (smoke):
+;   - thp_state construction (initial: disabled, 'never, khugepaged off)
+;   - thp-state? predicate
+;   - thp-enable / thp-disable
+;   - thp-set-defrag ('always / 'defer / 'never)
+;   - thp-start-khugepaged / thp-stop-khugepaged
+;   - thp_page construction + refcount
+;   - thp-page-split (decrement refcount)
+;
+; Verified via separate probes during development:
+;   - thp-page-split at refcount 0 stays at 0 (clamped)
+;
+; Deferred (full Linux THP):
+;   - real PMD-level mappings
+;   - khugepaged collapse logic
+;   - split_huge_pmd
+;   - THP fault path
+;   - migration / compaction for THP
+;   - THP shmem / tmpfs
+
+(require "std/test" all:)
+(require "039-thp" all:)
+
+; ----------------------------------------------------------------
+; thp_state construction + predicate
+; ----------------------------------------------------------------
+
+(test-suite "thp-001-construction"
+  ; New thp_state starts disabled, 'never, khugepaged off.
+  (check (= 1 (if (not (thp-state-enabled?
+                         (make-thp-state))) 1 0)))
+  (check (= 'never (thp-state-defrag (make-thp-state))))
+  (check (= 1 (if (not (thp-state-khugepaged?
+                         (make-thp-state))) 1 0))))
+
+(test-suite "thp-001-predicate"
+  ; thp-state? accepts only thp_state closures.
+  (check (= 1 (if (thp-state? (make-thp-state)) 1 0)))
+  (check (= 1 (if (not (thp-state? 'not-a-state)) 1 0)))
+  (check (= 1 (if (not (thp-state? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; enable / disable
+; ----------------------------------------------------------------
+
+(test-suite "thp-002-enable"
+  ; thp-enable sets enabled? to #t.
+  (check (= 1 (let ((s (make-thp-state)))
+                (thp-enable s)
+                (if (thp-state-enabled? s) 1 0)))))
+
+(test-suite "thp-002-disable"
+  ; thp-disable sets enabled? to #f after enable.
+  (check (= 1 (let ((s (make-thp-state)))
+                (thp-enable s)
+                (thp-disable s)
+                (if (not (thp-state-enabled? s)) 1 0)))))
+
+; ----------------------------------------------------------------
+; set-defrag
+; ----------------------------------------------------------------
+
+(test-suite "thp-003-set-defrag-always"
+  ; thp-set-defrag sets defrag to 'always.
+  (check (= 'always (let ((s (make-thp-state)))
+                      (thp-set-defrag s 'always)
+                      (thp-state-defrag s)))))
+
+(test-suite "thp-003-set-defrag-defer"
+  ; thp-set-defrag sets defrag to 'defer.
+  (check (= 'defer (let ((s (make-thp-state)))
+                     (thp-set-defrag s 'defer)
+                     (thp-state-defrag s)))))
+
+(test-suite "thp-003-set-defrag-never"
+  ; thp-set-defrag sets defrag to 'never.
+  (check (= 'never (let ((s (make-thp-state)))
+                     (thp-set-defrag s 'never)
+                     (thp-state-defrag s)))))
+
+; ----------------------------------------------------------------
+; start-khugepaged / stop-khugepaged
+; ----------------------------------------------------------------
+
+(test-suite "thp-004-start-khugepaged"
+  ; thp-start-khugepaged sets khugepaged? to #t.
+  (check (= 1 (let ((s (make-thp-state)))
+                (thp-start-khugepaged s)
+                (if (thp-state-khugepaged? s) 1 0)))))
+
+(test-suite "thp-004-stop-khugepaged"
+  ; thp-stop-khugepaged sets khugepaged? to #f.
+  (check (= 1 (let ((s (make-thp-state)))
+                (thp-start-khugepaged s)
+                (thp-stop-khugepaged s)
+                (if (not (thp-state-khugepaged? s)) 1 0)))))
+
+; ----------------------------------------------------------------
+; thp_page construction + predicate + refcount
+; ----------------------------------------------------------------
+
+(test-suite "thp-005-page-construction"
+  ; thp_page preserves addr, size, refcount.
+  (check (= 0x7f1234500000
+             (thp-page-addr (make-thp-page 0x7f1234500000 2097152 1))))
+  (check (= 2097152 (thp-page-size
+                      (make-thp-page 0x7f1234500000 2097152 1))))
+  (check (= 1 (thp-page-refcount
+                (make-thp-page 0x7f1234500000 2097152 1)))))
+
+(test-suite "thp-005-page-collapsed-init"
+  ; New thp_page starts with collapsed? = #f.
+  (check (= 1 (if (not (thp-page-collapsed?
+                         (make-thp-page 0 2097152 1))) 1 0))))
+
+(test-suite "thp-005-page-predicate"
+  ; thp-page? accepts only thp_page closures.
+  (check (= 1 (if (thp-page? (make-thp-page 0 2097152 1)) 1 0)))
+  (check (= 1 (if (not (thp-page? 'not-a-page)) 1 0)))
+  (check (= 1 (if (not (thp-page? 42)) 1 0))))
+
+; ----------------------------------------------------------------
+; thp-page-split
+; ----------------------------------------------------------------
+
+(test-suite "thp-006-split"
+  ; thp-page-split decrements refcount.
+  (check (= 0 (let ((p (make-thp-page 0 2097152 1)))
+                (thp-page-split p)
+                (thp-page-refcount p)))))
+
+(test-suite "thp-006-split-multiple"
+  ; Multiple splits accumulate.
+  (check (= 0 (let ((p (make-thp-page 0 2097152 5)))
+                (thp-page-split p)
+                (thp-page-split p)
+                (thp-page-split p)
+                (thp-page-split p)
+                (thp-page-split p)
+                (thp-page-refcount p)))))
+
+(test-suite "thp-006-split-clamp-zero"
+  ; thp-page-split at 0 stays at 0.
+  (check (= 0 (let ((p (make-thp-page 0 2097152 0)))
+                (thp-page-split p)
+                (thp-page-refcount p)))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

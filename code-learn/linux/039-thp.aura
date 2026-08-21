@@ -1,0 +1,188 @@
+; 039-thp.aura
+; =====================
+; thp — minimal capability port to aura.
+;
+; Maps to: Linux kernel Transparent Huge Pages (THP)
+; Source: mm/huge_memory.c + include/linux/huge_mm.h (Linux 7.0-rc1)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; Linux THP provides transparent 2MB huge pages for anonymous memory:
+;   - struct thp_mm / struct thp operations per-VMA
+;   - thp_enabled / thp_disabled / thp_size
+;   - khugepaged daemon (collapses 4K pages into 2MB transparently)
+;   - transhuge pages (PMD-level mappings)
+;   - madvise MADV_HUGEPAGE / MADV_NOHUGEPAGE
+;   - split_huge_page / khugepaged_collapse
+;   - /sys/kernel/mm/transparent_hugepage/enabled
+;   - /sys/kernel/mm/transparent_hugepage/defrag
+;   - THP defrag modes: 'always / 'defer / 'defer+madvise / 'never
+;
+; aura has no VMAs, no PMD, no page cache. v1 ships:
+;   - make-thp-state (enabled?, defrag, khugepaged-active?)
+;   - thp-enable / thp-disable
+;   - thp-set-defrag ('always / 'defer / 'never)
+;   - thp-start-khugepaged / thp-stop-khugepaged
+;   - make-thp-page (addr, size, refcount)
+;   - thp-page-split (decrement refcount or split)
+;   - thp-state? / thp-page? predicates
+;
+; Deferred (full Linux THP):
+;   - real PMD-level mappings
+;   - khugepaged collapse logic (merge 512 4K pages)
+;   - split_huge_pmd / split_huge_page
+;   - real /sys/kernel/mm/transparent_hugepage/* control
+;   - memcg THP accounting
+;   - khugepaged scan + collapse
+;   - THP fault path (do_huge_pmd_anonymous_page)
+;   - migration / compaction for THP
+;   - huge zero page
+;   - transparent_hugepage_cache_use
+;   - THP shmem / tmpfs
+
+(export
+  make-thp-state
+  thp-state?
+  thp-state-enabled?
+  thp-state-defrag
+  thp-state-khugepaged?
+  thp-enable
+  thp-disable
+  thp-set-defrag
+  thp-start-khugepaged
+  thp-stop-khugepaged
+  make-thp-page
+  thp-page?
+  thp-page-addr
+  thp-page-size
+  thp-page-refcount
+  thp-page-split
+  thp-page-collapsed?
+  'always
+  'defer
+  'never)
+
+; ----------------------------------------------------------------
+; thp_state — closure-based, mutable via letrec setters
+; ----------------------------------------------------------------
+
+; make-thp-state: create THP subsystem state.
+; Returns: thp_state closure (initial: enabled? = #f, defrag = 'never,
+; khugepaged-active? = #f).
+(define (make-thp-state)
+  (let ((enabled? #f)
+        (defrag 'never)
+        (khugepaged? #f))
+    (letrec ((set-enabled!   (lambda (v) (set! enabled? v) v))
+             (set-defrag!    (lambda (v) (set! defrag v) v))
+             (set-khugepaged! (lambda (v) (set! khugepaged? v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'enabled?)   enabled?)
+                       ((eq? msg 'defrag)     defrag)
+                       ((eq? msg 'khugepaged?) khugepaged?)
+                       ((eq? msg 'set-enabled!)   set-enabled!)
+                       ((eq? msg 'set-defrag!)    set-defrag!)
+                       ((eq? msg 'set-khugepaged!) set-khugepaged!)
+                       (else #f)))))
+      self)))
+
+; thp-state?: is the object a thp_state?
+; Detected by querying 'defrag — only thp_state closures return
+; one of the known defrag symbols.
+(define (thp-state? obj)
+  (if (procedure? obj)
+      (let ((d (obj 'defrag)))
+        (if (or (eq? d 'always) (eq? d 'defer) (eq? d 'never))
+            #t #f))
+      #f))
+
+; thp-state-enabled?: is THP enabled?
+(define (thp-state-enabled? s) (s 'enabled?))
+
+; thp-state-defrag: get defrag mode
+(define (thp-state-defrag s) (s 'defrag))
+
+; thp-state-khugepaged?: is khugepaged running?
+(define (thp-state-khugepaged? s) (s 'khugepaged?))
+
+; thp-enable: enable THP.
+; Returns the new enabled state.
+(define (thp-enable s)
+  ((s 'set-enabled!) #t))
+
+; thp-disable: disable THP.
+; Returns the new enabled state.
+(define (thp-disable s)
+  ((s 'set-enabled!) #f))
+
+; thp-set-defrag: set defrag mode ('always / 'defer / 'never).
+; Returns the new defrag mode.
+(define (thp-set-defrag s mode)
+  ((s 'set-defrag!) mode))
+
+; thp-start-khugepaged: start khugepaged daemon.
+; Returns the new khugepaged state.
+(define (thp-start-khugepaged s)
+  ((s 'set-khugepaged!) #t))
+
+; thp-stop-khugepaged: stop khugepaged daemon.
+; Returns the new khugepaged state.
+(define (thp-stop-khugepaged s)
+  ((s 'set-khugepaged!) #f))
+
+; ----------------------------------------------------------------
+; thp_page — closure-based, mutable refcount
+; ----------------------------------------------------------------
+
+; make-thp-page: create a transhuge page entry.
+; Args: addr (integer), size (integer), refcount (integer)
+; Returns: thp_page closure.
+(define (make-thp-page addr size refcount)
+  (let ((collapsed? #f))
+    (letrec ((set-collapsed!  (lambda (v) (set! collapsed? v) v))
+             (set-refcount!   (lambda (v) (set! refcount v) v))
+             (inc-refcount!   (lambda () (set! refcount (+ refcount 1)) refcount))
+             (dec-refcount!   (lambda () (set! refcount (- refcount 1)) refcount))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'addr) addr)
+                       ((eq? msg 'size) size)
+                       ((eq? msg 'refcount) refcount)
+                       ((eq? msg 'collapsed?) collapsed?)
+                       ((eq? msg 'set-collapsed!) set-collapsed!)
+                       ((eq? msg 'set-refcount!)  set-refcount!)
+                       ((eq? msg 'inc-refcount!)  inc-refcount!)
+                       ((eq? msg 'dec-refcount!)  dec-refcount!)
+                       (else #f)))))
+      self)))
+
+; thp-page?: is the object a thp_page?
+; Detected by querying 'collapsed? — only thp_page closures return a
+; boolean.
+(define (thp-page? obj)
+  (if (procedure? obj)
+      (let ((c (obj 'collapsed?)))
+        (if (or (eq? c #t) (eq? c #f)) #t #f))
+      #f))
+
+; thp-page-addr: get page address
+(define (thp-page-addr p) (p 'addr))
+
+; thp-page-size: get page size (typically 2MB = 2097152)
+(define (thp-page-size p) (p 'size))
+
+; thp-page-refcount: get current refcount
+(define (thp-page-refcount p) (p 'refcount))
+
+; thp-page-collapsed?: was this page created by khugepaged collapse?
+(define (thp-page-collapsed? p) (p 'collapsed?))
+
+; thp-page-split: simulate splitting a thp into smaller pages.
+; Decrements refcount (each sub-page keeps its own refcount).
+; Returns the new refcount.
+(define (thp-page-split p)
+  (let ((current (p 'refcount)))
+    (if (= current 0)
+        0
+        ((p 'dec-refcount!)))))
