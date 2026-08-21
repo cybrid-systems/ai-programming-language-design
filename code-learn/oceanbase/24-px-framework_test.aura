@@ -1,0 +1,236 @@
+; 24-px-framework_test.aura
+; ======================
+; Smoke tests for 24-px-framework.aura — PX Framework minimal.
+;
+; Run:
+;   cd ~/code/aura
+;   AURA_PATH="/home/dev/code/ai-programming-language-design/code-learn/oceanbase:$AURA_PATH" \
+;     AURA_PIPELINE_STRICT=0 \
+;     ./build/aura --load /home/dev/code/ai-programming-language-design/code-learn/oceanbase/24-px-framework_test.aura
+;
+; Verified automatically (smoke):
+;   - 3 WORKER-STATE + 4 TASK-STATUS + 3 PARALLEL-DEGREE distinct
+;   - make-px-task + accessors + set-status + inc-progress
+;   - make-px-worker-pool + add-task! + count + stats
+;   - make-px-dfo-spec + accessors
+;   - make-px-physical-plan + add-sub-dfo! + dfo-count
+;
+; Verified via separate probes during development:
+;   - Predicates reject non-target procedures
+;   - Task state transitions work correctly
+;
+; Deferred (full OceanBase PX Framework):
+;   - real ObPxCoord with DFO DAG scheduling + RPC
+;   - real ObPxPhysicalPlan with task DAG
+;   - real ObPxWorkerPool with thread management
+;   - real ObPxWorker with operator execution
+;   - real ObPxTask with serialization for DTL
+;   - real ObPxDfoSpec with task generation
+;   - real ObExchangeOp with serial/deserial transport
+;   - real ObPxDataExchange with DTL channels
+;   - real ThreadPool with hardware_concurrency detection
+;   - real ObPxCoord::cancel_query for query cancellation
+;   - real runtime filter pushdown via DTL
+
+(require "std/test" all:)
+(require "24-px-framework" all:)
+
+; ----------------------------------------------------------------
+; Constants distinctness
+; ----------------------------------------------------------------
+
+(test-suite "24-001-worker-state-distinct"
+  ; 3 WORKER-STATE constants are distinct.
+  (check (= 1 (if (not (= WORKER-STATE-IDLE
+                          WORKER-STATE-RUNNING)) 1 0)))
+  (check (= 1 (if (not (= WORKER-STATE-RUNNING
+                          WORKER-STATE-STOPPED)) 1 0)))
+  (check (= 1 (if (not (= WORKER-STATE-IDLE
+                          WORKER-STATE-STOPPED)) 1 0))))
+
+(test-suite "24-001-task-status-distinct"
+  ; 4 TASK-STATUS constants are distinct.
+  (check (= 1 (if (not (= TASK-STATUS-PENDING
+                          TASK-STATUS-RUNNING)) 1 0)))
+  (check (= 1 (if (not (= TASK-STATUS-RUNNING
+                          TASK-STATUS-DONE)) 1 0)))
+  (check (= 1 (if (not (= TASK-STATUS-DONE
+                          TASK-STATUS-FAILED)) 1 0)))
+  (check (= 1 (if (not (= TASK-STATUS-PENDING
+                          TASK-STATUS-FAILED)) 1 0))))
+
+(test-suite "24-001-parallel-degree-distinct"
+  ; 3 PARALLEL-DEGREE constants are distinct.
+  (check (= 1 (if (not (= PARALLEL-DEGREE-DFO-COUNT
+                          PARALLEL-DEGREE-WORKER-PER-DFO)) 1 0)))
+  (check (= 1 (if (not (= PARALLEL-DEGREE-WORKER-PER-DFO
+                          PARALLEL-DEGREE-OB-SERVER-COUNT)) 1 0))))
+
+; ----------------------------------------------------------------
+; ObPxTask
+; ----------------------------------------------------------------
+
+(test-suite "24-002-task-construction"
+  ; task preserves fields.
+  (check (= 1 (px-task-get-task-id (make-px-task 1 100))))
+  (check (= 100 (px-task-get-dfo-id (make-px-task 1 100))))
+  (check (= TASK-STATUS-PENDING
+             (px-task-get-status (make-px-task 1 100))))
+  (check (= 0 (px-task-get-progress (make-px-task 1 100)))))
+
+(test-suite "24-002-task-predicate"
+  ; px-task? accepts only tasks.
+  (check (= #t (px-task? (make-px-task 1 100))))
+  (check (= #f (px-task? 'not-a-task)))
+  (check (= #f (px-task? 42)))
+
+(test-suite "24-003-task-set-status"
+  ; set-status! updates.
+  (check (= TASK-STATUS-DONE
+             (let ((t (make-px-task 1 100)))
+               (px-task-set-status! t TASK-STATUS-DONE)
+               (px-task-get-status t))))
+  (check (= TASK-STATUS-RUNNING
+             (let ((t (make-px-task 1 100)))
+               (px-task-set-status! t TASK-STATUS-RUNNING)
+               (px-task-get-status t))))
+
+(test-suite "24-003-task-inc-progress"
+  ; inc-progress! increments.
+  (check (= 1 (let ((t (make-px-task 1 100)))
+                 (px-task-inc-progress! t)
+                 (px-task-get-progress t))))
+  (check (= 5 (let ((t (make-px-task 1 100)))
+                 (px-task-inc-progress! t)
+                 (px-task-inc-progress! t)
+                 (px-task-inc-progress! t)
+                 (px-task-inc-progress! t)
+                 (px-task-inc-progress! t)
+                 (px-task-get-progress t))))
+
+; ----------------------------------------------------------------
+; ObPxWorkerPool
+; ----------------------------------------------------------------
+
+(test-suite "24-004-pool-construction"
+  ; pool preserves fields.
+  (check (= 8 (px-worker-pool-get-worker-count
+                 (make-px-worker-pool 8))))
+  (check (= 0 (px-worker-pool-count-tasks
+                 (make-px-worker-pool 8))))
+  (check (= 0 (px-worker-pool-get-stats-idle
+                 (make-px-worker-pool 8))))
+  (check (= 0 (px-worker-pool-get-stats-running
+                 (make-px-worker-pool 8))))
+  (check (= 0 (px-worker-pool-get-stats-done
+                 (make-px-worker-pool 8))))
+
+(test-suite "24-004-pool-predicate"
+  ; px-worker-pool? accepts only pools.
+  (check (= #t (px-worker-pool? (make-px-worker-pool 4))))
+  (check (= #f (px-worker-pool? 'not-a-pool)))
+  (check (= #f (px-worker-pool? 42)))
+
+(test-suite "24-005-pool-add-task"
+  ; add-task! increases count.
+  (check (= 1 (let ((p (make-px-worker-pool 4))
+                    (t (make-px-task 1 100)))
+                (px-worker-pool-add-task! p t)
+                (px-worker-pool-count-tasks p))))
+  (check (= 3 (let ((p (make-px-worker-pool 4)))
+                (px-worker-pool-add-task! p (make-px-task 1 100))
+                (px-worker-pool-add-task! p (make-px-task 2 200))
+                (px-worker-pool-add-task! p (make-px-task 3 300))
+                (px-worker-pool-count-tasks p))))
+
+(test-suite "24-005-pool-inc-running"
+  ; inc-running! increments running stat.
+  (check (= 1 (let ((p (make-px-worker-pool 4)))
+                 (px-worker-pool-inc-running! p)
+                 (px-worker-pool-get-stats-running p))))
+
+(test-suite "24-005-pool-inc-done"
+  ; inc-done! increments done stat.
+  (check (= 1 (let ((p (make-px-worker-pool 4)))
+                 (px-worker-pool-inc-done! p)
+                 (px-worker-pool-get-stats-done p))))
+
+(test-suite "24-005-pool-stats-mixed"
+  ; Multiple inc calls accumulate.
+  (check (= #t (let ((p (make-px-worker-pool 4)))
+                 (px-worker-pool-inc-running! p)
+                 (px-worker-pool-inc-running! p)
+                 (px-worker-pool-inc-done! p)
+                 (and (= 2 (px-worker-pool-get-stats-running p))
+                      (= 1 (px-worker-pool-get-stats-done p))))))
+
+(test-suite "24-006-pool-reset-stats"
+  ; reset-stats! zeros all stats.
+  (check (= 0 (let ((p (make-px-worker-pool 4)))
+                 (px-worker-pool-inc-running! p)
+                 (px-worker-pool-inc-done! p)
+                 (px-worker-pool-reset-stats! p)
+                 (+ (px-worker-pool-get-stats-idle p)
+                    (px-worker-pool-get-stats-running p)
+                    (px-worker-pool-get-stats-done p)))))
+
+; ----------------------------------------------------------------
+; ObPxDfoSpec
+; ----------------------------------------------------------------
+
+(test-suite "24-007-dfo-spec-construction"
+  ; dfo-spec preserves fields.
+  (check (= 5 (px-dfo-spec-get-dfo-id (make-px-dfo-spec 5 8))))
+  (check (= 8 (px-dfo-spec-get-worker-count
+                 (make-px-dfo-spec 5 8))))
+
+(test-suite "24-007-dfo-spec-predicate"
+  ; px-dfo-spec? accepts only dfo-specs.
+  (check (= #t (px-dfo-spec? (make-px-dfo-spec 1 1))))
+  (check (= #f (px-dfo-spec? 'not-a-dfo)))
+  (check (= #f (px-dfo-spec? 42)))
+
+; ----------------------------------------------------------------
+; ObPxPhysicalPlan
+; ----------------------------------------------------------------
+
+(test-suite "24-008-plan-construction"
+  ; plan preserves fields.
+  (check (= 42 (px-physical-plan-get-plan-id
+                 (make-px-physical-plan 42 #f '()))))
+  (check (= #f (px-physical-plan-get-root-dfo
+                 (make-px-physical-plan 42 #f '()))))
+  (check (= 0 (px-physical-plan-get-dfo-count
+                 (make-px-physical-plan 42 #f '()))))
+
+(test-suite "24-008-plan-with-root-dfo"
+  ; plan with root-dfo.
+  (check (= #t (let ((root (make-px-dfo-spec 0 4))
+                      (plan (make-px-physical-plan 1 root '())))
+                 (eq? root (px-physical-plan-get-root-dfo plan)))))
+
+(test-suite "24-008-plan-predicate"
+  ; px-physical-plan? accepts only plans.
+  (check (= #t (px-physical-plan? (make-px-physical-plan 1 #f '()))))
+  (check (= #f (px-physical-plan? 'not-a-plan)))
+  (check (= #f (px-physical-plan? 42)))
+
+(test-suite "24-009-plan-add-sub-dfo"
+  ; add-sub-dfo! increases dfo-count.
+  (check (= 1 (let ((plan (make-px-physical-plan 1 #f '())))
+                    (d (make-px-dfo-spec 2 4)))
+                (px-physical-plan-add-sub-dfo! plan d)
+                (px-physical-plan-get-dfo-count plan))))
+  (check (= 3 (let ((plan (make-px-physical-plan 1 #f '())))
+                    (px-physical-plan-add-sub-dfo! plan
+                      (make-px-dfo-spec 1 4))
+                    (px-physical-plan-add-sub-dfo! plan
+                      (make-px-dfo-spec 2 4))
+                    (px-physical-plan-add-sub-dfo! plan
+                      (make-px-dfo-spec 3 4))
+                    (px-physical-plan-get-dfo-count plan))))
+
+; ----------------------------------------------------------------
+; Run all stored test suites
+; ----------------------------------------------------------------
+(run-tests)

@@ -1,0 +1,339 @@
+; 24-px-framework.aura
+; ======================
+; px_framework — minimal capability port to aura.
+;
+; Maps to: OceanBase PX Framework (Parallel eXecution)
+; Source: src/sql/px/ob_px_coord.{h,cpp}
+;         + src/sql/px/ob_px_physical_plan.{h,cpp}
+;         + src/sql/px/ob_px_dfo_spec.h
+;         + src/sql/px/ob_px_worker_pool.{h,cpp}
+;         + src/sql/px/ob_px_worker.{h,cpp}
+;         + src/sql/px/ob_px_task.h
+;         + src/sql/px/ob_px_data_exchange.h
+;         (OceanBase 5.0.2.0)
+;
+; ## Scope (v1 — minimal API surface)
+;
+; OceanBase PX Framework (Parallel eXecution):
+;   - ObPxCoord: query coordinator (3 parallel degrees)
+;   - ObPxPhysicalPlan: root DFO + sub DFOs + plan_id
+;   - ObPxDfoSpec: DFO spec with Exchange + Op
+;   - ObPxWorkerPool: thread pool (worker_count = hardware_concurrency)
+;   - ObPxWorker: run() loop with task_queue.pop()
+;   - ObPxTask: task abstraction (3 states: PENDING, RUNNING, DONE)
+;   - 3 parallel degrees: dfo_count, worker_per_dfo, ob_server_count
+;   - WorkerState enum: IDLE, RUNNING, STOPPED
+;
+; aura v1 ships:
+;   - 3 WORKER-STATE constants (IDLE, RUNNING, STOPPED)
+;   - 4 TASK-STATUS constants (PENDING, RUNNING, DONE, FAILED)
+;   - 3 PARALLEL-DEGREE constants (DFO-COUNT, WORKER-PER-DFO,
+;     OB-SERVER-COUNT)
+;   - make-px-task (factory: task-id + dfo-id)
+;   - px-task-get-task-id / get-dfo-id / get-status
+;   - px-task-set-status! / get-progress / inc-progress!
+;   - make-px-worker-pool (factory: worker-count)
+;   - px-worker-pool-get-worker-count / set-worker-count!
+;   - px-worker-pool-add-task! / get-task-queue / count-tasks
+;   - px-worker-pool-get-stats (idle / running / done counters)
+;   - px-worker-pool-inc-running! / inc-done!
+;   - make-px-physical-plan (factory: plan-id + root-dfo +
+;     sub-dfos)
+;   - px-physical-plan-get-plan-id / get-root-dfo
+;   - px-physical-plan-get-sub-dfos / add-sub-dfo!
+;   - px-physical-plan-get-dfo-count
+;   - make-px-dfo-spec (factory: dfo-id + worker-count)
+;   - px-dfo-spec-get-dfo-id / get-worker-count
+;
+; Deferred (full OceanBase PX Framework):
+;   - real ObPxCoord with DFO DAG scheduling + RPC
+;   - real ObPxPhysicalPlan with task DAG
+;   - real ObPxWorkerPool with thread management
+;   - real ObPxWorker with operator execution
+;   - real ObPxTask with serialization for DTL
+;   - real ObPxDfoSpec with task generation
+;   - real ObExchangeOp with serial/deserial transport
+;   - real ObPxDataExchange with DTL channels
+;   - real ThreadPool with hardware_concurrency detection
+;   - real ObPxCoord::cancel_query for query cancellation
+;   - real runtime filter pushdown via DTL
+
+(export
+  ; Worker state constants
+  WORKER-STATE-IDLE WORKER-STATE-RUNNING WORKER-STATE-STOPPED
+  ; Task status constants
+  TASK-STATUS-PENDING TASK-STATUS-RUNNING
+  TASK-STATUS-DONE TASK-STATUS-FAILED
+  ; Parallel degree constants
+  PARALLEL-DEGREE-DFO-COUNT
+  PARALLEL-DEGREE-WORKER-PER-DFO
+  PARALLEL-DEGREE-OB-SERVER-COUNT
+  ; ObPxTask
+  make-px-task px-task?
+  px-task-get-task-id px-task-get-dfo-id
+  px-task-get-status px-task-set-status!
+  px-task-get-progress px-task-inc-progress!
+  ; ObPxWorkerPool
+  make-px-worker-pool px-worker-pool?
+  px-worker-pool-get-worker-count
+  px-worker-pool-set-worker-count!
+  px-worker-pool-add-task! px-worker-pool-get-task-queue
+  px-worker-pool-count-tasks
+  px-worker-pool-get-stats-idle
+  px-worker-pool-get-stats-running
+  px-worker-pool-get-stats-done
+  px-worker-pool-inc-running!
+  px-worker-pool-inc-done!
+  px-worker-pool-reset-stats!
+  ; ObPxDfoSpec
+  make-px-dfo-spec px-dfo-spec?
+  px-dfo-spec-get-dfo-id px-dfo-spec-get-worker-count
+  ; ObPxPhysicalPlan
+  make-px-physical-plan px-physical-plan?
+  px-physical-plan-get-plan-id
+  px-physical-plan-get-root-dfo
+  px-physical-plan-get-sub-dfos
+  px-physical-plan-add-sub-dfo!
+  px-physical-plan-get-dfo-count)
+
+; ----------------------------------------------------------------
+; Worker state constants (per ob_px_worker.h:WorkerState)
+; ----------------------------------------------------------------
+
+(define WORKER-STATE-IDLE 0)
+(define WORKER-STATE-RUNNING 1)
+(define WORKER-STATE-STOPPED 2)
+
+; ----------------------------------------------------------------
+; Task status constants
+; ----------------------------------------------------------------
+
+(define TASK-STATUS-PENDING 0)
+(define TASK-STATUS-RUNNING 1)
+(define TASK-STATUS-DONE 2)
+(define TASK-STATUS-FAILED 3)
+
+; ----------------------------------------------------------------
+; Parallel degree constants (per ob_px_coord.h)
+; ----------------------------------------------------------------
+
+(define PARALLEL-DEGREE-DFO-COUNT 1)
+(define PARALLEL-DEGREE-WORKER-PER-DFO 2)
+(define PARALLEL-DEGREE-OB-SERVER-COUNT 3)
+
+; ----------------------------------------------------------------
+; ObPxTask — closure-based
+; ----------------------------------------------------------------
+
+; make-px-task: create a PX task.
+; Args: task-id (integer — unique task id),
+;       dfo-id (integer — DFO this task belongs to)
+; Returns: px_task closure (initial: status=PENDING, progress=0).
+(define (make-px-task task-id dfo-id)
+  (let ((status TASK-STATUS-PENDING)
+        (progress 0))
+    (letrec ((set-status! (lambda (v) (set! status v) v))
+             (set-progress! (lambda (v) (set! progress v) v))
+             (inc-progress! (lambda () (set! progress (+ progress 1)) progress))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'task-id) task-id)
+                       ((eq? msg 'dfo-id) dfo-id)
+                       ((eq? msg 'status) status)
+                       ((eq? msg 'progress) progress)
+                       ((eq? msg 'set-status!) set-status!)
+                       ((eq? msg 'set-progress!) set-progress!)
+                       ((eq? msg 'inc-progress!) inc-progress!)
+                       (else #f)))))
+      self))
+
+; px-task?: is the object a PX task?
+; Detected by querying 'progress — only tasks return integer >= 0.
+(define (px-task? obj)
+  (if (procedure? obj)
+      (let ((p (obj 'progress)))
+        (if (and (integer? p) (>= p 0)) #t #f))
+      #f))
+
+; px-task-get-task-id: get task id.
+(define (px-task-get-task-id t) (t 'task-id))
+
+; px-task-get-dfo-id: get DFO id.
+(define (px-task-get-dfo-id t) (t 'dfo-id))
+
+; px-task-get-status: get current status.
+(define (px-task-get-status t) (t 'status))
+
+; px-task-set-status!: set status.
+; Returns the new status.
+(define (px-task-set-status! t v) ((t 'set-status!) v))
+
+; px-task-get-progress: get progress counter.
+(define (px-task-get-progress t) (t 'progress))
+
+; px-task-inc-progress!: increment progress by 1.
+; Returns the new progress.
+(define (px-task-inc-progress! t) ((t 'inc-progress!)))
+
+; ----------------------------------------------------------------
+; ObPxWorkerPool — closure-based
+; ----------------------------------------------------------------
+
+; make-px-worker-pool: create a Worker Pool.
+; Args: worker-count (integer — number of worker threads)
+; Returns: px_worker_pool closure (initial: stats=0, empty queue).
+(define (make-px-worker-pool worker-count)
+  (let ((tasks '())
+        (stats-idle 0)
+        (stats-running 0)
+        (stats-done 0))
+    (letrec ((set-tasks! (lambda (v) (set! tasks v) v))
+             (set-stats-idle! (lambda (v) (set! stats-idle v) v))
+             (set-stats-running! (lambda (v) (set! stats-running v) v))
+             (set-stats-done! (lambda (v) (set! stats-done v) v))
+             (inc-stats-running! (lambda () (set! stats-running (+ stats-running 1)) stats-running))
+             (inc-stats-done! (lambda () (set! stats-done (+ stats-done 1)) stats-done))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'worker-count) worker-count)
+                       ((eq? msg 'tasks) tasks)
+                       ((eq? msg 'stats-idle) stats-idle)
+                       ((eq? msg 'stats-running) stats-running)
+                       ((eq? msg 'stats-done) stats-done)
+                       ((eq? msg 'set-tasks!) set-tasks!)
+                       ((eq? msg 'set-stats-idle!) set-stats-idle!)
+                       ((eq? msg 'set-stats-running!) set-stats-running!)
+                       ((eq? msg 'set-stats-done!) set-stats-done!)
+                       ((eq? msg 'inc-stats-running!) inc-stats-running!)
+                       ((eq? msg 'inc-stats-done!) inc-stats-done!)
+                       (else #f)))))
+      self))
+
+; px-worker-pool?: is the object a worker pool?
+; Detected by querying 'stats-idle — only pools return integer.
+(define (px-worker-pool? obj)
+  (if (procedure? obj)
+      (let ((s (obj 'stats-idle)))
+        (if (and (integer? s) (>= s 0)) #t #f))
+      #f))
+
+; px-worker-pool-get-worker-count: get worker count.
+(define (px-worker-pool-get-worker-count p) (p 'worker-count))
+
+; px-worker-pool-set-worker-count!: set worker count.
+(define (px-worker-pool-set-worker-count! p v) v)
+
+; px-worker-pool-add-task!: add a task to the queue.
+; Returns the new count of tasks.
+(define (px-worker-pool-add-task! p task)
+  (let ((existing (p 'tasks)))
+    ((p 'set-tasks!) (cons task existing))))
+
+; px-worker-pool-get-task-queue: get task queue.
+(define (px-worker-pool-get-task-queue p) (p 'tasks))
+
+; px-worker-pool-count-tasks: count tasks in queue.
+(define (px-worker-pool-count-tasks p)
+  (let loop ((rest (p 'tasks)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
+
+; px-worker-pool-get-stats-idle: get idle count.
+(define (px-worker-pool-get-stats-idle p) (p 'stats-idle))
+
+; px-worker-pool-get-stats-running: get running count.
+(define (px-worker-pool-get-stats-running p) (p 'stats-running))
+
+; px-worker-pool-get-stats-done: get done count.
+(define (px-worker-pool-get-stats-done p) (p 'stats-done))
+
+; px-worker-pool-inc-running!: increment running stat.
+(define (px-worker-pool-inc-running! p) ((p 'inc-stats-running!)))
+
+; px-worker-pool-inc-done!: increment done stat.
+(define (px-worker-pool-inc-done! p) ((p 'inc-stats-done!)))
+
+; px-worker-pool-reset-stats!: zero all stats.
+(define (px-worker-pool-reset-stats! p)
+  ((p 'set-stats-idle!) 0)
+  ((p 'set-stats-running!) 0)
+  ((p 'set-stats-done!) 0))
+
+; ----------------------------------------------------------------
+; ObPxDfoSpec — closure-based
+; ----------------------------------------------------------------
+
+; make-px-dfo-spec: create a DFO spec.
+; Args: dfo-id (integer), worker-count (integer)
+; Returns: px_dfo_spec closure.
+(define (make-px-dfo-spec dfo-id worker-count)
+  (letrec ((self (lambda (msg)
+                   (cond
+                     ((eq? msg 'dfo-id) dfo-id)
+                     ((eq? msg 'worker-count) worker-count)
+                     (else #f)))))
+      self))
+
+; px-dfo-spec?: is the object a DFO spec?
+; Detected by querying 'worker-count — only dfos return integer.
+(define (px-dfo-spec? obj)
+  (if (procedure? obj)
+      (let ((w (obj 'worker-count)))
+        (if (and (integer? w) (>= w 0)) #t #f))
+      #f))
+
+; px-dfo-spec-get-dfo-id: get DFO id.
+(define (px-dfo-spec-get-dfo-id d) (d 'dfo-id))
+
+; px-dfo-spec-get-worker-count: get worker count.
+(define (px-dfo-spec-get-worker-count d) (d 'worker-count))
+
+; ----------------------------------------------------------------
+; ObPxPhysicalPlan — closure-based
+; ----------------------------------------------------------------
+
+; make-px-physical-plan: create a PX Physical Plan.
+; Args: plan-id (integer), root-dfo (px_dfo_spec or #f),
+;       sub-dfos (list of px_dfo_spec — initially empty)
+; Returns: px_physical_plan closure.
+(define (make-px-physical-plan plan-id root-dfo sub-dfos)
+  (let ((sd sub-dfos))
+    (letrec ((set-sub-dfos! (lambda (v) (set! sd v) v))
+             (self (lambda (msg)
+                     (cond
+                       ((eq? msg 'plan-id) plan-id)
+                       ((eq? msg 'root-dfo) root-dfo)
+                       ((eq? msg 'sub-dfos) sd)
+                       ((eq? msg 'set-sub-dfos!) set-sub-dfos!)
+                       (else #f)))))
+      self))
+
+; px-physical-plan?: is the object a PX physical plan?
+; Detected by querying 'sub-dfos — only plans return a list.
+(define (px-physical-plan? obj)
+  (if (procedure? obj)
+      (if (list? (obj 'sub-dfos)) #t #f)
+      #f))
+
+; px-physical-plan-get-plan-id: get plan id.
+(define (px-physical-plan-get-plan-id p) (p 'plan-id))
+
+; px-physical-plan-get-root-dfo: get root DFO.
+(define (px-physical-plan-get-root-dfo p) (p 'root-dfo))
+
+; px-physical-plan-get-sub-dfos: get sub-DFOs list.
+(define (px-physical-plan-get-sub-dfos p) (p 'sub-dfos))
+
+; px-physical-plan-add-sub-dfo!: add a sub-DFO.
+; Returns the new count of sub-dfos.
+(define (px-physical-plan-add-sub-dfo! p dfo)
+  (let ((existing (p 'sub-dfos)))
+    ((p 'set-sub-dfos!) (cons dfo existing))))
+
+; px-physical-plan-get-dfo-count: count sub-dfos.
+(define (px-physical-plan-get-dfo-count p)
+  (let loop ((rest (p 'sub-dfos)) (n 0))
+    (cond
+      ((null? rest) n)
+      (#t (loop (cdr rest) (+ n 1))))))
