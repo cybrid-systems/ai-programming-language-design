@@ -35,6 +35,7 @@
 | 17 | [多节点压测](17-distributed-bench.md) | 3 meta + 3 storage + 1 graph、实测 RTT、RF=1/3、分区数、leader、杀进程 |
 | 20 | [中间表示](20-intermediate-representation.md) | 场景二三条查询的算子输出：`Value` / `DataSet` 列布局、Thrift 字节、glibc 堆；和水位、下推的关系 |
 | 21 | [中间表示方案](21-ir-optimization-design.md) | 按收益和风险分的通用改法：P0 不改对外协议，P1 改 storage 可选字段，P2 改调度；含 v3.8.0 上的 PoC patch |
+| 22 | [中间表示收益实测](22-ir-bench.md) | 同一棵 `fa928930` 上原版对 P0：P50/P95/P99、QPS、RSS、水位；P1/P2 只给估算 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -44,7 +45,7 @@
 
 15 是下推框架。16 是它在 `v3.8.0` 上的实现和单机重测。17 是同一台 VM 上的多进程集群，RTT 来自 ping，不是 `tc netem`（这个内核没编进 `sch_netem`）。
 
-[20](20-intermediate-representation.md) 接在 11–14 后面：用场景二的 40415 条边、382 个商品、4000 个用户，写每个算子吐出的 `DataSet` 和 Thrift 字节。12 有时延和行数，没有这组字节。[21](21-ir-optimization-design.md) 把这些字节收成 graphd、storaged 和两边协议的分阶段改法。写 21 时 origin/main 上还没有 15–19，下推重叠以 [10](10-pushdown-capability.md) 为准。15–17 是后来补上的下推实现，不改 20/21 里的字节计数。
+[20](20-intermediate-representation.md) 接在 11–14 后面：用场景二的 40415 条边、382 个商品、4000 个用户，写每个算子吐出的 `DataSet` 和 Thrift 字节。12 有时延和行数，没有这组字节。[21](21-ir-optimization-design.md) 把这些字节收成 graphd、storaged 和两边协议的分阶段改法。写 21 时 origin/main 上还没有 15–19，下推重叠以 [10](10-pushdown-capability.md) 为准。15–17 是后来补上的下推实现，不改 20/21 里的字节计数。[22](22-ir-bench.md) 是 P0 补丁在场景二上的时延实测，二进制不含 16 的部分聚合补丁。
 
 ---
 

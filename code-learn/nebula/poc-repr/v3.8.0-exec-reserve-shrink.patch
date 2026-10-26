@@ -1,0 +1,79 @@
+diff --git a/src/graph/context/iterator/Iterator.h b/src/graph/context/iterator/Iterator.h
+--- a/src/graph/context/iterator/Iterator.h
++++ b/src/graph/context/iterator/Iterator.h
+@@ -73,6 +73,10 @@
+   // position
+   virtual void eraseRange(size_t first, size_t last) = 0;
+ 
++  // Release spare row capacity. Iterators that do not own a row vector no-op.
++  // May invalidate the current position; callers reset afterwards.
++  virtual void shrinkToFit() {}
++
+   // Reset iterator position to `pos' from begin. Must be sure that the `pos'
+   // position is lower than `size()' before resetting
+   void reset(size_t pos = 0) {
+diff --git a/src/graph/context/iterator/SequentialIter.h b/src/graph/context/iterator/SequentialIter.h
+--- a/src/graph/context/iterator/SequentialIter.h
++++ b/src/graph/context/iterator/SequentialIter.h
+@@ -37,6 +37,8 @@
+ 
+   void eraseRange(size_t first, size_t last) override;
+ 
++  void shrinkToFit() override;
++
+   void select(std::size_t offset, std::size_t count) override {
+     auto size = this->size();
+     if (size <= static_cast<size_t>(offset)) {
+diff --git a/src/graph/context/iterator/SequentialIter.cpp b/src/graph/context/iterator/SequentialIter.cpp
+--- a/src/graph/context/iterator/SequentialIter.cpp
++++ b/src/graph/context/iterator/SequentialIter.cpp
+@@ -83,6 +83,13 @@
+   rows_->pop_back();
+ }
+ 
++void SequentialIter::shrinkToFit() {
++  if (rows_ != nullptr) {
++    rows_->shrink_to_fit();
++    reset();
++  }
++}
++
+ void SequentialIter::eraseRange(size_t first, size_t last) {
+   if (first >= last || first >= size()) {
+     return;
+diff --git a/src/graph/executor/query/DedupExecutor.cpp b/src/graph/executor/query/DedupExecutor.cpp
+--- a/src/graph/executor/query/DedupExecutor.cpp
++++ b/src/graph/executor/query/DedupExecutor.cpp
+@@ -34,6 +34,7 @@
+       iter->next();
+     }
+   }
++  iter->shrinkToFit();
+   iter->reset();
+   return finish(std::move(result));
+ }
+diff --git a/src/graph/executor/query/TopNExecutor.cpp b/src/graph/executor/query/TopNExecutor.cpp
+--- a/src/graph/executor/query/TopNExecutor.cpp
++++ b/src/graph/executor/query/TopNExecutor.cpp
+@@ -61,6 +61,7 @@
+ 
+   executeTopN<SequentialIter>(iter);
+   iter->eraseRange(maxCount_, size);
++  iter->shrinkToFit();
+   return finish(ResultBuilder().value(result.valuePtr()).iter(std::move(result).iter()).build());
+ }
+ 
+diff --git a/src/graph/executor/query/ExpandAllExecutor.cpp b/src/graph/executor/query/ExpandAllExecutor.cpp
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp
+@@ -276,6 +276,10 @@
+ }
+ 
+ Status ExpandAllExecutor::handleLastStep(GetNeighborsIter* iter, std::vector<int64_t>& samples) {
++  // One output row per edge on the last step. joinInput_ can emit more than
++  // one row per edge when several input vids share that edge; reserve is then
++  // a lower bound and the vector grows.
++  result_.rows.reserve(result_.rows.size() + iter->size());
+   QueryExpressionContext ctx(ectx_);
+   List curVertexProps;
+   Value curVid;

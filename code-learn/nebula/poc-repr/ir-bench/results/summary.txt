@@ -1,0 +1,292 @@
+runs=10 variants={'base': 5, 'p0': 5}
+
+## q_users
+  concurrency 1
+    base: all n=5 ok=[5, 5, 5, 5, 5] err=[0, 0, 0, 0, 0] wm=[0, 0, 0, 0, 0]
+      clean server_p50 n=5 med=35.785 min=34.752 max=42.590
+      clean server_p95 n=5 med=37.275 min=36.378 max=44.214
+      clean server_p99 n=5 med=37.773 min=36.423 max=44.436
+      clean qps n=5 med=18.028 min=15.430 max=18.113
+      clean client_p50 n=5 med=51.981 min=50.899 max=60.802
+      clean graphd_rss_kb n=5 med=79576.000 min=78744.000 max=84496.000
+      clean storaged_rss_kb n=5 med=78132.000 min=76248.000 max=79652.000
+    p0: all n=5 ok=[5, 5, 5, 5, 5] err=[0, 0, 0, 0, 0] wm=[0, 0, 0, 0, 0]
+      clean server_p50 n=5 med=36.277 min=35.384 max=46.994
+      clean server_p95 n=5 med=37.339 min=36.411 max=50.442
+      clean server_p99 n=5 med=37.443 min=36.466 max=50.725
+      clean qps n=5 med=17.973 min=14.198 max=18.171
+      clean client_p50 n=5 med=52.909 min=51.583 max=69.683
+      clean graphd_rss_kb n=5 med=80728.000 min=78620.000 max=88380.000
+      clean storaged_rss_kb n=5 med=79296.000 min=78308.000 max=83552.000
+  concurrency 10
+    base: all n=3 ok=[50, 50, 50] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=53.842 min=47.386 max=56.267
+      clean server_p95 n=3 med=152.442 min=148.437 max=163.485
+      clean server_p99 n=3 med=154.435 min=151.070 max=166.413
+      clean qps n=3 med=36.929 min=36.076 max=37.575
+      clean client_p50 n=3 med=240.384 min=236.771 max=243.137
+      clean graphd_rss_kb n=3 med=127712.000 min=124088.000 max=131504.000
+      clean storaged_rss_kb n=3 med=101160.000 min=99000.000 max=102148.000
+    p0: all n=3 ok=[50, 50, 50] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=55.594 min=54.180 max=68.337
+      clean server_p95 n=3 med=167.361 min=150.285 max=175.956
+      clean server_p99 n=3 med=169.083 min=152.867 max=181.997
+      clean qps n=3 med=32.662 min=31.789 max=37.025
+      clean client_p50 n=3 med=240.858 min=228.580 max=285.693
+      clean graphd_rss_kb n=3 med=127104.000 min=126700.000 max=133380.000
+      clean storaged_rss_kb n=3 med=104328.000 min=101596.000 max=110004.000
+  concurrency 50
+    base: all n=3 ok=[250, 250, 250] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=53.428 min=50.326 max=57.082
+      clean server_p95 n=3 med=660.478 min=639.727 max=776.486
+      clean server_p99 n=3 med=820.475 min=810.853 max=826.219
+      clean qps n=3 med=35.751 min=35.299 max=36.228
+      clean client_p50 n=3 med=1104.623 min=1062.328 max=1112.165
+      clean graphd_rss_kb n=3 med=285164.000 min=249272.000 max=310260.000
+      clean storaged_rss_kb n=3 med=140092.000 min=137584.000 max=198216.000
+    p0: all n=3 ok=[250, 250, 250] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=59.751 min=58.423 max=76.108
+      clean server_p95 n=3 med=789.809 min=771.612 max=950.233
+      clean server_p99 n=3 med=805.950 min=796.365 max=969.299
+      clean qps n=3 med=33.749 min=32.200 max=35.633
+      clean client_p50 n=3 med=1115.096 min=1030.761 max=1270.742
+      clean graphd_rss_kb n=3 med=299792.000 min=272028.000 max=341828.000
+      clean storaged_rss_kb n=3 med=163692.000 min=155736.000 max=166848.000
+  concurrency 100
+    base: all n=3 ok=[500, 500, 500] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=54.341 min=53.729 max=62.480
+      clean server_p95 n=3 med=1610.099 min=736.491 max=1690.567
+      clean server_p99 n=3 med=1627.914 min=772.083 max=1710.635
+      clean qps n=3 med=34.974 min=34.963 max=36.334
+      clean client_p50 n=3 med=2196.548 min=2087.254 max=2228.110
+      clean graphd_rss_kb n=3 med=368476.000 min=329944.000 max=459884.000
+      clean storaged_rss_kb n=3 med=217260.000 min=166748.000 max=245376.000
+    p0: all n=3 ok=[500, 500, 500] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=58.064 min=54.047 max=70.355
+      clean server_p95 n=3 med=1614.362 min=1373.244 max=1677.884
+      clean server_p99 n=3 med=1638.897 min=1478.436 max=1691.070
+      clean qps n=3 med=34.112 min=33.205 max=36.824
+      clean client_p50 n=3 med=2172.015 min=2109.138 max=2411.741
+      clean graphd_rss_kb n=3 med=541056.000 min=480496.000 max=596824.000
+      clean storaged_rss_kb n=3 med=214848.000 min=191284.000 max=262516.000
+  concurrency 200
+    base: all n=3 ok=[1000, 1000, 1000] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=55.534 min=55.107 max=61.769
+      clean server_p95 n=3 med=3260.762 min=3099.857 max=3520.578
+      clean server_p99 n=3 med=3334.809 min=3166.350 max=3567.691
+      clean qps n=3 med=33.970 min=33.915 max=34.736
+      clean client_p50 n=3 med=4666.850 min=4547.396 max=4746.824
+      clean graphd_rss_kb n=3 med=577508.000 min=469852.000 max=724928.000
+      clean storaged_rss_kb n=3 med=315068.000 min=301944.000 max=395780.000
+    p0: all n=3 ok=[1000, 1000, 158] err=[0, 0, 842] wm=[0, 0, 842]
+      clean server_p50 n=2 med=64.810 min=60.274 max=69.346
+      clean server_p95 n=2 med=3059.189 min=2919.523 max=3198.855
+      clean server_p99 n=2 med=3146.580 min=3050.427 max=3242.734
+      clean qps n=2 med=33.063 min=32.140 max=33.986
+      clean client_p50 n=2 med=4708.644 min=4455.922 max=4961.366
+      clean graphd_rss_kb n=2 med=765246.000 min=617724.000 max=912768.000
+      clean storaged_rss_kb n=2 med=201806.000 min=184152.000 max=219460.000
+
+## q_sales
+  concurrency 1
+    base: all n=5 ok=[5, 5, 5, 5, 5] err=[0, 0, 0, 0, 0] wm=[0, 0, 0, 0, 0]
+      clean server_p50 n=5 med=46.125 min=44.103 max=51.483
+      clean server_p95 n=5 med=46.450 min=44.470 max=63.343
+      clean server_p99 n=5 med=46.506 min=44.483 max=64.467
+      clean qps n=5 med=21.293 min=17.630 max=22.360
+      clean client_p50 n=5 med=46.974 min=45.242 max=53.247
+      clean graphd_rss_kb n=5 med=112088.000 min=104868.000 max=121704.000
+      clean storaged_rss_kb n=5 med=97272.000 min=84084.000 max=110984.000
+    p0: all n=4 ok=[5, 5, 5, 5] err=[0, 0, 0, 0] wm=[0, 0, 0, 0]
+      clean server_p50 n=4 med=45.558 min=44.240 max=46.963
+      clean server_p95 n=4 med=46.615 min=45.107 max=49.466
+      clean server_p99 n=4 med=46.698 min=45.125 max=50.068
+      clean qps n=4 med=21.404 min=20.893 max=21.981
+      clean client_p50 n=4 med=46.535 min=45.308 max=48.481
+      clean graphd_rss_kb n=4 med=111706.000 min=104652.000 max=128484.000
+      clean storaged_rss_kb n=4 med=96484.000 min=85444.000 max=109980.000
+  concurrency 10
+    base: all n=3 ok=[50, 50, 50] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=163.364 min=162.448 max=164.584
+      clean server_p95 n=3 med=208.582 min=188.513 max=218.386
+      clean server_p99 n=3 med=211.978 min=211.021 max=255.649
+      clean qps n=3 med=56.000 min=53.127 max=56.782
+      clean client_p50 n=3 med=172.897 min=172.747 max=175.912
+      clean graphd_rss_kb n=3 med=188020.000 min=176968.000 max=204680.000
+      clean storaged_rss_kb n=3 med=143748.000 min=142724.000 max=145028.000
+    p0: all n=2 ok=[50, 50] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=171.631 min=166.287 max=176.976
+      clean server_p95 n=2 med=186.871 min=178.659 max=195.083
+      clean server_p99 n=2 med=194.052 min=188.693 max=199.412
+      clean qps n=2 med=54.408 min=52.601 max=56.216
+      clean client_p50 n=2 med=181.510 min=173.894 max=189.127
+      clean graphd_rss_kb n=2 med=196018.000 min=192088.000 max=199948.000
+      clean storaged_rss_kb n=2 med=141940.000 min=134508.000 max=149372.000
+  concurrency 50
+    base: all n=3 ok=[250, 250, 250] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=803.781 min=789.352 max=845.428
+      clean server_p95 n=3 med=920.675 min=835.218 max=987.733
+      clean server_p99 n=3 med=943.759 min=852.440 max=1007.361
+      clean qps n=3 med=54.422 min=53.034 max=57.308
+      clean client_p50 n=3 med=891.291 min=859.029 max=923.729
+      clean graphd_rss_kb n=3 med=464892.000 min=454612.000 max=625212.000
+      clean storaged_rss_kb n=3 med=232492.000 min=227744.000 max=299808.000
+    p0: all n=2 ok=[250, 250] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=794.656 min=793.792 max=795.520
+      clean server_p95 n=2 med=1076.865 min=856.660 max=1297.070
+      clean server_p99 n=2 med=1182.168 min=947.500 max=1416.836
+      clean qps n=2 med=54.774 min=53.165 max=56.383
+      clean client_p50 n=2 med=869.813 min=856.511 max=883.115
+      clean graphd_rss_kb n=2 med=541004.000 min=533168.000 max=548840.000
+      clean storaged_rss_kb n=2 med=249044.000 min=225224.000 max=272864.000
+  concurrency 100
+    base: all n=3 ok=[500, 500, 130] err=[0, 0, 370] wm=[0, 0, 370]
+      clean server_p50 n=2 med=1569.954 min=1523.876 max=1616.032
+      clean server_p95 n=2 med=1934.579 min=1925.765 max=1943.393
+      clean server_p99 n=2 med=1984.882 min=1964.319 max=2005.446
+      clean qps n=2 med=55.360 min=53.878 max=56.841
+      clean client_p50 n=2 med=1724.739 min=1671.855 max=1777.622
+      clean graphd_rss_kb n=2 med=933154.000 min=906168.000 max=960140.000
+      clean storaged_rss_kb n=2 med=387168.000 min=380100.000 max=394236.000
+    p0: all n=2 ok=[500, 500] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=1454.365 min=1411.946 max=1496.784
+      clean server_p95 n=2 med=1910.389 min=1721.093 max=2099.685
+      clean server_p99 n=2 med=1990.382 min=1768.970 max=2211.793
+      clean qps n=2 med=54.692 min=52.912 max=56.472
+      clean client_p50 n=2 med=1710.061 min=1655.819 max=1764.304
+      clean graphd_rss_kb n=2 med=914452.000 min=742500.000 max=1086404.000
+      clean storaged_rss_kb n=2 med=435376.000 min=370648.000 max=500104.000
+  concurrency 200
+    base: all n=3 ok=[1000, 1000, 0] err=[0, 0, 0] wm=[0, 0, 188]
+      clean server_p50 n=2 med=3396.831 min=3245.885 max=3547.776
+      clean server_p95 n=2 med=3794.336 min=3775.070 max=3813.602
+      clean server_p99 n=2 med=3916.069 min=3827.284 max=4004.855
+      clean qps n=2 med=53.995 min=51.971 max=56.020
+      clean client_p50 n=2 med=3624.465 min=3416.458 max=3832.472
+      clean graphd_rss_kb n=2 med=1673690.000 min=1601644.000 max=1745736.000
+      clean storaged_rss_kb n=2 med=666708.000 min=634248.000 max=699168.000
+    p0: all n=2 ok=[1000, 999] err=[0, 1] wm=[0, 0]
+      clean server_p50 n=1 med=3515.511 min=3515.511 max=3515.511
+      clean server_p95 n=1 med=4165.165 min=4165.165 max=4165.165
+      clean server_p99 n=1 med=4267.692 min=4267.692 max=4267.692
+      clean qps n=1 med=52.792 min=52.792 max=52.792
+      clean client_p50 n=1 med=3786.760 min=3786.760 max=3786.760
+      clean graphd_rss_kb n=1 med=1497272.000 min=1497272.000 max=1497272.000
+      clean storaged_rss_kb n=1 med=664580.000 min=664580.000 max=664580.000
+
+## q_model
+  concurrency 1
+    base: all n=5 ok=[5, 5, 5, 5, 5] err=[0, 0, 0, 0, 0] wm=[0, 0, 0, 0, 0]
+      clean server_p50 n=5 med=72.709 min=63.686 max=78.985
+      clean server_p95 n=5 med=79.263 min=65.814 max=82.351
+      clean server_p99 n=5 med=79.719 min=65.899 max=82.724
+      clean qps n=5 med=3.246 min=3.058 max=3.967
+      clean client_p50 n=5 med=313.510 min=248.524 max=317.941
+      clean graphd_rss_kb n=5 med=276388.000 min=126208.000 max=1052856.000
+      clean storaged_rss_kb n=5 med=180464.000 min=154536.000 max=390756.000
+    p0: all n=4 ok=[5, 5, 5, 5] err=[0, 0, 0, 0] wm=[0, 0, 0, 0]
+      clean server_p50 n=4 med=62.022 min=60.584 max=64.276
+      clean server_p95 n=4 med=66.867 min=64.136 max=68.087
+      clean server_p99 n=4 med=67.309 min=64.629 max=68.401
+      clean qps n=4 med=3.742 min=3.624 max=3.928
+      clean client_p50 n=4 med=270.603 min=252.066 max=277.817
+      clean graphd_rss_kb n=4 med=615702.000 min=118764.000 max=1284280.000
+      clean storaged_rss_kb n=4 med=193520.000 min=147756.000 max=464736.000
+  concurrency 10
+    base: all n=3 ok=[50, 50, 50] err=[0, 0, 0] wm=[0, 0, 0]
+      clean server_p50 n=3 med=91.549 min=69.773 max=106.516
+      clean server_p95 n=3 med=405.742 min=377.440 max=497.535
+      clean server_p99 n=3 med=416.456 min=394.438 max=516.153
+      clean qps n=3 med=4.382 min=3.684 max=4.402
+      clean client_p50 n=3 med=2150.875 min=2135.893 max=2548.441
+      clean graphd_rss_kb n=3 med=659024.000 min=147808.000 max=732420.000
+      clean storaged_rss_kb n=3 med=272512.000 min=262520.000 max=336736.000
+    p0: all n=2 ok=[50, 50] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=75.278 min=73.549 max=77.007
+      clean server_p95 n=2 med=313.491 min=311.950 max=315.032
+      clean server_p99 n=2 med=322.365 min=319.984 max=324.746
+      clean qps n=2 med=4.520 min=4.381 max=4.658
+      clean client_p50 n=2 med=2135.252 min=2098.878 max=2171.626
+      clean graphd_rss_kb n=2 med=515366.000 min=192572.000 max=838160.000
+      clean storaged_rss_kb n=2 med=275510.000 min=268232.000 max=282788.000
+  concurrency 50
+    base: all n=3 ok=[250, 96, 0] err=[0, 154, 250] wm=[0, 154, 250]
+      clean server_p50 n=1 med=97.300 min=97.300 max=97.300
+      clean server_p95 n=1 med=2416.418 min=2416.418 max=2416.418
+      clean server_p99 n=1 med=2434.255 min=2434.255 max=2434.255
+      clean qps n=1 med=4.115 min=4.115 max=4.115
+      clean client_p50 n=1 med=11313.120 min=11313.120 max=11313.120
+      clean graphd_rss_kb n=1 med=560408.000 min=560408.000 max=560408.000
+      clean storaged_rss_kb n=1 med=613456.000 min=613456.000 max=613456.000
+    p0: all n=2 ok=[250, 250] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=71.629 min=69.073 max=74.184
+      clean server_p95 n=2 med=1593.832 min=1566.746 max=1620.918
+      clean server_p99 n=2 med=1612.933 min=1587.851 max=1638.015
+      clean qps n=2 med=4.162 min=4.109 max=4.216
+      clean client_p50 n=2 med=11453.997 min=11067.170 max=11840.823
+      clean graphd_rss_kb n=2 med=664058.000 min=640932.000 max=687184.000
+      clean storaged_rss_kb n=2 med=577386.000 min=566696.000 max=588076.000
+  concurrency 100
+    base: all n=3 ok=[500, 0, 0] err=[0, 0, 0] wm=[0, 65, 100]
+      clean server_p50 n=1 med=97.625 min=97.625 max=97.625
+      clean server_p95 n=1 med=4833.459 min=4833.459 max=4833.459
+      clean server_p99 n=1 med=4859.929 min=4859.929 max=4859.929
+      clean qps n=1 med=4.019 min=4.019 max=4.019
+      clean client_p50 n=1 med=23792.140 min=23792.140 max=23792.140
+      clean graphd_rss_kb n=1 med=1083908.000 min=1083908.000 max=1083908.000
+      clean storaged_rss_kb n=1 med=1115604.000 min=1115604.000 max=1115604.000
+    p0: all n=2 ok=[500, 500] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=67.551 min=65.719 max=69.382
+      clean server_p95 n=2 med=3099.441 min=3087.940 max=3110.941
+      clean server_p99 n=2 med=3123.938 min=3103.965 max=3143.911
+      clean qps n=2 med=4.196 min=4.192 max=4.200
+      clean client_p50 n=2 med=22392.885 min=22355.561 max=22430.209
+      clean graphd_rss_kb n=2 med=1213328.000 min=1130620.000 max=1296036.000
+      clean storaged_rss_kb n=2 med=959642.000 min=944028.000 max=975256.000
+  concurrency 200
+    base: all n=3 ok=[1000, 0, 0] err=[0, 0, 0] wm=[0, 58, 174]
+      clean server_p50 n=1 med=104.730 min=104.730 max=104.730
+      clean server_p95 n=1 med=9666.905 min=9666.905 max=9666.905
+      clean server_p99 n=1 med=9678.124 min=9678.124 max=9678.124
+      clean qps n=1 med=3.929 min=3.929 max=3.929
+      clean client_p50 n=1 med=48590.605 min=48590.605 max=48590.605
+      clean graphd_rss_kb n=1 med=2138468.000 min=2138468.000 max=2138468.000
+      clean storaged_rss_kb n=1 med=1868132.000 min=1868132.000 max=1868132.000
+    p0: all n=2 ok=[1000, 1000] err=[0, 0] wm=[0, 0]
+      clean server_p50 n=2 med=67.444 min=67.133 max=67.755
+      clean server_p95 n=2 med=6465.559 min=6410.215 max=6520.903
+      clean server_p99 n=2 med=6490.301 min=6441.553 max=6539.050
+      clean qps n=2 med=4.201 min=4.199 max=4.203
+      clean client_p50 n=2 med=44918.095 min=44413.479 max=45422.710
+      clean graphd_rss_kb n=2 med=2320096.000 min=2201560.000 max=2438632.000
+      clean storaged_rss_kb n=2 med=1689690.000 min=1652284.000 max=1727096.000
+
+## checks
+r1 base q_users ok True
+r1 base q_sales ok True
+r1 base q_model ok True
+r1 p0 q_users ok True
+r1 p0 q_sales ok True
+r1 p0 q_model ok True
+r2 base q_users ok True
+r2 base q_sales ok True
+r2 base q_model ok True
+r2 p0 q_users ok True
+r2 p0 q_sales ok True
+r2 p0 q_model ok True
+r3 base q_users ok True
+r3 base q_sales ok True
+r3 base q_model ok True
+r3 p0 q_users ok True
+r4 base q_users ok True
+r4 base q_sales ok True
+r4 base q_model ok True
+r4 p0 q_users ok True
+r4 p0 q_sales ok True
+r4 p0 q_model ok True
+r5 base q_users ok True
+r5 base q_sales ok True
+r5 base q_model ok True
+r5 p0 q_users ok True
+r5 p0 q_sales ok True
+r5 p0 q_model ok True

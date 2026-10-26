@@ -19,7 +19,7 @@
 | P1 | graphd 内部的定长 VID 列；`GetNeighbors` 增加可选的扁平边列表；只把下一算子会读的 cell 解成 `Value` | 新增可选字段。旧字段保留。flag 关掉时两边仍走现在的嵌套列 | 扁平化针对 q_users / q_sales 的双层 `List`（堆 3.42 MB / 4.07 MB，wire 1.51 MB / 1.99 MB）。紧凑 VID 列的上界是 [20](20-intermediate-representation.md) 的裸 `list<i64>` 32,005 对一列 INT `DataSet` 84,025 |
 | P2 | 算子之间按批交接；列式批；向量化表达式；调度器不再等整个算子的 future | 内部批格式。到客户端边界仍收成 `DataSet` | 调度器今天等齐依赖再 `execute`，见 [13](13-control-flow.md)。列式加法的微基准在 [20](20-intermediate-representation.md)，不是查询时延 |
 
-P0 里两处已经写成补丁，放在 [`poc-repr/`](poc-repr/)，没有打进 `patches/`，也没有链进 nebula 二进制。`patch -p1 --dry-run` 能贴上 `fa928930`。单测和 tck 没有在这台机器上跑。
+P0 里三处补丁放在 [`poc-repr/`](poc-repr/)（聚合、返回列、`reserve` / `shrink_to_fit`），没有打进 `patches/`。时延、QPS、RSS 和水位是 [22](22-ir-bench.md) 的实测，不是本节的字节差。
 
 ---
 
@@ -302,11 +302,11 @@ P0 的少分配走 `operator new`，跟踪器打开时会计入。水位那条�
 | `properties(edge)`、`id($^)` 的列和今天一致 | visitor 没有把这两条误收紧 |
 | 多列 DISTINCT、含 NULL 的 DISTINCT | `enable_int_dedup_key` 必须走回 `Row*` |
 
-这次没有编译 nebula，也没有跑 tck。补丁只做了 `patch --dry-run`。
+编译、单测、tck 和场景二时延在 [22](22-ir-bench.md)。写这一节时补丁还只做过 `patch --dry-run`。
 
 ### 5.5 性能和观测
 
-沿用 [12](12-scenario2-bench.md)：server 的 `latency_in_us` 和客户端墙钟分开记，PROFILE 看行数。本文不给出新的时延。
+沿用 [12](12-scenario2-bench.md)：server 的 `latency_in_us` 和客户端墙钟分开记，PROFILE 看行数。那组时延在 [22](22-ir-bench.md)，不写在本节。
 
 `graph/util/Utils.cpp` 的 `collectRespProfileData` 现在写 `host`、`exec`、`total`、`vertices`，以及可选的 `storage_detail`。没有字节。建议在同一张 folly 对象里加两项：storage 响应缓冲的长度（RPC 层读到的字节，含帧头时单独标），以及 graphd 上该算子输出 `DataSet` 的行数和列数。应用层 Thrift 宽度可以用 [20](20-intermediate-representation.md) 的规则离线算，在线先记缓冲长度，避免在热路径上再扫一遍 `Value`。
 
@@ -357,8 +357,9 @@ P0 合入前的门槛：场景二的三条语句在 flag 开 / 关下校验和�
 
 | 文件 | 状态 |
 |------|------|
-| [`poc-repr/v3.8.0-aggdata-lazy-set.patch`](poc-repr/v3.8.0-aggdata-lazy-set.patch) | 对 `/tmp` 里的 `fa928930` `patch -p1 --dry-run` 通过。没有 apply，没有编译 `AggregateExpressionTest` |
-| [`poc-repr/v3.8.0-returncols-key-funcs.patch`](poc-repr/v3.8.0-returncols-key-funcs.patch) | 同样只做了 dry-run。没有跑 LOOKUP / GO 的 tck |
+| [`poc-repr/v3.8.0-aggdata-lazy-set.patch`](poc-repr/v3.8.0-aggdata-lazy-set.patch) | 已打进实测用的 `fa928930` 树。`AggregateExpressionTest` 见 [22](22-ir-bench.md) |
+| [`poc-repr/v3.8.0-returncols-key-funcs.patch`](poc-repr/v3.8.0-returncols-key-funcs.patch) | 同上。LOOKUP 的返回列和 tck 见 [22](22-ir-bench.md) |
+| [`poc-repr/v3.8.0-exec-reserve-shrink.patch`](poc-repr/v3.8.0-exec-reserve-shrink.patch) | `ExpandAll` reserve、`Dedup` / `TopN` 之后 `shrink_to_fit`。和前两份一起编进 P0 二进制 |
 | [`poc-repr/measure.cpp`](poc-repr/measure.cpp) | 第 1 节的新行。`make run` 复现。二进制不要提交 |
 
 没有把补丁放进 `patches/`。`enable_dst_only_edge_filter` 仍由那一边的补丁独占。

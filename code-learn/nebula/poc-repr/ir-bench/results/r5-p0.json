@@ -1,0 +1,1688 @@
+{
+  "tag": "r5-p0",
+  "hardware": {
+    "platform": "Linux-6.12.94+-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "python": "3.12.3",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "meminfo": {
+      "MemTotal": "16387280 kB",
+      "MemAvailable": "4725748 kB",
+      "SwapTotal": "0 kB"
+    },
+    "hostname": "cursor"
+  },
+  "dataset": {
+    "users": 4000,
+    "items": 2000,
+    "edges": 500000,
+    "beauty_ratio": 0.2,
+    "recent_ratio": 0.4,
+    "seed": 2,
+    "parts": 10,
+    "now": 1761436800,
+    "window": 7776000,
+    "cutoff": 1753660800,
+    "beauty_items": 382,
+    "recent_beauty_users": 4000,
+    "matching_edges": 40415,
+    "sales_users": 4000,
+    "sales_sum": 10073144
+  },
+  "percentile": "linear interpolation, rank = p/100 * (n-1) on successful samples",
+  "queries": {
+    "q_users": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD DISTINCT buy._dst AS user",
+      "space": "beauty_stock",
+      "check": {
+        "name": "q_users",
+        "ok": true,
+        "got": 4000,
+        "expect": 4000,
+        "missing_sample": [],
+        "extra_sample": [],
+        "sha256": "ca7e464a7a501db98ca99fba8b12cb48f56e2b37f666450e05012923a1f0a2b8",
+        "expect_sha256": "ca7e464a7a501db98ca99fba8b12cb48f56e2b37f666450e05012923a1f0a2b8"
+      },
+      "result_rows": 4000,
+      "ok": true,
+      "profile": {
+        "rows": 4000,
+        "server_us": 37867,
+        "client_us": 53600,
+        "keys": [
+          "user"
+        ],
+        "plan": {
+          "optimize_time_in_us": 290,
+          "nodes": [
+            {
+              "name": "Dedup",
+              "id": 11,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Project_10"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 4000,
+                  "exec_duration_in_us": 922,
+                  "total_duration_in_us": 924,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                10
+              ]
+            },
+            {
+              "name": "Project",
+              "id": 10,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Filter_9"
+                },
+                {
+                  "key": "columns",
+                  "value": "[\"$__COL_1 AS user\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 2460,
+                  "total_duration_in_us": 2465,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                15
+              ]
+            },
+            {
+              "name": "HashInnerJoin",
+              "id": 15,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "{\"rightVar\":\"__ExpandAll_7\",\"leftVar\":\"__Project_3\"}"
+                },
+                {
+                  "key": "hashKeys",
+                  "value": "[\"$-.id\"]"
+                },
+                {
+                  "key": "probeKeys",
+                  "value": "[\"$__ExpandAll_7._expand_vid\"]"
+                },
+                {
+                  "key": "kind",
+                  "value": "InnerJoin"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 4101,
+                  "total_duration_in_us": 4105,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                3,
+                16
+              ]
+            },
+            {
+              "name": "Project",
+              "id": 3,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Filter_2"
+                },
+                {
+                  "key": "columns",
+                  "value": "[\"id(VERTEX) AS id\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 126,
+                  "total_duration_in_us": 128,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                12
+              ]
+            },
+            {
+              "name": "TagIndexPrefixScan",
+              "id": 12,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": ""
+                },
+                {
+                  "key": "space",
+                  "value": "1"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": "9223372036854775807"
+                },
+                {
+                  "key": "filter",
+                  "value": ""
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "schemaId",
+                  "value": "4"
+                },
+                {
+                  "key": "isEdge",
+                  "value": "false"
+                },
+                {
+                  "key": "returnCols",
+                  "value": "[\"_vid\",\"type\"]"
+                },
+                {
+                  "key": "indexCtx",
+                  "value": "[{\"columnHints\":[{\"includeEnd\":false,\"includeBegin\":true,\"endValue\":\"__EMPTY__\",\"beginValue\":\"beauty\",\"scanType\":\"PREFIX\",\"column\":\"type\"}],\"filter\":\"\",\"index_id\":6}]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 1565,
+                  "other_stats": {
+                    "resp[0]": "{\n  \"exec\": \"786(us)\",\n  \"host\": \"127.0.0.1:9779\",\n  \"storage_detail\": {\n    \"IndexLimitNode(limit=9223372036854775807)\": \"3493(us)\",\n    \"IndexProjectionNode(projectColumn=[_vid,type])\": \"3470(us)\",\n    \"IndexVertexScanNode(IndexID=6, Path=(type=\\\"beauty\\\", ))\": \"3391(us)\"\n  },\n  \"total\": \"1469(us)\"\n}"
+                  }
+                }
+              ],
+              "dependencies": [
+                0
+              ]
+            },
+            {
+              "name": "Start",
+              "id": 0,
+              "description": [],
+              "profiles": [
+                {
+                  "rows": 0,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 13,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": []
+            },
+            {
+              "name": "ExpandAll",
+              "id": 16,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Expand_6"
+                },
+                {
+                  "key": "space",
+                  "value": "1"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": "9223372036854775807"
+                },
+                {
+                  "key": "filter",
+                  "value": "(buy.ts>1753660800)"
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "sample",
+                  "value": "false"
+                },
+                {
+                  "key": "joinInput",
+                  "value": "true"
+                },
+                {
+                  "key": "maxSteps",
+                  "value": "1"
+                },
+                {
+                  "key": "edgeProps",
+                  "value": "[{\"props\":[\"_dst\",\"ts\"],\"type\":-5}]"
+                },
+                {
+                  "key": "stepLimits",
+                  "value": "[]"
+                },
+                {
+                  "key": "minSteps",
+                  "value": "1"
+                },
+                {
+                  "key": "vertexProps",
+                  "value": ""
+                },
+                {
+                  "key": "vertexColumns",
+                  "value": "[]"
+                },
+                {
+                  "key": "edgeColumns",
+                  "value": "[\"buy.ts AS __COL_0\",\"buy._dst AS __COL_1\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 10310,
+                  "total_duration_in_us": 27902,
+                  "other_stats": {
+                    "graphExpandAllTime+2": "10214(us)",
+                    "resp[0]": "{\n  \"exec\": \"9339(us)\",\n  \"host\": \"127.0.0.1:9779\",\n  \"storage_detail\": {\n    \"FilterNode\": \"2027(us)\",\n    \"GetNeighborsNode\": \"34928(us)\",\n    \"HashJoinNode\": \"1756(us)\",\n    \"RelNode\": \"34965(us)\",\n    \"SingleEdgeNode\": \"1682(us)\"\n  },\n  \"total\": \"17455(us)\"\n}"
+                  }
+                }
+              ],
+              "dependencies": [
+                6
+              ]
+            },
+            {
+              "name": "Expand",
+              "id": 6,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Argument_5"
+                },
+                {
+                  "key": "space",
+                  "value": "1"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": ""
+                },
+                {
+                  "key": "filter",
+                  "value": ""
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "sample",
+                  "value": "false"
+                },
+                {
+                  "key": "joinInput",
+                  "value": "true"
+                },
+                {
+                  "key": "maxSteps",
+                  "value": "0"
+                },
+                {
+                  "key": "edgeProps",
+                  "value": "[{\"props\":[\"_dst\"],\"type\":-5}]"
+                },
+                {
+                  "key": "stepLimits",
+                  "value": "[]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 13,
+                  "total_duration_in_us": 49,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                5
+              ]
+            },
+            {
+              "name": "Argument",
+              "id": 5,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Project_3"
+                },
+                {
+                  "key": "alias",
+                  "value": "id"
+                },
+                {
+                  "key": "isInputVertexRequired",
+                  "value": "0"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 89,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": []
+            }
+          ]
+        }
+      },
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 52.90881699875172,
+            "p95": 66.8655695993948,
+            "p99": 69.63002911950753,
+            "min": 49.58889800036559,
+            "max": 70.3211439995357
+          },
+          "server_ms": {
+            "p50": 36.277,
+            "p95": 37.3392,
+            "p99": 37.443039999999996,
+            "min": 33.858,
+            "max": 37.469
+          },
+          "row_counts": [
+            4000
+          ],
+          "watermark_errors": 0,
+          "concurrency": 1,
+          "warmup_per_worker": 2,
+          "rounds_per_worker": 5,
+          "wall_s": 0.27819201499914925,
+          "qps": 17.97319739754317,
+          "worker_errors": [],
+          "rss": {
+            "before": {
+              "nebula-graphd": {
+                "rss_kb": 57768,
+                "hwm_kb": 57768,
+                "pid": 33596
+              },
+              "nebula-storaged": {
+                "rss_kb": 74528,
+                "hwm_kb": 74528,
+                "pid": 33175
+              },
+              "nebula-metad": {
+                "rss_kb": 48536,
+                "hwm_kb": 48536,
+                "pid": 32814
+              }
+            },
+            "sampled_rss_kb_max": {
+              "nebula-graphd": 78620,
+              "nebula-storaged": 78372,
+              "nebula-metad": 48608
+            },
+            "after": {
+              "nebula-graphd": {
+                "rss_kb": 79660,
+                "hwm_kb": 79660,
+                "pid": 33596
+              },
+              "nebula-storaged": {
+                "rss_kb": 80192,
+                "hwm_kb": 80192,
+                "pid": 33175
+              },
+              "nebula-metad": {
+                "rss_kb": 48628,
+                "hwm_kb": 48628,
+                "pid": 32814
+              }
+            }
+          },
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 52.90881699875172,
+              "server_us": 36820,
+              "error": null,
+              "rows": 4000
+            },
+            {
+              "ok": true,
+              "client_ms": 53.04327199883119,
+              "server_us": 37469,
+              "error": null,
+              "rows": 4000
+            },
+            {
+              "ok": true,
+              "client_ms": 70.3211439995357,
+              "server_us": 34939,
+              "error": null,
+              "rows": 4000
+            },
+            {
+              "ok": true,
+              "client_ms": 52.308038000774104,
+              "server_us": 36277,
+              "error": null,
+              "rows": 4000
+            },
+            {
+              "ok": true,
+              "client_ms": 49.58889800036559,
+              "server_us": 33858,
+              "error": null,
+              "rows": 4000
+            }
+          ]
+        }
+      ]
+    },
+    "q_sales": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD buy._dst AS uid, buy.amount AS amt | GROUP BY $-.uid YIELD $-.uid AS uid, sum($-.amt) AS sales | ORDER BY $-.sales DESC | LIMIT 100",
+      "space": "beauty_stock",
+      "sales_check": {
+        "ok": true,
+        "got": 4000,
+        "expect": 4000,
+        "mismatch_sample": [],
+        "extra_sample": [],
+        "sum_got": 10073144.0,
+        "sum_expect": 10073144.0
+      },
+      "top_rows": [
+        [
+          97,
+          6669.0
+        ],
+        [
+          1425,
+          6269.0
+        ],
+        [
+          2793,
+          6216.0
+        ],
+        [
+          3997,
+          6143.0
+        ],
+        [
+          2453,
+          5804.0
+        ],
+        [
+          748,
+          5772.0
+        ],
+        [
+          903,
+          5769.0
+        ],
+        [
+          87,
+          5525.0
+        ],
+        [
+          2420,
+          5510.0
+        ],
+        [
+          1575,
+          5389.0
+        ],
+        [
+          2402,
+          5353.0
+        ],
+        [
+          2627,
+          5314.0
+        ],
+        [
+          2123,
+          5303.0
+        ],
+        [
+          2200,
+          5301.0
+        ],
+        [
+          1652,
+          5299.0
+        ],
+        [
+          2016,
+          5272.0
+        ],
+        [
+          52,
+          5251.0
+        ],
+        [
+          256,
+          5230.0
+        ],
+        [
+          916,
+          5222.0
+        ],
+        [
+          1698,
+          5205.0
+        ],
+        [
+          924,
+          5197.0
+        ],
+        [
+          3890,
+          5163.0
+        ],
+        [
+          3187,
+          5162.0
+        ],
+        [
+          2693,
+          5139.0
+        ],
+        [
+          41,
+          5129.0
+        ],
+        [
+          595,
+          5126.0
+        ],
+        [
+          3382,
+          5123.0
+        ],
+        [
+          2681,
+          5096.0
+        ],
+        [
+          3992,
+          5091.0
+        ],
+        [
+          3093,
+          5090.0
+        ],
+        [
+          3040,
+          5081.0
+        ],
+        [
+          3936,
+          5065.0
+        ],
+        [
+          3224,
+          5033.0
+        ],
+        [
+          1126,
+          5030.0
+        ],
+        [
+          2554,
+          5001.0
+        ],
+        [
+          1684,
+          4999.0
+        ],
+        [
+          3331,
+          4994.0
+        ],
+        [
+          3873,
+          4974.0
+        ],
+        [
+          3843,
+          4950.0
+        ],
+        [
+          1617,
+          4921.0
+        ],
+        [
+          2721,
+          4907.0
+        ],
+        [
+          712,
+          4901.0
+        ],
+        [
+          1438,
+          4899.0
+        ],
+        [
+          3237,
+          4898.0
+        ],
+        [
+          1983,
+          4894.0
+        ],
+        [
+          1229,
+          4893.0
+        ],
+        [
+          2377,
+          4879.0
+        ],
+        [
+          2602,
+          4879.0
+        ],
+        [
+          2146,
+          4875.0
+        ],
+        [
+          427,
+          4872.0
+        ],
+        [
+          1308,
+          4863.0
+        ],
+        [
+          1628,
+          4856.0
+        ],
+        [
+          2962,
+          4855.0
+        ],
+        [
+          1625,
+          4847.0
+        ],
+        [
+          2612,
+          4844.0
+        ],
+        [
+          3828,
+          4835.0
+        ],
+        [
+          2838,
+          4827.0
+        ],
+        [
+          3313,
+          4812.0
+        ],
+        [
+          2502,
+          4800.0
+        ],
+        [
+          944,
+          4778.0
+        ],
+        [
+          1063,
+          4778.0
+        ],
+        [
+          3927,
+          4774.0
+        ],
+        [
+          674,
+          4762.0
+        ],
+        [
+          2991,
+          4746.0
+        ],
+        [
+          3527,
+          4745.0
+        ],
+        [
+          260,
+          4741.0
+        ],
+        [
+          1704,
+          4732.0
+        ],
+        [
+          3295,
+          4729.0
+        ],
+        [
+          3702,
+          4729.0
+        ],
+        [
+          3662,
+          4726.0
+        ],
+        [
+          3107,
+          4705.0
+        ],
+        [
+          485,
+          4702.0
+        ],
+        [
+          3454,
+          4687.0
+        ],
+        [
+          2161,
+          4683.0
+        ],
+        [
+          3825,
+          4659.0
+        ],
+        [
+          3750,
+          4640.0
+        ],
+        [
+          340,
+          4635.0
+        ],
+        [
+          1505,
+          4632.0
+        ],
+        [
+          1705,
+          4631.0
+        ],
+        [
+          1301,
+          4627.0
+        ],
+        [
+          2728,
+          4625.0
+        ],
+        [
+          2343,
+          4618.0
+        ],
+        [
+          1492,
+          4618.0
+        ],
+        [
+          2544,
+          4616.0
+        ],
+        [
+          2808,
+          4614.0
+        ],
+        [
+          581,
+          4606.0
+        ],
+        [
+          1897,
+          4594.0
+        ],
+        [
+          3108,
+          4588.0
+        ],
+        [
+          1090,
+          4584.0
+        ],
+        [
+          3738,
+          4572.0
+        ],
+        [
+          3259,
+          4566.0
+        ],
+        [
+          1991,
+          4558.0
+        ],
+        [
+          2930,
+          4545.0
+        ],
+        [
+          2498,
+          4540.0
+        ],
+        [
+          838,
+          4540.0
+        ],
+        [
+          2710,
+          4538.0
+        ],
+        [
+          3989,
+          4530.0
+        ],
+        [
+          2840,
+          4529.0
+        ],
+        [
+          2106,
+          4522.0
+        ],
+        [
+          3387,
+          4515.0
+        ]
+      ],
+      "result_rows": 100,
+      "ok": true,
+      "profile": {
+        "rows": 100,
+        "server_us": 60163,
+        "client_us": 61594,
+        "keys": [
+          "uid",
+          "sales"
+        ],
+        "plan": {
+          "optimize_time_in_us": 276,
+          "nodes": [
+            {
+              "name": "TopN",
+              "id": 15,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Aggregate_11"
+                },
+                {
+                  "key": "factors",
+                  "value": "[{\"sales\":\"DESCEND\"}]"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                },
+                {
+                  "key": "count",
+                  "value": "100"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 100,
+                  "exec_duration_in_us": 225,
+                  "total_duration_in_us": 226,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                11
+              ]
+            },
+            {
+              "name": "Aggregate",
+              "id": 11,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Project_10"
+                },
+                {
+                  "key": "groupKeys",
+                  "value": "[\"$-.uid\"]"
+                },
+                {
+                  "key": "groupItems",
+                  "value": "[{\"expr\":\"$-.uid\"},{\"expr\":\"sum($-.amt)\"}]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 4000,
+                  "exec_duration_in_us": 4598,
+                  "total_duration_in_us": 4600,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                10
+              ]
+            },
+            {
+              "name": "Project",
+              "id": 10,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Filter_9"
+                },
+                {
+                  "key": "columns",
+                  "value": "[\"$__COL_1 AS uid\",\"$__COL_2 AS amt\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 4757,
+                  "total_duration_in_us": 4761,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                18
+              ]
+            },
+            {
+              "name": "HashInnerJoin",
+              "id": 18,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "{\"rightVar\":\"__ExpandAll_7\",\"leftVar\":\"__Project_3\"}"
+                },
+                {
+                  "key": "hashKeys",
+                  "value": "[\"$-.id\"]"
+                },
+                {
+                  "key": "probeKeys",
+                  "value": "[\"$__ExpandAll_7._expand_vid\"]"
+                },
+                {
+                  "key": "kind",
+                  "value": "InnerJoin"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 6911,
+                  "total_duration_in_us": 6915,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                3,
+                19
+              ]
+            },
+            {
+              "name": "Project",
+              "id": 3,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Filter_2"
+                },
+                {
+                  "key": "columns",
+                  "value": "[\"id(VERTEX) AS id\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 130,
+                  "total_duration_in_us": 132,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                14
+              ]
+            },
+            {
+              "name": "TagIndexPrefixScan",
+              "id": 14,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": ""
+                },
+                {
+                  "key": "space",
+                  "value": "1"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": "9223372036854775807"
+                },
+                {
+                  "key": "filter",
+                  "value": ""
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "schemaId",
+                  "value": "4"
+                },
+                {
+                  "key": "isEdge",
+                  "value": "false"
+                },
+                {
+                  "key": "returnCols",
+                  "value": "[\"_vid\",\"type\"]"
+                },
+                {
+                  "key": "indexCtx",
+                  "value": "[{\"columnHints\":[{\"includeEnd\":false,\"includeBegin\":true,\"endValue\":\"__EMPTY__\",\"beginValue\":\"beauty\",\"scanType\":\"PREFIX\",\"column\":\"type\"}],\"filter\":\"\",\"index_id\":6}]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 871,
+                  "other_stats": {
+                    "resp[0]": "{\n  \"exec\": \"408(us)\",\n  \"host\": \"127.0.0.1:9779\",\n  \"storage_detail\": {\n    \"IndexLimitNode(limit=9223372036854775807)\": \"2073(us)\",\n    \"IndexProjectionNode(projectColumn=[_vid,type])\": \"2057(us)\",\n    \"IndexVertexScanNode(IndexID=6, Path=(type=\\\"beauty\\\", ))\": \"1986(us)\"\n  },\n  \"total\": \"743(us)\"\n}"
+                  }
+                }
+              ],
+              "dependencies": [
+                0
+              ]
+            },
+            {
+              "name": "Start",
+              "id": 0,
+              "description": [],
+              "profiles": [
+                {
+                  "rows": 0,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 12,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": []
+            },
+            {
+              "name": "ExpandAll",
+              "id": 19,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Expand_6"
+                },
+                {
+                  "key": "space",
+                  "value": "1"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": "9223372036854775807"
+                },
+                {
+                  "key": "filter",
+                  "value": "(buy.ts>1753660800)"
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "sample",
+                  "value": "false"
+                },
+                {
+                  "key": "joinInput",
+                  "value": "true"
+                },
+                {
+                  "key": "maxSteps",
+                  "value": "1"
+                },
+                {
+                  "key": "edgeProps",
+                  "value": "[{\"props\":[\"_dst\",\"amount\",\"ts\"],\"type\":-5}]"
+                },
+                {
+                  "key": "stepLimits",
+                  "value": "[]"
+                },
+                {
+                  "key": "minSteps",
+                  "value": "1"
+                },
+                {
+                  "key": "vertexProps",
+                  "value": ""
+                },
+                {
+                  "key": "vertexColumns",
+                  "value": "[]"
+                },
+                {
+                  "key": "edgeColumns",
+                  "value": "[\"buy.ts AS __COL_0\",\"buy._dst AS __COL_1\",\"buy.amount AS __COL_2\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 22143,
+                  "total_duration_in_us": 41882,
+                  "other_stats": {
+                    "graphExpandAllTime+2": "22043(us)",
+                    "resp[0]": "{\n  \"exec\": \"9912(us)\",\n  \"host\": \"127.0.0.1:9779\",\n  \"storage_detail\": {\n    \"FilterNode\": \"1878(us)\",\n    \"GetNeighborsNode\": \"51358(us)\",\n    \"HashJoinNode\": \"1573(us)\",\n    \"RelNode\": \"51390(us)\",\n    \"SingleEdgeNode\": \"1489(us)\"\n  },\n  \"total\": \"19542(us)\"\n}"
+                  }
+                }
+              ],
+              "dependencies": [
+                6
+              ]
+            },
+            {
+              "name": "Expand",
+              "id": 6,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Argument_5"
+                },
+                {
+                  "key": "space",
+                  "value": "1"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": ""
+                },
+                {
+                  "key": "filter",
+                  "value": ""
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "sample",
+                  "value": "false"
+                },
+                {
+                  "key": "joinInput",
+                  "value": "true"
+                },
+                {
+                  "key": "maxSteps",
+                  "value": "0"
+                },
+                {
+                  "key": "edgeProps",
+                  "value": "[{\"props\":[\"_dst\"],\"type\":-5}]"
+                },
+                {
+                  "key": "stepLimits",
+                  "value": "[]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 21,
+                  "total_duration_in_us": 65,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                5
+              ]
+            },
+            {
+              "name": "Argument",
+              "id": 5,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Project_3"
+                },
+                {
+                  "key": "alias",
+                  "value": "id"
+                },
+                {
+                  "key": "isInputVertexRequired",
+                  "value": "0"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 382,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 68,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": []
+            }
+          ]
+        }
+      },
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 47.01613999895926,
+            "p95": 50.46407299960265,
+            "p99": 51.08074979943922,
+            "min": 44.98831499950029,
+            "max": 51.23491899939836
+          },
+          "server_ms": {
+            "p50": 46.09,
+            "p95": 49.4658,
+            "p99": 50.06836,
+            "min": 44.133,
+            "max": 50.219
+          },
+          "row_counts": [
+            100
+          ],
+          "watermark_errors": 0,
+          "concurrency": 1,
+          "warmup_per_worker": 2,
+          "rounds_per_worker": 5,
+          "wall_s": 0.23663323000073433,
+          "qps": 21.129745809514937,
+          "worker_errors": [],
+          "rss": {
+            "before": {
+              "nebula-graphd": {
+                "rss_kb": 88776,
+                "hwm_kb": 88776,
+                "pid": 33596
+              },
+              "nebula-storaged": {
+                "rss_kb": 84584,
+                "hwm_kb": 84584,
+                "pid": 33175
+              },
+              "nebula-metad": {
+                "rss_kb": 48644,
+                "hwm_kb": 48644,
+                "pid": 32814
+              }
+            },
+            "sampled_rss_kb_max": {
+              "nebula-graphd": 104652,
+              "nebula-storaged": 85444,
+              "nebula-metad": 48664
+            },
+            "after": {
+              "nebula-graphd": {
+                "rss_kb": 108576,
+                "hwm_kb": 109352,
+                "pid": 33596
+              },
+              "nebula-storaged": {
+                "rss_kb": 86152,
+                "hwm_kb": 86152,
+                "pid": 33175
+              },
+              "nebula-metad": {
+                "rss_kb": 48676,
+                "hwm_kb": 48676,
+                "pid": 32814
+              }
+            }
+          },
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 47.01613999895926,
+              "server_us": 46090,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 51.23491899939836,
+              "server_us": 50219,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 45.99768800107995,
+              "server_us": 44782,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 47.38068900041981,
+              "server_us": 46453,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 44.98831499950029,
+              "server_us": 44133,
+              "error": null,
+              "rows": 100
+            }
+          ]
+        }
+      ]
+    },
+    "q_model": {
+      "sql": "LOOKUP ON buy WHERE buy.item_type == \"beauty\" AND buy.ts > 1753660800 YIELD src(edge) AS user",
+      "space": "beauty_model",
+      "check": {
+        "name": "q_model",
+        "ok": true,
+        "got": 4000,
+        "expect": 4000,
+        "missing_sample": [],
+        "extra_sample": [],
+        "sha256": "ca7e464a7a501db98ca99fba8b12cb48f56e2b37f666450e05012923a1f0a2b8",
+        "expect_sha256": "ca7e464a7a501db98ca99fba8b12cb48f56e2b37f666450e05012923a1f0a2b8"
+      },
+      "result_rows": 40415,
+      "duplicate_rows": 36415,
+      "ok": true,
+      "profile": {
+        "rows": 40415,
+        "server_us": 57572,
+        "client_us": 258738,
+        "keys": [
+          "user"
+        ],
+        "plan": {
+          "optimize_time_in_us": 75,
+          "nodes": [
+            {
+              "name": "Project",
+              "id": 3,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": "__Filter_2"
+                },
+                {
+                  "key": "columns",
+                  "value": "[\"src(EDGE) AS user\"]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 17857,
+                  "total_duration_in_us": 17863,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": [
+                4
+              ]
+            },
+            {
+              "name": "EdgeIndexPrefixScan",
+              "id": 4,
+              "description": [
+                {
+                  "key": "inputVar",
+                  "value": ""
+                },
+                {
+                  "key": "space",
+                  "value": "2"
+                },
+                {
+                  "key": "dedup",
+                  "value": "0"
+                },
+                {
+                  "key": "limit",
+                  "value": "9223372036854775807"
+                },
+                {
+                  "key": "filter",
+                  "value": ""
+                },
+                {
+                  "key": "orderBy",
+                  "value": "[]"
+                },
+                {
+                  "key": "schemaId",
+                  "value": "6"
+                },
+                {
+                  "key": "isEdge",
+                  "value": "true"
+                },
+                {
+                  "key": "returnCols",
+                  "value": "[\"_src\",\"_dst\",\"_rank\",\"_type\",\"item_type\",\"ts\"]"
+                },
+                {
+                  "key": "indexCtx",
+                  "value": "[{\"columnHints\":[{\"includeEnd\":false,\"includeBegin\":true,\"endValue\":\"__EMPTY__\",\"beginValue\":\"beauty\",\"scanType\":\"PREFIX\",\"column\":\"item_type\"},{\"includeEnd\":false,\"includeBegin\":false,\"endValue\":\"__EMPTY__\",\"beginValue\":1753660800,\"scanType\":\"RANGE\",\"column\":\"ts\"}],\"filter\":\"\",\"index_id\":8}]"
+                }
+              ],
+              "profiles": [
+                {
+                  "rows": 40415,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 39404,
+                  "other_stats": {
+                    "resp[0]": "{\n  \"exec\": \"27099(us)\",\n  \"host\": \"127.0.0.1:9779\",\n  \"storage_detail\": {\n    \"IndexEdgeScanNode(IndexID=8, Path=(item_type=\\\"beauty\\\", ts=(1753660800,INF]))\": \"189291(us)\",\n    \"IndexLimitNode(limit=9223372036854775807)\": \"189437(us)\",\n    \"IndexProjectionNode(projectColumn=[_src,_dst,_rank,_type,item_type,ts])\": \"189401(us)\"\n  },\n  \"total\": \"36045(us)\"\n}"
+                  }
+                }
+              ],
+              "dependencies": [
+                0
+              ]
+            },
+            {
+              "name": "Start",
+              "id": 0,
+              "description": [],
+              "profiles": [
+                {
+                  "rows": 0,
+                  "exec_duration_in_us": 0,
+                  "total_duration_in_us": 9,
+                  "other_stats": {}
+                }
+              ],
+              "dependencies": []
+            }
+          ]
+        }
+      },
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 277.81728400077554,
+            "p95": 294.22755599880475,
+            "p99": 295.8125807986653,
+            "min": 215.8272480010055,
+            "max": 296.20883699863043
+          },
+          "server_ms": {
+            "p50": 60.584,
+            "p95": 64.1362,
+            "p99": 64.62884,
+            "min": 56.471,
+            "max": 64.752
+          },
+          "row_counts": [
+            40415
+          ],
+          "watermark_errors": 0,
+          "concurrency": 1,
+          "warmup_per_worker": 2,
+          "rounds_per_worker": 5,
+          "wall_s": 1.3339097370007948,
+          "qps": 3.748379565203684,
+          "worker_errors": [],
+          "rss": {
+            "before": {
+              "nebula-graphd": {
+                "rss_kb": 114160,
+                "hwm_kb": 114160,
+                "pid": 33596
+              },
+              "nebula-storaged": {
+                "rss_kb": 147756,
+                "hwm_kb": 151088,
+                "pid": 33175
+              },
+              "nebula-metad": {
+                "rss_kb": 48720,
+                "hwm_kb": 48720,
+                "pid": 32814
+              }
+            },
+            "sampled_rss_kb_max": {
+              "nebula-graphd": 118764,
+              "nebula-storaged": 147756,
+              "nebula-metad": 48768
+            },
+            "after": {
+              "nebula-graphd": {
+                "rss_kb": 107048,
+                "hwm_kb": 119012,
+                "pid": 33596
+              },
+              "nebula-storaged": {
+                "rss_kb": 137884,
+                "hwm_kb": 155332,
+                "pid": 33175
+              },
+              "nebula-metad": {
+                "rss_kb": 48768,
+                "hwm_kb": 48768,
+                "pid": 32814
+              }
+            }
+          },
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 286.302431999502,
+              "server_us": 61673,
+              "error": null,
+              "rows": 40415
+            },
+            {
+              "ok": true,
+              "client_ms": 277.81728400077554,
+              "server_us": 60584,
+              "error": null,
+              "rows": 40415
+            },
+            {
+              "ok": true,
+              "client_ms": 257.32198000150674,
+              "server_us": 56471,
+              "error": null,
+              "rows": 40415
+            },
+            {
+              "ok": true,
+              "client_ms": 215.8272480010055,
+              "server_us": 59322,
+              "error": null,
+              "rows": 40415
+            },
+            {
+              "ok": true,
+              "client_ms": 296.20883699863043,
+              "server_us": 64752,
+              "error": null,
+              "rows": 40415
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "ok": true
+}
