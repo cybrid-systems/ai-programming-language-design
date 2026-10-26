@@ -1,0 +1,883 @@
+diff --git a/conf/nebula-graphd.conf.default b/conf/nebula-graphd.conf.default
+index 57c8fbd..3446763 100644
+--- a/conf/nebula-graphd.conf.default
++++ b/conf/nebula-graphd.conf.default
+@@ -5,6 +5,9 @@
+ --pid_file=pids/nebula-graphd.pid
+ # Whether to enable optimizer
+ --enable_optimizer=true
++# 1-step DISTINCT dst + edge filter via getDstBySrc. Keep false until every
++# storaged is upgraded to read GetDstBySrcRequest.filter.
++# --enable_dst_only_edge_filter=false
+ # The default charset when a space is created
+ --default_charset=utf8
+ # The default collate when a space is created
+diff --git a/conf/nebula-graphd.conf.production b/conf/nebula-graphd.conf.production
+index f4e9cd2..7dd089e 100644
+--- a/conf/nebula-graphd.conf.production
++++ b/conf/nebula-graphd.conf.production
+@@ -5,6 +5,9 @@
+ --pid_file=pids/nebula-graphd.pid
+ # Whether to enable optimizer
+ --enable_optimizer=true
++# 1-step DISTINCT dst + edge filter via getDstBySrc. Keep false until every
++# storaged is upgraded to read GetDstBySrcRequest.filter.
++# --enable_dst_only_edge_filter=false
+ # Heartbeat interval of communication between meta client and graphd service
+ --heartbeat_interval_secs=10
+ # Whether to use the configuration obtained from the configuration file
+diff --git a/conf/nebula-standalone.conf.default b/conf/nebula-standalone.conf.default
+index fc299a2..d3ee66c 100644
+--- a/conf/nebula-standalone.conf.default
++++ b/conf/nebula-standalone.conf.default
+@@ -5,6 +5,9 @@
+ --pid_file=pids/nebula-standalone.pid
+ # Whether to enable optimizer
+ --enable_optimizer=true
++# 1-step DISTINCT dst + edge filter via getDstBySrc. Keep false until every
++# storaged is upgraded to read GetDstBySrcRequest.filter.
++# --enable_dst_only_edge_filter=false
+ # The default charset when a space is created
+ --default_charset=utf8
+ # The defaule collate when a space is created
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index a86032b..9303a34 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -114,7 +114,8 @@ StorageRpcRespFuture<cpp2::GetNeighborsResponse> StorageClient::getNeighbors(
+ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     const CommonRequestParam& param,
+     const std::vector<Value>& vertices,
+-    const std::vector<EdgeType>& edgeTypes) {
++    const std::vector<EdgeType>& edgeTypes,
++    const Expression* filter) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -137,6 +138,9 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     req.parts_ref() = std::move(c.second);
+     req.edge_types_ref() = edgeTypes;
+     req.common_ref() = common;
++    if (filter != nullptr) {
++      req.filter_ref() = filter->encode();
++    }
+   }
+ 
+   return collectResponse(param.evb,
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index f60dc77..95fef4a 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -84,7 +84,8 @@ class StorageClient
+   StorageRpcRespFuture<cpp2::GetDstBySrcResponse> getDstBySrc(
+       const CommonRequestParam& param,
+       const std::vector<Value>& vertices,
+-      const std::vector<EdgeType>& edgeTypes);
++      const std::vector<EdgeType>& edgeTypes,
++      const Expression* filter = nullptr);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+diff --git a/src/graph/context/ast/QueryAstContext.h b/src/graph/context/ast/QueryAstContext.h
+index 36057a0..b316def 100644
+--- a/src/graph/context/ast/QueryAstContext.h
++++ b/src/graph/context/ast/QueryAstContext.h
+@@ -82,6 +82,9 @@ struct GoContext final : AstContext {
+   StepClause steps;
+   Over over;
+   Expression* filter{nullptr};
++  // Edge-property form of filter, kept for getDstBySrc. buildColumns() rewrites
++  // filter into a VariableProperty that storage cannot evaluate.
++  Expression* dstOnlyFilter{nullptr};
+   YieldColumns* yieldExpr;
+   bool distinct{false};
+   // true: sample, false: limit
+diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
+index edb388f..2a7780c 100644
+--- a/src/graph/executor/query/ExpandExecutor.cpp
++++ b/src/graph/executor/query/ExpandExecutor.cpp
+@@ -76,7 +76,8 @@ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
+                                           qctx_->plan()->isProfileEnabled());
+   std::vector<Value> vids(nextStepVids_.size());
+   std::move(nextStepVids_.begin(), nextStepVids_.end(), vids.begin());
+-  return storageClient->getDstBySrc(param, std::move(vids), expand_->edgeTypes())
++  return storageClient->getDstBySrc(
++      param, std::move(vids), expand_->edgeTypes(), expand_->filter())
+       .via(runner())
+       .ensure([this, getDstTime]() {
+         SCOPED_TIMER(&execTime_);
+diff --git a/src/graph/optimizer/test/CMakeLists.txt b/src/graph/optimizer/test/CMakeLists.txt
+index 03c5654..68c90e7 100644
+--- a/src/graph/optimizer/test/CMakeLists.txt
++++ b/src/graph/optimizer/test/CMakeLists.txt
+@@ -63,6 +63,21 @@ set(OPTIMIZER_TEST_LIB
+ )
+ endif()
+ 
++nebula_add_test(
++    NAME
++        dst_only_edge_filter_test
++    SOURCES
++        DstOnlyEdgeFilterTest.cpp
++    OBJECTS
++        ${OPTIMIZER_TEST_LIB}
++    LIBRARIES
++        ${PROXYGEN_LIBRARIES}
++        ${THRIFT_LIBRARIES}
++        gtest
++        gtest_main
++        curl
++)
++
+ nebula_add_test(
+     NAME
+         index_scan_rule_test
+diff --git a/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
+new file mode 100644
+index 0000000..2c386d5
+--- /dev/null
++++ b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
+@@ -0,0 +1,95 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include <gtest/gtest.h>
++
++#include "common/base/ObjectPool.h"
++#include "common/expression/EdgeExpression.h"
++#include "common/expression/FunctionCallExpression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/expression/RelationalExpression.h"
++#include "graph/util/DstOnlyEdgeFilter.h"
++
++namespace nebula {
++namespace graph {
++
++class DstOnlyEdgeFilterTest : public ::testing::Test {
++ protected:
++  ObjectPool pool_;
++};
++
++TEST_F(DstOnlyEdgeFilterTest, EdgeTimestampComparison) {
++  auto* expr = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "buy", "ts"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  EXPECT_TRUE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, AndOfEdgePropsAndNow) {
++  auto* ts = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "buy", "ts"),
++      FunctionCallExpression::make(&pool_, "now"));
++  auto* amount = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "buy", "amount"),
++      ConstantExpression::make(&pool_, Value(0L)));
++  auto* expr = LogicalExpression::makeAnd(&pool_, ts, amount);
++  EXPECT_TRUE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, NullExpr) {
++  EXPECT_FALSE(DstOnlyEdgeFilter::canPush(nullptr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, StarEdgeRejected) {
++  auto* expr = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "*", "ts"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  EXPECT_FALSE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, DestPropertyRejected) {
++  auto* edge = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "buy", "ts"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  auto* dst = RelationalExpression::makeGT(
++      &pool_,
++      DestPropertyExpression::make(&pool_, "user", "age"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  auto* expr = LogicalExpression::makeAnd(&pool_, edge, dst);
++  EXPECT_FALSE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, SourcePropertyRejected) {
++  auto* expr = RelationalExpression::makeEQ(
++      &pool_,
++      SourcePropertyExpression::make(&pool_, "item", "type"),
++      ConstantExpression::make(&pool_, Value("beauty")));
++  EXPECT_FALSE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, WholeEdgeFunctionRejected) {
++  // rank(edge) is a function over the edge expression, not EdgeRankExpression.
++  auto* rank = FunctionCallExpression::make(&pool_, "rank", {EdgeExpression::make(&pool_)});
++  auto* expr =
++      RelationalExpression::makeGT(&pool_, rank, ConstantExpression::make(&pool_, Value(1L)));
++  EXPECT_FALSE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, NamedEdgeRankAllowed) {
++  auto* expr = RelationalExpression::makeGT(
++      &pool_,
++      EdgeRankExpression::make(&pool_, "buy"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  EXPECT_TRUE(DstOnlyEdgeFilter::canPush(expr));
++}
++
++}  // namespace graph
++}  // namespace nebula
+diff --git a/src/graph/planner/ngql/GoPlanner.cpp b/src/graph/planner/ngql/GoPlanner.cpp
+index 3f9b36e..594ba2c 100644
+--- a/src/graph/planner/ngql/GoPlanner.cpp
++++ b/src/graph/planner/ngql/GoPlanner.cpp
+@@ -160,6 +160,12 @@ SubPlan GoPlanner::doSimplePlan() {
+   expand->setEdgeTypes(buildEdgeTypes());
+   expand->setColNames({"_expand_vid"});
+   expand->setInputVar(goCtx_->vidsVar);
++  // Set only for GO 1 STEP. isSimpleCase refuses M TO N when a filter is
++  // present, so this Expand is the only hop and the predicate cannot drop
++  // an edge that a later hop still needs.
++  if (goCtx_->dstOnlyFilter != nullptr) {
++    expand->setFilter(goCtx_->dstOnlyFilter);
++  }
+ 
+   auto dep = expand;
+   if (minStep != maxStep) {
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 662d7a5..164d6a5 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -62,6 +62,12 @@ DEFINE_int64(max_allowed_connections,
+              "Max connections of the whole cluster");
+ 
+ DEFINE_bool(enable_optimizer, false, "Whether to enable optimizer");
++DEFINE_bool(enable_dst_only_edge_filter,
++            false,
++            "When true, GO 1 STEP ... WHERE <edge-only predicate> "
++            "YIELD DISTINCT edge._dst uses getDstBySrc and filters in storaged. "
++            "Every storaged must understand GetDstBySrcRequest.filter. "
++            "Requires a full-cluster upgrade; default false.");
+ 
+ #ifndef BUILD_STANDALONE
+ DEFINE_uint32(ft_request_retry_times, 3, "Retry times if fulltext request failed");
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index 8713911..6c0cec1 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -53,6 +53,10 @@ DECLARE_uint32(password_lock_time_in_secs);
+ 
+ // Optimizer
+ DECLARE_bool(enable_optimizer);
++// 1-step GO YIELD DISTINCT edge._dst WHERE <edge predicate> uses getDstBySrc
++// and ships the predicate in GetDstBySrcRequest.filter. Default false: mixed
++// clusters whose storaged does not know field 5 would drop the predicate.
++DECLARE_bool(enable_dst_only_edge_filter);
+ DECLARE_bool(optimize_appendvertice);
+ DECLARE_uint32(num_path_thread);
+ 
+diff --git a/src/graph/util/DstOnlyEdgeFilter.h b/src/graph/util/DstOnlyEdgeFilter.h
+new file mode 100644
+index 0000000..12c8cab
+--- /dev/null
++++ b/src/graph/util/DstOnlyEdgeFilter.h
+@@ -0,0 +1,150 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_UTIL_DSTONLYEDGEFILTER_H_
++#define GRAPH_UTIL_DSTONLYEDGEFILTER_H_
++
++#include "common/expression/ExprVisitorImpl.h"
++#include "common/expression/Expression.h"
++
++namespace nebula {
++namespace graph {
++
++// Predicates that GetDstBySrc can evaluate while scanning one vertex's edges.
++// The RPC returns only dst vids, so the predicate must be computable from the
++// edge key and the edge value. Tag, src/dst vertex, input and variable
++// expressions stay on the GetNeighbors plan.
++class DstOnlyEdgeFilterVisitor final : public ExprVisitorImpl {
++ public:
++  bool canPush() const {
++    return !rejected_;
++  }
++
++  void visit(UnaryExpression* expr) override {
++    auto kind = expr->kind();
++    if (kind == Expression::Kind::kUnaryIncr || kind == Expression::Kind::kUnaryDecr) {
++      rejected_ = true;
++      return;
++    }
++    ExprVisitorImpl::visit(expr);
++  }
++
++  void visit(SubscriptExpression*) override {
++    rejected_ = true;
++  }
++  void visit(AttributeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(LabelAttributeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(LabelExpression*) override {
++    rejected_ = true;
++  }
++  void visit(UUIDExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VariableExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VersionedVariableExpression*) override {
++    rejected_ = true;
++  }
++  void visit(LabelTagPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(TagPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(InputPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VariablePropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(DestPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(SourcePropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VertexExpression*) override {
++    rejected_ = true;
++  }
++  void visit(EdgeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(ColumnExpression*) override {
++    rejected_ = true;
++  }
++  void visit(AggregateExpression*) override {
++    rejected_ = true;
++  }
++  void visit(CaseExpression*) override {
++    rejected_ = true;
++  }
++  void visit(PredicateExpression*) override {
++    rejected_ = true;
++  }
++  void visit(ListComprehensionExpression*) override {
++    rejected_ = true;
++  }
++  void visit(ReduceExpression*) override {
++    rejected_ = true;
++  }
++  void visit(SubscriptRangeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(MatchPathPatternExpression*) override {
++    rejected_ = true;
++  }
++  void visit(PathBuildExpression*) override {
++    rejected_ = true;
++  }
++
++  void visit(EdgePropertyExpression* expr) override {
++    rejectStar(expr->sym());
++  }
++  void visit(EdgeSrcIdExpression* expr) override {
++    rejectStar(expr->sym());
++  }
++  void visit(EdgeTypeExpression* expr) override {
++    rejectStar(expr->sym());
++  }
++  void visit(EdgeRankExpression* expr) override {
++    rejectStar(expr->sym());
++  }
++  void visit(EdgeDstIdExpression* expr) override {
++    rejectStar(expr->sym());
++  }
++
++ private:
++  void rejectStar(const std::string& sym) {
++    if (sym.empty() || sym == "*") {
++      rejected_ = true;
++    }
++  }
++
++  bool rejected_{false};
++};
++
++class DstOnlyEdgeFilter {
++ public:
++  // True when every leaf is an edge key/property (named, not "*"), a constant,
++  // or a function/arithmetic/logical/relational combination of those.
++  static bool canPush(const Expression* expr) {
++    if (expr == nullptr) {
++      return false;
++    }
++    DstOnlyEdgeFilterVisitor visitor;
++    const_cast<Expression*>(expr)->accept(&visitor);
++    return visitor.canPush();
++  }
++};
++
++}  // namespace graph
++}  // namespace nebula
++
++#endif  // GRAPH_UTIL_DSTONLYEDGEFILTER_H_
+diff --git a/src/graph/validator/GoValidator.cpp b/src/graph/validator/GoValidator.cpp
+index 518a017..ef3aeb9 100644
+--- a/src/graph/validator/GoValidator.cpp
++++ b/src/graph/validator/GoValidator.cpp
+@@ -6,6 +6,8 @@
+ #include "graph/validator/GoValidator.h"
+ 
+ #include "graph/planner/plan/Logic.h"
++#include "graph/service/GraphFlags.h"
++#include "graph/util/DstOnlyEdgeFilter.h"
+ #include "graph/util/ExpressionUtils.h"
+ #include "graph/util/ValidateUtil.h"
+ #include "graph/visitor/ExtractPropExprVisitor.h"
+@@ -57,6 +59,10 @@ Status GoValidator::validateImpl() {
+     return Status::SemanticError("Only support single input in a go sentence.");
+   }
+   goCtx_->isSimple = isSimpleCase();
++  // Clone before buildColumns() rewrites the predicate into a column reference.
++  if (goCtx_->isSimple && goCtx_->filter != nullptr) {
++    goCtx_->dstOnlyFilter = goCtx_->filter->clone();
++  }
+ 
+   NG_RETURN_IF_ERROR(buildColumns());
+   return Status::OK();
+@@ -284,9 +290,25 @@ bool GoValidator::checkDstPropOrVertexExist(const Expression* expr) {
+ }
+ 
+ bool GoValidator::isSimpleCase() {
+-  if (!goCtx_->limits.empty() || !goCtx_->distinct || goCtx_->filter != nullptr) {
++  if (!goCtx_->limits.empty() || !goCtx_->distinct) {
+     return false;
+   }
++  // A filter used to force the GetNeighbors plan. 1-step DISTINCT dst can stay
++  // on getDstBySrc when the predicate only touches that edge: storaged filters
++  // and dedups dst vids, and graphd Dedup still merges hosts. Multi-step would
++  // filter intermediate hops and change reachability, so leave those alone.
++  if (goCtx_->filter != nullptr) {
++    if (!FLAGS_enable_dst_only_edge_filter) {
++      return false;
++    }
++    const auto& steps = goCtx_->steps;
++    if (steps.isMToN() || steps.steps() != 1) {
++      return false;
++    }
++    if (!DstOnlyEdgeFilter::canPush(goCtx_->filter)) {
++      return false;
++    }
++  }
+   // Check if the yield cluase uses:
+   // 1. src tag props,
+   // 2. or edge props, except the dst id of edge.
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index 2a95ba3..9519414 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -247,6 +247,11 @@ struct GetDstBySrcRequest {
+         (cpp.template = "std::unordered_map")   parts,
+     3: list<common.EdgeType>                    edge_types,
+     4: optional RequestCommon                   common,
++    // Optional edge predicate. When set, storaged drops edges that do not pass
++    // before deduping dst vids. Absent on older clients. An older storaged that
++    // ignores unknown fields would return unfiltered dsts, so graphd only sets
++    // this after --enable_dst_only_edge_filter and a full-cluster upgrade.
++    5: optional binary                         filter,
+ }
+ 
+ struct GetDstBySrcResponse {
+diff --git a/src/storage/exec/GetDstBySrcNode.h b/src/storage/exec/GetDstBySrcNode.h
+index 33f841c..893ce9d 100644
+--- a/src/storage/exec/GetDstBySrcNode.h
++++ b/src/storage/exec/GetDstBySrcNode.h
+@@ -7,6 +7,8 @@
+ #define STORAGE_EXEC_GETDSTBYSRCNODE_H_
+ 
+ #include "common/base/Base.h"
++#include "common/expression/Expression.h"
++#include "storage/context/StorageExpressionContext.h"
+ 
+ namespace nebula {
+ namespace storage {
+@@ -19,12 +21,16 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+                   const std::vector<SingleEdgeNode*>& edgeNodes,
+                   EdgeContext* edgeContext,
+                   std::deque<Value>* result,
+-                  int64_t limit)
++                  int64_t limit,
++                  Expression* filter = nullptr,
++                  StorageExpressionContext* expCtx = nullptr)
+       : context_(context),
+         edgeNodes_(edgeNodes),
+         edgeContext_(edgeContext),
+         result_(result),
+-        limit_(limit) {
++        limit_(limit),
++        filter_(filter),
++        expCtx_(expCtx) {
+     name_ = "GetDstBySrcNode";
+   }
+ 
+@@ -50,16 +56,21 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+ 
+  private:
+   nebula::cpp2::ErrorCode iterateEdges() {
+-    int64_t count = 0;
+-    for (; iter_->valid(); iter_->next(), ++count) {
+-      if (count >= limit_) {
+-        return nebula::cpp2::ErrorCode::SUCCEEDED;
+-      }
++    // limit_ counts edges returned, matching GetNeighborsNode. Edges rejected by
++    // the filter do not consume it, otherwise a vertex whose old edges sit first
++    // in rank order would drop later matches once FLAGS_max_edge_returned_per_vertex
++    // was reached.
++    int64_t returned = 0;
++    for (; iter_->valid() && returned < limit_; iter_->next()) {
+       EdgeType type = iter_->edgeType();
+       if (type != context_->edgeType_) {
+         // update info when edgeType changes while iterating over different edge types
+         setCurrentEdgeInfo(type);
+       }
++      if (!passEdgeFilter()) {
++        continue;
++      }
++      ++returned;
+       auto key = iter_->key();
+       auto dstId = NebulaKeyUtils::getDstId(context_->vIdLen(), key);
+       if (context_->isIntId()) {
+@@ -85,6 +96,23 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+     context_->props_ = &(edgeContext_->propContexts_[idx].second);
+     DCHECK_EQ(context_->props_->size(), 1);
+     DCHECK_EQ((*context_->props_)[0].name_, kDst);
++    if (expCtx_ != nullptr) {
++      expCtx_->resetSchema(context_->edgeName_, context_->edgeSchema_, true);
++    }
++  }
++
++  // NULL and non-bool results are false, same as FilterNode::checkTagAndEdge.
++  bool passEdgeFilter() {
++    if (filter_ == nullptr) {
++      return true;
++    }
++    auto* reader = iter_->reader();
++    if (reader == nullptr || expCtx_ == nullptr) {
++      return false;
++    }
++    expCtx_->reset(reader, iter_->key().str());
++    auto boolean = filter_->eval(*expCtx_).toBool();
++    return boolean.isBool() && boolean.getBool();
+   }
+ 
+  private:
+@@ -94,6 +122,8 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+   std::deque<Value>* result_;
+   std::unique_ptr<MultiEdgeIterator> iter_;
+   int64_t limit_;
++  Expression* filter_{nullptr};
++  StorageExpressionContext* expCtx_{nullptr};
+ };
+ 
+ }  // namespace storage
+diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
+index 9c89662..9a755c3 100644
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -7,6 +7,13 @@
+ 
+ #include <robin_hood.h>
+ 
++#include "common/expression/BinaryExpression.h"
++#include "common/expression/ContainerExpression.h"
++#include "common/expression/FunctionCallExpression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/expression/TypeCastingExpression.h"
++#include "common/expression/UnaryExpression.h"
+ #include "common/memory/MemoryTracker.h"
+ #include "common/thread/GenericThreadPool.h"
+ #include "storage/StorageFlags.h"
+@@ -69,7 +76,8 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req) {
+   memory::MemoryCheckGuard guard;
+   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+-  auto plan = buildPlan(&contexts_.front(), &flatResult_);
++  StorageExpressionContext expCtx(this->spaceVidLen_, this->isIntId_);
++  auto plan = buildPlan(&contexts_.front(), &flatResult_, filter_ == nullptr ? nullptr : &expCtx);
+   std::unordered_set<PartitionID> failedParts;
+   for (const auto& partEntry : req.get_parts()) {
+     auto partId = partEntry.first;
+@@ -168,7 +176,8 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> GetDstBySrcProces
+                         return std::make_pair(nebula::cpp2::ErrorCode::E_STORAGE_MEMORY_EXCEEDED,
+                                               partId);
+                       }
+-                      auto plan = buildPlan(context, result);
++                      StorageExpressionContext expCtx(this->spaceVidLen_, this->isIntId_);
++                      auto plan = buildPlan(context, result, filter_ == nullptr ? nullptr : &expCtx);
+                       for (const auto& src : input) {
+                         auto& vId = src.getStr();
+ 
+@@ -196,7 +205,8 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> GetDstBySrcProces
+ }
+ 
+ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
+-                                                      std::deque<Value>* result) {
++                                                      std::deque<Value>* result,
++                                                      StorageExpressionContext* expCtx) {
+   /*
+     The StoragePlan looks like this:
+         +------------------+
+@@ -210,16 +220,18 @@ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
+   StoragePlan<VertexID> plan;
+   std::vector<SingleEdgeNode*> edges;
+   for (const auto& ec : edgeContext_.propContexts_) {
+-    // Since we only return dst in this processor, some steps would be skipped when iterating
+-    // key-values if possible, for example, decoding value
++    // Decode the value when a filter needs it. Rank lives in the key, but
++    // StorageExpressionContext::getEdgeProp still requires a reader.
+     auto edge = std::make_unique<SingleEdgeNode>(
+-        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true);
++        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, filter_ == nullptr);
+     edges.emplace_back(edge.get());
+     plan.addNode(std::move(edge));
+   }
+ 
+   int64_t limit = FLAGS_max_edge_returned_per_vertex;
+-  auto output = std::make_unique<GetDstBySrcNode>(context, edges, &edgeContext_, result, limit);
++  Expression* filter = filter_ == nullptr ? nullptr : filter_->clone();
++  auto output = std::make_unique<GetDstBySrcNode>(
++      context, edges, &edgeContext_, result, limit, filter, expCtx);
+   for (auto* edge : edges) {
+     output->addDependency(edge);
+   }
+@@ -238,6 +250,173 @@ nebula::cpp2::ErrorCode GetDstBySrcProcessor::checkAndBuildContexts(
+   if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     return code;
+   }
++  code = buildEdgeFilter(req);
++  if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++    return code;
++  }
++  return nebula::cpp2::ErrorCode::SUCCEEDED;
++}
++
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::buildEdgeFilter(const cpp2::GetDstBySrcRequest& req) {
++  if (!req.filter_ref().has_value()) {
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++  const auto* filterStr = req.get_filter();
++  if (filterStr == nullptr || filterStr->empty()) {
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++  auto* pool = &this->planContext_->objPool_;
++  filter_ = Expression::decode(pool, *filterStr);
++  if (filter_ == nullptr) {
++    return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++  }
++  // Do not call checkExp(). It inserts the referenced property into propContexts_,
++  // and GetDstBySrcNode requires that list to stay { _dst }. The row reader can
++  // still see every column.
++  return validateEdgeFilter(filter_);
++}
++
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::validateEdgeFilter(const Expression* exp) {
++  if (exp == nullptr) {
++    return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++  }
++  auto recurseUnary = [this](const Expression* e) {
++    return validateEdgeFilter(static_cast<const UnaryExpression*>(e)->operand());
++  };
++  switch (exp->kind()) {
++    case Expression::Kind::kConstant:
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    case Expression::Kind::kUnaryPlus:
++    case Expression::Kind::kUnaryNegate:
++    case Expression::Kind::kUnaryNot:
++    case Expression::Kind::kIsNull:
++    case Expression::Kind::kIsNotNull:
++    case Expression::Kind::kIsEmpty:
++    case Expression::Kind::kIsNotEmpty:
++      return recurseUnary(exp);
++    case Expression::Kind::kAdd:
++    case Expression::Kind::kMinus:
++    case Expression::Kind::kMultiply:
++    case Expression::Kind::kDivision:
++    case Expression::Kind::kMod:
++    case Expression::Kind::kRelEQ:
++    case Expression::Kind::kRelNE:
++    case Expression::Kind::kRelLT:
++    case Expression::Kind::kRelLE:
++    case Expression::Kind::kRelGT:
++    case Expression::Kind::kRelGE:
++    case Expression::Kind::kRelREG:
++    case Expression::Kind::kRelIn:
++    case Expression::Kind::kRelNotIn:
++    case Expression::Kind::kContains:
++    case Expression::Kind::kNotContains:
++    case Expression::Kind::kStartsWith:
++    case Expression::Kind::kNotStartsWith:
++    case Expression::Kind::kEndsWith:
++    case Expression::Kind::kNotEndsWith: {
++      auto* binary = static_cast<const BinaryExpression*>(exp);
++      auto code = validateEdgeFilter(binary->left());
++      if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++        return code;
++      }
++      return validateEdgeFilter(binary->right());
++    }
++    case Expression::Kind::kLogicalAnd:
++    case Expression::Kind::kLogicalOr:
++    case Expression::Kind::kLogicalXor: {
++      auto* logical = static_cast<const LogicalExpression*>(exp);
++      for (const auto* operand : logical->operands()) {
++        auto code = validateEdgeFilter(operand);
++        if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++          return code;
++        }
++      }
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    case Expression::Kind::kTypeCasting:
++      return validateEdgeFilter(static_cast<const TypeCastingExpression*>(exp)->operand());
++    case Expression::Kind::kFunctionCall: {
++      auto* call = static_cast<const FunctionCallExpression*>(exp);
++      for (const auto* arg : call->args()->args()) {
++        auto code = validateEdgeFilter(arg);
++        if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++          return code;
++        }
++      }
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    case Expression::Kind::kList: {
++      auto* list = static_cast<const ListExpression*>(exp);
++      for (const auto* item : list->items()) {
++        auto code = validateEdgeFilter(item);
++        if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++          return code;
++        }
++      }
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    case Expression::Kind::kSet: {
++      auto* set = static_cast<const SetExpression*>(exp);
++      for (const auto* item : set->items()) {
++        auto code = validateEdgeFilter(item);
++        if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++          return code;
++        }
++      }
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    case Expression::Kind::kMap: {
++      auto* map = static_cast<const MapExpression*>(exp);
++      for (const auto& item : map->items()) {
++        auto code = validateEdgeFilter(item.second);
++        if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++          return code;
++        }
++      }
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    case Expression::Kind::kEdgeProperty:
++    case Expression::Kind::kEdgeSrc:
++    case Expression::Kind::kEdgeType:
++    case Expression::Kind::kEdgeRank:
++    case Expression::Kind::kEdgeDst:
++      return validateEdgeRef(static_cast<const PropertyExpression*>(exp));
++    default:
++      return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++  }
++}
++
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::validateEdgeRef(const PropertyExpression* exp) {
++  const auto& edgeName = exp->sym();
++  if (edgeName.empty() || edgeName == "*") {
++    return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++  }
++  auto edgeRet = this->env_->schemaMan_->toEdgeType(spaceId_, edgeName);
++  if (!edgeRet.ok()) {
++    VLOG(1) << "Can't find edge " << edgeName << " in space " << spaceId_;
++    return nebula::cpp2::ErrorCode::E_EDGE_NOT_FOUND;
++  }
++  auto edgeType = edgeRet.value();
++  if (edgeContext_.indexMap_.count(edgeType) == 0 &&
++      edgeContext_.indexMap_.count(-edgeType) == 0) {
++    VLOG(1) << "Edge " << edgeName << " is not in this getDstBySrc request";
++    return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++  }
++  auto schemaIter = edgeContext_.schemas_.find(std::abs(edgeType));
++  if (schemaIter == edgeContext_.schemas_.end() || schemaIter->second.empty()) {
++    return nebula::cpp2::ErrorCode::E_EDGE_NOT_FOUND;
++  }
++  if (exp->kind() != Expression::Kind::kEdgeProperty) {
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++  const auto& propName = exp->prop();
++  if (propName == kSrc || propName == kDst || propName == kRank || propName == kType) {
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++  if (schemaIter->second.back()->field(propName) == nullptr) {
++    VLOG(1) << "Can't find prop " << propName << " on edge " << edgeName;
++    return nebula::cpp2::ErrorCode::E_EDGE_PROP_NOT_FOUND;
++  }
+   return nebula::cpp2::ErrorCode::SUCCEEDED;
+ }
+ 
+diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
+index 11e9944..d5e34d8 100644
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -9,7 +9,10 @@
+ #include <deque>
+ 
+ #include "common/base/Base.h"
++#include "common/expression/Expression.h"
++#include "common/expression/PropertyExpression.h"
+ #include "storage/BaseProcessor.h"
++#include "storage/context/StorageExpressionContext.h"
+ #include "storage/exec/StoragePlan.h"
+ 
+ namespace nebula {
+@@ -44,6 +47,12 @@ class GetDstBySrcProcessor
+ 
+   nebula::cpp2::ErrorCode buildEdgeContext(const cpp2::GetDstBySrcRequest& req);
+ 
++  nebula::cpp2::ErrorCode buildEdgeFilter(const cpp2::GetDstBySrcRequest& req);
++
++  nebula::cpp2::ErrorCode validateEdgeFilter(const Expression* exp);
++
++  nebula::cpp2::ErrorCode validateEdgeRef(const PropertyExpression* exp);
++
+   void runInSingleThread(const cpp2::GetDstBySrcRequest& req);
+ 
+   void runInMultipleThread(const cpp2::GetDstBySrcRequest& req);
+@@ -54,7 +63,9 @@ class GetDstBySrcProcessor
+       PartitionID partId,
+       const std::vector<Value>& srcIds);
+ 
+-  StoragePlan<VertexID> buildPlan(RuntimeContext* context, std::deque<Value>* result);
++  StoragePlan<VertexID> buildPlan(RuntimeContext* context,
++                                  std::deque<Value>* result,
++                                  StorageExpressionContext* expCtx);
+ 
+  private:
+   std::vector<RuntimeContext> contexts_;

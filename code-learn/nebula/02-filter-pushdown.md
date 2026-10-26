@@ -249,3 +249,5 @@ bool PushEFilterDownRule::match(...) const {
 | 显式边类型更容易下推 | `PushEFilterDownRule::rewriteStarEdge` 在单一边类型时把 `*` 换成边名；多种边则包 `_any`。`edgeProps` 为空时 GetNeighbors / ExpandAll 两条规则直接 match 失败。显式 `OVER follow` 让规划器带上边属性，这条观察成立。 |
 
 不确定、源码里没有写死的部分：某种具体 nGQL 在 EXPLAIN 里最终落在 `filter` 还是 `edge filter`，还取决于 yield 列名是否被 `rewrite2VarProp` 收进 `ExpandAll` 的输出列。上面给出的是规则条件，不是把每条语句都跑过一遍的执行日志。
+
+能力总表见 [10](10-pushdown-capability.md)。「美妆类商品、近 3 个月购买、用户去重」这条 1 跳反向边的计划，以及 `getDstBySrc` 补丁，见 [11](11-scenario2-beauty-buyers.md)。变步 GO 仍然不下推。

@@ -25,8 +25,11 @@
 | 07 | [行 value](07-row-encoding.md) | `RowWriterV2` / `RowReaderV2`、null bitmap、schema 版本、默认值、TTL、LIST/SET |
 | 08 | [索引 key](08-index-key-encoding.md) | 整数、浮点、字符串、null、地理如何编成有序字节 |
 | 09 | [写入读出与建模](09-write-read-chain.md) | INSERT / FETCH / GO / LOOKUP / ALTER 各用哪套编码，以及 VID、热点、大属性 |
+| 10 | [下推能力总表](10-pushdown-capability.md) | Filter、投影、索引、Limit、TopN、Aggregate 在 GO / MATCH / LOOKUP / FETCH / 最短路上各自停在哪一层 |
+| 11 | [场景二：美妆购买用户](11-scenario2-beauty-buyers.md) | 类目索引 → 反向购买边 → 边时间过滤 → 用户去重，以及销售额排序；和用户拆解的出入；`getDstBySrc` 补丁与建模对比 |
+| 12 | [场景二压测](12-scenario2-bench.md) | 造数、10–200 并发脚本、未实测说明、多节点复现步骤 |
 
-下推阅读顺序是 01 → 02 → 03 → 04 → 05。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
+下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
 编码阅读顺序是 06 → 07 → 08 → 09。09 把前三篇接到一条写入读出链上。04 只讲 filter / limit 怎么进 storaged，不讲 key 和行格式。
 
@@ -57,3 +60,4 @@ nGQL
 1. 普通 `GO ... WHERE` 下推到 `ExpandAll.filter`，不是 `PushFilterDownGetNbrsRule` 所匹配的 `GetNeighbors`。变步不下推。
 2. `FIND SHORTEST PATH ... | LIMIT n` 在 offset 为 0 时由解析器折进语句，再由 `PathPlanner::setLimit` 写到最短路算子。这是 3.6.0 没有、3.8.0 已有的行为。它不是一条 `PushLimit` 规则。
 3. 笔记中的 `-1005: scan vertices or edges need to specify a limit number...` 不在上述社区源码里。`-1005` 是 `E_EXECUTION_ERROR`。
+4. 一步 `GO ... WHERE 边属性` 在 `--enable_optimizer=true` 时已经进 `GetNeighbors` 的 filter。它减的是回传边的行数，不减「每个商品 VID 一次 RPC」——`StorageClient` 按 host 把 VID 拼成一次请求。`YIELD DISTINCT 边._dst` 原本因为有 WHERE 而不能走 `getDstBySrc`。见 [11](11-scenario2-beauty-buyers.md)。
