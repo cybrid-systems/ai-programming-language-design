@@ -1,0 +1,1589 @@
+{
+  "phase": "measure",
+  "tag": "p3_rf1_fwd0",
+  "space": "beauty_p3_rf1",
+  "parts": [
+    [
+      1,
+      "10.88.0.23:9779",
+      "10.88.0.23:9779",
+      ""
+    ],
+    [
+      2,
+      "10.88.0.22:9779",
+      "10.88.0.22:9779",
+      ""
+    ],
+    [
+      3,
+      "10.88.0.21:9779",
+      "10.88.0.21:9779",
+      ""
+    ]
+  ],
+  "replica": 1,
+  "hardware": {
+    "platform": "Linux-6.12.94+-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "python": "3.12.3",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "meminfo": {
+      "MemTotal": "16387280 kB",
+      "MemAvailable": "13175512 kB",
+      "SwapTotal": "0 kB"
+    },
+    "hostname": "cursor"
+  },
+  "dataset": {
+    "users": 800,
+    "items": 200,
+    "edges": 20000,
+    "parts": 3,
+    "cutoff": 1753660800,
+    "beauty_items": 43,
+    "recent_beauty_users": 686,
+    "matching_edges": 1566,
+    "sales_sum": 397318.0
+  },
+  "ok": true,
+  "hosts": [
+    [
+      "10.88.0.21",
+      9779,
+      "ONLINE",
+      4,
+      "beauty_p3_rf1:1, beauty_p9_rf1:3",
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:9",
+      ""
+    ],
+    [
+      "10.88.0.22",
+      9779,
+      "ONLINE",
+      6,
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:2",
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:9",
+      ""
+    ],
+    [
+      "10.88.0.23",
+      9779,
+      "ONLINE",
+      11,
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:7",
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:9",
+      ""
+    ]
+  ],
+  "queries": {
+    "q_users": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD DISTINCT buy._dst AS user",
+      "check": {
+        "name": "q_users",
+        "ok": true,
+        "got": 686,
+        "expect": 686,
+        "missing_sample": [],
+        "extra_sample": [],
+        "sha256": "cd2789acb6919ac55ac2c4cf0d547fea1439a6aa6d779c36a7db77dadeaaa80a",
+        "expect_sha256": "cd2789acb6919ac55ac2c4cf0d547fea1439a6aa6d779c36a7db77dadeaaa80a"
+      },
+      "result_rows": 686,
+      "ok": true,
+      "profile_rows": 686,
+      "profile_server_us": 2231,
+      "hosts": [
+        {
+          "state": "step1 resp [1]",
+          "host": "10.88.0.22:9779",
+          "vertices": 411,
+          "raw": "{\n  \"exec\": \"582(us)\",\n  \"host\": \"10.88.0.22:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"39(us)\",\n    \"GetDstBySrcProcessorTotal\": \"580(us)\"\n  },\n  \"total\": \"924(us)\",\n  \"vertices\": 411\n}"
+        },
+        {
+          "state": "step1 resp [2]",
+          "host": "10.88.0.23:9779",
+          "vertices": 344,
+          "raw": "{\n  \"exec\": \"559(us)\",\n  \"host\": \"10.88.0.23:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"55(us)\",\n    \"GetDstBySrcProcessorTotal\": \"557(us)\"\n  },\n  \"total\": \"854(us)\",\n  \"vertices\": 344\n}"
+        },
+        {
+          "state": "step1 resp [0]",
+          "host": "10.88.0.21:9779",
+          "vertices": 366,
+          "raw": "{\n  \"exec\": \"714(us)\",\n  \"host\": \"10.88.0.21:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"69(us)\",\n    \"GetDstBySrcProcessorTotal\": \"712(us)\"\n  },\n  \"total\": \"1044(us)\",\n  \"vertices\": 366\n}"
+        }
+      ],
+      "partial": false,
+      "plan_names": [
+        "Project",
+        "Dedup",
+        "Expand",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 5.648651997034904,
+            "p95": 6.228535000991542,
+            "p99": 6.301899001409765,
+            "min": 5.487217000336386,
+            "max": 6.320240001514321
+          },
+          "server_ms": {
+            "p50": 2.109,
+            "p95": 2.3632,
+            "p99": 2.39904,
+            "min": 2.047,
+            "max": 2.408
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.028926519000378903,
+          "qps": 172.8517696835387,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 5.861714998900425,
+              "server_us": 2184,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 6.320240001514321,
+              "server_us": 2109,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 5.648651997034904,
+              "server_us": 2047,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 5.590667002252303,
+              "server_us": 2408,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 5.487217000336386,
+              "server_us": 2053,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 20.793564999621594,
+            "p95": 59.4820790010999,
+            "p99": 83.99396326945856,
+            "min": 5.878571999346605,
+            "max": 99.44541599907097
+          },
+          "server_ms": {
+            "p50": 2.4425,
+            "p95": 8.931399999999998,
+            "p99": 9.835529999999999,
+            "min": 1.849,
+            "max": 10.033
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.16483746199810412,
+          "qps": 303.32910610195563,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 13.675570000486914,
+              "server_us": 6218,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 10.509844003536273,
+              "server_us": 2512,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 24.933741999120684,
+              "server_us": 2046,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 46.091282998531824,
+              "server_us": 1921,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 5.878571999346605,
+              "server_us": 2184,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 29.104430999723263,
+              "server_us": 8688,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.083292997209355,
+              "server_us": 2115,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 24.407169999904,
+              "server_us": 2357,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 17.609352002182277,
+              "server_us": 1937,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 8.807617999991635,
+              "server_us": 2339,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 42.65068499807967,
+              "server_us": 10033,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 9.468939999351278,
+              "server_us": 2507,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 37.07901199959451,
+              "server_us": 3744,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 8.390833998419112,
+              "server_us": 2564,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 17.510294001112925,
+              "server_us": 2356,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.32971499892301,
+              "server_us": 6769,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.330368997936603,
+              "server_us": 2503,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.034676001348998,
+              "server_us": 2239,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.17072999983793,
+              "server_us": 2038,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 44.66980400320608,
+              "server_us": 2405,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 36.916155000653816,
+              "server_us": 7537,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.592137999803526,
+              "server_us": 1914,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 9.29774700125563,
+              "server_us": 2428,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 8.754876002058154,
+              "server_us": 2369,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 50.27458600307,
+              "server_us": 2411,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 16.660731002048124,
+              "server_us": 9043,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 53.741382998850895,
+              "server_us": 3339,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 21.45022699914989,
+              "server_us": 2457,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.179790002061054,
+              "server_us": 3692,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 11.56500000070082,
+              "server_us": 2481,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.42347700020764,
+              "server_us": 9630,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 53.012652999314014,
+              "server_us": 2143,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.81204699911177,
+              "server_us": 3925,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 20.136903000093298,
+              "server_us": 3960,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 23.639013001229614,
+              "server_us": 2290,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 39.85465900041163,
+              "server_us": 8795,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 27.893987000425113,
+              "server_us": 2164,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 67.91183899986208,
+              "server_us": 1849,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 6.006731000525178,
+              "server_us": 2171,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.16438899791683,
+              "server_us": 3996,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 19.908529000531416,
+              "server_us": 8417,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 62.71478000053321,
+              "server_us": 2610,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 55.53100000179256,
+              "server_us": 2053,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 8.809447001112858,
+              "server_us": 5290,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 15.341209000325762,
+              "server_us": 2077,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 10.455350999109214,
+              "server_us": 5012,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 99.44541599907097,
+              "server_us": 3452,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 22.91324500038172,
+              "server_us": 2392,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.059810000209836,
+              "server_us": 2353,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 19.8775549979473,
+              "server_us": 2386,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.275
+    },
+    "q_sales": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD buy._dst AS uid, buy.amount AS amt | GROUP BY $-.uid YIELD $-.uid AS uid, sum($-.amt) AS sales | ORDER BY $-.sales DESC | LIMIT 100",
+      "sales_check": {
+        "ok": true,
+        "got": 686,
+        "expect": 686,
+        "mismatch_sample": [],
+        "extra_sample": [],
+        "sum_got": 397318.0,
+        "sum_expect": 397318.0
+      },
+      "top_rows": [
+        [
+          657,
+          2481.0
+        ],
+        [
+          233,
+          2277.0
+        ],
+        [
+          405,
+          2149.0
+        ],
+        [
+          22,
+          1981.0
+        ],
+        [
+          730,
+          1913.0
+        ]
+      ],
+      "result_rows": 100,
+      "ok": true,
+      "profile_rows": 100,
+      "profile_server_us": 2913,
+      "hosts": [
+        {
+          "state": "step1 resp [1]",
+          "host": "10.88.0.22:9779",
+          "vertices": 411,
+          "raw": "{\n  \"exec\": \"632(us)\",\n  \"host\": \"10.88.0.22:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"630(us)\"\n  },\n  \"total\": \"1088(us)\",\n  \"vertices\": 411\n}"
+        },
+        {
+          "state": "step1 resp [2]",
+          "host": "10.88.0.23:9779",
+          "vertices": 344,
+          "raw": "{\n  \"exec\": \"505(us)\",\n  \"host\": \"10.88.0.23:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"503(us)\"\n  },\n  \"total\": \"1032(us)\",\n  \"vertices\": 344\n}"
+        },
+        {
+          "state": "step1 resp [0]",
+          "host": "10.88.0.21:9779",
+          "vertices": 366,
+          "raw": "{\n  \"exec\": \"577(us)\",\n  \"host\": \"10.88.0.21:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"575(us)\"\n  },\n  \"total\": \"1070(us)\",\n  \"vertices\": 366\n}"
+        }
+      ],
+      "partial": true,
+      "plan_names": [
+        "TopN",
+        "Aggregate",
+        "Expand",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 3.6507600016193464,
+            "p95": 3.864516198518686,
+            "p99": 3.90464803786017,
+            "min": 3.563072001270484,
+            "max": 3.914680997695541
+          },
+          "server_ms": {
+            "p50": 2.753,
+            "p95": 2.9899999999999998,
+            "p99": 3.0347999999999997,
+            "min": 2.682,
+            "max": 3.046
+          },
+          "row_counts": [
+            100
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.018435391000821255,
+          "qps": 271.2174642662725,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 3.663857001811266,
+              "server_us": 2753,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 3.6507600016193464,
+              "server_us": 2766,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 3.629849998105783,
+              "server_us": 2727,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 3.563072001270484,
+              "server_us": 2682,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 3.914680997695541,
+              "server_us": 3046,
+              "error": null,
+              "rows": 100
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 14.853583499643719,
+            "p95": 18.920139750480303,
+            "p99": 20.818541819608065,
+            "min": 5.473337998409988,
+            "max": 22.31852099794196
+          },
+          "server_ms": {
+            "p50": 10.284500000000001,
+            "p95": 12.90775,
+            "p99": 15.217949999999998,
+            "min": 4.072,
+            "max": 15.534
+          },
+          "row_counts": [
+            100
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.07814324200080591,
+          "qps": 639.8505964147781,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 11.643533998721978,
+              "server_us": 10109,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 9.160839999822201,
+              "server_us": 4261,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 14.802443998632953,
+              "server_us": 10319,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 12.68156900187023,
+              "server_us": 10782,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 14.386467999429442,
+              "server_us": 9677,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 10.000275000493275,
+              "server_us": 5514,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 10.261170999001479,
+              "server_us": 5860,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.265371999907074,
+              "server_us": 13000,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 12.663227000302868,
+              "server_us": 9905,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 18.248369997309055,
+              "server_us": 9772,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 15.513965998252388,
+              "server_us": 11535,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 10.125027998583391,
+              "server_us": 7093,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.620031001366442,
+              "server_us": 10287,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 14.918050001142547,
+              "server_us": 11074,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 13.155485001334455,
+              "server_us": 8576,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 18.077133998303907,
+              "server_us": 11572,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 15.314206000766717,
+              "server_us": 11768,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 13.991342999361223,
+              "server_us": 11598,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 13.764149000053294,
+              "server_us": 11968,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 10.464427999977488,
+              "server_us": 6857,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 15.335169002355542,
+              "server_us": 9758,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 10.63042700116057,
+              "server_us": 6811,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 18.788687000778737,
+              "server_us": 15534,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 14.625289000832709,
+              "server_us": 11363,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 13.071643003058853,
+              "server_us": 10173,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.08623200081638,
+              "server_us": 11614,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 13.304246000188868,
+              "server_us": 9814,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.656282998155802,
+              "server_us": 10791,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 12.632059999305056,
+              "server_us": 7733,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 14.904723000654485,
+              "server_us": 10348,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 18.649063000339083,
+              "server_us": 12076,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 19.02769200023613,
+              "server_us": 14889,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 11.566048000531737,
+              "server_us": 7479,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.22798699827399,
+              "server_us": 10608,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 9.489947002293775,
+              "server_us": 5354,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 12.948873001732863,
+              "server_us": 8991,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 17.375965999235632,
+              "server_us": 10664,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 12.009091002255445,
+              "server_us": 10282,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 15.476368000236107,
+              "server_us": 10309,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 17.62115299789002,
+              "server_us": 7712,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.574179997405736,
+              "server_us": 11750,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 9.986414999730187,
+              "server_us": 6910,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 13.206032999732997,
+              "server_us": 9443,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 17.31318399833981,
+              "server_us": 12726,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 19.25733900134219,
+              "server_us": 8249,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 22.31852099794196,
+              "server_us": 9783,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.294289998768363,
+              "server_us": 12293,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 17.097350999392802,
+              "server_us": 12795,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 16.061303998867515,
+              "server_us": 10481,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 5.473337998409988,
+              "server_us": 4072,
+              "error": null,
+              "rows": 100
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.158,
+      "want_partial": true
+    },
+    "q_count": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD buy._dst AS uid, buy.amount AS amt | GROUP BY $-.uid YIELD $-.uid AS uid, count($-.amt) AS n",
+      "check": {
+        "ok": true,
+        "got": 686,
+        "expect": 686,
+        "sum_got": 1566,
+        "sum_expect": 1566
+      },
+      "result_rows": 686,
+      "ok": true,
+      "profile_rows": 686,
+      "profile_server_us": 2747,
+      "hosts": [
+        {
+          "state": "step1 resp [1]",
+          "host": "10.88.0.22:9779",
+          "vertices": 411,
+          "raw": "{\n  \"exec\": \"612(us)\",\n  \"host\": \"10.88.0.22:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"609(us)\"\n  },\n  \"total\": \"1081(us)\",\n  \"vertices\": 411\n}"
+        },
+        {
+          "state": "step1 resp [2]",
+          "host": "10.88.0.23:9779",
+          "vertices": 344,
+          "raw": "{\n  \"exec\": \"499(us)\",\n  \"host\": \"10.88.0.23:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"497(us)\"\n  },\n  \"total\": \"1017(us)\",\n  \"vertices\": 344\n}"
+        },
+        {
+          "state": "step1 resp [0]",
+          "host": "10.88.0.21:9779",
+          "vertices": 366,
+          "raw": "{\n  \"exec\": \"508(us)\",\n  \"host\": \"10.88.0.21:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"506(us)\"\n  },\n  \"total\": \"1064(us)\",\n  \"vertices\": 366\n}"
+        }
+      ],
+      "partial": true,
+      "plan_names": [
+        "Aggregate",
+        "Expand",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 7.387099998595659,
+            "p95": 7.574262800335418,
+            "p99": 7.579781360400375,
+            "min": 7.067872000334319,
+            "max": 7.581161000416614
+          },
+          "server_ms": {
+            "p50": 2.759,
+            "p95": 2.8733999999999997,
+            "p99": 2.8826799999999997,
+            "min": 2.637,
+            "max": 2.885
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.03684799500115332,
+          "qps": 135.69259331053163,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 7.252082999912091,
+              "server_us": 2827,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 7.387099998595659,
+              "server_us": 2885,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 7.067872000334319,
+              "server_us": 2637,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 7.581161000416614,
+              "server_us": 2759,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 7.546670000010636,
+              "server_us": 2685,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 28.872854501969414,
+            "p95": 91.23012239851954,
+            "p99": 133.34225202896044,
+            "min": 8.553431001928402,
+            "max": 147.99847199901706
+          },
+          "server_ms": {
+            "p50": 2.9924999999999997,
+            "p95": 9.932549999999999,
+            "p99": 11.105059999999998,
+            "min": 2.468,
+            "max": 11.402
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.23714430999825709,
+          "qps": 210.8420817702414,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 34.81793500031927,
+              "server_us": 10796,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 17.79174100011005,
+              "server_us": 3377,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 21.94652199978009,
+              "server_us": 2951,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 38.57810399858863,
+              "server_us": 2707,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 13.432673000352224,
+              "server_us": 2602,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 14.560282001184532,
+              "server_us": 7281,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 29.94103800301673,
+              "server_us": 3085,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 51.68163200141862,
+              "server_us": 2891,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 13.51857299960102,
+              "server_us": 3126,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.37392199903843,
+              "server_us": 4043,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 57.409434997680364,
+              "server_us": 9877,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 21.154609999939566,
+              "server_us": 3099,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 40.40972000075271,
+              "server_us": 2960,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.796793998859357,
+              "server_us": 2833,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 34.11198899993906,
+              "server_us": 2918,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.98230999885709,
+              "server_us": 8989,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 35.20093400220503,
+              "server_us": 2581,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 78.08913600092637,
+              "server_us": 2505,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 21.44092299931799,
+              "server_us": 2588,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.900627999566495,
+              "server_us": 2552,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 22.047033002309036,
+              "server_us": 9442,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 64.7307679973892,
+              "server_us": 2754,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.429989998287056,
+              "server_us": 4225,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 25.929269002517685,
+              "server_us": 2491,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 43.98270299861906,
+              "server_us": 2613,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 48.66235300141852,
+              "server_us": 8583,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 43.03059700032463,
+              "server_us": 3089,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.691735998610966,
+              "server_us": 3488,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 56.64250400150195,
+              "server_us": 4517,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.1800700003223,
+              "server_us": 2594,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.51100799831329,
+              "server_us": 9646,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.957004000782035,
+              "server_us": 2564,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 147.99847199901706,
+              "server_us": 3405,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.33363599871518,
+              "server_us": 3025,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 17.78935499896761,
+              "server_us": 3406,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 39.18997799701174,
+              "server_us": 11402,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 118.08781899890164,
+              "server_us": 2468,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.1773730017012,
+              "server_us": 2878,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 27.8046710009221,
+              "server_us": 2732,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.756338001054246,
+              "server_us": 2669,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 99.16791899740929,
+              "server_us": 9552,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 44.80171600152971,
+              "server_us": 4072,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 58.4813679997751,
+              "server_us": 3076,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 16.354190000129165,
+              "server_us": 2796,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 12.964900997758377,
+              "server_us": 2685,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 81.52837099987664,
+              "server_us": 9978,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 70.7390649986337,
+              "server_us": 2716,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 16.818560001411242,
+              "server_us": 2782,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 58.3221249980852,
+              "server_us": 3403,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 8.553431001928402,
+              "server_us": 2587,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.373,
+      "want_partial": true
+    }
+  }
+}

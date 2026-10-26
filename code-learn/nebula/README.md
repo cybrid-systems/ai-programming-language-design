@@ -30,6 +30,9 @@
 | 12 | [场景二压测](12-scenario2-bench.md) | 单机实测：flag 关 / flag 开 / 购买边复合索引，P50/P95/P99、QPS、PROFILE 行数；多节点复现步骤 |
 | 13 | [控制流](13-control-flow.md) | 请求入口与会话、future 调度、执行模型（物化 / Volcano / 向量化）、`Select`/`Loop`/`PassThrough`、GO 与 MATCH 的计划 |
 | 14 | [数据流](14-data-flow.md) | `ExecutionContext` / `Result` / `Iterator`、拷贝与释放、graphd→storaged 的 RPC 合并、GO 与 MATCH 的行、写路径到 Raft |
+| 15 | [边上的可下推框架](15-general-pushdown.md) | 表达式判定、合取拆分、部分聚合、TopN 的分区前提、滚动升级；和现有 Filter / Aggregate / GetDstBySrc 怎么接 |
+| 16 | [部分聚合实现与测试](16-partial-agg-impl.md) | 第二份补丁、null/多边/回退、美妆 q_sales 重测、q_model DISTINCT、graphd worker |
+| 17 | [多节点压测](17-distributed-bench.md) | 3 meta + 3 storage + 1 graph、实测 RTT、RF=1/3、分区数、leader、杀进程 |
 | 20 | [中间表示](20-intermediate-representation.md) | 场景二三条查询的算子输出：`Value` / `DataSet` 列布局、Thrift 字节、glibc 堆；和水位、下推的关系 |
 | 21 | [中间表示方案](21-ir-optimization-design.md) | 按收益和风险分的通用改法：P0 不改对外协议，P1 改 storage 可选字段，P2 改调度；含 v3.8.0 上的 PoC patch |
 
@@ -39,7 +42,9 @@
 
 控制流和数据流是 13 → 14。13 回答「算子按什么模型被拉动」，14 回答「行放在哪个变量里」。01 的优化器、04 的 `FilterNode`、09 的编码在这两篇里只引用，不重复。
 
-[20](20-intermediate-representation.md) 接在 11–14 后面：用场景二的 40415 条边、382 个商品、4000 个用户，写每个算子吐出的 `DataSet` 和 Thrift 字节。12 有时延和行数，没有这组字节。[21](21-ir-optimization-design.md) 把这些字节收成 graphd、storaged 和两边协议的分阶段改法。写 21 时 origin/main 上还没有 15–19，下推重叠以 [10](10-pushdown-capability.md) 为准。
+15 是下推框架。16 是它在 `v3.8.0` 上的实现和单机重测。17 是同一台 VM 上的多进程集群，RTT 来自 ping，不是 `tc netem`（这个内核没编进 `sch_netem`）。
+
+[20](20-intermediate-representation.md) 接在 11–14 后面：用场景二的 40415 条边、382 个商品、4000 个用户，写每个算子吐出的 `DataSet` 和 Thrift 字节。12 有时延和行数，没有这组字节。[21](21-ir-optimization-design.md) 把这些字节收成 graphd、storaged 和两边协议的分阶段改法。写 21 时 origin/main 上还没有 15–19，下推重叠以 [10](10-pushdown-capability.md) 为准。15–17 是后来补上的下推实现，不改 20/21 里的字节计数。
 
 ---
 

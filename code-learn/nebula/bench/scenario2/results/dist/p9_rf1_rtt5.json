@@ -1,0 +1,2102 @@
+{
+  "phase": "measure",
+  "tag": "p9_rf1_rtt5",
+  "space": "beauty_p9_rf1",
+  "parts": [
+    [
+      1,
+      "10.88.0.23:9779",
+      "10.88.0.23:9779",
+      ""
+    ],
+    [
+      2,
+      "10.88.0.22:9779",
+      "10.88.0.22:9779",
+      ""
+    ],
+    [
+      3,
+      "10.88.0.21:9779",
+      "10.88.0.21:9779",
+      ""
+    ],
+    [
+      4,
+      "10.88.0.23:9779",
+      "10.88.0.23:9779",
+      ""
+    ],
+    [
+      5,
+      "10.88.0.22:9779",
+      "10.88.0.22:9779",
+      ""
+    ],
+    [
+      6,
+      "10.88.0.21:9779",
+      "10.88.0.21:9779",
+      ""
+    ],
+    [
+      7,
+      "10.88.0.23:9779",
+      "10.88.0.23:9779",
+      ""
+    ],
+    [
+      8,
+      "10.88.0.22:9779",
+      "10.88.0.22:9779",
+      ""
+    ],
+    [
+      9,
+      "10.88.0.21:9779",
+      "10.88.0.21:9779",
+      ""
+    ]
+  ],
+  "replica": 1,
+  "hardware": {
+    "platform": "Linux-6.12.94+-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "python": "3.12.3",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "meminfo": {
+      "MemTotal": "16387280 kB",
+      "MemAvailable": "13235324 kB",
+      "SwapTotal": "0 kB"
+    },
+    "hostname": "cursor"
+  },
+  "dataset": {
+    "users": 800,
+    "items": 200,
+    "edges": 20000,
+    "parts": 9,
+    "cutoff": 1753660800,
+    "beauty_items": 43,
+    "recent_beauty_users": 686,
+    "matching_edges": 1566,
+    "sales_sum": 397318.0
+  },
+  "ok": true,
+  "hosts": [
+    [
+      "10.88.0.21",
+      9779,
+      "ONLINE",
+      3,
+      "beauty_p9_rf1:3",
+      "beauty_p9_rf1:3",
+      ""
+    ],
+    [
+      "10.88.0.22",
+      9779,
+      "ONLINE",
+      3,
+      "beauty_p9_rf1:3",
+      "beauty_p9_rf1:3",
+      ""
+    ],
+    [
+      "10.88.0.23",
+      9779,
+      "ONLINE",
+      3,
+      "beauty_p9_rf1:3",
+      "beauty_p9_rf1:3",
+      ""
+    ]
+  ],
+  "queries": {
+    "q_users": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD DISTINCT buy._dst AS user",
+      "check": {
+        "name": "q_users",
+        "ok": true,
+        "got": 686,
+        "expect": 686,
+        "missing_sample": [],
+        "extra_sample": [],
+        "sha256": "cd2789acb6919ac55ac2c4cf0d547fea1439a6aa6d779c36a7db77dadeaaa80a",
+        "expect_sha256": "cd2789acb6919ac55ac2c4cf0d547fea1439a6aa6d779c36a7db77dadeaaa80a"
+      },
+      "result_rows": 686,
+      "ok": true,
+      "profile_rows": 686,
+      "profile_server_us": 14789,
+      "hosts": [
+        {
+          "state": "step1 resp [1]",
+          "host": "10.88.0.22:9779",
+          "vertices": 411,
+          "raw": "{\n  \"exec\": \"602(us)\",\n  \"host\": \"10.88.0.22:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"95(us)\",\n    \"GetDstBySrcProcessorTotal\": \"597(us)\"\n  },\n  \"total\": \"6517(us)\",\n  \"vertices\": 411\n}"
+        },
+        {
+          "state": "step1 resp [2]",
+          "host": "10.88.0.23:9779",
+          "vertices": 344,
+          "raw": "{\n  \"exec\": \"1143(us)\",\n  \"host\": \"10.88.0.23:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"70(us)\",\n    \"GetDstBySrcProcessorTotal\": \"1140(us)\"\n  },\n  \"total\": \"6920(us)\",\n  \"vertices\": 344\n}"
+        },
+        {
+          "state": "step1 resp [0]",
+          "host": "10.88.0.21:9779",
+          "vertices": 366,
+          "raw": "{\n  \"exec\": \"607(us)\",\n  \"host\": \"10.88.0.21:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"69(us)\",\n    \"GetDstBySrcProcessorTotal\": \"604(us)\"\n  },\n  \"total\": \"6329(us)\",\n  \"vertices\": 366\n}"
+        }
+      ],
+      "partial": false,
+      "plan_names": [
+        "Project",
+        "Dedup",
+        "Expand",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 18.221043999801623,
+            "p95": 18.457302398746833,
+            "p99": 18.50438927882351,
+            "min": 17.444511999201495,
+            "max": 18.51616099884268
+          },
+          "server_ms": {
+            "p50": 13.972,
+            "p95": 14.2366,
+            "p99": 14.26572,
+            "min": 13.301,
+            "max": 14.273
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.08992679199945997,
+          "qps": 55.60078246792153,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 18.22186799836345,
+              "server_us": 14091,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.221043999801623,
+              "server_us": 13970,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 17.49506600026507,
+              "server_us": 13301,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.51616099884268,
+              "server_us": 14273,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 17.444511999201495,
+              "server_us": 13972,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 34.398193998640636,
+            "p95": 56.84921785014011,
+            "p99": 68.67591439193347,
+            "min": 24.70218400048907,
+            "max": 70.36160700226901
+          },
+          "server_ms": {
+            "p50": 22.2145,
+            "p95": 29.0796,
+            "p99": 29.36881,
+            "min": 15.747,
+            "max": 29.433
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.21030882999912137,
+          "qps": 237.7456048812068,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 40.4766510000627,
+              "server_us": 29302,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 34.034928001347,
+              "server_us": 21480,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.957634000718826,
+              "server_us": 24222,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.25445200203103,
+              "server_us": 23959,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 28.245659999811323,
+              "server_us": 18382,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 47.34941599963349,
+              "server_us": 29274,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.10716200171737,
+              "server_us": 20063,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.207451000227593,
+              "server_us": 21129,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.495314000494545,
+              "server_us": 21290,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.10885900261928,
+              "server_us": 19672,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 30.906153999239905,
+              "server_us": 27584,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 36.27282399975229,
+              "server_us": 15747,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.79310700215865,
+              "server_us": 16963,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 35.51406800033874,
+              "server_us": 19316,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 46.47409800236346,
+              "server_us": 22088,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 51.851315998646896,
+              "server_us": 28842,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 30.874266998580424,
+              "server_us": 22906,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 33.61146300085238,
+              "server_us": 25254,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 33.87231200031238,
+              "server_us": 26092,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 34.42966799775604,
+              "server_us": 17423,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 44.33386900200276,
+              "server_us": 28354,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 45.127082001272356,
+              "server_us": 22830,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 40.882827997847926,
+              "server_us": 20842,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 30.134264001389965,
+              "server_us": 20109,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 27.040223001677077,
+              "server_us": 19223,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 70.36160700226901,
+              "server_us": 27525,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 24.70218400048907,
+              "server_us": 19286,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 34.56454600018333,
+              "server_us": 19241,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 33.68005399897811,
+              "server_us": 22250,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 26.432686998305144,
+              "server_us": 17056,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 34.36671999952523,
+              "server_us": 28015,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 27.910691002034582,
+              "server_us": 18007,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 39.36983899984625,
+              "server_us": 22179,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 55.20327200065367,
+              "server_us": 23565,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 36.54067800016492,
+              "server_us": 22100,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 58.175758000288624,
+              "server_us": 29433,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 27.71579600084806,
+              "server_us": 19237,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.53779299848247,
+              "server_us": 27816,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 34.70485200159601,
+              "server_us": 23051,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 42.801536998013034,
+              "server_us": 17535,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 55.22789099995862,
+              "server_us": 27857,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 37.29121799915447,
+              "server_us": 18803,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 29.38529599850881,
+              "server_us": 18278,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 49.015896998753306,
+              "server_us": 25390,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 36.432382999919355,
+              "server_us": 22521,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 37.57560099984403,
+              "server_us": 28066,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 66.92141800158424,
+              "server_us": 23437,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 41.26770600123564,
+              "server_us": 23718,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.080818000395084,
+              "server_us": 20523,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.05423500185134,
+              "server_us": 22561,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.544
+    },
+    "q_sales": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD buy._dst AS uid, buy.amount AS amt | GROUP BY $-.uid YIELD $-.uid AS uid, sum($-.amt) AS sales | ORDER BY $-.sales DESC | LIMIT 100",
+      "sales_check": {
+        "ok": true,
+        "got": 686,
+        "expect": 686,
+        "mismatch_sample": [],
+        "extra_sample": [],
+        "sum_got": 397318.0,
+        "sum_expect": 397318.0
+      },
+      "top_rows": [
+        [
+          657,
+          2481.0
+        ],
+        [
+          233,
+          2277.0
+        ],
+        [
+          405,
+          2149.0
+        ],
+        [
+          22,
+          1981.0
+        ],
+        [
+          730,
+          1913.0
+        ]
+      ],
+      "result_rows": 100,
+      "ok": true,
+      "profile_rows": 100,
+      "profile_server_us": 17206,
+      "hosts": [
+        {
+          "state": "step1 resp [1]",
+          "host": "10.88.0.22:9779",
+          "vertices": 411,
+          "raw": "{\n  \"exec\": \"514(us)\",\n  \"host\": \"10.88.0.22:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"510(us)\"\n  },\n  \"total\": \"7121(us)\",\n  \"vertices\": 411\n}"
+        },
+        {
+          "state": "step1 resp [2]",
+          "host": "10.88.0.23:9779",
+          "vertices": 344,
+          "raw": "{\n  \"exec\": \"526(us)\",\n  \"host\": \"10.88.0.23:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"523(us)\"\n  },\n  \"total\": \"6961(us)\",\n  \"vertices\": 344\n}"
+        },
+        {
+          "state": "step1 resp [0]",
+          "host": "10.88.0.21:9779",
+          "vertices": 366,
+          "raw": "{\n  \"exec\": \"840(us)\",\n  \"host\": \"10.88.0.21:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"832(us)\"\n  },\n  \"total\": \"7537(us)\",\n  \"vertices\": 366\n}"
+        }
+      ],
+      "partial": true,
+      "plan_names": [
+        "TopN",
+        "Aggregate",
+        "Expand",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 17.03154899951187,
+            "p95": 19.803631999820936,
+            "p99": 19.99084720009705,
+            "min": 15.497527998377336,
+            "max": 20.03765100016608
+          },
+          "server_ms": {
+            "p50": 14.737,
+            "p95": 17.833999999999996,
+            "p99": 17.965999999999998,
+            "min": 13.537,
+            "max": 17.999
+          },
+          "row_counts": [
+            100
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.08814604500003043,
+          "qps": 56.72404246836343,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 16.69474899972556,
+              "server_us": 14737,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 18.867555998440366,
+              "server_us": 17174,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 17.03154899951187,
+              "server_us": 14678,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 20.03765100016608,
+              "server_us": 17999,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 15.497527998377336,
+              "server_us": 13537,
+              "error": null,
+              "rows": 100
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 34.08384000067599,
+            "p95": 39.788974948532996,
+            "p99": 40.699322068285255,
+            "min": 24.251031998574035,
+            "max": 41.520883998600766
+          },
+          "server_ms": {
+            "p50": 27.4845,
+            "p95": 33.1635,
+            "p99": 35.810599999999994,
+            "min": 20.663,
+            "max": 37.947
+          },
+          "row_counts": [
+            100
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.1876005099984468,
+          "qps": 266.52379569977694,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 29.739670997514622,
+              "server_us": 26962,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 27.783379999164026,
+              "server_us": 23388,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.50096899905475,
+              "server_us": 27387,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 25.425801999517716,
+              "server_us": 22323,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.01625799961039,
+              "server_us": 29038,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.308840997255174,
+              "server_us": 29130,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 25.041739998414414,
+              "server_us": 21085,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 32.0878120000998,
+              "server_us": 24302,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 27.230210002016975,
+              "server_us": 23150,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.23956600090605,
+              "server_us": 28549,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.864860998117365,
+              "server_us": 31511,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 29.406641002424294,
+              "server_us": 24502,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 32.62256500238436,
+              "server_us": 26449,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 30.609647001256235,
+              "server_us": 22726,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 28.353418998449342,
+              "server_us": 23293,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 32.91061100026127,
+              "server_us": 28778,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 29.46720099862432,
+              "server_us": 25680,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 30.124275999696692,
+              "server_us": 21271,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 27.278656998532824,
+              "server_us": 22885,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 37.48751900275238,
+              "server_us": 33587,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.88750200267532,
+              "server_us": 32143,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 28.265066001040395,
+              "server_us": 22706,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.7720820029499,
+              "server_us": 29748,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 24.251031998574035,
+              "server_us": 20663,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.01890299958177,
+              "server_us": 30924,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 37.26197400101228,
+              "server_us": 32020,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 28.585272000782425,
+              "server_us": 21201,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.0670580008009,
+              "server_us": 27434,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 39.81797699816525,
+              "server_us": 33062,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.37476500039338,
+              "server_us": 31259,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.08768100073212,
+              "server_us": 32580,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 33.53419899940491,
+              "server_us": 24230,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 37.40845899665146,
+              "server_us": 31574,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 37.86498100089375,
+              "server_us": 27040,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 31.59078099997714,
+              "server_us": 27098,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 31.477980999625288,
+              "server_us": 27131,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.70802699687192,
+              "server_us": 27535,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 34.100622000551084,
+              "server_us": 27247,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 39.75352799898246,
+              "server_us": 33114,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.17619000194827,
+              "server_us": 28500,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 32.27691299980506,
+              "server_us": 28781,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 29.44750499955262,
+              "server_us": 25179,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 39.454450001358055,
+              "server_us": 29591,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 39.844226997956866,
+              "server_us": 32592,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 35.29098600120051,
+              "server_us": 28931,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 37.29502599890111,
+              "server_us": 32151,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 32.238957999652484,
+              "server_us": 23901,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 37.288158000592375,
+              "server_us": 31317,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 39.24150899911183,
+              "server_us": 33204,
+              "error": null,
+              "rows": 100
+            },
+            {
+              "ok": true,
+              "client_ms": 41.520883998600766,
+              "server_us": 37947,
+              "error": null,
+              "rows": 100
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.52,
+      "want_partial": true
+    },
+    "q_count": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD buy._dst AS uid, buy.amount AS amt | GROUP BY $-.uid YIELD $-.uid AS uid, count($-.amt) AS n",
+      "check": {
+        "ok": true,
+        "got": 686,
+        "expect": 686,
+        "sum_got": 1566,
+        "sum_expect": 1566
+      },
+      "result_rows": 686,
+      "ok": true,
+      "profile_rows": 686,
+      "profile_server_us": 14235,
+      "hosts": [
+        {
+          "state": "step1 resp [1]",
+          "host": "10.88.0.22:9779",
+          "vertices": 411,
+          "raw": "{\n  \"exec\": \"471(us)\",\n  \"host\": \"10.88.0.22:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"469(us)\"\n  },\n  \"total\": \"6511(us)\",\n  \"vertices\": 411\n}"
+        },
+        {
+          "state": "step1 resp [2]",
+          "host": "10.88.0.23:9779",
+          "vertices": 344,
+          "raw": "{\n  \"exec\": \"423(us)\",\n  \"host\": \"10.88.0.23:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"388(us)\"\n  },\n  \"total\": \"6550(us)\",\n  \"vertices\": 344\n}"
+        },
+        {
+          "state": "step1 resp [0]",
+          "host": "10.88.0.21:9779",
+          "vertices": 366,
+          "raw": "{\n  \"exec\": \"627(us)\",\n  \"host\": \"10.88.0.21:9779\",\n  \"storage_detail\": {\n    \"GetDstBySrcProcessorDedup\": \"0(us)\",\n    \"GetDstBySrcProcessorTotal\": \"625(us)\"\n  },\n  \"total\": \"6528(us)\",\n  \"vertices\": 366\n}"
+        }
+      ],
+      "partial": true,
+      "plan_names": [
+        "Aggregate",
+        "Expand",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 18.810972000210313,
+            "p95": 20.084574197244365,
+            "p99": 20.33475083677331,
+            "min": 18.352205002884148,
+            "max": 20.397294996655546
+          },
+          "server_ms": {
+            "p50": 13.786,
+            "p95": 14.785800000000002,
+            "p99": 14.92036,
+            "min": 13.523,
+            "max": 14.954
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.09517642100036028,
+          "qps": 52.53401995417618,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 18.352205002884148,
+              "server_us": 13523,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 20.397294996655546,
+              "server_us": 14954,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.810972000210313,
+              "server_us": 13786,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.76873999935924,
+              "server_us": 13705,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 18.83369099959964,
+              "server_us": 14113,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 50.27715700089175,
+            "p95": 76.73837494949112,
+            "p99": 98.52179929963305,
+            "min": 24.770777999947313,
+            "max": 118.47113499970874
+          },
+          "server_ms": {
+            "p50": 22.125,
+            "p95": 27.729999999999997,
+            "p99": 28.553279999999997,
+            "min": 14.025,
+            "max": 29.204
+          },
+          "row_counts": [
+            686
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.2873691429995233,
+          "qps": 173.99223687730085,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 37.195771001279354,
+              "server_us": 25257,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 31.671987002482638,
+              "server_us": 19099,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 49.47782099770848,
+              "server_us": 22355,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 54.74735499956296,
+              "server_us": 22642,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 41.520586997648934,
+              "server_us": 25063,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 58.06349200065597,
+              "server_us": 27587,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 40.59665199747542,
+              "server_us": 20792,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 47.94485900129075,
+              "server_us": 17540,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 43.9076840011694,
+              "server_us": 25081,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 28.584742001839913,
+              "server_us": 18452,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 33.068104999983916,
+              "server_us": 25098,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 75.99154700073996,
+              "server_us": 14079,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 33.82629500265466,
+              "server_us": 19503,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 54.06696499994723,
+              "server_us": 27566,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 37.57723799935775,
+              "server_us": 23371,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 41.64835600022343,
+              "server_us": 23754,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 72.37433900081669,
+              "server_us": 14025,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 64.11707399820443,
+              "server_us": 29204,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.54186699996353,
+              "server_us": 22995,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 28.81447900290368,
+              "server_us": 19068,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 53.223730999889085,
+              "server_us": 26501,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 49.68988700056798,
+              "server_us": 20813,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 69.68520399823319,
+              "server_us": 20887,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 32.494586001121206,
+              "server_us": 22182,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 50.86442700121552,
+              "server_us": 19269,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 49.517421997734345,
+              "server_us": 27876,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 45.589094999741064,
+              "server_us": 19704,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 33.246880000660894,
+              "server_us": 16122,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 51.60615999920992,
+              "server_us": 26674,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 68.78228699861211,
+              "server_us": 19775,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 45.15633499977412,
+              "server_us": 24955,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 77.75820499955444,
+              "server_us": 20390,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 55.40540400033933,
+              "server_us": 17912,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 50.95914900084608,
+              "server_us": 22409,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 37.16517499924521,
+              "server_us": 22068,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 73.86441999915405,
+              "server_us": 27847,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 58.94678199911141,
+              "server_us": 21717,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 58.181079002679326,
+              "server_us": 24455,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 52.439544997469056,
+              "server_us": 20017,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 29.727873999945587,
+              "server_us": 20211,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 77.34941599846934,
+              "server_us": 27223,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 60.02595600148197,
+              "server_us": 21241,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 62.415511998551665,
+              "server_us": 26298,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 52.13477699726354,
+              "server_us": 19743,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 29.892315000324743,
+              "server_us": 23587,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 118.47113499970874,
+              "server_us": 27463,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 53.91621600210783,
+              "server_us": 25381,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 52.41508399922168,
+              "server_us": 18695,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 37.326737998228054,
+              "server_us": 17445,
+              "error": null,
+              "rows": 686
+            },
+            {
+              "ok": true,
+              "client_ms": 24.770777999947313,
+              "server_us": 19268,
+              "error": null,
+              "rows": 686
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.624,
+      "want_partial": true
+    },
+    "q_by_amount": {
+      "sql": "LOOKUP ON item WHERE item.type == \"beauty\" YIELD id(vertex) AS id | GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > 1753660800 YIELD buy.amount AS amt | GROUP BY $-.amt YIELD $-.amt AS amt, count(*) AS n",
+      "check": {
+        "ok": true,
+        "groups": 470,
+        "sum_got": 1566,
+        "sum_expect": 1566
+      },
+      "result_rows": 470,
+      "ok": true,
+      "profile_rows": 470,
+      "profile_server_us": 16787,
+      "hosts": [],
+      "partial": false,
+      "plan_names": [
+        "Aggregate",
+        "Project",
+        "HashInnerJoin",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start",
+        "ExpandAll",
+        "Expand",
+        "Argument"
+      ],
+      "levels": [
+        {
+          "samples": 5,
+          "ok": 5,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 18.828002001100685,
+            "p95": 23.355306201119674,
+            "p99": 24.02769564112532,
+            "min": 17.844743000750896,
+            "max": 24.19579300112673
+          },
+          "server_ms": {
+            "p50": 14.73,
+            "p95": 14.9422,
+            "p99": 14.97564,
+            "min": 14.45,
+            "max": 14.984
+          },
+          "row_counts": [
+            470
+          ],
+          "concurrency": 1,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.09898229700047523,
+          "qps": 50.51408334134734,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 18.828002001100685,
+              "server_us": 14984,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 18.107258998497855,
+              "server_us": 14775,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 24.19579300112673,
+              "server_us": 14450,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 19.99335900109145,
+              "server_us": 14643,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 17.844743000750896,
+              "server_us": 14730,
+              "error": null,
+              "rows": 470
+            }
+          ]
+        },
+        {
+          "samples": 50,
+          "ok": 50,
+          "errors": 0,
+          "first_error": null,
+          "client_ms": {
+            "p50": 39.11032050018548,
+            "p95": 57.41246074849185,
+            "p99": 64.36948675924212,
+            "min": 26.411283997731516,
+            "max": 66.29169599909801
+          },
+          "server_ms": {
+            "p50": 26.8805,
+            "p95": 43.80094999999998,
+            "p99": 47.7287,
+            "min": 19.461,
+            "max": 47.812
+          },
+          "row_counts": [
+            470
+          ],
+          "concurrency": 10,
+          "warmup_per_worker": 1,
+          "rounds_per_worker": 5,
+          "wall_s": 0.24195031600174843,
+          "qps": 206.65399750764814,
+          "worker_errors": [],
+          "samples_raw": [
+            {
+              "ok": true,
+              "client_ms": 28.280442998948274,
+              "server_us": 24266,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 42.76869399836869,
+              "server_us": 33249,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 26.411283997731516,
+              "server_us": 19461,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 45.702380000875564,
+              "server_us": 31366,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 36.31108099943958,
+              "server_us": 22518,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 39.12353299892857,
+              "server_us": 26243,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 34.335097996518016,
+              "server_us": 22318,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 34.39739500026917,
+              "server_us": 22676,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 38.15365300033591,
+              "server_us": 31294,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 41.7591369987349,
+              "server_us": 26096,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 45.22026300037396,
+              "server_us": 28059,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 37.56732499823556,
+              "server_us": 22393,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 34.56785799789941,
+              "server_us": 21883,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 34.65554200010956,
+              "server_us": 25803,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 38.92592999909539,
+              "server_us": 29449,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 42.261503000190714,
+              "server_us": 31168,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 43.822108000313165,
+              "server_us": 21733,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 34.40450900234282,
+              "server_us": 23326,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 36.19696500027203,
+              "server_us": 26609,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 37.22159599783481,
+              "server_us": 22861,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 59.50124599985429,
+              "server_us": 47234,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 33.80073100197478,
+              "server_us": 25508,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 40.704753999307286,
+              "server_us": 33945,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 34.58180700181401,
+              "server_us": 25657,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 33.57736800171551,
+              "server_us": 26071,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 48.187930002313806,
+              "server_us": 39605,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 37.55443100089906,
+              "server_us": 30880,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 38.008744999388,
+              "server_us": 20903,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 36.56386299917358,
+              "server_us": 23869,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 47.67250300210435,
+              "server_us": 33700,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 54.85950099682668,
+              "server_us": 47642,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 36.16964300090331,
+              "server_us": 23696,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 39.931287999934284,
+              "server_us": 30517,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 41.37764099868946,
+              "server_us": 24900,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 47.93998999957694,
+              "server_us": 31564,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 66.29169599909801,
+              "server_us": 39125,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 39.09710800144239,
+              "server_us": 29322,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 43.97035999863874,
+              "server_us": 34635,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 33.206816002348205,
+              "server_us": 25696,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 41.02656699978979,
+              "server_us": 32445,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 52.15725000016391,
+              "server_us": 27948,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 48.631121000653366,
+              "server_us": 31854,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 36.792386999877635,
+              "server_us": 26154,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 38.50988799968036,
+              "server_us": 27798,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 50.0255240003753,
+              "server_us": 37609,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 62.368819999392144,
+              "server_us": 47812,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 50.00689199732733,
+              "server_us": 27152,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 50.00450999796158,
+              "server_us": 24521,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 47.73190600099042,
+              "server_us": 34254,
+              "error": null,
+              "rows": 470
+            },
+            {
+              "ok": true,
+              "client_ms": 30.91857199979131,
+              "server_us": 22131,
+              "error": null,
+              "rows": 470
+            }
+          ]
+        }
+      ],
+      "wall_s": 0.576,
+      "want_partial": false
+    }
+  }
+}

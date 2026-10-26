@@ -1,0 +1,24 @@
+{
+  "beauty_p9_rf1": {
+    "ok": true,
+    "msg": "",
+    "rows": 686,
+    "got": 686,
+    "expect": 686,
+    "mismatch_sample": [],
+    "extra_sample": [],
+    "sum_got": 397318.0,
+    "sum_expect": 397318.0
+  },
+  "beauty_p9_rf3": {
+    "ok": true,
+    "msg": "",
+    "rows": 686,
+    "got": 686,
+    "expect": 686,
+    "mismatch_sample": [],
+    "extra_sample": [],
+    "sum_got": 397318.0,
+    "sum_expect": 397318.0
+  }
+}

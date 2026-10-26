@@ -243,3 +243,9 @@ flag 关回给后续算子的是 40415 条过滤后的购买边，再在 graphd 
 7. 对比冷缓存时，每档之前重启 storaged 或丢页缓存。本次单机没有做这一步。
 
 多个 storaged 若只是同一台机器上的多个进程，报告里仍要写明 RPC 走 loopback。可以横比的是 PROFILE 行数，以及同一台机器上三种计划的相对差。
+
+## 9. 和后面两篇的关系
+
+这一篇的表是第一份补丁（`enable_dst_only_edge_filter`）的单机记录。q_sales 在那次 flag 开和 flag 关都是 `ExpandAll`，所以表里没有销售额的收益。
+
+第二份补丁打开 `--enable_partial_edge_agg` 之后，同一条 q_sales 变成部分聚合。单机重测、`q_model` 加 `DISTINCT`、以及把 graphd worker 调到 16/32 的数在 [16](16-partial-agg-impl.md)。3 个 storaged 加实测 RTT 在 [17](17-distributed-bench.md)。不要把 12 的「q_sales 仍是 GetNeighbors」当成第二份补丁的计划。

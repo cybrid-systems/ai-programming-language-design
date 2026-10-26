@@ -7,6 +7,8 @@ BIN="${NEBULA_BIN:-/tmp/nebula-380/build/bin}"
 ROOT="${NEBULA_ROOT:-/tmp/nebula-cluster}"
 SRC_CONF="${NEBULA_CONF:-/tmp/nebula-380/conf}"
 ENABLE_DST_ONLY="${ENABLE_DST_ONLY:-false}"
+ENABLE_PARTIAL_EDGE_AGG="${ENABLE_PARTIAL_EDGE_AGG:-false}"
+GRAPH_WORKERS="${GRAPH_WORKERS:-}"
 TMUX_CONF="/exec-daemon/tmux.portal.conf"
 ACTION="${1:-start}"
 
@@ -17,11 +19,11 @@ fi
 
 mkdir -p "$ROOT"/{conf,logs,pids,data/meta,data/storage}
 
-python3 - "$ROOT" "$SRC_CONF" "$ENABLE_DST_ONLY" <<'PY'
+python3 - "$ROOT" "$SRC_CONF" "$ENABLE_DST_ONLY" "$GRAPH_WORKERS" "$ENABLE_PARTIAL_EDGE_AGG" <<'PY'
 import sys
 from pathlib import Path
 
-root, src, flag = sys.argv[1:]
+root, src, flag, workers, partial = sys.argv[1:]
 src = Path(src)
 dst = Path(root) / "conf"
 
@@ -61,6 +63,12 @@ rewrite("nebula-graphd.conf.default", [
 ])
 text = (dst / "nebula-graphd.conf.default").read_text()
 text += f"\n--enable_dst_only_edge_filter={flag}\n"
+text += f"--enable_partial_edge_agg={partial}\n"
+if workers:
+    # Command-line gflags use the last assignment. Appending overrides the
+    # default in nebula-graphd.conf.default (--num_worker_threads=0 means
+    # hardware concurrency) when a positive value is requested.
+    text += f"--num_worker_threads={workers}\n"
 (dst / "nebula-graphd.conf").write_text(text)
 # The binary default looks for the install layout share/resources/. Point every
 # daemon at the csv shipped in the source tree.
@@ -68,7 +76,10 @@ tz = "/tmp/nebula-380/resources/date_time_zonespec.csv"
 for name in ("nebula-metad.conf", "nebula-storaged.conf", "nebula-graphd.conf"):
     path = dst / name
     path.write_text(path.read_text() + f"\n--timezone_file={tz}\n")
-print(f"wrote conf under {dst} enable_dst_only_edge_filter={flag}")
+print(
+    f"wrote conf under {dst} enable_dst_only_edge_filter={flag} "
+    f"enable_partial_edge_agg={partial} graph_workers={workers or 'default'}"
+)
 PY
 
 export LD_LIBRARY_PATH="/opt/vesoft/third-party/3.3/lib64:/opt/vesoft/third-party/3.3/lib:${LD_LIBRARY_PATH:-}"
@@ -138,4 +149,4 @@ case "$ACTION" in
     ;;
 esac
 
-echo "action=$ACTION enable_dst_only_edge_filter=$ENABLE_DST_ONLY root=$ROOT"
+echo "action=$ACTION enable_dst_only_edge_filter=$ENABLE_DST_ONLY enable_partial_edge_agg=$ENABLE_PARTIAL_EDGE_AGG graph_workers=${GRAPH_WORKERS:-default} root=$ROOT"

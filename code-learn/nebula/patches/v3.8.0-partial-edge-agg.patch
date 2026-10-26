@@ -1,0 +1,1970 @@
+diff --git a/conf/nebula-graphd.conf.default b/conf/nebula-graphd.conf.default
+index 09e192b..bf76a6c 100644
+--- a/conf/nebula-graphd.conf.default
++++ b/conf/nebula-graphd.conf.default
+@@ -8,6 +8,10 @@
+ # 1-step DISTINCT dst + edge filter via getDstBySrc. Keep false until every
+ # storaged is upgraded to read GetDstBySrcRequest.filter.
+ # --enable_dst_only_edge_filter=false
++# Partial SUM/COUNT/MIN/MAX grouped by edge dst, inside getDstBySrc.
++# Leave false until storaged understands GetDstBySrcRequest.aggs. An old
++# storaged still returns a correct answer: graphd recomputes via GetNeighbors.
++# --enable_partial_edge_agg=false
+ # The default charset when a space is created
+ --default_charset=utf8
+ # The default collate when a space is created
+diff --git a/conf/nebula-graphd.conf.production b/conf/nebula-graphd.conf.production
+index 7dd089e..ff31633 100644
+--- a/conf/nebula-graphd.conf.production
++++ b/conf/nebula-graphd.conf.production
+@@ -8,6 +8,7 @@
+ # 1-step DISTINCT dst + edge filter via getDstBySrc. Keep false until every
+ # storaged is upgraded to read GetDstBySrcRequest.filter.
+ # --enable_dst_only_edge_filter=false
++# --enable_partial_edge_agg=false
+ # Heartbeat interval of communication between meta client and graphd service
+ --heartbeat_interval_secs=10
+ # Whether to use the configuration obtained from the configuration file
+diff --git a/conf/nebula-standalone.conf.default b/conf/nebula-standalone.conf.default
+index 9d7e15d..ec726bc 100644
+--- a/conf/nebula-standalone.conf.default
++++ b/conf/nebula-standalone.conf.default
+@@ -8,6 +8,7 @@
+ # 1-step DISTINCT dst + edge filter via getDstBySrc. Keep false until every
+ # storaged is upgraded to read GetDstBySrcRequest.filter.
+ # --enable_dst_only_edge_filter=false
++# --enable_partial_edge_agg=false
+ # The default charset when a space is created
+ --default_charset=utf8
+ # The defaule collate when a space is created
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index 9303a34..577a8ce 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -115,7 +115,8 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     const CommonRequestParam& param,
+     const std::vector<Value>& vertices,
+     const std::vector<EdgeType>& edgeTypes,
+-    const Expression* filter) {
++    const Expression* filter,
++    const std::vector<cpp2::PartialEdgeAgg>* aggs) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -141,6 +142,9 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     if (filter != nullptr) {
+       req.filter_ref() = filter->encode();
+     }
++    if (aggs != nullptr && !aggs->empty()) {
++      req.aggs_ref() = *aggs;
++    }
+   }
+ 
+   return collectResponse(param.evb,
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index 95fef4a..a3b03f1 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -85,7 +85,8 @@ class StorageClient
+       const CommonRequestParam& param,
+       const std::vector<Value>& vertices,
+       const std::vector<EdgeType>& edgeTypes,
+-      const Expression* filter = nullptr);
++      const Expression* filter = nullptr,
++      const std::vector<cpp2::PartialEdgeAgg>* aggs = nullptr);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+diff --git a/src/common/function/PartialAgg.h b/src/common/function/PartialAgg.h
+index e69de29..cd6f8b0 100644
+--- a/src/common/function/PartialAgg.h
++++ b/src/common/function/PartialAgg.h
+@@ -0,0 +1,136 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef COMMON_FUNCTION_PARTIALAGG_H_
++#define COMMON_FUNCTION_PARTIALAGG_H_
++
++#include "common/datatypes/Value.h"
++
++namespace nebula {
++
++class Expression;
++
++// Decomposable aggregate ops. AVG is not here: it is sum+count, divided after
++// the final merge. The numeric values match storage.thrift PartialAggOp.
++enum class PartialAggOp : int8_t { SUM = 1, COUNT = 2, MIN = 3, MAX = 4 };
++
++// One aggregate argument evaluated per edge that passed the filter.
++// `expr` is not owned.
++struct PartialAggExpr {
++  PartialAggOp op{PartialAggOp::SUM};
++  Expression* expr{nullptr};
++};
++
++// Same null/empty/bad-type rules as AggFunctionManager's SUM/COUNT/MIN/MAX.
++// A default-constructed Value is __EMPTY__, not null. That is the state of a
++// group that has not seen a row yet. EMPTY + x stays EMPTY, and x < EMPTY is
++// false, so SUM/COUNT/MIN would stick at empty while MAX (x > EMPTY) would
++// look fine. Treat empty like null: uninitialized.
++// SUM and COUNT turn that into 0 on the first applied row, then skip null and
++// empty inputs. MIN/MAX stay null until the first comparable value.
++inline bool partialUninitialized(const Value& state) {
++  return state.isNull() || state.empty();
++}
++
++inline void applyPartial(PartialAggOp op, Value& state, const Value& val) {
++  if (state.isBadNull()) {
++    return;
++  }
++  switch (op) {
++    case PartialAggOp::COUNT: {
++      if (partialUninitialized(state)) {
++        state = 0;
++      }
++      if (val.isNull() || val.empty()) {
++        return;
++      }
++      state = state + 1;
++      return;
++    }
++    case PartialAggOp::SUM: {
++      if (partialUninitialized(state)) {
++        state = 0;
++      }
++      if (!val.isNull() && !val.empty() && !val.isNumeric()) {
++        state = Value::kNullBadType;
++        return;
++      }
++      if (val.isNull() || val.empty()) {
++        return;
++      }
++      state = state + val;
++      return;
++    }
++    case PartialAggOp::MIN:
++    case PartialAggOp::MAX: {
++      if (val.isNull() || val.empty()) {
++        return;
++      }
++      if (partialUninitialized(state)) {
++        state = val;
++        return;
++      }
++      if (op == PartialAggOp::MIN) {
++        if (val < state) {
++          state = val;
++        }
++      } else if (val > state) {
++        state = val;
++      }
++      return;
++    }
++  }
++}
++
++// Combine two partial states. SUM/COUNT add. MIN/MAX take the more extreme
++// value and ignore a null partial (that partition had no comparable input).
++inline void mergePartial(PartialAggOp op, Value& state, const Value& partial) {
++  if (state.isBadNull() || partial.isBadNull()) {
++    state = Value::kNullBadType;
++    return;
++  }
++  if (op == PartialAggOp::SUM || op == PartialAggOp::COUNT) {
++    if (partial.isNull() || partial.empty()) {
++      return;
++    }
++    if (!partial.isNumeric() || (!partialUninitialized(state) && !state.isNumeric())) {
++      state = Value::kNullBadType;
++      return;
++    }
++    if (partialUninitialized(state)) {
++      state = partial;
++      return;
++    }
++    state = state + partial;
++    return;
++  }
++  applyPartial(op, state, partial);
++}
++
++inline const char* partialAggName(PartialAggOp op) {
++  switch (op) {
++    case PartialAggOp::SUM:
++      return "SUM";
++    case PartialAggOp::COUNT:
++      return "COUNT";
++    case PartialAggOp::MIN:
++      return "MIN";
++    case PartialAggOp::MAX:
++      return "MAX";
++  }
++  return "SUM";
++}
++
++// COUNT's final merge is a SUM of partial counts. MIN/MAX/SUM merge as themselves.
++inline const char* partialMergeName(PartialAggOp op) {
++  if (op == PartialAggOp::COUNT) {
++    return "SUM";
++  }
++  return partialAggName(op);
++}
++
++}  // namespace nebula
++
++#endif  // COMMON_FUNCTION_PARTIALAGG_H_
+diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
+index 2a7780c..69202de 100644
+--- a/src/graph/executor/query/ExpandExecutor.cpp
++++ b/src/graph/executor/query/ExpandExecutor.cpp
+@@ -4,7 +4,12 @@
+ 
+ #include "graph/executor/query/ExpandExecutor.h"
+ 
++#include <unordered_map>
++
+ #include "common/algorithm/ReservoirSampling.h"
++#include "common/function/PartialAgg.h"
++#include "graph/context/QueryExpressionContext.h"
++#include "graph/context/iterator/GetNeighborsIter.h"
+ #include "graph/service/GraphFlags.h"
+ #include "graph/util/SchemaUtil.h"
+ #include "graph/util/Utils.h"
+@@ -67,6 +72,9 @@ folly::Future<Status> ExpandExecutor::execute() {
+ }
+ 
+ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
++  if (!expand_->partialAggs().empty()) {
++    return partialAgg();
++  }
+   currentStep_++;
+   time::Duration getDstTime;
+   StorageClient* storageClient = qctx_->getStorageClient();
+@@ -385,5 +393,174 @@ folly::Future<Status> ExpandExecutor::buildResult() {
+   return finish(ResultBuilder().value(Value(std::move(ds))).build());
+ }
+ 
++folly::Future<Status> ExpandExecutor::partialAgg() {
++  currentStep_++;
++  time::Duration getDstTime;
++  StorageClient* storageClient = qctx_->getStorageClient();
++  StorageClient::CommonRequestParam param(expand_->space(),
++                                          qctx_->rctx()->session()->id(),
++                                          qctx_->plan()->id(),
++                                          qctx_->plan()->isProfileEnabled());
++  std::vector<Value> vids(nextStepVids_.size());
++  std::move(nextStepVids_.begin(), nextStepVids_.end(), vids.begin());
++  partialReqVids_ = vids;
++  std::vector<storage::cpp2::PartialEdgeAgg> aggs;
++  aggs.reserve(expand_->partialAggs().size());
++  for (const auto& agg : expand_->partialAggs()) {
++    if (agg.expr == nullptr) {
++      return Status::Error("partial edge aggregate is missing its expression");
++    }
++    storage::cpp2::PartialEdgeAgg spec;
++    spec.op_ref() = static_cast<storage::cpp2::PartialAggOp>(static_cast<int32_t>(agg.op));
++    spec.expr_ref() = agg.expr->encode();
++    aggs.emplace_back(std::move(spec));
++  }
++  return storageClient
++      ->getDstBySrc(param, std::move(vids), expand_->edgeTypes(), expand_->filter(), &aggs)
++      .via(runner())
++      .ensure([this, getDstTime]() {
++        SCOPED_TIMER(&execTime_);
++        addState("total_rpc_time", getDstTime);
++      })
++      .thenValue([this](StorageRpcResponse<GetDstBySrcResponse>&& resps) {
++        memory::MemoryCheckGuard guard;
++        nextStepVids_.clear();
++        SCOPED_TIMER(&execTime_);
++        auto& hostLatency = resps.hostLatency();
++        for (size_t i = 0; i < hostLatency.size(); ++i) {
++          size_t size = 0u;
++          auto& result = resps.responses()[i];
++          if (result.dsts_ref().has_value()) {
++            size = (*result.dsts_ref()).size();
++          }
++          auto info = util::collectRespProfileData(result.result, hostLatency[i], size);
++          addState(folly::sformat("step{} resp [{}]", currentStep_, i), info);
++        }
++        auto completeness = handleCompleteness(resps, FLAGS_accept_partial_success);
++        if (!completeness.ok()) {
++          return folly::makeFuture<Status>(completeness.status());
++        }
++        bool applied = true;
++        for (const auto& resp : resps.responses()) {
++          // get_partial_agg() is a pointer (null when the field was not
++          // serialized). A set false must not be treated as applied.
++          const bool* bit = resp.get_partial_agg();
++          if (bit == nullptr || !*bit) {
++            applied = false;
++            break;
++          }
++        }
++        if (!applied) {
++          addState("partial_agg_applied", 0);
++          return fallbackPartialAgg();
++        }
++        addState("partial_agg_applied", 1);
++        DataSet ds;
++        ds.colNames = expand_->colNames();
++        for (auto& resp : resps.responses()) {
++          auto* dataset = resp.get_dsts();
++          if (dataset == nullptr) {
++            continue;
++          }
++          for (auto& row : dataset->rows) {
++            if (row.values.size() != ds.colNames.size()) {
++              return folly::makeFuture<Status>(
++                  Status::Error("partial edge aggregate column count does not match the plan"));
++            }
++            ds.rows.emplace_back(std::move(row));
++          }
++        }
++        ResultBuilder builder;
++        builder.state(completeness.value());
++        builder.value(Value(std::move(ds))).iter(Iterator::Kind::kSequential);
++        finish(builder.build());
++        return folly::makeFuture<Status>(Status::OK());
++      });
++}
++
++folly::Future<Status> ExpandExecutor::fallbackPartialAgg() {
++  if (expand_->edgeProps() == nullptr || expand_->edgeProps()->empty()) {
++    return Status::Error(
++        "storaged did not apply partial edge aggregate and the scan has no edge "
++        "props, so graphd cannot recompute the groups");
++  }
++  StorageClient* storageClient = qctx_->getStorageClient();
++  StorageClient::CommonRequestParam param(expand_->space(),
++                                          qctx_->rctx()->session()->id(),
++                                          qctx_->plan()->id(),
++                                          qctx_->plan()->isProfileEnabled());
++  return storageClient
++      ->getNeighbors(param,
++                     {nebula::kVid},
++                     partialReqVids_,
++                     {},
++                     storage::cpp2::EdgeDirection::OUT_EDGE,
++                     nullptr,
++                     nullptr,
++                     expand_->edgeProps(),
++                     nullptr,
++                     false,
++                     false,
++                     std::vector<storage::cpp2::OrderBy>(),
++                     std::numeric_limits<int64_t>::max(),
++                     expand_->filter(),
++                     nullptr)
++      .via(runner())
++      .thenValue([this](RpcResponse&& resp) {
++        memory::MemoryCheckGuard guard;
++        SCOPED_TIMER(&execTime_);
++        addStats(resp);
++        auto completeness = handleCompleteness(resp, FLAGS_accept_partial_success);
++        if (!completeness.ok()) {
++          return folly::makeFuture<Status>(completeness.status());
++        }
++        List list;
++        for (auto& one : resp.responses()) {
++          auto* dataset = one.get_vertices();
++          if (dataset != nullptr) {
++            list.values.emplace_back(std::move(*dataset));
++          }
++        }
++        auto listVal = std::make_shared<Value>(std::move(list));
++        auto iter = std::make_unique<GetNeighborsIter>(listVal);
++        QueryExpressionContext exprCtx(ectx_);
++        const auto& aggs = expand_->partialAggs();
++        std::unordered_map<Value, std::vector<Value>> groups;
++        for (; iter->valid(); iter->next()) {
++          auto dst = iter->getEdgeProp("*", nebula::kDst);
++          if (dst.isNull() || dst.empty()) {
++            continue;
++          }
++          auto& states = groups[dst];
++          if (states.empty()) {
++            states.resize(aggs.size());
++          }
++          for (size_t i = 0; i < aggs.size(); ++i) {
++            applyPartial(aggs[i].op, states[i], aggs[i].expr->eval(exprCtx(iter.get())));
++          }
++        }
++        DataSet ds;
++        ds.colNames = expand_->colNames();
++        ds.rows.reserve(groups.size());
++        for (auto& kv : groups) {
++          Row row;
++          row.values.emplace_back(kv.first);
++          for (auto& state : kv.second) {
++            row.values.emplace_back(std::move(state));
++          }
++          if (row.values.size() != ds.colNames.size()) {
++            return folly::makeFuture<Status>(
++                Status::Error("partial edge aggregate fallback column count mismatch"));
++          }
++          ds.rows.emplace_back(std::move(row));
++        }
++        ResultBuilder builder;
++        builder.state(completeness.value());
++        builder.value(Value(std::move(ds))).iter(Iterator::Kind::kSequential);
++        finish(builder.build());
++        return folly::makeFuture<Status>(Status::OK());
++      });
++}
++
+ }  // namespace graph
+ }  // namespace nebula
+diff --git a/src/graph/executor/query/ExpandExecutor.h b/src/graph/executor/query/ExpandExecutor.h
+index 8ac3dfa..300c404 100644
+--- a/src/graph/executor/query/ExpandExecutor.h
++++ b/src/graph/executor/query/ExpandExecutor.h
+@@ -43,6 +43,13 @@ class ExpandExecutor final : public StorageAccessExecutor {
+ 
+   folly::Future<Status> GetDstBySrc();
+ 
++  // One-shot partial aggregate. Not used for multi-step expansion.
++  folly::Future<Status> partialAgg();
++
++  // Old storaged ignored GetDstBySrcRequest.aggs. Recompute the same groups
++  // from GetNeighbors so a mixed cluster does not treat dst vids as sums.
++  folly::Future<Status> fallbackPartialAgg();
++
+   void getNeighborsFromCache(std::unordered_map<Value, std::unordered_set<Value>>& dst2VidMap,
+                              std::unordered_set<Value>& visitedVids,
+                              std::vector<int64_t>& samples);
+@@ -69,6 +76,9 @@ class ExpandExecutor final : public StorageAccessExecutor {
+   std::vector<int64_t> stepLimits_;
+ 
+   std::unordered_set<Value> nextStepVids_;
++  // Vids sent with a partial-agg RPC, kept so a partial_agg=false response can
++  // be recomputed without asking storage for a different vertex set.
++  std::vector<Value> partialReqVids_;
+   std::unordered_set<Value> preVisitedVids_;
+   std::unordered_map<Value, std::unordered_set<Value>> adjDsts_;
+ 
+diff --git a/src/graph/optimizer/CMakeLists.txt b/src/graph/optimizer/CMakeLists.txt
+index c1eb342..159548f 100644
+--- a/src/graph/optimizer/CMakeLists.txt
++++ b/src/graph/optimizer/CMakeLists.txt
+@@ -31,6 +31,7 @@ nebula_add_library(
+     rule/TopNRule.cpp
+     rule/PushEFilterDownRule.cpp
+     rule/PushFilterDownAggregateRule.cpp
++    rule/PushPartialEdgeAggRule.cpp
+     rule/PushFilterDownProjectRule.cpp
+     rule/PushFilterDownExpandAllRule.cpp
+     rule/PushFilterDownAllPathsRule.cpp
+diff --git a/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp b/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
+index e69de29..0db52a8 100644
+--- a/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
++++ b/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
+@@ -0,0 +1,419 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushPartialEdgeAggRule.h"
++
++#include <algorithm>
++#include <cctype>
++
++#include <folly/String.h>
++
++#include "common/expression/AggregateExpression.h"
++#include "common/thrift/ThriftTypes.h"
++#include "common/expression/Expression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/function/PartialAgg.h"
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/service/GraphFlags.h"
++#include "graph/util/EdgePushdown.h"
++#include "parser/Clauses.h"
++
++using nebula::graph::Aggregate;
++using nebula::graph::Expand;
++using nebula::graph::ExpandAll;
++using nebula::graph::Filter;
++using nebula::graph::HashInnerJoin;
++using nebula::graph::PlanNode;
++using nebula::graph::Project;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushPartialEdgeAggRule::kInstance =
++    std::unique_ptr<PushPartialEdgeAggRule>(new PushPartialEdgeAggRule());
++
++const Pattern& PushPartialEdgeAggRule::pattern() const {
++  static Pattern pattern = Pattern::create(PlanNode::Kind::kAggregate);
++  return pattern;
++}
++
++namespace {
++
++const OptGroupNode* soleNode(const OptGroup* group) {
++  if (group == nullptr || group->groupNodes().size() != 1) {
++    return nullptr;
++  }
++  return group->groupNodes().front();
++}
++
++Expression* columnExpr(const Project* project, const ExpandAll* expand, const std::string& name) {
++  if (project != nullptr && project->columns() != nullptr) {
++    for (auto* col : project->columns()->columns()) {
++      if (col->name() != name && col->alias() != name) {
++        continue;
++      }
++      auto* expr = col->expr();
++      if (expr == nullptr) {
++        continue;
++      }
++      // `uid = $-.uid` is the column itself, not a definition to unfold.
++      if ((expr->kind() == Expression::Kind::kVarProperty ||
++           expr->kind() == Expression::Kind::kInputProperty) &&
++          static_cast<const PropertyExpression*>(expr)->prop() == name) {
++        continue;
++      }
++      return expr;
++    }
++  }
++  if (expand != nullptr && expand->edgeColumns() != nullptr) {
++    for (auto* col : expand->edgeColumns()->columns()) {
++      if ((col->name() == name || col->alias() == name) && col->expr() != nullptr) {
++        return col->expr();
++      }
++    }
++  }
++  return nullptr;
++}
++
++Expression* unfold(Expression* expr, const std::vector<const Project*>& projects, const ExpandAll* expand) {
++  for (int i = 0; i < 8 && expr != nullptr; ++i) {
++    if (expr->kind() != Expression::Kind::kVarProperty &&
++        expr->kind() != Expression::Kind::kInputProperty) {
++      return expr;
++    }
++    auto name = static_cast<PropertyExpression*>(expr)->prop();
++    Expression* next = nullptr;
++    for (auto* project : projects) {
++      next = columnExpr(project, nullptr, name);
++      if (next != nullptr && next != expr) {
++        break;
++      }
++      next = nullptr;
++    }
++    if (next == nullptr) {
++      next = columnExpr(nullptr, expand, name);
++    }
++    if (next == nullptr || next == expr) {
++      return expr;
++    }
++    expr = next;
++  }
++  return expr;
++}
++
++std::string upper(std::string name) {
++  std::transform(name.begin(), name.end(), name.begin(), ::toupper);
++  return name;
++}
++
++bool aggOp(const std::string& name, PartialAggOp* op) {
++  auto n = upper(name);
++  if (n == "SUM") {
++    *op = PartialAggOp::SUM;
++  } else if (n == "COUNT") {
++    *op = PartialAggOp::COUNT;
++  } else if (n == "MIN") {
++    *op = PartialAggOp::MIN;
++  } else if (n == "MAX") {
++    *op = PartialAggOp::MAX;
++  } else {
++    return false;
++  }
++  return true;
++}
++
++struct Scan {
++  const ExpandAll* expandAll{nullptr};
++  const OptGroupNode* expandAllNode{nullptr};
++  // 0-step Expand under ExpandAll. Its input variable is the vid list for a
++  // direct `GO FROM <list>`. That list is planted in the execution context
++  // and is not Start's output.
++  const Expand* pass{nullptr};
++  OptGroup* vidGroup{nullptr};
++  const HashInnerJoin* join{nullptr};
++  std::vector<const Project*> projects;
++  const Expression* extraFilter{nullptr};
++};
++
++bool absorb(const OptGroupNode* node, Scan* scan) {
++  while (node != nullptr) {
++    auto kind = node->node()->kind();
++    if (kind == PlanNode::Kind::kProject) {
++      scan->projects.emplace_back(static_cast<const Project*>(node->node()));
++      if (node->dependencies().size() != 1) {
++        return false;
++      }
++      node = soleNode(node->dependencies()[0]);
++      continue;
++    }
++    if (kind == PlanNode::Kind::kFilter) {
++      auto* filter = static_cast<const Filter*>(node->node());
++      if (scan->extraFilter != nullptr) {
++        return false;
++      }
++      scan->extraFilter = filter->condition();
++      if (node->dependencies().size() != 1) {
++        return false;
++      }
++      node = soleNode(node->dependencies()[0]);
++      continue;
++    }
++    break;
++  }
++  if (node == nullptr) {
++    return false;
++  }
++  if (node->node()->kind() == PlanNode::Kind::kHashInnerJoin) {
++    if (node->dependencies().size() != 2) {
++      return false;
++    }
++    scan->join = static_cast<const HashInnerJoin*>(node->node());
++    scan->vidGroup = node->dependencies()[0];
++    node = soleNode(node->dependencies()[1]);
++    if (node != nullptr && node->node()->kind() == PlanNode::Kind::kFilter) {
++      if (scan->extraFilter != nullptr) {
++        return false;
++      }
++      scan->extraFilter = static_cast<const Filter*>(node->node())->condition();
++      if (node->dependencies().size() != 1) {
++        return false;
++      }
++      node = soleNode(node->dependencies()[0]);
++    }
++  }
++  if (node == nullptr || node->node()->kind() != PlanNode::Kind::kExpandAll) {
++    return false;
++  }
++  scan->expandAllNode = node;
++  scan->expandAll = static_cast<const ExpandAll*>(node->node());
++  if (scan->vidGroup == nullptr) {
++    if (node->dependencies().size() != 1) {
++      return false;
++    }
++    auto* pass = soleNode(node->dependencies()[0]);
++    if (pass == nullptr || pass->node()->kind() != PlanNode::Kind::kExpand) {
++      return false;
++    }
++    if (static_cast<const Expand*>(pass->node())->maxSteps() != 0) {
++      return false;
++    }
++    if (pass->dependencies().size() != 1) {
++      return false;
++    }
++    scan->pass = static_cast<const Expand*>(pass->node());
++    scan->vidGroup = pass->dependencies()[0];
++  }
++  return scan->vidGroup != nullptr;
++}
++
++std::vector<EdgeType> edgeTypesOf(const ExpandAll* expandAll) {
++  std::vector<EdgeType> types = expandAll->edgeTypes();
++  if (!types.empty() || expandAll->edgeProps() == nullptr) {
++    return types;
++  }
++  for (const auto& prop : *expandAll->edgeProps()) {
++    types.emplace_back(prop.get_type());
++  }
++  return types;
++}
++
++}  // namespace
++
++bool PushPartialEdgeAggRule::match(OptContext* ctx, const MatchedResult& matched) const {
++  if (!FLAGS_enable_partial_edge_agg) {
++    return false;
++  }
++  if (!OptRule::match(ctx, matched)) {
++    return false;
++  }
++  auto* aggNode = matched.node;
++  if (aggNode->dependencies().size() != 1) {
++    return false;
++  }
++  auto* agg = static_cast<const Aggregate*>(aggNode->node());
++  if (agg->groupKeys().size() != 1) {
++    return false;
++  }
++  Scan scan;
++  if (!absorb(soleNode(aggNode->dependencies()[0]), &scan)) {
++    return false;
++  }
++  const auto* expandAll = scan.expandAll;
++  if (expandAll->minSteps() != 1 || expandAll->maxSteps() != 1 || expandAll->sample() ||
++      !expandAll->stepLimits().empty()) {
++    return false;
++  }
++  if (expandAll->edgeProps() == nullptr || expandAll->edgeProps()->empty()) {
++    return false;
++  }
++  if (edgeTypesOf(expandAll).empty()) {
++    return false;
++  }
++  if (scan.join != nullptr) {
++    if (scan.join->probeKeys().size() != 1 || scan.join->hashKeys().size() != 1) {
++      return false;
++    }
++    auto* probe = scan.join->probeKeys()[0];
++    if (probe->kind() != Expression::Kind::kVarProperty &&
++        probe->kind() != Expression::Kind::kInputProperty) {
++      return false;
++    }
++    if (static_cast<const PropertyExpression*>(probe)->prop() != "_expand_vid") {
++      return false;
++    }
++  }
++  auto* groupKey = unfold(agg->groupKeys()[0], scan.projects, expandAll);
++  if (groupKey == nullptr || groupKey->kind() != Expression::Kind::kEdgeDst) {
++    return false;
++  }
++  auto edgeName = static_cast<const PropertyExpression*>(groupKey)->sym();
++  if (edgeName.empty() || edgeName == "*") {
++    return false;
++  }
++  if (scan.extraFilter != nullptr && !graph::EdgePushdown::canPush(scan.extraFilter, edgeName)) {
++    return false;
++  }
++  if (expandAll->filter() != nullptr &&
++      !graph::EdgePushdown::canPush(expandAll->filter(), edgeName)) {
++    return false;
++  }
++  bool sawAgg = false;
++  for (auto* item : agg->groupItems()) {
++    if (item->kind() == Expression::Kind::kAggregate) {
++      auto* call = static_cast<AggregateExpression*>(item);
++      if (call->distinct() || call->arg() == nullptr) {
++        return false;
++      }
++      PartialAggOp op;
++      if (!aggOp(call->name(), &op)) {
++        return false;
++      }
++      auto* arg = unfold(call->arg(), scan.projects, expandAll);
++      if (!graph::EdgePushdown::canPush(arg, edgeName)) {
++        return false;
++      }
++      sawAgg = true;
++      continue;
++    }
++    auto* plain = unfold(item, scan.projects, expandAll);
++    if (plain == nullptr || plain->kind() != Expression::Kind::kEdgeDst ||
++        static_cast<const PropertyExpression*>(plain)->sym() != edgeName) {
++      return false;
++    }
++  }
++  return sawAgg;
++}
++
++StatusOr<OptRule::TransformResult> PushPartialEdgeAggRule::transform(OptContext* ctx,
++                                                                     const MatchedResult& matched) const {
++  auto* aggNode = matched.node;
++  auto* agg = static_cast<const Aggregate*>(aggNode->node());
++  Scan scan;
++  if (!absorb(soleNode(aggNode->dependencies()[0]), &scan)) {
++    return TransformResult::noTransform();
++  }
++  auto* expandAll = scan.expandAll;
++  auto* pool = ctx->qctx()->objPool();
++  auto* groupKey = unfold(agg->groupKeys()[0], scan.projects, expandAll);
++  auto edgeName = static_cast<const PropertyExpression*>(groupKey)->sym();
++
++  Expression* filter = nullptr;
++  if (expandAll->filter() != nullptr) {
++    filter = expandAll->filter()->clone();
++  }
++  if (scan.extraFilter != nullptr) {
++    auto* extra = const_cast<Expression*>(scan.extraFilter)->clone();
++    filter = filter == nullptr ? extra : LogicalExpression::makeAnd(pool, filter, extra);
++  }
++
++  std::vector<PartialAggExpr> partials;
++  std::vector<Expression*> mergeItems;
++  partials.reserve(agg->groupItems().size());
++  mergeItems.reserve(agg->groupItems().size());
++  for (auto* item : agg->groupItems()) {
++    if (item->kind() != Expression::Kind::kAggregate) {
++      mergeItems.emplace_back(VariablePropertyExpression::make(pool, "", "_dst"));
++      continue;
++    }
++    auto* call = static_cast<AggregateExpression*>(item);
++    PartialAggOp op;
++    aggOp(call->name(), &op);
++    auto* arg = unfold(call->arg(), scan.projects, expandAll)->clone();
++    auto col = folly::stringPrintf("_pa%zu", partials.size());
++    partials.push_back(PartialAggExpr{op, arg});
++    mergeItems.emplace_back(AggregateExpression::make(
++        pool, partialMergeName(op), VariablePropertyExpression::make(pool, "", col), false));
++  }
++
++  auto edgeProps = std::make_unique<std::vector<storage::cpp2::EdgeProp>>(*expandAll->edgeProps());
++  auto* expand = Expand::make(ctx->qctx(), nullptr, expandAll->space(), false, 1, std::move(edgeProps));
++  expand->setEdgeTypes(edgeTypesOf(expandAll));
++  expand->setFilter(filter);
++  expand->setPartialAggs(std::move(partials));
++  std::vector<std::string> outCols{"_dst"};
++  for (size_t i = 0; i < expand->partialAggs().size(); ++i) {
++    outCols.emplace_back(folly::stringPrintf("_pa%zu", i));
++  }
++  expand->setColNames(std::move(outCols));
++
++  OptGroup* vidGroup = scan.vidGroup;
++  if (scan.join != nullptr) {
++    auto* hashKey = scan.join->hashKeys()[0];
++    std::string vidCol;
++    if (hashKey->kind() == Expression::Kind::kVarProperty ||
++        hashKey->kind() == Expression::Kind::kInputProperty) {
++      vidCol = static_cast<const PropertyExpression*>(hashKey)->prop();
++    }
++    const auto* leftNode = soleNode(vidGroup);
++    bool firstIsVid = leftNode != nullptr && !leftNode->node()->colNames().empty() &&
++                      leftNode->node()->colNames()[0] == vidCol;
++    if (!vidCol.empty() && !firstIsVid) {
++      auto* cols = pool->makeAndAdd<YieldColumns>();
++      cols->addColumn(new YieldColumn(InputPropertyExpression::make(pool, vidCol), vidCol));
++      auto* project = Project::make(ctx->qctx(), nullptr, cols);
++      project->setColNames({vidCol});
++      project->setInputVar(vidGroup->outputVar());
++      auto* projectGroup = OptGroup::create(ctx);
++      auto* projectNode = projectGroup->makeGroupNode(project);
++      projectNode->dependsOn(vidGroup);
++      vidGroup = projectGroup;
++    }
++  }
++  if (scan.join == nullptr && scan.pass != nullptr && !scan.pass->inputVar().empty()) {
++    // Keep the variable buildConstantInput already filled. Start's own output
++    // is empty, so pointing the scan at it drops every source vertex.
++    expand->setInputVar(scan.pass->inputVar());
++  } else {
++    expand->setInputVar(vidGroup->outputVar());
++  }
++  auto* expandGroup = OptGroup::create(ctx);
++  auto* expandGN = expandGroup->makeGroupNode(expand);
++  expandGN->dependsOn(vidGroup);
++
++  std::vector<Expression*> mergeKeys;
++  mergeKeys.emplace_back(VariablePropertyExpression::make(pool, "", "_dst"));
++  auto* merged = Aggregate::make(ctx->qctx(), nullptr, std::move(mergeKeys), std::move(mergeItems));
++  merged->setOutputVar(agg->outputVar());
++  merged->setColNames(agg->colNames());
++  merged->setInputVar(expand->outputVar());
++  auto* mergedGN = OptGroupNode::create(ctx, merged, aggNode->group());
++  mergedGN->dependsOn(expandGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(mergedGN);
++  return result;
++}
++
++std::string PushPartialEdgeAggRule::toString() const {
++  return "PushPartialEdgeAggRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+diff --git a/src/graph/optimizer/rule/PushPartialEdgeAggRule.h b/src/graph/optimizer/rule/PushPartialEdgeAggRule.h
+index e69de29..e3108f4 100644
+--- a/src/graph/optimizer/rule/PushPartialEdgeAggRule.h
++++ b/src/graph/optimizer/rule/PushPartialEdgeAggRule.h
+@@ -0,0 +1,54 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHPARTIALEDGEAGGRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHPARTIALEDGEAGGRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Partial-aggregate a 1-step edge scan that groups by the edge destination.
++//
++//   Aggregate(group by edge._dst, SUM/COUNT/MIN/MAX of edge exprs)
++//     Project* / Filter*
++//       ExpandAll(1, 1)                  or HashInnerJoin(vids, ExpandAll)
++//
++// becomes
++//
++//   Aggregate(merge partials)
++//     Expand(getDstBySrc with PartialEdgeAgg)
++//       <the same vid input>
++//
++// TopN stays above the merge. The group key is the edge dst, which is not
++// partition-aligned, so a per-host TopN would be wrong and is not pushed.
++// AVG, DISTINCT aggregates, multi-step scans, and predicates that still need
++// a column this scan does not return are left unchanged.
++//
++// Requires --enable_partial_edge_agg. The scan sets partial_agg on the
++// response; graphd recomputes from GetNeighbors when that bit is absent.
++class PushPartialEdgeAggRule final : public OptRule {
++ public:
++  const Pattern& pattern() const override;
++
++  bool match(OptContext* ctx, const MatchedResult& matched) const override;
++
++  StatusOr<TransformResult> transform(OptContext* ctx, const MatchedResult& matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushPartialEdgeAggRule() {
++    RuleSet::QueryRules().addRule(this);
++  }
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHPARTIALEDGEAGGRULE_H_
+diff --git a/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
+index 2c386d5..8db6f06 100644
+--- a/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
++++ b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
+@@ -11,7 +11,9 @@
+ #include "common/expression/LogicalExpression.h"
+ #include "common/expression/PropertyExpression.h"
+ #include "common/expression/RelationalExpression.h"
++#include "common/function/PartialAgg.h"
+ #include "graph/util/DstOnlyEdgeFilter.h"
++#include "graph/util/EdgePushdown.h"
+ 
+ namespace nebula {
+ namespace graph {
+@@ -30,6 +32,8 @@ TEST_F(DstOnlyEdgeFilterTest, EdgeTimestampComparison) {
+ }
+ 
+ TEST_F(DstOnlyEdgeFilterTest, AndOfEdgePropsAndNow) {
++  // now() is not deterministic. The whole AND cannot ride a dst-only RPC,
++  // but the amount comparison can be split off and pushed alone.
+   auto* ts = RelationalExpression::makeGT(
+       &pool_,
+       EdgePropertyExpression::make(&pool_, "buy", "ts"),
+@@ -39,7 +43,14 @@ TEST_F(DstOnlyEdgeFilterTest, AndOfEdgePropsAndNow) {
+       EdgePropertyExpression::make(&pool_, "buy", "amount"),
+       ConstantExpression::make(&pool_, Value(0L)));
+   auto* expr = LogicalExpression::makeAnd(&pool_, ts, amount);
+-  EXPECT_TRUE(DstOnlyEdgeFilter::canPush(expr));
++  EXPECT_FALSE(DstOnlyEdgeFilter::canPush(expr));
++  auto split = EdgePushdown::splitAnd(&pool_, expr);
++  ASSERT_NE(split.pushable, nullptr);
++  ASSERT_NE(split.residual, nullptr);
++  EXPECT_TRUE(EdgePushdown::canPush(split.pushable));
++  EXPECT_FALSE(EdgePushdown::canPush(split.residual));
++  EXPECT_TRUE(EdgePushdown::canPush(amount));
++  EXPECT_FALSE(EdgePushdown::canPush(ts));
+ }
+ 
+ TEST_F(DstOnlyEdgeFilterTest, NullExpr) {
+@@ -83,6 +94,92 @@ TEST_F(DstOnlyEdgeFilterTest, WholeEdgeFunctionRejected) {
+   EXPECT_FALSE(DstOnlyEdgeFilter::canPush(expr));
+ }
+ 
++TEST(PartialAggTest, SumSkipsNullAndMergesAcrossParts) {
++  Value part1;
++  Value part2;
++  applyPartial(PartialAggOp::SUM, part1, Value(static_cast<int64_t>(10)));
++  applyPartial(PartialAggOp::SUM, part1, Value::kNullValue);
++  applyPartial(PartialAggOp::SUM, part1, Value::kEmpty);
++  applyPartial(PartialAggOp::SUM, part2, Value(static_cast<int64_t>(5)));
++  applyPartial(PartialAggOp::SUM, part2, Value::kNullValue);
++  mergePartial(PartialAggOp::SUM, part1, part2);
++  EXPECT_EQ(part1, Value(static_cast<int64_t>(15)));
++}
++
++TEST(PartialAggTest, SumAllNullIsZero) {
++  Value state;
++  applyPartial(PartialAggOp::SUM, state, Value::kNullValue);
++  applyPartial(PartialAggOp::SUM, state, Value::kEmpty);
++  EXPECT_EQ(state, Value(0));
++}
++
++TEST(PartialAggTest, SumBadTypeSticks) {
++  Value state;
++  applyPartial(PartialAggOp::SUM, state, Value("x"));
++  EXPECT_TRUE(state.isBadNull());
++  applyPartial(PartialAggOp::SUM, state, Value(static_cast<int64_t>(1)));
++  EXPECT_TRUE(state.isBadNull());
++  Value other(static_cast<int64_t>(3));
++  mergePartial(PartialAggOp::SUM, other, state);
++  EXPECT_TRUE(other.isBadNull());
++}
++
++TEST(PartialAggTest, CountSkipsNullAndAddsPartials) {
++  Value part1;
++  Value part2;
++  applyPartial(PartialAggOp::COUNT, part1, Value(static_cast<int64_t>(1)));
++  applyPartial(PartialAggOp::COUNT, part1, Value::kNullValue);
++  applyPartial(PartialAggOp::COUNT, part2, Value::kEmpty);
++  applyPartial(PartialAggOp::COUNT, part2, Value(static_cast<int64_t>(9)));
++  applyPartial(PartialAggOp::COUNT, part2, Value(static_cast<int64_t>(8)));
++  mergePartial(PartialAggOp::COUNT, part1, part2);
++  EXPECT_EQ(part1, Value(static_cast<int64_t>(3)));
++}
++
++TEST(PartialAggTest, MinMaxIgnoreNullPartials) {
++  Value lo;
++  Value hi;
++  applyPartial(PartialAggOp::MIN, lo, Value::kNullValue);
++  applyPartial(PartialAggOp::MIN, lo, Value(static_cast<int64_t>(4)));
++  applyPartial(PartialAggOp::MIN, lo, Value(static_cast<int64_t>(2)));
++  Value other;
++  applyPartial(PartialAggOp::MIN, other, Value(static_cast<int64_t>(3)));
++  mergePartial(PartialAggOp::MIN, lo, other);
++  mergePartial(PartialAggOp::MIN, lo, Value::kNullValue);
++  EXPECT_EQ(lo, Value(static_cast<int64_t>(2)));
++
++  applyPartial(PartialAggOp::MAX, hi, Value(static_cast<int64_t>(4)));
++  mergePartial(PartialAggOp::MAX, hi, Value(static_cast<int64_t>(9)));
++  mergePartial(PartialAggOp::MAX, hi, Value::kNullValue);
++  EXPECT_EQ(hi, Value(static_cast<int64_t>(9)));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, OrStaysWhole) {
++  auto* edge = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "buy", "ts"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  auto* dst = RelationalExpression::makeGT(
++      &pool_,
++      DestPropertyExpression::make(&pool_, "user", "age"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  auto* expr = LogicalExpression::makeOr(&pool_, edge, dst);
++  auto split = EdgePushdown::splitAnd(&pool_, expr);
++  EXPECT_EQ(split.pushable, nullptr);
++  ASSERT_NE(split.residual, nullptr);
++  EXPECT_FALSE(EdgePushdown::canPush(split.residual));
++}
++
++TEST_F(DstOnlyEdgeFilterTest, OnlyEdgeMismatch) {
++  auto* expr = RelationalExpression::makeGT(
++      &pool_,
++      EdgePropertyExpression::make(&pool_, "follow", "ts"),
++      ConstantExpression::make(&pool_, Value(1L)));
++  EXPECT_TRUE(EdgePushdown::canPush(expr));
++  EXPECT_FALSE(EdgePushdown::canPush(expr, "buy"));
++  EXPECT_TRUE(EdgePushdown::canPush(expr, "follow"));
++}
++
+ TEST_F(DstOnlyEdgeFilterTest, NamedEdgeRankAllowed) {
+   auto* expr = RelationalExpression::makeGT(
+       &pool_,
+diff --git a/src/graph/planner/plan/Query.cpp b/src/graph/planner/plan/Query.cpp
+index 9ee98a9..9c94467 100644
+--- a/src/graph/planner/plan/Query.cpp
++++ b/src/graph/planner/plan/Query.cpp
+@@ -119,6 +119,14 @@ std::unique_ptr<PlanNodeDescription> Expand::explain() const {
+     limits.push_back(folly::to<std::string>(i));
+   }
+   addDescription("stepLimits", folly::toJson(limits), desc.get());
++  if (!partialAggs_.empty()) {
++    folly::dynamic aggs = folly::dynamic::array();
++    for (const auto& agg : partialAggs_) {
++      aggs.push_back(std::string(partialAggName(agg.op)) + "(" +
++                     (agg.expr != nullptr ? agg.expr->toString() : "") + ")");
++    }
++    addDescription("partialAgg", folly::toJson(aggs), desc.get());
++  }
+   return desc;
+ }
+ 
+@@ -140,6 +148,11 @@ void Expand::cloneMembers(const Expand& expand) {
+   stepLimits_ = expand.stepLimits();
+   joinInput_ = expand.joinInput();
+   edgeTypes_ = expand.edgeTypes();
++  partialAggs_.clear();
++  partialAggs_.reserve(expand.partialAggs().size());
++  for (const auto& agg : expand.partialAggs()) {
++    partialAggs_.push_back(PartialAggExpr{agg.op, agg.expr != nullptr ? agg.expr->clone() : nullptr});
++  }
+ }
+ 
+ std::unique_ptr<PlanNodeDescription> ExpandAll::explain() const {
+diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
+index 7c5f96f..180c0c6 100644
+--- a/src/graph/planner/plan/Query.h
++++ b/src/graph/planner/plan/Query.h
+@@ -9,6 +9,7 @@
+ #include <glog/logging.h>
+ 
+ #include "common/expression/AggregateExpression.h"
++#include "common/function/PartialAgg.h"
+ #include "graph/context/QueryContext.h"
+ #include "graph/planner/plan/PlanNode.h"
+ #include "interface/gen-cpp2/storage_types.h"
+@@ -316,6 +317,16 @@ class Expand : public Explore {
+     return maxSteps_;
+   }
+ 
++  // Empty unless PushPartialEdgeAggRule rewrote this scan. When set, one RPC
++  // returns partial groups (_dst, one column per agg) instead of dst vids.
++  const std::vector<PartialAggExpr>& partialAggs() const {
++    return partialAggs_;
++  }
++
++  void setPartialAggs(std::vector<PartialAggExpr> aggs) {
++    partialAggs_ = std::move(aggs);
++  }
++
+   std::unique_ptr<PlanNodeDescription> explain() const override;
+ 
+   PlanNode* clone() const override;
+@@ -343,6 +354,7 @@ class Expand : public Explore {
+   std::vector<int64_t> stepLimits_;
+   bool joinInput_{false};
+   std::vector<EdgeType> edgeTypes_;
++  std::vector<PartialAggExpr> partialAggs_;
+ };
+ 
+ class ExpandAll : public Expand {
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 164d6a5..5f4b0c4 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -69,6 +69,13 @@ DEFINE_bool(enable_dst_only_edge_filter,
+             "Every storaged must understand GetDstBySrcRequest.filter. "
+             "Requires a full-cluster upgrade; default false.");
+ 
++DEFINE_bool(enable_partial_edge_agg,
++            false,
++            "When true, a 1-step GROUP BY edge._dst of SUM/COUNT/MIN/MAX over "
++            "edge props is partial-aggregated inside getDstBySrc and merged on "
++            "graphd. If a storaged leaves partial_agg unset, graphd recomputes "
++            "that scan with GetNeighbors. Default false.");
++
+ #ifndef BUILD_STANDALONE
+ DEFINE_uint32(ft_request_retry_times, 3, "Retry times if fulltext request failed");
+ DEFINE_bool(enable_client_white_list, true, "Turn on/off the client white list.");
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index 6c0cec1..d07f198 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -57,6 +57,10 @@ DECLARE_bool(enable_optimizer);
+ // and ships the predicate in GetDstBySrcRequest.filter. Default false: mixed
+ // clusters whose storaged does not know field 5 would drop the predicate.
+ DECLARE_bool(enable_dst_only_edge_filter);
++// 1-step edge scan grouped by dst: SUM/COUNT/MIN/MAX partials inside
++// getDstBySrc, merged by the graphd Aggregate. Default false. A storaged that
++// does not set partial_agg causes graphd to recompute from GetNeighbors.
++DECLARE_bool(enable_partial_edge_agg);
+ DECLARE_bool(optimize_appendvertice);
+ DECLARE_uint32(num_path_thread);
+ 
+diff --git a/src/graph/util/DstOnlyEdgeFilter.h b/src/graph/util/DstOnlyEdgeFilter.h
+index 12c8cab..b90c9f6 100644
+--- a/src/graph/util/DstOnlyEdgeFilter.h
++++ b/src/graph/util/DstOnlyEdgeFilter.h
+@@ -6,141 +6,18 @@
+ #ifndef GRAPH_UTIL_DSTONLYEDGEFILTER_H_
+ #define GRAPH_UTIL_DSTONLYEDGEFILTER_H_
+ 
+-#include "common/expression/ExprVisitorImpl.h"
+-#include "common/expression/Expression.h"
++#include "graph/util/EdgePushdown.h"
+ 
+ namespace nebula {
+ namespace graph {
+ 
+ // Predicates that GetDstBySrc can evaluate while scanning one vertex's edges.
+-// The RPC returns only dst vids, so the predicate must be computable from the
+-// edge key and the edge value. Tag, src/dst vertex, input and variable
+-// expressions stay on the GetNeighbors plan.
+-class DstOnlyEdgeFilterVisitor final : public ExprVisitorImpl {
+- public:
+-  bool canPush() const {
+-    return !rejected_;
+-  }
+-
+-  void visit(UnaryExpression* expr) override {
+-    auto kind = expr->kind();
+-    if (kind == Expression::Kind::kUnaryIncr || kind == Expression::Kind::kUnaryDecr) {
+-      rejected_ = true;
+-      return;
+-    }
+-    ExprVisitorImpl::visit(expr);
+-  }
+-
+-  void visit(SubscriptExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(AttributeExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(LabelAttributeExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(LabelExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(UUIDExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(VariableExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(VersionedVariableExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(LabelTagPropertyExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(TagPropertyExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(InputPropertyExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(VariablePropertyExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(DestPropertyExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(SourcePropertyExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(VertexExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(EdgeExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(ColumnExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(AggregateExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(CaseExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(PredicateExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(ListComprehensionExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(ReduceExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(SubscriptRangeExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(MatchPathPatternExpression*) override {
+-    rejected_ = true;
+-  }
+-  void visit(PathBuildExpression*) override {
+-    rejected_ = true;
+-  }
+-
+-  void visit(EdgePropertyExpression* expr) override {
+-    rejectStar(expr->sym());
+-  }
+-  void visit(EdgeSrcIdExpression* expr) override {
+-    rejectStar(expr->sym());
+-  }
+-  void visit(EdgeTypeExpression* expr) override {
+-    rejectStar(expr->sym());
+-  }
+-  void visit(EdgeRankExpression* expr) override {
+-    rejectStar(expr->sym());
+-  }
+-  void visit(EdgeDstIdExpression* expr) override {
+-    rejectStar(expr->sym());
+-  }
+-
+- private:
+-  void rejectStar(const std::string& sym) {
+-    if (sym.empty() || sym == "*") {
+-      rejected_ = true;
+-    }
+-  }
+-
+-  bool rejected_{false};
+-};
+-
++// The whole predicate must be pushable: the RPC returns only dst vids, so a
++// residual conjunct would have nothing left to read on graphd.
+ class DstOnlyEdgeFilter {
+  public:
+-  // True when every leaf is an edge key/property (named, not "*"), a constant,
+-  // or a function/arithmetic/logical/relational combination of those.
+   static bool canPush(const Expression* expr) {
+-    if (expr == nullptr) {
+-      return false;
+-    }
+-    DstOnlyEdgeFilterVisitor visitor;
+-    const_cast<Expression*>(expr)->accept(&visitor);
+-    return visitor.canPush();
++    return EdgePushdown::canPush(expr);
+   }
+ };
+ 
+diff --git a/src/graph/util/EdgePushdown.h b/src/graph/util/EdgePushdown.h
+index e69de29..a8346fd 100644
+--- a/src/graph/util/EdgePushdown.h
++++ b/src/graph/util/EdgePushdown.h
+@@ -0,0 +1,221 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_UTIL_EDGEPUSHDOWN_H_
++#define GRAPH_UTIL_EDGEPUSHDOWN_H_
++
++#include "common/expression/ExprVisitorImpl.h"
++#include "common/expression/Expression.h"
++#include "common/expression/FunctionCallExpression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/function/FunctionManager.h"
++
++namespace nebula {
++namespace graph {
++
++// Expressions storage can evaluate while scanning one edge, using only that
++// edge's key and value. Non-deterministic calls (now(), timestamp(), rand())
++// stay on graphd: each storaged would otherwise call them independently.
++// NULL and non-bool filter results are false, matching FilterNode::checkTagAndEdge.
++class EdgePushdownVisitor final : public ExprVisitorImpl {
++ public:
++  explicit EdgePushdownVisitor(std::string onlyEdge = "") : onlyEdge_(std::move(onlyEdge)) {}
++
++  bool canPush() const {
++    return !rejected_;
++  }
++
++  void visit(UnaryExpression* expr) override {
++    auto kind = expr->kind();
++    if (kind == Expression::Kind::kUnaryIncr || kind == Expression::Kind::kUnaryDecr) {
++      rejected_ = true;
++      return;
++    }
++    ExprVisitorImpl::visit(expr);
++  }
++
++  void visit(FunctionCallExpression* expr) override {
++    auto pure = FunctionManager::getIsPure(expr->name(), expr->args()->numArgs());
++    if (!pure.ok() || !pure.value()) {
++      rejected_ = true;
++      return;
++    }
++    ExprVisitorImpl::visit(expr);
++  }
++
++  void visit(SubscriptExpression*) override {
++    rejected_ = true;
++  }
++  void visit(AttributeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(LabelAttributeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(LabelExpression*) override {
++    rejected_ = true;
++  }
++  void visit(UUIDExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VariableExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VersionedVariableExpression*) override {
++    rejected_ = true;
++  }
++  void visit(LabelTagPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(TagPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(InputPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VariablePropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(DestPropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(SourcePropertyExpression*) override {
++    rejected_ = true;
++  }
++  void visit(VertexExpression*) override {
++    rejected_ = true;
++  }
++  void visit(EdgeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(ColumnExpression*) override {
++    rejected_ = true;
++  }
++  void visit(AggregateExpression*) override {
++    rejected_ = true;
++  }
++  void visit(CaseExpression*) override {
++    rejected_ = true;
++  }
++  void visit(PredicateExpression*) override {
++    rejected_ = true;
++  }
++  void visit(ListComprehensionExpression*) override {
++    rejected_ = true;
++  }
++  void visit(ReduceExpression*) override {
++    rejected_ = true;
++  }
++  void visit(SubscriptRangeExpression*) override {
++    rejected_ = true;
++  }
++  void visit(MatchPathPatternExpression*) override {
++    rejected_ = true;
++  }
++  void visit(PathBuildExpression*) override {
++    rejected_ = true;
++  }
++
++  void visit(EdgePropertyExpression* expr) override {
++    rejectEdge(expr->sym());
++  }
++  void visit(EdgeSrcIdExpression* expr) override {
++    rejectEdge(expr->sym());
++  }
++  void visit(EdgeTypeExpression* expr) override {
++    rejectEdge(expr->sym());
++  }
++  void visit(EdgeRankExpression* expr) override {
++    rejectEdge(expr->sym());
++  }
++  void visit(EdgeDstIdExpression* expr) override {
++    rejectEdge(expr->sym());
++  }
++
++ private:
++  void rejectEdge(const std::string& sym) {
++    if (sym.empty() || sym == "*") {
++      rejected_ = true;
++      return;
++    }
++    if (!onlyEdge_.empty() && sym != onlyEdge_) {
++      rejected_ = true;
++    }
++  }
++
++  bool rejected_{false};
++  std::string onlyEdge_;
++};
++
++class EdgePushdown {
++ public:
++  // True when every leaf is deterministic and is an edge key/property, a
++  // constant, or a pure function/arithmetic/logical/relational combination.
++  static bool canPush(const Expression* expr, const std::string& onlyEdge = "") {
++    if (expr == nullptr) {
++      return false;
++    }
++    EdgePushdownVisitor visitor(onlyEdge);
++    const_cast<Expression*>(expr)->accept(&visitor);
++    return visitor.canPush();
++  }
++
++  struct Split {
++    // AND of the conjuncts storage can evaluate. Null when none.
++    Expression* pushable{nullptr};
++    // AND of the conjuncts that must stay on graphd. Null when none.
++    Expression* residual{nullptr};
++  };
++
++  // Split a predicate on AND only. OR/XOR stay intact: if the whole call is
++  // pushable it is one pushable piece, otherwise the whole call is residual.
++  static Split splitAnd(ObjectPool* pool, const Expression* expr) {
++    Split out;
++    if (expr == nullptr || pool == nullptr) {
++      return out;
++    }
++    std::vector<Expression*> pushable;
++    std::vector<Expression*> residual;
++    collect(pool, expr, pushable, residual);
++    out.pushable = combine(pool, pushable);
++    out.residual = combine(pool, residual);
++    return out;
++  }
++
++ private:
++  static void collect(ObjectPool* pool,
++                      const Expression* expr,
++                      std::vector<Expression*>& pushable,
++                      std::vector<Expression*>& residual) {
++    if (expr->kind() == Expression::Kind::kLogicalAnd) {
++      auto* logical = static_cast<const LogicalExpression*>(expr);
++      for (const auto* operand : logical->operands()) {
++        collect(pool, operand, pushable, residual);
++      }
++      return;
++    }
++    auto* cloned = const_cast<Expression*>(expr)->clone();
++    if (canPush(cloned)) {
++      pushable.emplace_back(cloned);
++    } else {
++      residual.emplace_back(cloned);
++    }
++    (void)pool;
++  }
++
++  static Expression* combine(ObjectPool* pool, const std::vector<Expression*>& parts) {
++    Expression* acc = nullptr;
++    for (auto* part : parts) {
++      acc = acc == nullptr ? part : LogicalExpression::makeAnd(pool, acc, part);
++    }
++    return acc;
++  }
++};
++
++}  // namespace graph
++}  // namespace nebula
++
++#endif  // GRAPH_UTIL_EDGEPUSHDOWN_H_
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index 9519414..841a9ec 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -240,6 +240,21 @@ struct GetNeighborsResponse {
+  * End of GetNeighbors section
+  */
+ 
++// Partial aggregate over edges of one source vertex, grouped by dst id.
++// AVG is not an op: graphd sends SUM and COUNT and divides after the merge.
++enum PartialAggOp {
++    SUM = 1,
++    COUNT = 2,
++    MIN = 3,
++    MAX = 4,
++} (cpp.enum_strict)
++
++struct PartialEdgeAgg {
++    1: PartialAggOp op,
++    // Expression::encode() of the per-edge argument. COUNT(*) is a constant.
++    2: binary expr,
++}
++
+ struct GetDstBySrcRequest {
+     1: common.GraphSpaceID                      space_id,
+     // list of srcId in each part
+@@ -252,12 +267,20 @@ struct GetDstBySrcRequest {
+     // ignores unknown fields would return unfiltered dsts, so graphd only sets
+     // this after --enable_dst_only_edge_filter and a full-cluster upgrade.
+     5: optional binary                         filter,
++    // When set, group passing edges by dst and return one partial row per dst
++    // (_dst, then one column per agg). An older storaged ignores this field and
++    // returns raw dst vids. graphd must check GetDstBySrcResponse.partial_agg.
++    6: optional list<PartialEdgeAgg>           aggs,
+ }
+ 
+ struct GetDstBySrcResponse {
+     1: required ResponseCommon                  result,
+-    // Only one dst column, each row is a dst
++    // Without aggs: one dst column. With aggs: _dst plus one partial column
++    // per PartialEdgeAgg, in request order.
+     2: optional common.DataSet                  dsts,
++    // True only when this storaged applied field 6. Unset on older binaries.
++    // graphd must not read dst vids as partial sums when this is false.
++    3: optional bool                            partial_agg = false,
+ }
+ 
+ 
+diff --git a/src/storage/exec/GetDstBySrcNode.h b/src/storage/exec/GetDstBySrcNode.h
+index 893ce9d..b4f3fbc 100644
+--- a/src/storage/exec/GetDstBySrcNode.h
++++ b/src/storage/exec/GetDstBySrcNode.h
+@@ -6,8 +6,11 @@
+ #ifndef STORAGE_EXEC_GETDSTBYSRCNODE_H_
+ #define STORAGE_EXEC_GETDSTBYSRCNODE_H_
+ 
++#include <unordered_map>
++
+ #include "common/base/Base.h"
+ #include "common/expression/Expression.h"
++#include "common/function/PartialAgg.h"
+ #include "storage/context/StorageExpressionContext.h"
+ 
+ namespace nebula {
+@@ -23,14 +26,16 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+                   std::deque<Value>* result,
+                   int64_t limit,
+                   Expression* filter = nullptr,
+-                  StorageExpressionContext* expCtx = nullptr)
++                  StorageExpressionContext* expCtx = nullptr,
++                  std::vector<PartialAggExpr> aggs = {})
+       : context_(context),
+         edgeNodes_(edgeNodes),
+         edgeContext_(edgeContext),
+         result_(result),
+         limit_(limit),
+         filter_(filter),
+-        expCtx_(expCtx) {
++        expCtx_(expCtx),
++        aggs_(std::move(aggs)) {
+     name_ = "GetDstBySrcNode";
+   }
+ 
+@@ -72,16 +77,57 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+       }
+       ++returned;
+       auto key = iter_->key();
+-      auto dstId = NebulaKeyUtils::getDstId(context_->vIdLen(), key);
+-      if (context_->isIntId()) {
+-        result_->emplace_back(*reinterpret_cast<const int64_t*>(dstId.data()));
+-      } else {
+-        result_->emplace_back(dstId.subpiece(0, dstId.find_first_of('\0')).toString());
++      auto dst = dstValue(key);
++      if (aggs_.empty()) {
++        result_->emplace_back(std::move(dst));
++        continue;
++      }
++      if (expCtx_ == nullptr) {
++        return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++      }
++      // A filter already reset the reader. Without one, eval still needs it:
++      // StorageExpressionContext::getEdgeProp returns empty when reader_ is null.
++      if (filter_ == nullptr) {
++        auto* reader = iter_->reader();
++        if (reader == nullptr) {
++          return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++        }
++        expCtx_->reset(reader, key.str());
++      }
++      auto& states = groups_[dst];
++      if (states.empty()) {
++        states.resize(aggs_.size());
++      }
++      for (size_t i = 0; i < aggs_.size(); ++i) {
++        if (aggs_[i].expr == nullptr) {
++          return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++        }
++        applyPartial(aggs_[i].op, states[i], aggs_[i].expr->eval(*expCtx_));
+       }
+     }
++    if (!aggs_.empty()) {
++      for (auto& kv : groups_) {
++        List row;
++        row.values.reserve(aggs_.size() + 1);
++        row.values.emplace_back(kv.first);
++        for (auto& state : kv.second) {
++          row.values.emplace_back(std::move(state));
++        }
++        result_->emplace_back(std::move(row));
++      }
++      groups_.clear();
++    }
+     return nebula::cpp2::ErrorCode::SUCCEEDED;
+   }
+ 
++  Value dstValue(folly::StringPiece key) const {
++    auto dstId = NebulaKeyUtils::getDstId(context_->vIdLen(), key);
++    if (context_->isIntId()) {
++      return *reinterpret_cast<const int64_t*>(dstId.data());
++    }
++    return dstId.subpiece(0, dstId.find_first_of('\0')).toString();
++  }
++
+   void setCurrentEdgeInfo(EdgeType type) {
+     auto idxIter = edgeContext_->indexMap_.find(type);
+     CHECK(idxIter != edgeContext_->indexMap_.end());
+@@ -124,6 +170,10 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+   int64_t limit_;
+   Expression* filter_{nullptr};
+   StorageExpressionContext* expCtx_{nullptr};
++  std::vector<PartialAggExpr> aggs_;
++  // Per source vertex. Flushed into result_ at the end of iterateEdges so the
++  // processor can merge the same dst across vertices and parts.
++  std::unordered_map<Value, std::vector<Value>> groups_;
+ };
+ 
+ }  // namespace storage
+diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
+index 9a755c3..a18a56e 100644
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -7,6 +7,9 @@
+ 
+ #include <robin_hood.h>
+ 
++#include <folly/String.h>
++#include <unordered_map>
++
+ #include "common/expression/BinaryExpression.h"
+ #include "common/expression/ContainerExpression.h"
+ #include "common/expression/FunctionCallExpression.h"
+@@ -77,7 +80,8 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
+   memory::MemoryCheckGuard guard;
+   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+   StorageExpressionContext expCtx(this->spaceVidLen_, this->isIntId_);
+-  auto plan = buildPlan(&contexts_.front(), &flatResult_, filter_ == nullptr ? nullptr : &expCtx);
++  bool needReader = filter_ != nullptr || !aggs_.empty();
++  auto plan = buildPlan(&contexts_.front(), &flatResult_, needReader ? &expCtx : nullptr);
+   std::unordered_set<PartitionID> failedParts;
+   for (const auto& partEntry : req.get_parts()) {
+     auto partId = partEntry.first;
+@@ -177,7 +181,9 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> GetDstBySrcProces
+                                               partId);
+                       }
+                       StorageExpressionContext expCtx(this->spaceVidLen_, this->isIntId_);
+-                      auto plan = buildPlan(context, result, filter_ == nullptr ? nullptr : &expCtx);
++                      bool needReader = filter_ != nullptr || !aggs_.empty();
++                      auto plan =
++                          buildPlan(context, result, needReader ? &expCtx : nullptr);
+                       for (const auto& src : input) {
+                         auto& vId = src.getStr();
+ 
+@@ -222,16 +228,23 @@ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
+   for (const auto& ec : edgeContext_.propContexts_) {
+     // Decode the value when a filter needs it. Rank lives in the key, but
+     // StorageExpressionContext::getEdgeProp still requires a reader.
++    // Decode the value when a filter or a partial aggregate reads a property.
++    bool maySkipDecode = filter_ == nullptr && aggs_.empty();
+     auto edge = std::make_unique<SingleEdgeNode>(
+-        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, filter_ == nullptr);
++        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, maySkipDecode);
+     edges.emplace_back(edge.get());
+     plan.addNode(std::move(edge));
+   }
+ 
+   int64_t limit = FLAGS_max_edge_returned_per_vertex;
+   Expression* filter = filter_ == nullptr ? nullptr : filter_->clone();
++  std::vector<PartialAggExpr> cloned;
++  cloned.reserve(aggs_.size());
++  for (const auto& agg : aggs_) {
++    cloned.push_back(PartialAggExpr{agg.op, agg.expr == nullptr ? nullptr : agg.expr->clone()});
++  }
+   auto output = std::make_unique<GetDstBySrcNode>(
+-      context, edges, &edgeContext_, result, limit, filter, expCtx);
++      context, edges, &edgeContext_, result, limit, filter, expCtx, std::move(cloned));
+   for (auto* edge : edges) {
+     output->addDependency(edge);
+   }
+@@ -254,6 +267,44 @@ nebula::cpp2::ErrorCode GetDstBySrcProcessor::checkAndBuildContexts(
+   if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     return code;
+   }
++  code = buildEdgeAggs(req);
++  if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++    return code;
++  }
++  for (size_t i = 0; i < aggs_.size(); ++i) {
++    resultDataSet_.colNames.emplace_back(folly::stringPrintf("_agg%zu", i));
++  }
++  return nebula::cpp2::ErrorCode::SUCCEEDED;
++}
++
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::buildEdgeAggs(const cpp2::GetDstBySrcRequest& req) {
++  if (!req.aggs_ref().has_value()) {
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++  const auto* aggs = req.get_aggs();
++  if (aggs == nullptr || aggs->empty()) {
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++  auto* pool = &this->planContext_->objPool_;
++  aggs_.reserve(aggs->size());
++  for (const auto& agg : *aggs) {
++    // expr is a required binary. get_expr() returns the string, not a pointer.
++    if (agg.get_expr().empty()) {
++      return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++    }
++    auto* expr = Expression::decode(pool, agg.get_expr());
++    if (expr == nullptr) {
++      return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++    }
++    auto code = validateEdgeFilter(expr);
++    if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++      return code;
++    }
++    DecodedAgg decoded;
++    decoded.op = static_cast<PartialAggOp>(static_cast<int>(agg.get_op()));
++    decoded.expr = expr;
++    aggs_.emplace_back(decoded);
++  }
+   return nebula::cpp2::ErrorCode::SUCCEEDED;
+ }
+ 
+@@ -449,7 +500,51 @@ nebula::cpp2::ErrorCode GetDstBySrcProcessor::buildEdgeContext(
+   return nebula::cpp2::ErrorCode::SUCCEEDED;
+ }
+ 
++void GetDstBySrcProcessor::mergePartialGroups() {
++  std::unordered_map<Value, std::vector<Value>> groups;
++  for (auto& val : flatResult_) {
++    if (!val.isList()) {
++      continue;
++    }
++    auto& list = val.getList().values;
++    if (list.size() != aggs_.size() + 1) {
++      continue;
++    }
++    auto& states = groups[list[0]];
++    if (states.empty()) {
++      states.assign(list.begin() + 1, list.end());
++      continue;
++    }
++    for (size_t i = 0; i < aggs_.size(); ++i) {
++      mergePartial(aggs_[i].op, states[i], list[i + 1]);
++    }
++  }
++  std::vector<Row> rows;
++  rows.reserve(groups.size());
++  for (auto& kv : groups) {
++    Row row;
++    row.values.reserve(aggs_.size() + 1);
++    row.values.emplace_back(kv.first);
++    for (auto& state : kv.second) {
++      row.values.emplace_back(std::move(state));
++    }
++    rows.emplace_back(std::move(row));
++  }
++  resultDataSet_.rows = std::move(rows);
++}
++
+ void GetDstBySrcProcessor::onProcessFinished() {
++  if (!aggs_.empty()) {
++    mergePartialGroups();
++    // Set only after the groups are built. Old graphd never reads this field.
++    resp_.partial_agg_ref() = true;
++    resp_.dsts_ref() = std::move(resultDataSet_);
++    if (profileDetailFlag_) {
++      profileDetail("GetDstBySrcProcessorDedup", 0);
++      profileDetail("GetDstBySrcProcessorTotal", totalDuration_.elapsedInUSec());
++    }
++    return;
++  }
+   if (profileDetailFlag_) {
+     dedupDuration_.reset();
+   }
+diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
+index d5e34d8..7c65a06 100644
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -13,6 +13,7 @@
+ #include "common/expression/PropertyExpression.h"
+ #include "storage/BaseProcessor.h"
+ #include "storage/context/StorageExpressionContext.h"
++#include "common/function/PartialAgg.h"
+ #include "storage/exec/StoragePlan.h"
+ 
+ namespace nebula {
+@@ -49,6 +50,8 @@ class GetDstBySrcProcessor
+ 
+   nebula::cpp2::ErrorCode buildEdgeFilter(const cpp2::GetDstBySrcRequest& req);
+ 
++  nebula::cpp2::ErrorCode buildEdgeAggs(const cpp2::GetDstBySrcRequest& req);
++
+   nebula::cpp2::ErrorCode validateEdgeFilter(const Expression* exp);
+ 
+   nebula::cpp2::ErrorCode validateEdgeRef(const PropertyExpression* exp);
+@@ -75,6 +78,14 @@ class GetDstBySrcProcessor
+ 
+   time::Duration totalDuration_;
+   time::Duration dedupDuration_;
++
++  struct DecodedAgg {
++    PartialAggOp op;
++    Expression* expr{nullptr};
++  };
++  std::vector<DecodedAgg> aggs_;
++
++  void mergePartialGroups();
+ };
+ 
+ }  // namespace storage
+diff --git a/tests/tck/features/go/PartialEdgeAgg.feature b/tests/tck/features/go/PartialEdgeAgg.feature
+index e69de29..334cf53 100644
+--- a/tests/tck/features/go/PartialEdgeAgg.feature
++++ b/tests/tck/features/go/PartialEdgeAgg.feature
+@@ -0,0 +1,62 @@
++# Copyright (c) 2026 vesoft inc. All rights reserved.
++#
++# This source code is licensed under Apache 2.0 License.
++#
++# Correctness of GROUP BY edge._dst over a 1-step GO. With
++# --enable_partial_edge_agg=false this stays Aggregate over ExpandAll.
++# With the flag on, storage returns partial SUM/COUNT/MIN/MAX and graphd
++# merges them. The rows below are the same in both plans. now() is not
++# pushed; a null amount does not add to SUM or COUNT.
++Feature: Partial edge aggregate by dst
++
++  Background:
++    Given an empty graph
++    And create a space with following options:
++      | partition_num  | 3        |
++      | replica_factor | 1        |
++      | vid_type       | INT64    |
++    And having executed:
++      """
++      CREATE TAG person(name string);
++      CREATE EDGE buy(amount int, ts int);
++      """
++    And wait 3 seconds
++    And having executed:
++      """
++      INSERT VERTEX person(name) VALUES 1:("u1"), 2:("u2"), 3:("u3"), 10:("i1"), 11:("i2");
++      INSERT EDGE buy(amount, ts) VALUES 1->10@0:(5, 10), 1->11@0:(7, 10), 1->11@1:(NULL, 10), 2->10@0:(4, 1), 3->11@0:(9, 10);
++      """
++
++  Scenario: sum and count by dst, null amount skipped
++    When executing query:
++      """
++      GO FROM 10, 11 OVER buy REVERSELY WHERE buy.ts > 5
++      YIELD buy._dst AS uid, buy.amount AS amt
++      | GROUP BY $-.uid
++      YIELD $-.uid AS uid, sum($-.amt) AS sales, count($-.amt) AS n
++      """
++    Then the result should be, in any order, with relax comparison:
++      | uid | sales | n |
++      | 1   | 12    | 2 |
++      | 3   | 9     | 1 |
++    When executing query:
++      """
++      GO FROM 10 OVER buy REVERSELY WHERE buy.ts > 5
++      YIELD buy._dst AS uid, buy.amount AS amt
++      | GROUP BY $-.uid
++      YIELD $-.uid AS uid, min($-.amt) AS lo, max($-.amt) AS hi
++      """
++    Then the result should be, in any order, with relax comparison:
++      | uid | lo | hi |
++      | 1   | 5  | 5  |
++
++  Scenario: empty filter result has no group
++    When executing query:
++      """
++      GO FROM 10, 11 OVER buy REVERSELY WHERE buy.ts > 100
++      YIELD buy._dst AS uid, buy.amount AS amt
++      | GROUP BY $-.uid
++      YIELD $-.uid AS uid, sum($-.amt) AS sales
++      """
++    Then the result should be, in any order, with relax comparison:
++      | uid | sales |

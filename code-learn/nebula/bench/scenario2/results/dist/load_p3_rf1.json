@@ -1,0 +1,80 @@
+{
+  "phase": "load",
+  "tag": "load_p3_rf1",
+  "space": "beauty_p3_rf1",
+  "parts": [
+    [
+      1,
+      "10.88.0.23:9779",
+      "10.88.0.23:9779",
+      ""
+    ],
+    [
+      2,
+      "10.88.0.22:9779",
+      "10.88.0.22:9779",
+      ""
+    ],
+    [
+      3,
+      "10.88.0.21:9779",
+      "10.88.0.21:9779",
+      ""
+    ]
+  ],
+  "replica": 1,
+  "hardware": {
+    "platform": "Linux-6.12.94+-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "python": "3.12.3",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "meminfo": {
+      "MemTotal": "16387280 kB",
+      "MemAvailable": "13204660 kB",
+      "SwapTotal": "0 kB"
+    },
+    "hostname": "cursor"
+  },
+  "dataset": {
+    "users": 800,
+    "items": 200,
+    "edges": 20000,
+    "parts": 3,
+    "cutoff": 1753660800,
+    "beauty_items": 43,
+    "recent_beauty_users": 686,
+    "matching_edges": 1566,
+    "sales_sum": 397318.0
+  },
+  "ok": true,
+  "hosts": [
+    [
+      "10.88.0.21",
+      9779,
+      "ONLINE",
+      4,
+      "beauty_p3_rf1:1, beauty_p9_rf1:3",
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:9",
+      ""
+    ],
+    [
+      "10.88.0.22",
+      9779,
+      "ONLINE",
+      6,
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:2",
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:9",
+      ""
+    ],
+    [
+      "10.88.0.23",
+      9779,
+      "ONLINE",
+      11,
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:7",
+      "beauty_p3_rf1:1, beauty_p9_rf1:3, beauty_p9_rf3:9",
+      ""
+    ]
+  ]
+}

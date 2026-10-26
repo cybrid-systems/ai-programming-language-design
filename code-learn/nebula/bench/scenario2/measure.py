@@ -114,10 +114,42 @@ def q_model(cutoff):
     )
 
 
+def q_model_distinct(cutoff):
+    # DISTINCT is a graphd dedup of the index rows. The index scan itself is unchanged.
+    return (
+        'LOOKUP ON buy WHERE buy.item_type == "beauty" AND buy.ts > '
+        f"{cutoff} YIELD DISTINCT src(edge) AS user"
+    )
+
+
+def q_count(cutoff):
+    # Same scan as q_sales, but COUNT. Partial agg merges counts with SUM.
+    return (
+        'LOOKUP ON item WHERE item.type == "beauty" YIELD id(vertex) AS id '
+        f"| GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > {cutoff} "
+        "YIELD buy._dst AS uid, buy.amount AS amt "
+        "| GROUP BY $-.uid YIELD $-.uid AS uid, count($-.amt) AS n"
+    )
+
+
+def q_by_amount(cutoff):
+    # Group key is the amount, not the dst. The partial-agg rule must leave this
+    # on ExpandAll. Every matching edge is counted once.
+    return (
+        'LOOKUP ON item WHERE item.type == "beauty" YIELD id(vertex) AS id '
+        f"| GO 1 STEP FROM $-.id OVER buy REVERSELY WHERE buy.ts > {cutoff} "
+        "YIELD buy.amount AS amt "
+        "| GROUP BY $-.amt YIELD $-.amt AS amt, count(*) AS n"
+    )
+
+
 QUERIES = {
     "q_users": {"space": STOCK_SPACE, "sql": q_users, "kind": "users"},
     "q_sales": {"space": STOCK_SPACE, "sql": q_sales, "kind": "sales_top"},
+    "q_count": {"space": STOCK_SPACE, "sql": q_count, "kind": "counts"},
+    "q_by_amount": {"space": STOCK_SPACE, "sql": q_by_amount, "kind": "amount_groups"},
     "q_model": {"space": MODEL_SPACE, "sql": q_model, "kind": "users_dup"},
+    "q_model_distinct": {"space": MODEL_SPACE, "sql": q_model_distinct, "kind": "users"},
 }
 
 
@@ -692,10 +724,42 @@ def measure(args, data):
                 resp = execute(session, sql)
                 entry["top_rows"] = rows_of(resp)
                 entry["result_rows"] = resp.row_size()
+            elif spec["kind"] == "counts":
+                resp = execute(session, sql)
+                got = {}
+                for row in rows_of(resp):
+                    got[int(row[0])] = int(row[1])
+                expect = {}
+                for uid, _iid, _rank, ts, _amount, kind in data["edges"]:
+                    if kind == "beauty" and ts > data["cutoff"]:
+                        expect[uid] = expect.get(uid, 0) + 1
+                entry["check"] = {
+                    "ok": got == expect,
+                    "got": len(got),
+                    "expect": len(expect),
+                    "sum_got": int(sum(got.values())),
+                    "sum_expect": int(sum(expect.values())),
+                }
+                entry["result_rows"] = resp.row_size()
+            elif spec["kind"] == "amount_groups":
+                resp = execute(session, sql)
+                got = rows_of(resp)
+                total = 0
+                for row in got:
+                    total += int(row[1])
+                entry["check"] = {
+                    "ok": total == data["matching_edges"],
+                    "groups": len(got),
+                    "sum_got": total,
+                    "sum_expect": data["matching_edges"],
+                }
+                entry["result_rows"] = resp.row_size()
             else:
                 raise RuntimeError(spec["kind"])
             if spec["kind"] == "sales_top":
                 entry["ok"] = entry["sales_check"]["ok"]
+            elif spec["kind"] in ("counts", "amount_groups"):
+                entry["ok"] = entry["check"]["ok"]
             else:
                 entry["ok"] = entry["check"]["ok"]
             if not entry["ok"]:
