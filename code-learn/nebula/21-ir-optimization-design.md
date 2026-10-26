@@ -218,7 +218,7 @@ storaged 到 graphd 的 RPC 若仍是 `DataSet`，wire 不变，省的是解码�
 
 **工作量** 大。`storage.thrift`、`GetNeighborsNode`、`GetNeighborsIter`、各语言的生成代码。生成代码可以后做：新字段是 optional，旧客户端不读它。
 
-**风险** 高，若用「旧进程忽略未知字段」来切换语义。`enable_dst_only_edge_filter` 的注释写了这个失败方式：旧 storaged 不认识新请求字段时，返回的是未过滤的 dst。扁平布局用第 5 节的显式字段，不用这个失败方式。
+**风险** 高，若用「旧进程忽略未知字段」来切换语义。本仓库补丁里 `enable_dst_only_edge_filter` 的注释写了这个失败方式（该 flag 不是 v3.8.0 原有代码，是这份补丁引入的）：旧 storaged 不认识新请求字段时，返回的是未过滤的 dst。扁平布局用第 5 节的显式字段，不用这个失败方式。
 
 ### 3.3 延迟物化
 
@@ -262,7 +262,7 @@ P1 的新布局：
 3. 新 storaged 只有在 bool 为 true 时才填扁平字段，并可以留空嵌套列。旧 storaged 看不到这个字段，嵌套列照旧填满，扁平字段不存在。
 4. 新 graphd 以「响应里扁平字段有值」为准来解码。字段没有值就走今天的 `GetNeighborsIter`。不要在字段缺失时假定对方已经按新语义过滤过。
 
-滚动顺序和 `enable_dst_only_edge_filter` 的注释同一套：先把全部 storaged 换成能识别 optional 字段、默认请求仍走旧响应的版本，再换 graphd，最后打开 flag。回退是把 flag 设回 false 并重启 graphd。已经发出的请求仍带旧字段，storaged 不需要降级。
+滚动顺序和本仓库补丁里 `enable_dst_only_edge_filter` 的注释同一套（该 flag 由这份补丁引入，不是 v3.8.0 既有行为）：先把全部 storaged 换成能识别 optional 字段、默认请求仍走旧响应的版本，再换 graphd，最后打开 flag。回退是把 flag 设回 false 并重启 graphd。已经发出的请求仍带旧字段，storaged 不需要降级。
 
 对外 `ExecutionResponse` 不增加列类型。内部列在 `fillRespData` 展开。
 

@@ -76,7 +76,7 @@ std::unordered_map<std::string, std::vector<Result>> valueMap_;
 
 - 优化关掉，或者输出变量的 `userCount != 0`：`setResult`，行数记进 profile。
 - 优化开着且 `userCount == 0`：这份结果没有读者，不写入 context。日志是 `Drop variable`。
-- 然后调用 `drop()`。
+- 然后在 `FLAGS_enable_lifetime_optimize` 打开时才调用 `drop()`（`Executor.cpp:744-746`）；关掉时输入变量的 `userCount` 不会递减。
 
 `drop` 对每个输入变量 `userCount.fetch_sub(1)`。减到 0 就 `ectx_->dropResult`。`FLAGS_enable_async_gc` 默认 false，直接 `vector::clear()`。打开时把 `vector<Result>` move 进 `GC` 的 `UMPMCQueue`，后台线程释放。`GC` 的注释说这是为了大查询的中间结果不要占着执行线程做析构。
 
@@ -107,7 +107,7 @@ std::unordered_map<std::string, std::vector<Result>> valueMap_;
 | `QueryEngine` 的 `graph-memory-monitor` | 每秒 `MemoryUtils::hitsHighWatermark`，结果放进 `kHitMemoryHighWatermark` |
 | `Executor::open` | 查询节点看到水位已满，返回错误，文案里带 `FLAGS_system_memory_high_watermark_ratio` |
 | `runExecute` 的 `MemoryCheckGuard` | 当前线程上的内存记账。`bad_alloc` 收成 `E_GRAPH_MEMORY_EXCEEDED` |
-| `Iterator::valid` | `checkMemory_` 为真时，`hitsSysMemoryHighWatermark` 会让 `valid()` 变成 false，循环停下来 |
+| `Iterator::valid` | `hitsSysMemoryHighWatermark` **抛 `std::runtime_error`**（`Iterator.cpp:16-30`），不是返回 false。`valid()` 返回的是 `!hitsSysMemoryHighWatermark()`，即 true；水位是让查询以异常中止，不是优雅结束迭代 |
 | storaged `GetNeighborsProcessor::process` | `MemoryCheckScope` 包住 `doProcess`。多 part 并行那条在 `via` 里再套 `MemoryCheckGuard`，超限记 `E_STORAGE_MEMORY_EXCEEDED` |
 
 `StorageClient::collectResponse` 在发 RPC 前用 `MemoryCheckOffGuard`，把各 host 的响应收齐之后再打开 `MemoryCheckGuard`。合并发生在记账重新打开的线程上。
@@ -185,7 +185,7 @@ M TO N 的多跳行在同一个 `result_.rows` 里顺序 append。第 M 步的�
 
 ### 5.2 MATCH
 
-`TraverseExecutor` 的成员 `paths_`：下标是路径长度，表的 key 是终点 VID，value 是到达这个 VID 的 path 集合。一步 RPC 的 `GetNeighborsIter` 用来扩展这张表，然后那份 RPC `Value` 可以在 `drop` 时释放。`buildResult` 在所有步结束之后才把 path 写成 `result_` 的行。
+`TraverseExecutor` 的成员 `dst2PathsMap_`（`VertexMap<Row>`，即 `unordered_map<Value, vector<Row>>`，`TraverseExecutor.h:102`）：按终点 VID 索引的扁平表，value 是到达这个 VID 的 path 集合——**不是**按路径长度分组的数组（`src/graph/` 里 `paths_` 只出现在两处注释里，没有这个成员）。一步 RPC 的 `GetNeighborsIter` 用来扩展这张表，然后那份 RPC `Value` 可以在 `drop` 时释放。`buildResult` 在所有步结束之后才把 path 写成 `result_` 的行。
 
 `TraverseExecutor.h` 给了一条 path 的物理形状：`[Vertex(a), [Edge(a→b), Vertex(b), Edge(b→c), Vertex(c)]]`。这是 trail（边不重复）。GO 的一行没有这条 path 数组，只有当前跳的属性列。
 
@@ -195,9 +195,9 @@ M TO N 的多跳行在同一个 `result_.rows` 里顺序 append。第 M 步的�
 
 | | 一步 GO 的 `ExpandAll` 输出 | 变步 GO 的 `ExpandAll` 输出 | MATCH `Traverse` 输出 |
 |--|----------------------------|-----------------------------|------------------------|
-| 容器 | 一个 `DataSet` | 同一个 `DataSet`，多跳 append | 先 `paths_`，最后一个 `DataSet` |
+| 容器 | 一个 `DataSet` | 同一个 `DataSet`，多跳 append | 先 `dst2PathsMap_`，最后一个 `DataSet` |
 | 一行 | 这一跳的 YIELD 列 | 某一跳的 YIELD 列，列集合相同 | 一条 trail |
-| 中间跳的 VID | 在 `Expand` 的输出变量里，`ExpandAll` 读完后按 `userCount` 释放 | 同左。M 之前的跳只有 VID | 在 `paths_[i]` 里，直到 `buildResult` |
+| 中间跳的 VID | 在 `Expand` 的输出变量里，`ExpandAll` 读完后按 `userCount` 释放 | 同左。M 之前的跳只有 VID | 在 `dst2PathsMap_` 里，直到 `buildResult` |
 | 跨 host | 各 host 的 `DataSet` 放进一个 `List`，游标顺序扫 | 每一步都这样 | 每一步都这样 |
 | 去重 | 语句写了 `DISTINCT` 才有 graphd `Dedup`。`getDstBySrc` 在 host 内去重 dst | 同左 | `Traverse::setDedup` 是存储侧「这个顶点的邻居行」。`RETURN DISTINCT` 另有 graphd `Dedup`，见 [10](10-pushdown-capability.md) |
 

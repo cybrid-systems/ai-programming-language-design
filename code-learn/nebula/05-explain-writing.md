@@ -22,7 +22,7 @@
 |------|----|------|------|
 | `Filter` | `condition` | `Filter::explain` | 仍在 graphd 执行的谓词 |
 | `Limit` | `offset`、`count` | `Limit::explain` | graphd 再截一次。存储拿到的通常是两者之和 |
-| `GetNeighbors` / `Expand` / `Scan*`（`Explore` 子类） | `filter`、`limit` | `Explore::explain` | 执行器会传给 `StorageClient` 的那两个字段 |
+| `GetNeighbors` / `Expand` / `Scan*`（`Explore` 子类） | `filter`、`limit` | `Explore::explain` | 执行器会传给 `StorageClient` 的那两个字段。注意 `Explore::explain` 对**所有** `Explore` 子类都另外吐 `space`、`dedup`、`orderBy`（`Query.cpp:36-44`） |
 | `Traverse` | 上面的 `filter`、`limit`，再加上 `vertex filter`、`edge filter`、`first step filter`、`tag filter` | `Traverse::explain` 调用 `GetNeighbors::explain` 后再追加 | `filter` 进 RPC；`edge filter` / `vertex filter` 在 `TraverseExecutor::expand` 里算 |
 | `AppendVertices` | `vertex_filter` | `AppendVertices::explain` | 点过滤还在 graphd 取点算子上 |
 | `AllPaths` / `BFSShortest` / `MultiShortestPath` | `limit` | `Algo.cpp` 的 `explain` | 最短路是规划器 `setLimit` 写上的；AllPaths 还可能来自 `PushLimitDownAllPathsRule` |
@@ -111,7 +111,7 @@ RETURN v
 LIMIT 10;
 ```
 
-`ScanSeek` 生成 `ScanVertices`。Limit 要靠 `PushLimitDownScanAppendVerticesRule` 穿过 `AppendVertices`：src 是 vid 列，`vFilter` 为空，并且 `ScanVertices` 上不能再挂 filter。没有 LIMIT 时扫描仍会生成，默认 limit 是 `int64` 最大值，**不会**稳定地报笔记中的那句 `-1005`。见 [03](03-limit-pushdown.md)。
+`ScanSeek` 生成 `ScanVertices`。Limit 要靠 `PushLimitDownScanAppendVerticesRule` 穿过 `AppendVertices`：src 是 vid 列，`vFilter` 为空，并且 `ScanVertices` 上不能再挂 filter。没有 LIMIT 时扫描仍会生成，默认 limit 是 **-1**（storage 侧再转成 `int64` 最大值），**不会**稳定地报笔记中的那句 `-1005`。见 [03](03-limit-pushdown.md)。
 
 ```ngql
 FIND SHORTEST PATH FROM "src" TO "dst" OVER follow
@@ -156,7 +156,7 @@ RETURN t;
 | 主要规则是 `PushFilterDownGetNbrsRule`，GO 的边过滤下推到 GetNeighbors | 普通 GO 的计划是 `Filter -> ExpandAll -> Expand`。一步且 `minSteps == maxSteps` 时走 `PushFilterDownExpandAllRule`。`PushFilterDownGetNbrsRule` 只匹配真正的 `GetNeighbors`。 |
 | `PushLimitDownProjectRule` 是 Limit 下推的代表 | 它只把 Limit 从 Project 上面搬到下面。嵌进扫描的是 `PushLimitDownScanEdgesRule`、`PushLimitDownIndexScanRule`、`GetEdgesTransformRule` 等。 |
 | SHORTEST PATH 的 Limit 下推是 3.8 优化器增强 | 3.6.0 已有 `PushLimitDownAllPathsRule`。3.8 新增的是解析器对 `FIND SHORTEST PATH \| LIMIT n`（offset 为 0）的折叠，以及 `PathPlanner::setLimit`。带 offset 不折叠。 |
-| 无 LIMIT 全表扫描报 `-1005: scan vertices or edges need to specify a limit number, or limit number can not push down` | 这句话不在 3.6.0、3.8.0、`release-3.8`、master 中。`-1005` 是 `E_EXECUTION_ERROR`。`Scan*` 默认 limit 为 `int64` 最大值；storage 把负数当作不限制。 |
+| 无 LIMIT 全表扫描报 `-1005: scan vertices or edges need to specify a limit number, or limit number can not push down` | 这句话不在 3.6.0、3.8.0、`release-3.8`、master 中。`-1005` 是 `E_EXECUTION_ERROR`。`Scan*` 在 graphd 侧默认 limit 是 -1；storage 收到负数才当作不限制。 |
 | 函数包裹通常阻碍下推 | 阻碍的是不可下推的参数种类（label、`$$`、`Vertex`、`Edge`）。`abs(follow.degree)` 这类不会被访问器拒绝。 |
 | `all()` 等部分谓词可嵌入 | 只有边上的 `all()`，且不能被 `NOT` 包住。`any()` 不走 `EmbedEdgeAllPredIntoTraverseRule`。 |
 | 属性裁剪来自 Project 规则 | 来自探索之后的 `PrunePropertiesVisitor`。它不访问 `ExpandAll` / `GetNeighbors`。 |

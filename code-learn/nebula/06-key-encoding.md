@@ -32,7 +32,7 @@
 | `kPrime` | 8 | `ConsistUtil::primeTable`，TOSS |
 | `kDoublePrime` | 9 | `ConsistUtil::doublePrimeTable`，TOSS |
 
-`getPart` 把前 4 字节读成 `PartitionID` 再 `>> 8`。小端上这等于把后三个字节拼回 partId。partId 只占高 24 位，代码没有再对 partId 做掩码。分区号在实际建空间时远小于 2^24，超出这个宽度会和 type 重叠；源码里没有看到单独的上限检查。
+`getPart` 把前 4 字节读成 `PartitionID` 再 `>> 8`。小端上这等于把后三个字节拼回 partId。partId 只占高 24 位，代码没有再对 partId 做掩码。分区号在实际建空间时远小于 2^24，超出这个宽度会截断 partId 自己的高位（不会和 type 重叠——type 固定在低 8 位）；源码里没有看到单独的上限检查。
 
 小端上的 4 字节头：
 
@@ -141,7 +141,7 @@ rank ^= 1 << 63
 
 `NebulaSystemKeyType`：commit = 1，part = 2，balance = 3。它们是 storaged 分区内部的系统行，不是 metad 的 schema。
 
-TOSS（`IsolationLevel::TOSS`）只在插入边时由 `InsertEdgesValidator::toPlan` 打开 `useChainInsert`。prime key 是「本 part 的 prime 前缀 + 一条 edge key」。恢复时 `edgeKeyFromPrime` 丢掉前 4 字节。锁和 prime 的状态机不在本文展开；key 的形状就这些。
+TOSS（`IsolationLevel::TOSS`）在 `InsertEdgesValidator::toPlan` 里会把 `useChainInsert` 置 true——但 **v3.8.0 里这个标记没有读者**：`useChainInsert()` 零调用者，`InsertEdgesExecutor` 硬编码 `useExperimentalFeature=false`，所以 INSERT EDGE 实际走不到 chain processor，prime key 也不会被写。prime key 是「本 part 的 prime 前缀 + 一条 edge key」。恢复时 `edgeKeyFromPrime` 丢掉前 4 字节。锁和 prime 的状态机不在本文展开；key 的形状就这些。
 
 ---
 
@@ -158,7 +158,7 @@ metad 不走 `NebulaKeyType`。`MetaKeyUtils.cpp` 的 `tableMaps` / `systemTable
 | `__indexes__` | spaceId + indexId |
 | `__users__`、`__zones__`、`__leaders__` 等 | 账号、zone、leader |
 
-`schemaTagKey` 是 `__tags__` + `GraphSpaceID` + `TagID` + `SchemaVer`，整数都是主机序。`CreateTagProcessor` 写 version 0。`AlterTagProcessor` 取当前最大 version 再 `+ 1`，插入新 key，不改旧 key。旧数据行怎么对着这些版本读，见 [07](07-row-encoding.md)。
+`schemaTagKey` 是 `__tags__` + `GraphSpaceID` + `TagID` + `SchemaVer`，整数都是主机序——但版本号存的是**反转值**（`max() - version`，`MetaKeyUtils.cpp:596-605`），所以更新的版本排在前面。`CreateTagProcessor` 写 version 0。`AlterTagProcessor` 取当前最大 version 再 `+ 1`，插入新 key，不改旧 key。旧数据行怎么对着这些版本读，见 [07](07-row-encoding.md)。
 
 ---
 

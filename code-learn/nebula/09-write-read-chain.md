@@ -70,13 +70,13 @@ sequenceDiagram
 
 `AddEdgesProcessor` 对每条 `EdgeKey` 调用 `edgeKey`，value 仍是 `encodeRowVal`。反向边是独立的一行，schema 用 `abs(edge_type)` 找。rank 在 key 里经过 `encodeRank`，不在 value 里再存一份。
 
-`IsolationLevel::TOSS` 时 `toPlan` 把 `useChainInsert` 设为 true，写入改走 chain processor，并额外写 `ConsistUtil::primeKey` / `doublePrime`。key 的形状见 [06](06-key-encoding.md)。默认隔离级别不是 TOSS。
+`IsolationLevel::TOSS` 时 `toPlan` 会把 `useChainInsert` 设为 true——但在 **v3.8.0 里这个标记没有读者**：`useChainInsert()` 零调用者，`InsertEdgesExecutor` 硬编码 `useExperimentalFeature=false`（`InsertExecutor.cpp:58`），所以 INSERT EDGE 实际仍走 `future_addEdges`，**不会**改走 chain processor，也不会写 `ConsistUtil::primeKey` / `doublePrime`。key 的形状见 [06](06-key-encoding.md)。默认隔离级别不是 TOSS。
 
 ---
 
 ## 3. FETCH 与 GO 怎么读回来
 
-FETCH 走 `getProps`。`GetPropNode` 用 `tagKey` 或 `edgeKey` 取 value，`RowReaderWrapper::getTagPropReader` 按行内 schema version 选历史 schema，`QueryUtils::readValue` 解出 `Value`。TTL 过期的 tag 被跳过。整数 VID 在结果第一列被还原成 `int64`（`GetPropNode` 与 `GetNeighborsNode` 同一写法）。
+FETCH 走 `getProps`。顶点/标签行由 `GetPropNode` 经 `tagKey` 取 value；边属性另走 `FetchEdgeNode` / `edgeKey`（`GetPropProcessor.cpp:247-252`），`RowReaderWrapper::getTagPropReader` 按行内 schema version 选历史 schema，`QueryUtils::readValue` 解出 `Value`。TTL 过期的 tag 被跳过。整数 VID 在结果第一列被还原成 `int64`（`GetPropNode` 与 `GetNeighborsNode` 同一写法）。
 
 GO 的一跳在存储侧是 `GetNeighbors`。`GetNeighborsNode::doExecute`：
 
@@ -90,7 +90,7 @@ GO 的一跳在存储侧是 `GetNeighbors`。`GetNeighborsNode::doExecute`：
 
 ## 4. 索引扫描
 
-LOOKUP 在 storaged 是 `LookupProcessor` → `IndexScanNode`。
+LOOKUP 在 storaged 是 `LookupProcessor` → `IndexVertexScanNode` / `IndexEdgeScanNode`（`IndexScanNode` 的两个子类，`LookupProcessor.cpp:189-208`）。
 
 1. `indexPrefix(partId, indexId)` 加上谓词能确定的列前缀。列的编码规则见 [08](08-index-key-encoding.md)。字符串只用索引长度那一段，后面的原文不在 key 里。
 2. 地理列是多条 S2 cell 前缀，key 里没有原始 Geography。

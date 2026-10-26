@@ -277,7 +277,7 @@ truncate_clause
 
 - 没有 SAMPLE / LIMIT，有 `DISTINCT`，没有 WHERE
 - 没有起点 tag、没有终点 tag
-- 边属性若出现，只能是 `_dst`
+- 边属性若出现，**多属性**时必须含 `_dst`（`GoValidator.cpp:301` 的判据是 `props.size() != 1 && props.find(kDst) == props.end()` 才返回 false）——单个非 `_dst` 边属性能过这一关，靠后面的 yield 列检查拒掉
 - YIELD 的每一列 kind 都是 `kEdgeDst`，并且要么写成 `*`，要么 `OVER` 只有一种边
 
 有 WHERE 就不是 simple。场景二那条带 `buy.ts` 和 `amount` 的语句因此走 `doPlan`，见 [11](11-scenario2-beauty-buyers.md)。`id($$)` 在 `isSimpleCase` 执行前已经被改成 `kEdgeDst`；`dst(edge)` 这个函数调用不会被改写，kind 对不上，也不是 simple。

@@ -47,7 +47,7 @@
 
 - 过滤：`toBool()` 不是 true 就丢边，和 `FilterNode::checkTagAndEdge` 一致。NULL 比较得到 NULL，边被丢掉。
 - `SUM` / `COUNT`：和 `AggFunctionManager` 一样，状态从 NULL 收成 0，然后跳过 NULL 和 empty；非数值 `SUM` 变成 bad null，之后不再累加。
-- `MIN` / `MAX`：跳过 NULL 和 empty，状态保持 NULL 直到第一个可比较的值。
+- `MIN` / `MAX`：跳过 NULL 和 empty，状态保持 `Value::__EMPTY__`（**不是 NULL**，`Value.h:86`；`partialUninitialized` 把 empty 和 null 一视同仁）直到第一个可比较的值。
 - `COUNT(*)` 在计划里是常量 `"*"`。常量非空，每条通过过滤的边加 1。这和 graphd 对 `COUNT(常量)` 的计数一致，也和「跳过 NULL 属性」的 `COUNT(buy.amount)` 不同。
 
 `now()` 的拒绝是相对上一份补丁的行为变化。上一份 visitor 会让 `buy.ts > now()` 整句下推，每台 storaged 各调一次 `now()`。时钟接近时结果差不多，但不是同一常量。要下推，先在 graphd 把 `now()` 折成字面量。美妆压测用的就是字面量 `1753660800`。
@@ -72,7 +72,7 @@
 
 `getDstBySrc` 在没有聚合时只投影 `_dst`，host 内去重，graphd `Dedup` 再并 host。这就是上一份补丁。
 
-有部分聚合时，投影是 `_dst` 加每个聚合一列（`_pa0`…）。跨源点、跨 part 的「去重」变成按 dst 合并部分状态，不是 VID 集合。同一个用户在多个 part 上各有一行部分和，graphd 的 `Aggregate` 再加总。不能在 storage 把用户 VID 去重后丢掉 `amount`。
+有部分聚合时，graphd 侧的投影是 `_dst` 加每个聚合一列（`_pa0`…）；storage 返回的列名却是 `_agg0`…（`GetDstBySrcProcessor`），graphd 按位置覆盖 `colNames`，值数一致，不影响结果。跨源点、跨 part 的「去重」变成按 dst 合并部分状态，不是 VID 集合。同一个用户在多个 part 上各有一行部分和，graphd 的 `Aggregate` 再加总。不能在 storage 把用户 VID 去重后丢掉 `amount`。
 
 属性裁剪（`PrunePropertiesVisitor`）仍不访问 `Expand` / `ExpandAll`。本阶段的裁剪是规则自己只把聚合参数和 `_dst` 放进 RPC，不靠那次后处理。
 
@@ -140,7 +140,7 @@ host 内多个 part 的 map 在 `GetDstBySrcProcessor::mergePartialGroups` 合�
 - `GetDstBySrcRequest.aggs`：可选的 `list<PartialEdgeAgg>`（`op` + `Expression::encode`）
 - `GetDstBySrcResponse.partial_agg`：可选 bool，默认不置位
 
-旧 storaged 忽略未知字段，回的是 dst VID，`partial_agg` 不在响应里。graphd `ExpandExecutor::partialAgg` 看到任一台没有把该位置上，就 **丢掉这批 VID**，用同一批源 VID 再发 `getNeighbors`（带原来的 filter 和 `edgeProps`），在 graphd 上按 dst 做成同样的部分行，再交给上面的合并 `Aggregate`。结果与未下推一致，只是少了少传字节的收益，并且多一次 RPC。
+旧 storaged 忽略未知字段，回的是 dst VID，`partial_agg` 不在响应里。graphd `ExpandExecutor::partialAgg` 看到任一台没有把该位置上，就置 `partial_agg_applied=0`（并不丢响应行），用保存的同一批源 VID 再发 `getNeighbors`（带原来的 filter 和 `edgeProps`），在 graphd 上按 dst 做成同样的部分行，再交给上面的合并 `Aggregate`。结果与未下推一致，只是少了少传字节的收益，并且多一次 RPC。
 
 不把「dst VID 列表」当成部分和。上一份过滤字段没有这个回应位，旧 storaged 会静默返回未过滤的 dst，所以那个开关要求整集群升级。聚合这条用回应位避免同类错误。
 
@@ -191,7 +191,7 @@ Aggregate          -- 分组键 _dst；SUM 合并 SUM，COUNT 合并 SUM，MIN/M
 
 `HashInnerJoin` 可以拿掉，是因为 `GO FROM $-.id` 的扫描输入已经是左表的 VID，内连接不再丢行（没有边的 VID 本来也不会产生分组）。分组键或聚合参数若还引用左表的其它列（例如商品名），规则不匹配，连接留着。
 
-管道 `LOOKUP | GO | GROUP BY | ORDER BY | LIMIT` 在过滤被 `PushFilterDownExpandAllRule` 写进 `ExpandAll.filter` 之后，下一轮才能匹配。规则列表里部分聚合写在过滤规则后面，探索又是自底向上，同一轮里过滤先落进 `ExpandAll`。
+管道 `LOOKUP | GO | GROUP BY | ORDER BY | LIMIT` 在过滤被 `PushFilterDownExpandAllRule` 写进 `ExpandAll.filter` 之后，下一轮才能匹配。部分聚合规则在 `CMakeLists.txt` 里排在过滤规则**前面**（规则自注册按链接序，所以它**先**注册）；真正让它在下一轮匹配上的是优化器迭代到不动点（`Optimizer.cpp:76-96`），不是规则顺序。
 
 不匹配时计划与打开开关之前相同。`AVG`、多步、`DISTINCT` 聚合、分组键不是 `_dst`、谓词含 `now()` 或 tag，都走这条退路。
 

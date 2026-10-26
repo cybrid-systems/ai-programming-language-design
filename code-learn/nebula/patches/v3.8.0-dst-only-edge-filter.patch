@@ -1,5 +1,5 @@
 diff --git a/conf/nebula-graphd.conf.default b/conf/nebula-graphd.conf.default
-index 57c8fbd..3446763 100644
+index d57d3f8a2..09e192b4f 100644
 --- a/conf/nebula-graphd.conf.default
 +++ b/conf/nebula-graphd.conf.default
 @@ -5,6 +5,9 @@
@@ -13,7 +13,7 @@ index 57c8fbd..3446763 100644
  --default_charset=utf8
  # The default collate when a space is created
 diff --git a/conf/nebula-graphd.conf.production b/conf/nebula-graphd.conf.production
-index f4e9cd2..7dd089e 100644
+index f4e9cd2fd..7dd089e85 100644
 --- a/conf/nebula-graphd.conf.production
 +++ b/conf/nebula-graphd.conf.production
 @@ -5,6 +5,9 @@
@@ -27,7 +27,7 @@ index f4e9cd2..7dd089e 100644
  --heartbeat_interval_secs=10
  # Whether to use the configuration obtained from the configuration file
 diff --git a/conf/nebula-standalone.conf.default b/conf/nebula-standalone.conf.default
-index fc299a2..d3ee66c 100644
+index e5f7a449e..9d7e15d47 100644
 --- a/conf/nebula-standalone.conf.default
 +++ b/conf/nebula-standalone.conf.default
 @@ -5,6 +5,9 @@
@@ -41,7 +41,7 @@ index fc299a2..d3ee66c 100644
  --default_charset=utf8
  # The defaule collate when a space is created
 diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
-index a86032b..9303a34 100644
+index a86032b94..9303a34a1 100644
 --- a/src/clients/storage/StorageClient.cpp
 +++ b/src/clients/storage/StorageClient.cpp
 @@ -114,7 +114,8 @@ StorageRpcRespFuture<cpp2::GetNeighborsResponse> StorageClient::getNeighbors(
@@ -65,7 +65,7 @@ index a86032b..9303a34 100644
  
    return collectResponse(param.evb,
 diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
-index f60dc77..95fef4a 100644
+index f60dc7772..95fef4a40 100644
 --- a/src/clients/storage/StorageClient.h
 +++ b/src/clients/storage/StorageClient.h
 @@ -84,7 +84,8 @@ class StorageClient
@@ -79,7 +79,7 @@ index f60dc77..95fef4a 100644
    StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
        const CommonRequestParam& param,
 diff --git a/src/graph/context/ast/QueryAstContext.h b/src/graph/context/ast/QueryAstContext.h
-index 36057a0..b316def 100644
+index 36057a0fb..b316def9e 100644
 --- a/src/graph/context/ast/QueryAstContext.h
 +++ b/src/graph/context/ast/QueryAstContext.h
 @@ -82,6 +82,9 @@ struct GoContext final : AstContext {
@@ -93,7 +93,7 @@ index 36057a0..b316def 100644
    bool distinct{false};
    // true: sample, false: limit
 diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
-index edb388f..2a7780c 100644
+index edb388f0e..2a7780c1c 100644
 --- a/src/graph/executor/query/ExpandExecutor.cpp
 +++ b/src/graph/executor/query/ExpandExecutor.cpp
 @@ -76,7 +76,8 @@ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
@@ -107,7 +107,7 @@ index edb388f..2a7780c 100644
        .ensure([this, getDstTime]() {
          SCOPED_TIMER(&execTime_);
 diff --git a/src/graph/optimizer/test/CMakeLists.txt b/src/graph/optimizer/test/CMakeLists.txt
-index 03c5654..68c90e7 100644
+index 03c565479..68c90e74c 100644
 --- a/src/graph/optimizer/test/CMakeLists.txt
 +++ b/src/graph/optimizer/test/CMakeLists.txt
 @@ -63,6 +63,21 @@ set(OPTIMIZER_TEST_LIB
@@ -134,7 +134,7 @@ index 03c5654..68c90e7 100644
          index_scan_rule_test
 diff --git a/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
 new file mode 100644
-index 0000000..2c386d5
+index 000000000..2c386d557
 --- /dev/null
 +++ b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
 @@ -0,0 +1,95 @@
@@ -234,7 +234,7 @@ index 0000000..2c386d5
 +}  // namespace graph
 +}  // namespace nebula
 diff --git a/src/graph/planner/ngql/GoPlanner.cpp b/src/graph/planner/ngql/GoPlanner.cpp
-index 3f9b36e..594ba2c 100644
+index 3f9b36e66..594ba2c41 100644
 --- a/src/graph/planner/ngql/GoPlanner.cpp
 +++ b/src/graph/planner/ngql/GoPlanner.cpp
 @@ -160,6 +160,12 @@ SubPlan GoPlanner::doSimplePlan() {
@@ -251,7 +251,7 @@ index 3f9b36e..594ba2c 100644
    auto dep = expand;
    if (minStep != maxStep) {
 diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
-index 662d7a5..164d6a5 100644
+index 662d7a532..164d6a58d 100644
 --- a/src/graph/service/GraphFlags.cpp
 +++ b/src/graph/service/GraphFlags.cpp
 @@ -62,6 +62,12 @@ DEFINE_int64(max_allowed_connections,
@@ -268,7 +268,7 @@ index 662d7a5..164d6a5 100644
  #ifndef BUILD_STANDALONE
  DEFINE_uint32(ft_request_retry_times, 3, "Retry times if fulltext request failed");
 diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
-index 8713911..6c0cec1 100644
+index 871391131..6c0cec166 100644
 --- a/src/graph/service/GraphFlags.h
 +++ b/src/graph/service/GraphFlags.h
 @@ -53,6 +53,10 @@ DECLARE_uint32(password_lock_time_in_secs);
@@ -284,10 +284,10 @@ index 8713911..6c0cec1 100644
  
 diff --git a/src/graph/util/DstOnlyEdgeFilter.h b/src/graph/util/DstOnlyEdgeFilter.h
 new file mode 100644
-index 0000000..12c8cab
+index 000000000..2fbe46159
 --- /dev/null
 +++ b/src/graph/util/DstOnlyEdgeFilter.h
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,151 @@
 +/* Copyright (c) 2026 vesoft inc. All rights reserved.
 + *
 + * This source code is licensed under Apache 2.0 License.
@@ -308,6 +308,7 @@ index 0000000..12c8cab
 +// expressions stay on the GetNeighbors plan.
 +class DstOnlyEdgeFilterVisitor final : public ExprVisitorImpl {
 + public:
++  using ExprVisitorImpl::visit;
 +  bool canPush() const {
 +    return !rejected_;
 +  }
@@ -439,7 +440,7 @@ index 0000000..12c8cab
 +
 +#endif  // GRAPH_UTIL_DSTONLYEDGEFILTER_H_
 diff --git a/src/graph/validator/GoValidator.cpp b/src/graph/validator/GoValidator.cpp
-index 518a017..ef3aeb9 100644
+index 518a01794..ef3aeb9b6 100644
 --- a/src/graph/validator/GoValidator.cpp
 +++ b/src/graph/validator/GoValidator.cpp
 @@ -6,6 +6,8 @@
@@ -490,7 +491,7 @@ index 518a017..ef3aeb9 100644
    // 1. src tag props,
    // 2. or edge props, except the dst id of edge.
 diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
-index 2a95ba3..9519414 100644
+index 2a95ba3ee..951941475 100644
 --- a/src/interface/storage.thrift
 +++ b/src/interface/storage.thrift
 @@ -247,6 +247,11 @@ struct GetDstBySrcRequest {
@@ -506,7 +507,7 @@ index 2a95ba3..9519414 100644
  
  struct GetDstBySrcResponse {
 diff --git a/src/storage/exec/GetDstBySrcNode.h b/src/storage/exec/GetDstBySrcNode.h
-index 33f841c..893ce9d 100644
+index 33f841c4a..893ce9d1d 100644
 --- a/src/storage/exec/GetDstBySrcNode.h
 +++ b/src/storage/exec/GetDstBySrcNode.h
 @@ -7,6 +7,8 @@
@@ -598,7 +599,7 @@ index 33f841c..893ce9d 100644
  
  }  // namespace storage
 diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
-index 9c89662..9a755c3 100644
+index 9c8966206..9a755c386 100644
 --- a/src/storage/query/GetDstBySrcProcessor.cpp
 +++ b/src/storage/query/GetDstBySrcProcessor.cpp
 @@ -7,6 +7,13 @@
@@ -843,7 +844,7 @@ index 9c89662..9a755c3 100644
  }
  
 diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
-index 11e9944..d5e34d8 100644
+index 11e994474..d5e34d8eb 100644
 --- a/src/storage/query/GetDstBySrcProcessor.h
 +++ b/src/storage/query/GetDstBySrcProcessor.h
 @@ -9,7 +9,10 @@

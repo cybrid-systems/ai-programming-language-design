@@ -98,7 +98,7 @@ YIELD src(edge) AS user
 
 两套时间：
 
-- **server**：`ResultSet.latency()`，即 graphd 写进响应的 `latencyInUs`。`RequestContext` 在 `GraphService::future_executeWithParameter` 入口构造，计时包含这次调用在 graphd 里的停留，不只是某个算子的 `exec`。
+- **server**：`ResultSet.latency()`，即 graphd 写进响应的 `latencyInUs`（响应里的 `latency_in_us` 字段，`graph.thrift:83`；`ResultSet` 本身是客户端 SDK 的类，不在这棵树里，能核的是字段与写入点 `QueryInstance.cpp:135`）。`RequestContext` 在 `GraphService::future_executeWithParameter` 入口构造，计时包含这次调用在 graphd 里的停留，不只是某个算子的 `exec`。
 - **client**：`session.execute` 前后的墙钟，含 Python 把结果解码出来的时间。
 - **QPS**：成功次数 /（所有 worker 过 barrier 之后，最早开始到最晚结束）。预热不在这个窗口里。这是这个 Python 客户端的端到端吞吐，不是 storaged 内部的算子吞吐。
 

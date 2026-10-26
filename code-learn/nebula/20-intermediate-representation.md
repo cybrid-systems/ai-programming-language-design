@@ -133,7 +133,7 @@ storaged 侧两条路径：
 | 算子 | 输出 | 堆（glibc） | Thrift |
 |------|------|-------------|--------|
 | storaged `IndexEdgeScanNode` → `IndexProjectionNode` | 七列，顺序同上。四个 key 字段和 `ts` 是 INT，`amount` 是 double，`item_type` 是 STRING `"beauty"` | part 的 `deque` 装下全部 40415 行：**7,477,616**。移进不 `reserve` 的 `vector` 之后，两者重叠的峰值 **9,836,928**；deque 清空后 vector **8,080,792**，容量 65536，cell 容量 7 | `DataSet` **3,839,533**；`LookupIndexResp` **3,839,580** |
-| graphd `IndexScanExecutor` | 同一批行。`insert` 已知长度，容量按 40415 而不是 65536 | **7,436,568** | — |
+| graphd `IndexScanExecutor` | 同一批行。源码里没有 `reserve`（`IndexScanExecutor.cpp:112` 只有 `insert`），40415 这个容量是 libstdc++ `vector::insert` 的增长副作用，不是源码保证 | **7,436,568** | — |
 | `Project`（`src(EDGE) AS user`） | 一列 INT | **1,940,048**，容量 40415 | `DataSet` **848,740**；`ExecutionResponse` **848,762** |
 
 投影之前，输入的七列和输出的一列同时在：`7436568 + 1940048 = 9,376,616` 字节（两个实测相加）。`userCount` 到 0 之后七列被 drop。
@@ -144,7 +144,7 @@ storaged 侧两条路径：
 
 [12](12-scenario2-bench.md) 的 PROFILE：`Expand` 4000，`vertices: 4000`，没有 `ExpandAll`。单 storaged 上 host 内去重就是全局的 4000。多 host 时每个 host 各去重一次，graphd 的 `Dedup` 还在；host 数未知，本文不外推行数。
 
-`GetDstBySrcResponse.dsts` 是一列 `_dst`。去重前 `flatResult_` 有 40415 个 INT。实测：这个 vector（容量 65536）**1,048,584**；加上 `std::unordered_set<Val>`（同样不是 robin_hood）**1,545,264**；再加 4000 行输出 **1,737,272**。响应 Thrift **84,052**。相对 flag 关的 `GetNeighbors` 响应 1,509,200，应用层大约小 18 倍。补丁没有改这个 `DataSet` 的形状，只是让这条语句走到它。
+`GetDstBySrcResponse.dsts` 是一列 `_dst`。去重前 `flatResult_` 有 40415 个 INT。实测：这个 vector（容量 65536）**1,048,584**；加上 `std::unordered_set<Val>`（生产路径用的是 robin_hood：`GetDstBySrcProcessor.cpp:282`）**1,545,264**；再加 4000 行输出 **1,737,272**。响应 Thrift **84,052**。相对 flag 关的 `GetNeighbors` 响应 1,509,200，应用层大约小 18 倍。补丁没有改这个 `DataSet` 的形状，只是让这条语句走到它。
 
 ---
 

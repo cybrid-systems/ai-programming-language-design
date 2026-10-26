@@ -34,7 +34,7 @@ Filter 下推做的事情是：把 `Filter` 算子上的谓词拆开，能在存
 | `PushFilterDownNodeRule` | 单个 `Traverse` 或 `AppendVertices` | 已有 `vFilter` | 可下推的部分进 `firstStepFilter` 或 `AppendVertices::filter`，其余留在 `vFilter` |
 | `PushFilterDownScanVerticesRule` | `Filter -> ScanVertices` | 无 | `ScanVertices::setFilter`，visitor 用 `kGetVertices` |
 | `PushVFilterDownScanVerticesRule` | `AppendVertices -> ScanVertices` | src 是 vid 列，且 `vFilter` 里没有 `*` tag | `vFilter` 与 `filter` 并入 `ScanVertices::filter` |
-| `PushFilterDownAllPathsRule` | `Filter -> AllPaths` | 子表达式可下推 | `AllPaths::setFilter` |
+| `PushFilterDownAllPathsRule` | `Filter -> AllPaths` | `edgeProps` 非空（和 GetNbrs/ExpandAll 同一道门）；子表达式可下推在 `transform` 里再查 | `AllPaths::setFilter` |
 | `PushFilterDownProjectRule` | `Filter -> Project` | 穿过 Project | 不直接进 storage |
 | `PushFilterThroughAppendVerticesRule` | `Filter -> AppendVertices` | 穿过取点 | 不直接进 storage |
 
@@ -81,7 +81,7 @@ GetNeighbors ($^.player.age>3)
 
 - `src(e)`、`dst(e)`、`properties(e)` 的参数是 `Label` 或 `Edge`，**不能**下推。
 - `id($$)`、`properties($$)` 碰到 `Vertex` / `DestProperty`，在 `kGetNeighbors` 下**不能**下推。
-- `follow._src`、`follow._dst`、`follow.degree` 在解析器里就是 `EdgeSrcIdExpression` / `EdgeDstIdExpression` / `EdgePropertyExpression`（`src/parser/parser.yy` 的 `edge_prop_expression`），**可以**下推。
+- `follow._src`、`follow._dst` 在解析器里就是 `EdgeSrcIdExpression` / `EdgeDstIdExpression`（`src/parser/parser.yy` 的 `edge_prop_expression`），**可以**下推。`follow.degree` 不是：`edge_prop_expression` 只产 Type/SrcId/DstId/Rank 四个，`follow.degree` 走 `name_label DOT name_label`（`parser.yy:849`）先成 `LabelAttributeExpression`，之后由 `rewriteLabelAttr2EdgeProp`（`GoValidator.cpp:77`）才改写成边属性。可下推性不变。
 - `abs(follow.degree)` 这种包住边属性的函数，访问器会认为可以下推。storage 的 `checkExp` 对 `kFunctionCall` 也只递归参数，不维护函数黑名单。能不能算对，取决于 storaged 的表达式求值里有没有这个函数，而不是优化器拒收。
 
 `NOT (A AND B)` / `NOT (A OR B)` 被显式拒绝：注释写明这种 NOT 本应先被化简，没化简就下推会产生错误结果（`ExtractFilterExprVisitor::visit(UnaryExpression)`）。

@@ -84,7 +84,7 @@ storageClient->scanVertex(param, *sv->props(), sv->limit(), sv->filter());
 
 `StorageClient::scanEdge` / `scanVertex` 把 limit 和 `filter->encode()` 放进 `ScanEdgeRequest` / `ScanVertexRequest` 的 `limit` 与 `filter` 字段。
 
-`StorageClient::getProps` 同样：`req.limit_ref() = limit`，`req.filter_ref() = filter->encode()`。`PushLimitDownGetVerticesRule`、`PushLimitDownGetEdgesRule`、`PushVFilterDownScanVerticesRule` 写在算子上的值从这里进 `GetPropProcessor`。
+`StorageClient::getProps` 同样：`req.limit_ref() = limit`，`req.filter_ref() = filter->encode()`。`PushLimitDownGetVerticesRule`、`PushLimitDownGetEdgesRule` 写在算子上的值从这里进 `GetPropProcessor`。`PushVFilterDownScanVerticesRule` 不一样：它写的是 `ScanVertices::setFilter`，走 **scanVertex** 路径（`StorageClient.cpp:270-272` → `ScanVertexProcessor`），不进 `GetPropProcessor`。
 
 ---
 

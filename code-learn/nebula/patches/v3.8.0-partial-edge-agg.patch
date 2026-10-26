@@ -1,5 +1,5 @@
 diff --git a/conf/nebula-graphd.conf.default b/conf/nebula-graphd.conf.default
-index 09e192b..bf76a6c 100644
+index 09e192b4f..bf76a6c70 100644
 --- a/conf/nebula-graphd.conf.default
 +++ b/conf/nebula-graphd.conf.default
 @@ -8,6 +8,10 @@
@@ -14,7 +14,7 @@ index 09e192b..bf76a6c 100644
  --default_charset=utf8
  # The default collate when a space is created
 diff --git a/conf/nebula-graphd.conf.production b/conf/nebula-graphd.conf.production
-index 7dd089e..ff31633 100644
+index 7dd089e85..ff316330a 100644
 --- a/conf/nebula-graphd.conf.production
 +++ b/conf/nebula-graphd.conf.production
 @@ -8,6 +8,7 @@
@@ -26,7 +26,7 @@ index 7dd089e..ff31633 100644
  --heartbeat_interval_secs=10
  # Whether to use the configuration obtained from the configuration file
 diff --git a/conf/nebula-standalone.conf.default b/conf/nebula-standalone.conf.default
-index 9d7e15d..ec726bc 100644
+index 9d7e15d47..ec726bc07 100644
 --- a/conf/nebula-standalone.conf.default
 +++ b/conf/nebula-standalone.conf.default
 @@ -8,6 +8,7 @@
@@ -38,7 +38,7 @@ index 9d7e15d..ec726bc 100644
  --default_charset=utf8
  # The defaule collate when a space is created
 diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
-index 9303a34..577a8ce 100644
+index 9303a34a1..577a8ce31 100644
 --- a/src/clients/storage/StorageClient.cpp
 +++ b/src/clients/storage/StorageClient.cpp
 @@ -115,7 +115,8 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
@@ -62,7 +62,7 @@ index 9303a34..577a8ce 100644
  
    return collectResponse(param.evb,
 diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
-index 95fef4a..a3b03f1 100644
+index 95fef4a40..a3b03f195 100644
 --- a/src/clients/storage/StorageClient.h
 +++ b/src/clients/storage/StorageClient.h
 @@ -85,7 +85,8 @@ class StorageClient
@@ -76,8 +76,9 @@ index 95fef4a..a3b03f1 100644
    StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
        const CommonRequestParam& param,
 diff --git a/src/common/function/PartialAgg.h b/src/common/function/PartialAgg.h
-index e69de29..cd6f8b0 100644
---- a/src/common/function/PartialAgg.h
+new file mode 100644
+index 000000000..cd6f8b032
+--- /dev/null
 +++ b/src/common/function/PartialAgg.h
 @@ -0,0 +1,136 @@
 +/* Copyright (c) 2026 vesoft inc. All rights reserved.
@@ -217,7 +218,7 @@ index e69de29..cd6f8b0 100644
 +
 +#endif  // COMMON_FUNCTION_PARTIALAGG_H_
 diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
-index 2a7780c..69202de 100644
+index 2a7780c1c..69202dee1 100644
 --- a/src/graph/executor/query/ExpandExecutor.cpp
 +++ b/src/graph/executor/query/ExpandExecutor.cpp
 @@ -4,7 +4,12 @@
@@ -419,7 +420,7 @@ index 2a7780c..69202de 100644
  }  // namespace graph
  }  // namespace nebula
 diff --git a/src/graph/executor/query/ExpandExecutor.h b/src/graph/executor/query/ExpandExecutor.h
-index 8ac3dfa..300c404 100644
+index 8ac3dfac9..300c40440 100644
 --- a/src/graph/executor/query/ExpandExecutor.h
 +++ b/src/graph/executor/query/ExpandExecutor.h
 @@ -43,6 +43,13 @@ class ExpandExecutor final : public StorageAccessExecutor {
@@ -447,7 +448,7 @@ index 8ac3dfa..300c404 100644
    std::unordered_map<Value, std::unordered_set<Value>> adjDsts_;
  
 diff --git a/src/graph/optimizer/CMakeLists.txt b/src/graph/optimizer/CMakeLists.txt
-index c1eb342..159548f 100644
+index c1eb34290..159548f0c 100644
 --- a/src/graph/optimizer/CMakeLists.txt
 +++ b/src/graph/optimizer/CMakeLists.txt
 @@ -31,6 +31,7 @@ nebula_add_library(
@@ -459,8 +460,9 @@ index c1eb342..159548f 100644
      rule/PushFilterDownExpandAllRule.cpp
      rule/PushFilterDownAllPathsRule.cpp
 diff --git a/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp b/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
-index e69de29..0db52a8 100644
---- a/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
+new file mode 100644
+index 000000000..0db52a8b3
+--- /dev/null
 +++ b/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
 @@ -0,0 +1,419 @@
 +/* Copyright (c) 2026 vesoft inc. All rights reserved.
@@ -883,8 +885,9 @@ index e69de29..0db52a8 100644
 +}  // namespace opt
 +}  // namespace nebula
 diff --git a/src/graph/optimizer/rule/PushPartialEdgeAggRule.h b/src/graph/optimizer/rule/PushPartialEdgeAggRule.h
-index e69de29..e3108f4 100644
---- a/src/graph/optimizer/rule/PushPartialEdgeAggRule.h
+new file mode 100644
+index 000000000..e3108f47d
+--- /dev/null
 +++ b/src/graph/optimizer/rule/PushPartialEdgeAggRule.h
 @@ -0,0 +1,54 @@
 +/* Copyright (c) 2026 vesoft inc. All rights reserved.
@@ -942,7 +945,7 @@ index e69de29..e3108f4 100644
 +
 +#endif  // GRAPH_OPTIMIZER_RULE_PUSHPARTIALEDGEAGGRULE_H_
 diff --git a/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
-index 2c386d5..8db6f06 100644
+index 2c386d557..8db6f0685 100644
 --- a/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
 +++ b/src/graph/optimizer/test/DstOnlyEdgeFilterTest.cpp
 @@ -11,7 +11,9 @@
@@ -1074,7 +1077,7 @@ index 2c386d5..8db6f06 100644
    auto* expr = RelationalExpression::makeGT(
        &pool_,
 diff --git a/src/graph/planner/plan/Query.cpp b/src/graph/planner/plan/Query.cpp
-index 9ee98a9..9c94467 100644
+index 9ee98a9c4..9c94467c7 100644
 --- a/src/graph/planner/plan/Query.cpp
 +++ b/src/graph/planner/plan/Query.cpp
 @@ -119,6 +119,14 @@ std::unique_ptr<PlanNodeDescription> Expand::explain() const {
@@ -1105,7 +1108,7 @@ index 9ee98a9..9c94467 100644
  
  std::unique_ptr<PlanNodeDescription> ExpandAll::explain() const {
 diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
-index 7c5f96f..180c0c6 100644
+index 7c5f96f15..180c0c6a0 100644
 --- a/src/graph/planner/plan/Query.h
 +++ b/src/graph/planner/plan/Query.h
 @@ -9,6 +9,7 @@
@@ -1142,7 +1145,7 @@ index 7c5f96f..180c0c6 100644
  
  class ExpandAll : public Expand {
 diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
-index 164d6a5..5f4b0c4 100644
+index 164d6a58d..5f4b0c45a 100644
 --- a/src/graph/service/GraphFlags.cpp
 +++ b/src/graph/service/GraphFlags.cpp
 @@ -69,6 +69,13 @@ DEFINE_bool(enable_dst_only_edge_filter,
@@ -1160,7 +1163,7 @@ index 164d6a5..5f4b0c4 100644
  DEFINE_uint32(ft_request_retry_times, 3, "Retry times if fulltext request failed");
  DEFINE_bool(enable_client_white_list, true, "Turn on/off the client white list.");
 diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
-index 6c0cec1..d07f198 100644
+index 6c0cec166..d07f19896 100644
 --- a/src/graph/service/GraphFlags.h
 +++ b/src/graph/service/GraphFlags.h
 @@ -57,6 +57,10 @@ DECLARE_bool(enable_optimizer);
@@ -1175,10 +1178,10 @@ index 6c0cec1..d07f198 100644
  DECLARE_uint32(num_path_thread);
  
 diff --git a/src/graph/util/DstOnlyEdgeFilter.h b/src/graph/util/DstOnlyEdgeFilter.h
-index 12c8cab..b90c9f6 100644
+index 2fbe46159..b90c9f655 100644
 --- a/src/graph/util/DstOnlyEdgeFilter.h
 +++ b/src/graph/util/DstOnlyEdgeFilter.h
-@@ -6,141 +6,18 @@
+@@ -6,142 +6,18 @@
  #ifndef GRAPH_UTIL_DSTONLYEDGEFILTER_H_
  #define GRAPH_UTIL_DSTONLYEDGEFILTER_H_
  
@@ -1195,6 +1198,7 @@ index 12c8cab..b90c9f6 100644
 -// expressions stay on the GetNeighbors plan.
 -class DstOnlyEdgeFilterVisitor final : public ExprVisitorImpl {
 - public:
+-  using ExprVisitorImpl::visit;
 -  bool canPush() const {
 -    return !rejected_;
 -  }
@@ -1325,10 +1329,11 @@ index 12c8cab..b90c9f6 100644
  };
  
 diff --git a/src/graph/util/EdgePushdown.h b/src/graph/util/EdgePushdown.h
-index e69de29..a8346fd 100644
---- a/src/graph/util/EdgePushdown.h
+new file mode 100644
+index 000000000..86070f0c4
+--- /dev/null
 +++ b/src/graph/util/EdgePushdown.h
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,225 @@
 +/* Copyright (c) 2026 vesoft inc. All rights reserved.
 + *
 + * This source code is licensed under Apache 2.0 License.
@@ -1354,6 +1359,10 @@ index e69de29..a8346fd 100644
 +class EdgePushdownVisitor final : public ExprVisitorImpl {
 + public:
 +  explicit EdgePushdownVisitor(std::string onlyEdge = "") : onlyEdge_(std::move(onlyEdge)) {}
++  // Un-hide the base overloads: this class overrides visit(EdgeDstIdExpression*),
++  // which ExprVisitorImpl does not declare, so without this the base visit()
++  // overloads stay hidden and -Werror=overloaded-virtual fires.
++  using ExprVisitorImpl::visit;
 +
 +  bool canPush() const {
 +    return !rejected_;
@@ -1551,7 +1560,7 @@ index e69de29..a8346fd 100644
 +
 +#endif  // GRAPH_UTIL_EDGEPUSHDOWN_H_
 diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
-index 9519414..841a9ec 100644
+index 951941475..841a9eca6 100644
 --- a/src/interface/storage.thrift
 +++ b/src/interface/storage.thrift
 @@ -240,6 +240,21 @@ struct GetNeighborsResponse {
@@ -1599,7 +1608,7 @@ index 9519414..841a9ec 100644
  
  
 diff --git a/src/storage/exec/GetDstBySrcNode.h b/src/storage/exec/GetDstBySrcNode.h
-index 893ce9d..b4f3fbc 100644
+index 893ce9d1d..b4f3fbc84 100644
 --- a/src/storage/exec/GetDstBySrcNode.h
 +++ b/src/storage/exec/GetDstBySrcNode.h
 @@ -6,8 +6,11 @@
@@ -1708,7 +1717,7 @@ index 893ce9d..b4f3fbc 100644
  
  }  // namespace storage
 diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
-index 9a755c3..a18a56e 100644
+index 9a755c386..a18a56ea2 100644
 --- a/src/storage/query/GetDstBySrcProcessor.cpp
 +++ b/src/storage/query/GetDstBySrcProcessor.cpp
 @@ -7,6 +7,9 @@
@@ -1866,7 +1875,7 @@ index 9a755c3..a18a56e 100644
      dedupDuration_.reset();
    }
 diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
-index d5e34d8..7c65a06 100644
+index d5e34d8eb..7c65a068f 100644
 --- a/src/storage/query/GetDstBySrcProcessor.h
 +++ b/src/storage/query/GetDstBySrcProcessor.h
 @@ -13,6 +13,7 @@
@@ -1902,8 +1911,9 @@ index d5e34d8..7c65a06 100644
  
  }  // namespace storage
 diff --git a/tests/tck/features/go/PartialEdgeAgg.feature b/tests/tck/features/go/PartialEdgeAgg.feature
-index e69de29..334cf53 100644
---- a/tests/tck/features/go/PartialEdgeAgg.feature
+new file mode 100644
+index 000000000..334cf532f
+--- /dev/null
 +++ b/tests/tck/features/go/PartialEdgeAgg.feature
 @@ -0,0 +1,62 @@
 +# Copyright (c) 2026 vesoft inc. All rights reserved.

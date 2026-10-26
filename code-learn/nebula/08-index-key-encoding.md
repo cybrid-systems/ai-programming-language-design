@@ -2,7 +2,7 @@
 
 > 源码基线与 [06-key-encoding](06-key-encoding.md) 相同。
 > 实现在 `src/common/utils/IndexKeyUtils.h` 与 `IndexKeyUtils.cpp`。
-> `encodeInt64`、`encodeDouble`、`encodeValues`、`vertexIndexKeys` 在 `v3.8.0` 与 master 之间没有 diff。master 只在 `toValueType` 里增加了 LIST / SET 的映射，而建索引时这些类型会被拒绝，见 [07](07-row-encoding.md)。
+> `encodeInt64`、`encodeDouble`、`encodeValues`、`vertexIndexKeys` 这**四个函数**在 `v3.8.0` 与 master 之间没有 diff。所在文件 `IndexKeyUtils.h` 有 8 行差异，全部在 `toValueType` 里（master 增加 LIST / SET 的映射），而建索引时这些类型会被拒绝，见 [07](07-row-encoding.md)。
 > 分析日期：2026-10-26
 
 ---

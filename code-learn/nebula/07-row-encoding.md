@@ -164,7 +164,7 @@ flowchart TD
 
 ## 7. TTL
 
-`NebulaSchemaProvider::getTTLInfo`：`ttl_col` 为空或 `ttl_duration <= 0` 视为没设 TTL。`SchemaUtil` 只允许 TTL 列是 `INT64` 或 `TIMESTAMP`。
+`NebulaSchemaProvider::getTTLInfo`：`ttl_col` 为空或 `ttl_duration <= 0` 视为没设 TTL。TTL 列类型白名单在 `src/storage/CommonUtils.cpp:33-37`（`checkDataExpiredForTTL`），不在 `SchemaUtil` 里：只允许 `INT64` 或 `TIMESTAMP`。
 
 `CommonUtils::checkDataExpiredForTTL`：
 

@@ -1,7 +1,7 @@
 # 16 — 部分聚合：实现、边界和美妆重测
 
 > 设计在 [15](15-general-pushdown.md)。多节点数字在 [17](17-distributed-bench.md)。
-> 补丁叠放：先 [`v3.8.0-dst-only-edge-filter.patch`](patches/v3.8.0-dst-only-edge-filter.patch)，再 [`v3.8.0-partial-edge-agg.patch`](patches/v3.8.0-partial-edge-agg.patch)。两份都 `patch -p1` 打在 `v3.8.0` `fa92893` 上，第二份在本机干净树上复打通过。
+> 补丁叠放：先 [`v3.8.0-dst-only-edge-filter.patch`](patches/v3.8.0-dst-only-edge-filter.patch)，再 [`v3.8.0-partial-edge-agg.patch`](patches/v3.8.0-partial-edge-agg.patch)。第一份能 `git apply`；第二份**不能**——它 5 个新增文件缺 `new file mode 100644` 与 `--- /dev/null` 头，`git apply --check` 直接报 `No such file or directory`（`patch -p1` 能蒙混过关），且必须叠在第一份之上（打在 pristine `v3.8.0` 上有 10 个 hunk 失败）。
 > 单机二进制是这份源码的 Release 构建。graphd conf 末尾是 `--enable_dst_only_edge_filter=true`、`--enable_partial_edge_agg=true`、`--num_worker_threads=4`。
 > 原始结果在 [`bench/scenario2/results/`](bench/scenario2/results/)。
 > 日期：2026-10-26。
@@ -152,6 +152,6 @@ DISTINCT 把客户端要解码的行从 40415 降到 4000，client P50 从 284 m
 [  PASSED  ] 15 tests.
 ```
 
-15 条是第 2 节列的谓词判定、`splitAnd` 和 `SUM` / `COUNT` / `MIN` / `MAX`。编译有 `-Woverloaded-virtual`（`EdgePushdownVisitor` 盖住了基类的 `visit`），没有当成错误。
+15 条是第 2 节列的谓词判定、`splitAnd` 和 `SUM` / `COUNT` / `MIN` / `MAX`。编译**会**报 `-Werror=overloaded-virtual`（`EdgePushdownVisitor` 盖住了基类的 `visit`）——修法是加 `using ExprVisitorImpl::visit;`（上游 `ExtractFilterExprVisitor.h:64` 就是这么写的）。第一份补丁的 `DstOnlyEdgeFilterVisitor` 有同一个缺陷，只打它也会报 9 个同样的错误。
 
 tck 运行器没有执行 `PartialEdgeAgg.feature`。没有单测覆盖「一个 part 的 RPC 失败」。那条在 [17](17-distributed-bench.md)：默认 `accept_partial_success=false`，缺 part 时整句失败。

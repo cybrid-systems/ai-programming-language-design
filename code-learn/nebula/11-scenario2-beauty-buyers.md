@@ -18,7 +18,7 @@
 
 | # | 用户的说法 | 源码 |
 |---|------------|------|
-| 1 | 持有 type 索引的那台 storaged 做 IndexScan，`type == 美妆` | 索引键按 part 前缀，`indexPrefix(partId, indexId)`，见 [08](08-index-key-encoding.md)。LOOKUP 扫的是**每个 part** 上的这份索引，不是某一台机器。非全文 LOOKUP 的计划节点是 `TagIndexFullScan`（`LookupPlanner::transform`），随后 `IndexScanRule` / `OptimizeTagIndexScanByFilterRule` 可以把 `type == "beauty"` 收成前缀。全文索引才是 IndexScan 再 `GetVertices` |
+| 1 | 持有 type 索引的那台 storaged 做 IndexScan，`type == 美妆` | 索引键按 part 前缀，`indexPrefix(partId, indexId)`，见 [08](08-index-key-encoding.md)。LOOKUP 扫的是**每个 part** 上的这份索引，不是某一台机器。非全文 LOOKUP 的计划节点是 `TagIndexFullScan`（`LookupPlanner::transform`），随后 `OptimizeTagIndexScanByFilterRule` 可以把 `type == "beauty"` 收成前缀（`IndexScanRule` 的 pattern 是 `kIndexScan`，按 kind 精确匹配，走不到 LOOKUP 这条路上）。全文索引才是 IndexScan 再 `GetVertices` |
 | 2 | GetVertices 拿商品 VID，可能跨节点 | 非全文 LOOKUP 的 yield 列（至少 `id(vertex)`）从索引行里出来，**没有** `GetVertices`。要商品上索引没覆盖的属性，才需要另一次 FETCH，那是第 6 步的形态 |
 | 3 | 每个商品 VID 一次 GetInEdges，这是跨节点热点 | 没有 GetInEdges 这个 RPC。`REVERSELY` 把 `buy` 的 type 取负，RPC 仍是 `getNeighbors` 或 `getDstBySrc`，方向参数保持 `OUT_EDGE`。`StorageClient::clusterIdsToHosts` 把落在同一 host 上的 VID **拼成一次请求**，按 part 放进 `parts` map。RPC 次数约等于「拥有至少一个命中商品的 host 数」，不是商品个数。host 内部仍按商品 VID 做前缀扫描，CPU 和边条数成正比。反向边的 key 写在商品所在 part，所以这次 RPC 的目标 host 就是商品 VID 的 host |
 | 4 | 边上 `timestamp > now-3个月`，希望在 storaged 做 | **一步 GO、优化器打开、谓词是边属性时，这已经发生。** 见下一节。没发生的是：`YIELD DISTINCT buy._dst` 被 WHERE 挡在 `getDstBySrc` 外面，过滤后的用户 VID 仍以整条边的形式回来 |
@@ -102,7 +102,7 @@ MATCH 这条补丁**不改**。边过滤已经在 storaged，用户去重仍在 
 
 ### 3.1 为什么是这一处
 
-场景二的第 3 步，在过滤已经下推之后，剩下的跨 host 字节是「窗口内的每一条购买」。`GetDstBySrc` 本来就只回 dst，并且在 `onProcessFinished` 里按 host 去重，但它的请求没有 filter，`SingleEdgeNode` 还把 `maySkipDecode` 设成 true，值都不读。`GoValidator::isSimpleCase` 看到 WHERE 就放弃这条 RPC。
+场景二的第 3 步，在过滤已经下推之后，剩下的跨 host 字节是「窗口内的每一条购买」。`GetDstBySrc` 本来就只回 dst，并且在 `onProcessFinished` 里按 host 去重，但它的请求没有 filter，`maySkipDecode` 由调用方置 true（`GetDstBySrcProcessor.cpp:215-217`；它是构造参数，且边类型带 TTL 时不生效），值都不读。`GoValidator::isSimpleCase` 看到 WHERE 就放弃这条 RPC。
 
 补丁让下面这句在 flag 打开后走 `getDstBySrc`：
 
@@ -111,7 +111,7 @@ MATCH 这条补丁**不改**。边过滤已经在 storaged，用户去重仍在 
 - WHERE 只含有名字的边属性、边的 `_src/_dst/_rank/_type`、常量、比较、算术、逻辑、函数（参数也得满足这些）。`*`、`$$`、`$^`、tag、输入变量、整条 `edge` 表达式都拒绝
 - 没有 SAMPLE / 每步 LIMIT（原来的 `isSimpleCase` 已经拒绝非空 `limits`）
 
-`now()` 在 `FunctionManager` 里注册了，返回 `INT`，`getIsPure("now")` 不是纯函数，不会被折成常量。每个 storaged 在扫边时各自求值。3 个月的窗口对秒级时钟差不敏感；若要全集群用同一个截止时间，把字面量写进语句。
+`now()` 在 `FunctionManager` 里注册了，返回 `INT`，`getIsPure("now")` 不是纯函数，不会被折成常量。每个 storaged 在扫边时各自求值。3 个月的窗口对秒级时钟差不敏感；若要全集群用同一个截止时间，把字面量写进语句。注意：第二份补丁叠上来后 `EdgePushdown::canPush` 会拒掉非纯函数，`now()` 就不再能下推到 dst-only 路径了（补丁 1 的单测原本断言它可以下推，补丁 2 翻成了 `EXPECT_FALSE`）。
 
 host 内同一个用户买了多件美妆，响应从「每条边一行」变成「每个用户一个 VID」。不同 host 上的同一个用户仍会各回一次，graphd 的 `Dedup` 保留。这是部分去重，不是全局去重下推。
 
