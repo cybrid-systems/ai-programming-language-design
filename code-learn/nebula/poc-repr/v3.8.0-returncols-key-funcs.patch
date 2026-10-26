@@ -1,0 +1,62 @@
+diff --git a/src/graph/visitor/DeducePropsVisitor.h b/src/graph/visitor/DeducePropsVisitor.h
+--- a/src/graph/visitor/DeducePropsVisitor.h
++++ b/src/graph/visitor/DeducePropsVisitor.h
+@@ -127,6 +127,7 @@
+   void visit(VertexExpression* expr) override;
+   void visit(EdgeExpression* expr) override;
+   void visit(ColumnExpression* expr) override;
++  void visit(FunctionCallExpression* expr) override;
+ 
+   void visitEdgePropExpr(PropertyExpression* expr);
+   void reportError(const Expression* expr);
+diff --git a/src/graph/visitor/DeducePropsVisitor.cpp b/src/graph/visitor/DeducePropsVisitor.cpp
+--- a/src/graph/visitor/DeducePropsVisitor.cpp
++++ b/src/graph/visitor/DeducePropsVisitor.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include "graph/visitor/DeducePropsVisitor.h"
+ 
++#include <algorithm>
++#include <cctype>
+ #include <sstream>
+ 
+ #include "graph/context/QueryContext.h"
+@@ -224,6 +226,38 @@
+   UNUSED(expr);
+ }
+ 
++// src(edge) / dst(edge) / rank(edge) / typeid(edge) only need the edge key.
++// The argument is an EdgeExpression, and visit(EdgeExpression) inserts every
++// schema field. id(vertex) only needs the vid; the bare VERTEX keyword must
++// not pull every tag field. $^ / $$ still fall through, and properties(edge)
++// still visits EdgeExpression.
++void DeducePropsVisitor::visit(FunctionCallExpression *expr) {
++  auto fname = expr->name();
++  std::transform(fname.begin(), fname.end(), fname.begin(), [](unsigned char c) {
++    return static_cast<char>(std::tolower(c));
++  });
++  const auto &args = expr->args()->args();
++  if (args.size() == 1 && args[0]->kind() == Expression::Kind::kEdge &&
++      (fname == "src" || fname == "dst" || fname == "rank" || fname == "typeid")) {
++    if (edgeTypes_ != nullptr) {
++      for (const auto &edgeType : *edgeTypes_) {
++        exprProps_->insertEdgeProp(edgeType, kType);
++        exprProps_->insertEdgeProp(edgeType, kSrc);
++        exprProps_->insertEdgeProp(edgeType, kDst);
++        exprProps_->insertEdgeProp(edgeType, kRank);
++      }
++    }
++    return;
++  }
++  if (args.size() == 1 && args[0]->kind() == Expression::Kind::kVertex && fname == "id") {
++    auto *vertex = static_cast<const VertexExpression *>(args[0]);
++    if (vertex->name() == "VERTEX") {
++      return;
++    }
++  }
++  ExprVisitorImpl::visit(expr);
++}
++
+ void DeducePropsVisitor::visit(VertexExpression *expr) {
+   if (tagIds_ == nullptr) {
+     UNUSED(expr);

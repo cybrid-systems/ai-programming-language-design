@@ -5,6 +5,7 @@
 > 源码：tag `v3.8.0` `fa928930`。`Value` / `DataSet` / `Cpp2Ops` / `GetNeighborsProcessor` 的列布局在 master `426266b5` 上与此相同；本文不再重复那份 diff。
 > 基数来自 [12](12-scenario2-bench.md) 的单机数据，不是本文新跑出来的：窗口内美妆购买边 **40415**，美妆商品 **382**，用户 **4000**（这个分布下每个用户至少有一条命中边）。单 storaged。
 > 字节是本文的程序 [`poc-repr/measure.cpp`](poc-repr/measure.cpp) 算的。堆是本机 glibc 的 `malloc_usable_size`，**不是** [12](12-scenario2-bench.md) 那次 Release 里的 jemalloc，也不是 graphd 进程的采样。
+> 按这些字节做的分阶段方案在 [21](21-ir-optimization-design.md)。
 > 分析日期：2026-10-26
 
 ---

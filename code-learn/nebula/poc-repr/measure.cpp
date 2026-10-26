@@ -719,6 +719,45 @@ int main(int argc, char** argv) {
     std::cout << "agg_map live " << s.live() << " peak " << s.peak() << " groups " << table.size()
               << " bucket_count " << table.bucket_count() << "\n";
   }
+  // Same table, but Agg does not allocate the empty Set. SUM / COUNT never touch it;
+  // only AggregateExpression::distinct_ reads uniques().
+  {
+    struct Agg {
+      Val cnt, sum, avg, deviation, result;
+      void* uniques;
+      Agg()
+          : cnt(make_int(0)),
+            sum(make_float(0)),
+            avg(make_float(0)),
+            deviation(make_float(0)),
+            result(make_int(0)),
+            uniques(nullptr) {}
+    };
+    struct Key {
+      std::vector<Val> values;
+      bool operator==(const Key& o) const {
+        return values.size() == o.values.size() && values[0].payload == o.values[0].payload;
+      }
+    };
+    struct HashKey {
+      std::size_t operator()(const Key& k) const {
+        return std::hash<std::uint64_t>{}(k.values[0].payload);
+      }
+    };
+    Scope s;
+    std::unordered_map<Key, std::vector<Agg>, HashKey> table;
+    table.reserve(kUsers);
+    for (int i = 0; i < kUsers; ++i) {
+      Key key;
+      key.values.emplace_back(make_int(i + 1));
+      std::vector<Agg> cols;
+      cols.emplace_back();
+      cols.emplace_back();
+      table.emplace(std::move(key), std::move(cols));
+    }
+    std::cout << "p0_agg_map_no_set live " << s.live() << " peak " << s.peak()
+              << " groups " << table.size() << " bucket_count " << table.bucket_count() << "\n";
+  }
 
   // Join hash on 382 int keys, one Row* each.
   {
@@ -948,6 +987,100 @@ int main(int argc, char** argv) {
   });
   std::cout << "bench sum_row_ms_median " << row_ms << " sum_col_ms_median " << col_ms << " loops " << kLoops
             << "\n";
+
+  std::vector<std::int64_t> dedup_keys(kEdges);
+  std::vector<Val> dedup_vals(kEdges);
+  for (int i = 0; i < kEdges; ++i) {
+    dedup_keys[static_cast<std::size_t>(i)] = i % kUsers;
+    dedup_vals[static_cast<std::size_t>(i)] = make_int(i % kUsers);
+  }
+  double hash_i64_ms = time_ms([&] {
+    std::unordered_set<std::int64_t> seen;
+    seen.reserve(static_cast<std::size_t>(kEdges));
+    for (auto k : dedup_keys) {
+      seen.insert(k);
+    }
+    return seen.size();
+  });
+  double hash_val_ms = time_ms([&] {
+    std::unordered_set<Val, HashVal, EqVal> seen;
+    seen.reserve(static_cast<std::size_t>(kEdges));
+    for (const auto& v : dedup_vals) {
+      seen.insert(v);
+    }
+    return seen.size();
+  });
+  std::cout << "bench dedup_i64_ms_median " << hash_i64_ms << " dedup_val_ms_median " << hash_val_ms
+            << " loops " << kLoops << "\n";
+
+  // P0 shapes. getEdge() still needs _src,_dst,_rank,_type. Dropping amount is the
+  // visit(EdgeExpression) over-collect. item_type stays while it is a FIXED_STRING
+  // filter column; ts is the integer index column the hint already applied.
+  flat(40415, {CellKind::Int, CellKind::Int, CellKind::Int}, true, "p0_expandall_users_reserved");
+  flat(40415,
+       {CellKind::Int, CellKind::Int, CellKind::Int, CellKind::Double},
+       true,
+       "p0_expandall_sales_reserved");
+  {
+    Scope s;
+    std::vector<Row> rows;
+    rows.reserve(static_cast<std::size_t>(kEdges));
+    for (int i = 0; i < kEdges; ++i) {
+      Row row;
+      row.values.emplace_back(make_int(i % kUsers));
+      rows.emplace_back(std::move(row));
+    }
+    while (rows.size() > static_cast<std::size_t>(kUsers)) {
+      rows.pop_back();
+    }
+    auto live_kept = s.live();
+    auto cap_kept = rows.capacity();
+    rows.shrink_to_fit();
+    std::cout << "p0_dedup_shrink before_live " << live_kept << " before_cap " << cap_kept
+              << " after_live " << s.live() << " after_cap " << rows.capacity()
+              << " size " << rows.size() << "\n";
+  }
+  auto model_shape = [&](const char* name, const std::vector<std::string>& cols,
+                          const std::vector<Cell>& proto, bool with_string) {
+    Scope s;
+    std::vector<Row> rows;
+    rows.reserve(static_cast<std::size_t>(kEdges));
+    for (int i = 0; i < kEdges; ++i) {
+      Row row;
+      row.values.reserve(proto.size());
+      for (const auto& cell : proto) {
+        if (cell.kind == CellKind::Int) {
+          row.values.push_back(make_int(1));
+        } else if (cell.kind == CellKind::Double) {
+          row.values.push_back(make_float(1.0));
+        } else if (cell.kind == CellKind::String) {
+          row.values.push_back(make_string("beauty"));
+        } else {
+          throw std::runtime_error("p0 cell");
+        }
+      }
+      rows.emplace_back(std::move(row));
+    }
+    std::cout << "p0_heap " << name << " live " << s.live() << " cap " << rows.capacity()
+              << " cell_cap " << rows.front().values.capacity() << " string " << with_string
+              << "\n";
+    std::vector<std::vector<Cell>> grid(kEdges, proto);
+    auto ds = dataset_bytes(cols, grid);
+    std::cout << "p0_thrift " << name << "_dataset " << ds << " lookup_resp " << wrap_response(ds, true)
+              << "\n";
+  };
+  model_shape("keys4",
+              {"buy._src", "buy._dst", "buy._rank", "buy._type"},
+              {CInt(), CInt(), CInt(), CInt()},
+              false);
+  model_shape("keys_plus_item_type",
+              {"buy._src", "buy._dst", "buy._rank", "buy._type", "buy.item_type"},
+              {CInt(), CInt(), CInt(), CInt(), CStr(6)},
+              true);
+  model_shape("keys_item_type_ts",
+              {"buy._src", "buy._dst", "buy._rank", "buy._type", "buy.item_type", "buy.ts"},
+              {CInt(), CInt(), CInt(), CInt(), CStr(6), CInt()},
+              true);
 
   // robin_hood flat set estimate: reserve(n) at 80% load, power-of-two capacity.
   auto rh = [](std::size_t n, std::size_t elem) {
