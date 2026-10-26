@@ -4,7 +4,7 @@
 > 线上观察（用户提供，不是本次测量）：10–200 并发时 P99 135–345 ms；加上销售额排序后到不了 35 ms。
 > 源码：`v3.8.0` `fa928930` 与 master `426266b5` 在本文引用的 planner / executor 上一致，除了补丁本身。
 > 补丁：[`patches/v3.8.0-dst-only-edge-filter.patch`](patches/v3.8.0-dst-only-edge-filter.patch)，`git apply` 打在 `v3.8.0`。
-> 压测脚本和「未实测」：[12](12-scenario2-bench.md)。
+> 单机实测（数字在 [12](12-scenario2-bench.md)，不是线上的 135–345 ms）：[`bench/scenario2/`](bench/scenario2/)。
 > 分析日期：2026-10-26。
 
 35 ms 相对 135–345 ms 大约是 4–10 倍。少回传 40% 的边，时延下界仍然在 80 ms 以上。下面先改用户拆解里和源码不一致的地方，再写补丁实际切的是哪一段，以及为什么销售额排序更该改模型。

@@ -27,7 +27,7 @@
 | 09 | [写入读出与建模](09-write-read-chain.md) | INSERT / FETCH / GO / LOOKUP / ALTER 各用哪套编码，以及 VID、热点、大属性 |
 | 10 | [下推能力总表](10-pushdown-capability.md) | Filter、投影、索引、Limit、TopN、Aggregate 在 GO / MATCH / LOOKUP / FETCH / 最短路上各自停在哪一层 |
 | 11 | [场景二：美妆购买用户](11-scenario2-beauty-buyers.md) | 类目索引 → 反向购买边 → 边时间过滤 → 用户去重，以及销售额排序；和用户拆解的出入；`getDstBySrc` 补丁与建模对比 |
-| 12 | [场景二压测](12-scenario2-bench.md) | 造数、10–200 并发脚本、未实测说明、多节点复现步骤 |
+| 12 | [场景二压测](12-scenario2-bench.md) | 单机实测：flag 关 / flag 开 / 购买边复合索引，P50/P95/P99、QPS、PROFILE 行数；多节点复现步骤 |
 | 13 | [控制流](13-control-flow.md) | 请求入口与会话、future 调度、执行模型（物化 / Volcano / 向量化）、`Select`/`Loop`/`PassThrough`、GO 与 MATCH 的计划 |
 | 14 | [数据流](14-data-flow.md) | `ExecutionContext` / `Result` / `Iterator`、拷贝与释放、graphd→storaged 的 RPC 合并、GO 与 MATCH 的行、写路径到 Raft |
 

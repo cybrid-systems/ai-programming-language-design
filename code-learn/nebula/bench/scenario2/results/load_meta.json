@@ -1,0 +1,29 @@
+{
+  "hardware": {
+    "platform": "Linux-6.12.94+-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "python": "3.12.3",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "meminfo": {
+      "MemTotal": "16387280 kB",
+      "MemAvailable": "9019344 kB",
+      "SwapTotal": "0 kB"
+    },
+    "hostname": "cursor"
+  },
+  "dataset": {
+    "users": 4000,
+    "items": 2000,
+    "edges": 500000,
+    "beauty_ratio": 0.2,
+    "recent_ratio": 0.4,
+    "seed": 2,
+    "parts": 10,
+    "cutoff": 1753660800,
+    "beauty_items": 382,
+    "recent_beauty_users": 4000,
+    "matching_edges": 40415,
+    "sales_sum": 10073144
+  }
+}

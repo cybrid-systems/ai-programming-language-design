@@ -1,0 +1,10 @@
+g++: g++-12 (Ubuntu 12.4.0-2ubuntu1~24.04.1) 12.4.0
+gcc: gcc-12 (Ubuntu 12.4.0-2ubuntu1~24.04.1) 12.4.0
+cmake_build: Release ENABLE_WERROR=OFF ENABLE_JEMALLOC=ON ENABLE_TESTING=OFF
+nebula_git: fa928930ab34f150db522933323aa610e54f26e7
+nebula_describe: v3.8.0
+third_party: vesoft-third-party 3.3 GCC 12.3.0 glibc 2.39 ABI 11
+Linux cursor 6.12.94+ #1 SMP PREEMPT_DYNAMIC Mon Oct 19 22:12:29 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+4
+model name	: Intel(R) Xeon(R) Processor
+MemTotal:       16387280 kB

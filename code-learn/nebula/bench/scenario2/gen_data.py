@@ -26,60 +26,103 @@ def write(path, text):
         f.write(text)
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.out, exist_ok=True)
-    rng = random.Random(args.seed)
-    cutoff = args.now - args.window
+def make_dataset(users, items, edges, beauty_ratio, recent_ratio, now, window, seed, parts):
+    """One RNG stream shared by the stock schema and the model schema.
+
+    Rank is a per (user, item) counter so a second purchase does not overwrite
+    the first. Time lives in the ts property. item_type on the model edge is
+    copied from the item vertex.
+    """
+    rng = random.Random(seed)
+    cutoff = now - window
     beauty_items = []
     other_items = []
-
-    user_rows = []
-    for uid in range(1, args.users + 1):
-        user_rows.append(f'INSERT VERTEX user(name) VALUES {uid}:("u{uid}");')
-
+    user_rows = [(uid, f"u{uid}") for uid in range(1, users + 1)]
     item_rows = []
-    for iid in range(1, args.items + 1):
-        beauty = rng.random() < args.beauty_ratio
-        kind = "beauty" if beauty else "other"
-        item_rows.append(f'INSERT VERTEX item(name, type) VALUES {100000000 + iid}:("i{iid}", "{kind}");')
-        (beauty_items if beauty else other_items).append(100000000 + iid)
+    for iid in range(1, items + 1):
+        vid = 100000000 + iid
+        kind = "beauty" if rng.random() < beauty_ratio else "other"
+        item_rows.append((vid, f"i{iid}", kind))
+        (beauty_items if kind == "beauty" else other_items).append(vid)
     if not beauty_items:
-        beauty_items.append(100000000 + 1)
+        beauty_items.append(item_rows[0][0])
 
-    stock_edges = []
-    model_edges = []
+    edge_rows = []
     recent_beauty_users = set()
+    sales = {}
     beauty_item_set = set(beauty_items)
     rank_of = {}
-    for _ in range(args.edges):
-        uid = rng.randint(1, args.users)
-        if rng.random() < args.beauty_ratio and beauty_items:
+    matching_edges = 0
+    for _ in range(edges):
+        uid = rng.randint(1, users)
+        if rng.random() < beauty_ratio and beauty_items:
             iid = rng.choice(beauty_items)
             kind = "beauty"
         else:
             pool = other_items or beauty_items
             iid = rng.choice(pool)
             kind = "beauty" if iid in beauty_item_set else "other"
-        if rng.random() < args.recent_ratio:
-            ts = rng.randint(cutoff + 1, args.now)
+        if rng.random() < recent_ratio:
+            ts = rng.randint(cutoff + 1, now)
         else:
-            ts = rng.randint(cutoff - args.window, cutoff)
+            ts = rng.randint(cutoff - window, cutoff)
         amount = rng.randint(1, 500)
-        # Time stays in the ts property. Rank only separates multiple purchases
-        # of the same user-item pair so INSERT does not overwrite.
         pair = (uid, iid)
         rank = rank_of.get(pair, 0)
         rank_of[pair] = rank + 1
-        stock_edges.append(
-            f"INSERT EDGE buy(ts, amount) VALUES {uid}->{iid}@{rank}:({ts}, {amount});"
-        )
-        model_edges.append(
-            "INSERT EDGE buy(ts, amount, item_type) VALUES "
-            f'{uid}->{iid}@{rank}:({ts}, {amount}, "{kind}");'
-        )
+        edge_rows.append((uid, iid, rank, ts, amount, kind))
         if kind == "beauty" and ts > cutoff:
             recent_beauty_users.add(uid)
+            sales[uid] = sales.get(uid, 0) + amount
+            matching_edges += 1
+    return {
+        "users": user_rows,
+        "items": item_rows,
+        "edges": edge_rows,
+        "cutoff": cutoff,
+        "now": now,
+        "window": window,
+        "parts": parts,
+        "seed": seed,
+        "beauty_items": len(beauty_items),
+        "recent_beauty_users": recent_beauty_users,
+        "sales": sales,
+        "matching_edges": matching_edges,
+    }
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.out, exist_ok=True)
+    data = make_dataset(
+        args.users,
+        args.items,
+        args.edges,
+        args.beauty_ratio,
+        args.recent_ratio,
+        args.now,
+        args.window,
+        args.seed,
+        args.parts,
+    )
+    cutoff = data["cutoff"]
+    recent_beauty_users = data["recent_beauty_users"]
+    user_rows = [
+        f'INSERT VERTEX user(name) VALUES {uid}:("{name}");' for uid, name in data["users"]
+    ]
+    item_rows = [
+        f'INSERT VERTEX item(name, type) VALUES {vid}:("{name}", "{kind}");'
+        for vid, name, kind in data["items"]
+    ]
+    stock_edges = [
+        f"INSERT EDGE buy(ts, amount) VALUES {uid}->{iid}@{rank}:({ts}, {amount});"
+        for uid, iid, rank, ts, amount, _kind in data["edges"]
+    ]
+    model_edges = [
+        "INSERT EDGE buy(ts, amount, item_type) VALUES "
+        f'{uid}->{iid}@{rank}:({ts}, {amount}, "{kind}");'
+        for uid, iid, rank, ts, amount, kind in data["edges"]
+    ]
 
     space = (
         "CREATE SPACE IF NOT EXISTS beauty_buy"
@@ -133,7 +176,8 @@ YIELD src(edge) AS user;
     )
     print(
         f"wrote {args.out}: users={args.users} items={args.items} edges={args.edges} "
-        f"beauty_items={len(beauty_items)} recent_beauty_users={len(recent_beauty_users)} cutoff={cutoff}"
+        f"beauty_items={data['beauty_items']} recent_beauty_users={len(recent_beauty_users)} "
+        f"matching_edges={data['matching_edges']} cutoff={cutoff}"
     )
 
 
