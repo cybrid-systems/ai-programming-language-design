@@ -2,6 +2,7 @@
 
 > 源码基线与 [01-optimizer-framework](01-optimizer-framework.md) 相同。
 > graphd 编码在 `src/clients/storage/StorageClient.cpp`，storaged 执行在 `src/storage/query/` 与 `src/storage/exec/`。
+> key / 行 / 索引的字节布局在 [06](06-key-encoding.md)–[09](09-write-read-chain.md)，本文不重复。
 > `v3.8.0` 与 `release-3.8` 的 `src/storage/query` 无差异。master 相对 3.8 只改了 `GetNeighborsProcessor::doProcess` 里 limit 与 `FLAGS_max_edge_returned_per_vertex` 的关系。
 > 分析日期：2026-10-26
 
