@@ -30,12 +30,15 @@
 | 12 | [场景二压测](12-scenario2-bench.md) | 单机实测：flag 关 / flag 开 / 购买边复合索引，P50/P95/P99、QPS、PROFILE 行数；多节点复现步骤 |
 | 13 | [控制流](13-control-flow.md) | 请求入口与会话、future 调度、执行模型（物化 / Volcano / 向量化）、`Select`/`Loop`/`PassThrough`、GO 与 MATCH 的计划 |
 | 14 | [数据流](14-data-flow.md) | `ExecutionContext` / `Result` / `Iterator`、拷贝与释放、graphd→storaged 的 RPC 合并、GO 与 MATCH 的行、写路径到 Raft |
+| 20 | [中间表示](20-intermediate-representation.md) | 场景二三条查询的算子输出：`Value` / `DataSet` 列布局、Thrift 字节、glibc 堆；和水位、下推的关系 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
 编码阅读顺序是 06 → 07 → 08 → 09。09 把前三篇接到一条写入读出链上。04 只讲 filter / limit 怎么进 storaged，不讲 key 和行格式。
 
 控制流和数据流是 13 → 14。13 回答「算子按什么模型被拉动」，14 回答「行放在哪个变量里」。01 的优化器、04 的 `FilterNode`、09 的编码在这两篇里只引用，不重复。
+
+[20](20-intermediate-representation.md) 接在 11–14 后面：用场景二的 40415 条边、382 个商品、4000 个用户，写每个算子吐出的 `DataSet` 和 Thrift 字节。12 有时延和行数，没有这组字节。
 
 ---
 

@@ -2,7 +2,7 @@
 
 > 源码基线与 [13-control-flow](13-control-flow.md) 相同：`v3.8.0` `fa928930`，对照 master `426266b5`。
 > 控制流（谁等谁、GO 的计划长什么样）在 [13](13-control-flow.md)。本文只写数据放在哪、游标怎么走、哪一次是拷贝。
-> key / 行字节见 [06](06-key-encoding.md)–[09](09-write-read-chain.md)。filter 字符串怎么进 `FilterNode` 见 [04](04-storage-execution.md)。
+> key / 行字节见 [06](06-key-encoding.md)–[09](09-write-read-chain.md)。filter 字符串怎么进 `FilterNode` 见 [04](04-storage-execution.md)。场景二三条查询的列布局和 Thrift / 堆字节见 [20](20-intermediate-representation.md)。
 > 分析日期：2026-10-26
 
 ---

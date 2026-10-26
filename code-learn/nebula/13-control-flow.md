@@ -7,7 +7,7 @@
 > 本文引用的 `src/graph/scheduler/`、`src/graph/context/`、`src/graph/validator/GoValidator.cpp`、`src/graph/planner/ngql/GoPlanner.cpp`、`src/graph/executor/query/Expand*.cpp`、`src/graph/executor/query/TraverseExecutor.*`、`src/storage/exec/RelNode.h`、`src/storage/exec/IndexNode.h` 在这两份树上没有差异。
 > master 相对 3.8 改过的、和查询执行挨着的文件是 `GetNeighborsProcessor.cpp` 的 limit 裁剪（见 [04](04-storage-execution.md)）、`UpdateExecutor`、`MatchSolver`、`NebulaStore` 快照。它们不改变本文的调度模型和 GO 计划形状。
 > 优化器入口不在这里展开，见 [01](01-optimizer-framework.md)。算子上的 filter 如何进 RPC，见 [04](04-storage-execution.md)。变量里的字节和 Iterator 怎么游走，见 [14](14-data-flow.md)。
-> 计划形状是从 planner / executor 源码串出来的，不是一份 EXPLAIN 日志。和 [11](11-scenario2-beauty-buyers.md) 同一限制。
+> 计划形状是从 planner / executor 源码串出来的，不是一份 EXPLAIN 日志。和 [11](11-scenario2-beauty-buyers.md) 同一限制。场景二那三条在 [12](12-scenario2-bench.md) 里有 PROFILE 行数；列和字节在 [20](20-intermediate-representation.md)。
 > 分析日期：2026-10-26
 
 ---
