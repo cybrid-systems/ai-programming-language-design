@@ -6,7 +6,7 @@
 > 分支 `release-3.8` `15fc0b7a12ba69b3977c6f4a9d70d15ec7f98742`（2025-03-19）
 > `v3.6.0` 只用于核对「3.8 才出现」的说法。
 
-两条线：01–05 是算子下推，06–09 是数据格式。下推系列里 `v3.8.0` 与 `release-3.8` 在 `src/graph/optimizer`、`src/graph/planner`、`src/graph/executor`、`src/storage/query` 上没有差异。编码系列以 master 与 `v3.8.0` 的 diff 为准：key 与标量索引编码相同，LIST / SET 行格式只在 master。
+三条线：01–05 是算子下推，06–09 是数据格式，13–14 是控制流和数据流。下推系列里 `v3.8.0` 与 `release-3.8` 在 `src/graph/optimizer`、`src/graph/planner`、`src/graph/executor`、`src/storage/query` 上没有差异。编码系列以 master 与 `v3.8.0` 的 diff 为准：key 与标量索引编码相同，LIST / SET 行格式只在 master。13–14 对照的是 `v3.8.0` 与 master `426266b5`：调度器、`GoPlanner`、`RelNode` 无差异。
 
 分析日期：2026-10-26。
 
@@ -28,10 +28,14 @@
 | 10 | [下推能力总表](10-pushdown-capability.md) | Filter、投影、索引、Limit、TopN、Aggregate 在 GO / MATCH / LOOKUP / FETCH / 最短路上各自停在哪一层 |
 | 11 | [场景二：美妆购买用户](11-scenario2-beauty-buyers.md) | 类目索引 → 反向购买边 → 边时间过滤 → 用户去重，以及销售额排序；和用户拆解的出入；`getDstBySrc` 补丁与建模对比 |
 | 12 | [场景二压测](12-scenario2-bench.md) | 造数、10–200 并发脚本、未实测说明、多节点复现步骤 |
+| 13 | [控制流](13-control-flow.md) | 请求入口与会话、future 调度、执行模型（物化 / Volcano / 向量化）、`Select`/`Loop`/`PassThrough`、GO 与 MATCH 的计划 |
+| 14 | [数据流](14-data-flow.md) | `ExecutionContext` / `Result` / `Iterator`、拷贝与释放、graphd→storaged 的 RPC 合并、GO 与 MATCH 的行、写路径到 Raft |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
 编码阅读顺序是 06 → 07 → 08 → 09。09 把前三篇接到一条写入读出链上。04 只讲 filter / limit 怎么进 storaged，不讲 key 和行格式。
+
+控制流和数据流是 13 → 14。13 回答「算子按什么模型被拉动」，14 回答「行放在哪个变量里」。01 的优化器、04 的 `FilterNode`、09 的编码在这两篇里只引用，不重复。
 
 ---
 
@@ -45,11 +49,14 @@ nGQL
         RuleSet 探索（默认 5 轮）
         PrunePropertiesVisitor
   → Executor
+        AsyncMsgNotifyBasedScheduler 按依赖 future 启动
         StorageClient::{getNeighbors,scanVertex,scanEdge,getProps}
   → storaged
         QueryBaseProcessor::buildFilter / checkExp
         FilterNode 或 Scan*PropNode
 ```
+
+调度、`Expand` / `ExpandAll` 与 `Traverse` 的差别、变量和 `Iterator` 见 [13](13-control-flow.md)、[14](14-data-flow.md)。
 
 发行配置 `conf/nebula-graphd.conf.default` 打开 `--enable_optimizer=true`。`GraphFlags.cpp` 里该 flag 的默认值是 false。Filter / Limit 规则都注册在 `QueryRules`，关开关时不会跑。
 
