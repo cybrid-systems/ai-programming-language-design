@@ -1,0 +1,268 @@
+diff --git a/src/storage/test/GetDstBySrcFilterTest.cpp b/src/storage/test/GetDstBySrcFilterTest.cpp
+new file mode 100644
+index 0000000..eecbd39
+--- /dev/null
++++ b/src/storage/test/GetDstBySrcFilterTest.cpp
+@@ -0,0 +1,238 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include <gtest/gtest.h>
++
++#include <map>
++
++#include "common/base/Base.h"
++#include "common/expression/ConstantExpression.h"
++#include "common/expression/Expression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/expression/RelationalExpression.h"
++#include "common/fs/TempDir.h"
++#include "storage/query/GetDstBySrcProcessor.h"
++#include "storage/test/QueryTestUtils.h"
++
++namespace nebula {
++namespace storage {
++namespace {
++
++// The mock schema manager names an edge after its numeric edge type, so an edge
++// property expression refers to edge "101", not "serve".
++constexpr EdgeType kServe = 101;
++constexpr EdgeType kTeammate = 102;
++
++// The pool must outlive every expression built from it, so it lives for the
++// whole process instead of a function scope.
++ObjectPool gObjPool;
++
++class GetDstBySrcFilterTest : public ::testing::Test {
++ public:
++  void SetUp() override {
++    cluster_.reset(new mock::MockCluster());
++    cluster_->initStorageKV(rootPath_.path());
++    env_ = cluster_->storageEnv_.get();
++    totalParts_ = cluster_->getTotalParts();
++    threadPool_ = std::make_shared<folly::IOThreadPoolExecutor>(4);
++    ASSERT_EQ(true, QueryTestUtils::mockEdgeData(env_, totalParts_));
++  }
++
++  void TearDown() override {}
++
++ protected:
++  // `edge.teamAvgScore > threshold`, the shape graphd pushes down: a relational
++  // expression over an edge property.
++  Expression* makeTeamAvgScoreFilter(double threshold, EdgeType edgeType = kServe) {
++    auto* pool = &gObjPool;
++    return RelationalExpression::makeGT(
++        pool,
++        EdgePropertyExpression::make(pool, folly::to<std::string>(edgeType), "teamAvgScore"),
++        ConstantExpression::make(pool, Value(threshold)));
++  }
++
++  cpp2::GetDstBySrcRequest buildRequest(const std::vector<VertexID>& vertices,
++                                        const std::vector<EdgeType>& edges,
++                                        const Expression* filter) {
++    std::hash<std::string> hash;
++    cpp2::GetDstBySrcRequest req;
++    req.space_id_ref() = 1;
++    for (const auto& vertex : vertices) {
++      PartitionID partId = (hash(vertex) % totalParts_) + 1;
++      (*req.parts_ref())[partId].emplace_back(vertex);
++    }
++    for (const auto& edge : edges) {
++      req.edge_types_ref()->emplace_back(edge);
++    }
++    if (filter != nullptr) {
++      req.filter_ref() = Expression::encode(*filter);
++    }
++    return req;
++  }
++
++  // Runs the request and returns the distinct dst vids, sorted.
++  std::vector<std::string> dstsOf(const cpp2::GetDstBySrcRequest& req) {
++    auto* processor = GetDstBySrcProcessor::instance(env_, nullptr, threadPool_.get());
++    auto fut = processor->getFuture();
++    processor->process(req);
++    auto resp = std::move(fut).get();
++    if (!resp.result.failed_parts.empty()) {
++      EXPECT_EQ(0, resp.result.failed_parts.size()) << "unexpected failure";
++      return {};
++    }
++    std::vector<std::string> dsts;
++    for (const auto& row : (*resp.dsts_ref()).rows) {
++      dsts.emplace_back(row.values[0].getStr());
++    }
++    std::sort(dsts.begin(), dsts.end());
++    return dsts;
++  }
++
++  // Returns the error code of the first failed part, or SUCCEEDED.
++  ::nebula::cpp2::ErrorCode errorCodeOf(const cpp2::GetDstBySrcRequest& req) {
++    auto* processor = GetDstBySrcProcessor::instance(env_, nullptr, threadPool_.get());
++    auto fut = processor->getFuture();
++    processor->process(req);
++    auto resp = std::move(fut).get();
++    if (resp.result.failed_parts.empty()) {
++      return ::nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    return resp.result.failed_parts[0].code;
++  }
++
++  // Declared before the cluster so it outlives it: the cluster keeps the data
++  // directory open.
++  fs::TempDir rootPath_{"/tmp/GetDstBySrcFilterTest.XXXXXX"};
++  std::unique_ptr<mock::MockCluster> cluster_;
++  StorageEnv* env_{nullptr};
++  int32_t totalParts_{0};
++  std::shared_ptr<folly::IOThreadPoolExecutor> threadPool_;
++};
++
++TEST_F(GetDstBySrcFilterTest, BaselineWithoutFilter) {
++  // Tracy McGrady served 6 teams; each one is the dst of a serve edge.
++  auto req = buildRequest({"Tracy McGrady"}, {kServe}, nullptr);
++  EXPECT_EQ((std::vector<std::string>{"Hawks",
++                                     "Knicks",
++                                     "Magic",
++                                     "Pistons",
++                                     "Raptors",
++                                     "Rockets"}),
++            dstsOf(req));
++}
++
++TEST_F(GetDstBySrcFilterTest, EdgePropFilterKeepsOnlyMatchingEdges) {
++  // teamAvgScore: Raptors 15.4, Magic 28.0, Rockets 24.4, Knicks 9.4,
++  //                Pistons 8.0, Hawks 5.3
++  auto* filter = makeTeamAvgScoreFilter(20);
++  auto req = buildRequest({"Tracy McGrady"}, {kServe}, filter);
++  EXPECT_EQ((std::vector<std::string>{"Magic", "Rockets"}), dstsOf(req));
++}
++
++TEST_F(GetDstBySrcFilterTest, EdgePropFilterIsAppliedPerEdge) {
++  // LeBron James has two edges to the Cavalriers (29.7 and 27.5) plus Heat
++  // (27.1) and the Lakers (25.7). The filter runs per edge, so the Lakers edge
++  // is dropped while the Cavaliers stay because one of their two edges passes.
++  auto req = buildRequest({"LeBron James"}, {kServe}, makeTeamAvgScoreFilter(27));
++  EXPECT_EQ((std::vector<std::string>{"Cavaliers", "Heat"}), dstsOf(req));
++}
++
++TEST_F(GetDstBySrcFilterTest, EdgePropFilterMatchingNothingYieldsNoDst) {
++  auto* filter = makeTeamAvgScoreFilter(100);
++  auto req = buildRequest({"Tracy McGrady"}, {kServe}, filter);
++  EXPECT_TRUE(dstsOf(req).empty());
++}
++
++TEST_F(GetDstBySrcFilterTest, EdgePropFilterOnUnknownPropIsRejected) {
++  auto* pool = &gObjPool;
++  auto* filter = RelationalExpression::makeGT(
++      pool,
++      EdgePropertyExpression::make(pool, folly::to<std::string>(kServe), "no_such_prop"),
++      ConstantExpression::make(pool, Value(20.0)));
++  auto req = buildRequest({"Tracy McGrady"}, {kServe}, filter);
++  EXPECT_EQ(::nebula::cpp2::ErrorCode::E_EDGE_PROP_NOT_FOUND, errorCodeOf(req));
++}
++
++TEST_F(GetDstBySrcFilterTest, EdgePropFilterOnEdgeOutsideRequestIsRejected) {
++  // The request only asks for edge type 101, so a filter on 102 is invalid.
++  auto* filter = makeTeamAvgScoreFilter(20, kTeammate);
++  auto req = buildRequest({"Tracy McGrady"}, {kServe}, filter);
++  EXPECT_EQ(::nebula::cpp2::ErrorCode::E_INVALID_FILTER, errorCodeOf(req));
++}
++
++TEST_F(GetDstBySrcFilterTest, PartialAggSumGroupsByDst) {
++  // LeBron James has two edges to the Cavaliers (2003-2010 and 2014-2018), so
++  // the partial aggregate has to group by dst instead of counting per edge.
++  // teamGames: Cavaliers 548 + 301 = 849, Heat 294, Lakers 115.
++  auto* pool = &gObjPool;
++  cpp2::PartialEdgeAgg spec;
++  spec.op_ref() = cpp2::PartialAggOp::SUM;
++  spec.expr_ref() =
++      Expression::encode(*EdgePropertyExpression::make(pool, "101", "teamGames"));
++  std::vector<cpp2::PartialEdgeAgg> aggs{spec};
++
++  auto req = buildRequest({"LeBron James"}, {kServe}, nullptr);
++  req.aggs_ref() = aggs;
++
++  auto* processor = GetDstBySrcProcessor::instance(env_, nullptr, threadPool_.get());
++  auto fut = processor->getFuture();
++  processor->process(req);
++  auto resp = std::move(fut).get();
++
++  ASSERT_EQ(0, resp.result.failed_parts.size());
++  ASSERT_TRUE(resp.partial_agg_ref().has_value());
++  EXPECT_TRUE(*resp.partial_agg_ref());
++  ASSERT_TRUE(resp.dsts_ref().has_value());
++  EXPECT_EQ((std::vector<std::string>{"_dst", "_agg0"}), (*resp.dsts_ref()).colNames);
++
++  std::map<std::string, int64_t> sums;
++  for (const auto& row : (*resp.dsts_ref()).rows) {
++    sums.emplace(row.values[0].getStr(), row.values[1].getInt());
++  }
++  EXPECT_EQ(3UL, sums.size());
++  EXPECT_EQ(849, sums["Cavaliers"]);
++  EXPECT_EQ(294, sums["Heat"]);
++  EXPECT_EQ(115, sums["Lakers"]);
++}
++
++TEST_F(GetDstBySrcFilterTest, PartialAggRespectsFilter) {
++  // The same aggregate, but only edges with teamAvgScore > 27 survive:
++  // Cavaliers 29.7 and 27.5, Heat 27.1; the Lakers edge (25.7) is dropped.
++  auto* pool = &gObjPool;
++  cpp2::PartialEdgeAgg spec;
++  spec.op_ref() = cpp2::PartialAggOp::SUM;
++  spec.expr_ref() =
++      Expression::encode(*EdgePropertyExpression::make(pool, "101", "teamGames"));
++  std::vector<cpp2::PartialEdgeAgg> aggs{spec};
++
++  auto* filter = makeTeamAvgScoreFilter(27);
++  auto req = buildRequest({"LeBron James"}, {kServe}, filter);
++  req.aggs_ref() = aggs;
++
++  auto* processor = GetDstBySrcProcessor::instance(env_, nullptr, threadPool_.get());
++  auto fut = processor->getFuture();
++  processor->process(req);
++  auto resp = std::move(fut).get();
++
++  ASSERT_EQ(0, resp.result.failed_parts.size());
++  std::map<std::string, int64_t> sums;
++  for (const auto& row : (*resp.dsts_ref()).rows) {
++    sums.emplace(row.values[0].getStr(), row.values[1].getInt());
++  }
++  EXPECT_EQ(2UL, sums.size());
++  EXPECT_EQ(849, sums["Cavaliers"]);
++  EXPECT_EQ(294, sums["Heat"]);
++}
++
++}  // namespace
++}  // namespace storage
++}  // namespace nebula
++
++int main(int argc, char** argv) {
++  testing::InitGoogleTest(&argc, argv);
++  folly::init(&argc, &argv, true);
++  google::SetStderrLogging(google::INFO);
++  return RUN_ALL_TESTS();
++}
+diff --git a/src/storage/test/CMakeLists.txt b/src/storage/test/CMakeLists.txt
+index 4838f8f..b206ffe 100644
+--- a/src/storage/test/CMakeLists.txt
++++ b/src/storage/test/CMakeLists.txt
+@@ -783,3 +783,19 @@ nebula_add_executable(
+         gtest
+         curl
+ )
++
++nebula_add_test(
++    NAME
++        get_dst_by_src_filter_test
++    SOURCES
++        GetDstBySrcFilterTest.cpp
++    OBJECTS
++        ${storage_test_deps}
++    LIBRARIES
++        ${ROCKSDB_LIBRARIES}
++        ${THRIFT_LIBRARIES}
++        ${PROXYGEN_LIBRARIES}
++        wangle
++        gtest
++        curl
++)
