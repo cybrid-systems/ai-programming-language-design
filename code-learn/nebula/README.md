@@ -41,6 +41,11 @@
 | 25 | [WAL 格式与恢复](25-wal-format-and-recovery.md) | `<LogID>.wal` 文件布局、`appendLogInternal`、尾部截断、`commitLogId` 恢复 |
 | 26 | [RocksDB 存储引擎](26-rocksdb-storage-engine.md) | 每 space 一个 DB、`Part::commitLogs` → `WriteBatch`、读路径、checkpoint |
 | 27 | [Meta 服务](27-meta-service.md) | Handler → Processor、BaseProcessor 锁、心跳、索引 DDL |
+| 28 | [Executor 框架](28-executor-framework.md) | PlanNode → Executor DAG、open/execute/close、finish、内存水位、生命周期 |
+| 29 | [遍历执行器](29-traversal-executors.md) | GetNeighbors / Expand / Traverse、GetDstBySrc、路径与 storage 下推 |
+| 30 | [查询算子](30-query-operators.md) | Filter / Project / Aggregate / Sort / TopN / Limit / Join / Union 的实现与 iterator 约束 |
+| 31 | [调度与生命周期](31-scheduler-and-lifetime.md) | Promise/Future 依赖图、Select/Loop、userCount drop、MemoryCheckGuard |
+| 32 | [算法算子](32-algo-executors.md) | ShortestPath / BFS 双向 / Multi / AllPaths / Subgraph |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -55,6 +60,8 @@
 ---
 
 24–27 是存储与元数据子系列：24 讲 Raft 副本组，25 讲 WAL 的文件格式与恢复，26 讲 RocksDB 如何承接 apply，27 讲 Meta 的 processor / 心跳 / 索引 DDL。它们不重复 01–22 的查询优化与下推内容，只补写路径和服务侧；14 里提到的 Raft 现在有了独立章节。
+
+28–32 是执行引擎子系列：28 讲 Executor 框架（PlanNode 树 → 异步 DAG、open/execute/close、finish 与生命周期），29 讲 GetNeighbors / Expand / Traverse 三件套，30 讲 Filter / Project / Aggregate / Sort / TopN / Limit / Join，31 讲 Promise/Future 调度、Select/Loop 与内存水位，32 讲最短路 / 全路径 / 子图。13–14 是控制流与数据流总览，这一组补的是 executor 内部实现和关键分支。
 
 ## 主线
 
