@@ -45,7 +45,8 @@ def parse_args():
     p.add_argument("--community-size", type=int, default=400)
     p.add_argument("--degree", type=int, default=8)
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--affinity", choices=["true", "false"], required=True)
+    p.add_argument("--affinity", choices=["true", "false"], default=None)
+    p.add_argument("--placement", choices=["affinity", "random", "mixed"], default=None)
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--concurrency", default="1,10,50,100,200")
     p.add_argument("--rounds", type=int, default=5)
@@ -124,7 +125,7 @@ def load(session, args, graph):
             chunk = ", ".join(f"{s}->{d}@{r}:()" for s, d, r in edges[i : i + 200])
             execute(session, f"INSERT EDGE IF NOT EXISTS know() VALUES {chunk}")
 
-    deadline = time.time() + 60
+    deadline = time.time() + 120
     last = None
     while time.time() < deadline:
         try:
@@ -132,7 +133,8 @@ def load(session, args, graph):
             return
         except RuntimeError as exc:
             last = exc
-            if "No schema" not in str(exc) and "not the leader" not in str(exc).lower():
+            low = str(exc).lower()
+            if not any(s in low for s in ("no schema", "not the leader", "tag not found", "edge not found", "invalid space vid len", "space not found")):
                 raise
             time.sleep(3)
     raise RuntimeError(f"schema not ready: {last}")
@@ -154,8 +156,9 @@ def profile_summary(resp):
     hosts = []
     applied = []
     names = []
+    choice = None
     if not resp.plan_desc():
-        return {"plan": names, "hosts": hosts, "applied": applied}
+        return {"plan": names, "hosts": hosts, "applied": applied, "choice": choice}
     for node in resp.plan_desc().plan_node_descs:
         name = node.name.decode() if isinstance(node.name, (bytes, bytearray)) else str(node.name)
         names.append(name)
@@ -163,6 +166,8 @@ def profile_summary(resp):
             for k, v in (st.other_stats or {}).items():
                 key = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
                 val = v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+                if key == "adaptive_choice":
+                    choice = val
                 if key.startswith("local_multihop"):
                     applied.append(val)
                 if key.startswith("step") and val.startswith("{"):
@@ -177,7 +182,15 @@ def profile_summary(resp):
                             "vertices": parsed.get("vertices"),
                         }
                     )
-    return {"plan": names, "hosts": hosts, "applied": applied}
+    waves = sorted({h["state"].split()[0] for h in hosts if h.get("state")})
+    return {
+        "plan": names,
+        "hosts": hosts,
+        "applied": applied,
+        "choice": choice,
+        "host_resps": len(hosts),
+        "waves": len(waves),
+    }
 
 
 def bench(host, port, space, sql, concurrency, warmup, rounds):
@@ -231,12 +244,17 @@ def bench(host, port, space, sql, concurrency, warmup, rounds):
 
 def main():
     args = parse_args()
+    placement = args.placement
+    if placement is None:
+        if args.affinity is None:
+            raise SystemExit("pass --placement or --affinity")
+        placement = "affinity" if args.affinity == "true" else "random"
     graph = build(
         args.parts,
         args.community_size,
         args.degree,
         args.seed,
-        args.affinity == "true",
+        placement=placement,
     )
     expect = walk(graph["adj"], graph["seeds"], args.steps)
     os.makedirs(args.results, exist_ok=True)
@@ -245,7 +263,8 @@ def main():
     report = {
         "tag": args.tag,
         "space": args.space,
-        "affinity": args.affinity == "true",
+        "affinity": placement == "affinity",
+        "placement": placement,
         "parts": args.parts,
         "replica": args.replica,
         "community_size": args.community_size,
@@ -281,7 +300,13 @@ def main():
         prof = execute(session, "PROFILE " + sql)
         report["profile"] = profile_summary(prof)
         report["profile_us"] = prof.latency()
-        print(json.dumps({"check": report["check"], "applied": report["profile"]["applied"], "hosts": report["profile"]["hosts"]}))
+        print(json.dumps({
+            "check": report["check"],
+            "choice": report["profile"].get("choice"),
+            "applied": report["profile"]["applied"],
+            "waves": report["profile"].get("waves"),
+            "host_resps": report["profile"].get("host_resps"),
+        }))
         if not report["check"]["ok"]:
             raise SystemExit("oracle mismatch")
         report["levels"] = []

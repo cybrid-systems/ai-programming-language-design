@@ -1,0 +1,18 @@
+graph -> stor1
+PING 10.88.0.21 (10.88.0.21) 56(84) bytes of data.
+
+--- 10.88.0.21 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 1061ms
+rtt min/avg/max/mdev = 0.017/0.022/0.088/0.015 ms
+stor1 -> stor2
+PING 10.88.0.22 (10.88.0.22) 56(84) bytes of data.
+
+--- 10.88.0.22 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 1073ms
+rtt min/avg/max/mdev = 0.019/0.026/0.101/0.017 ms
+graph -> meta1
+PING 10.88.0.11 (10.88.0.11) 56(84) bytes of data.
+
+--- 10.88.0.11 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 1066ms
+rtt min/avg/max/mdev = 0.018/0.022/0.064/0.009 ms

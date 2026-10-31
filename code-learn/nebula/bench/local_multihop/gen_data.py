@@ -14,19 +14,45 @@ def affinity_vid(community, index, nparts):
     return community + index * nparts
 
 
-def build(nparts, community_size, degree, seed, affinity):
+def build(nparts, community_size, degree, seed, affinity=True, placement=None):
+    """placement is affinity, random, or mixed.
+
+    mixed keeps even communities on one part and shuffles odd communities
+    across the vid pool that those communities would have owned. That pool
+    is exactly the odd parts, so each odd community is spread over those
+    parts instead of sitting on one.
+    """
+    if placement is None:
+        placement = "affinity" if affinity else "random"
     rng = random.Random(seed)
     logical = []
     for c in range(nparts):
         for i in range(community_size):
             logical.append((c, i))
-    if affinity:
-        vids = [affinity_vid(c, i, nparts) for c, i in logical]
-    else:
+    natural = [affinity_vid(c, i, nparts) for c, i in logical]
+    if placement == "affinity":
+        vids = natural
+    elif placement == "random":
         # Positive ints that still cover every part, but not grouped.
         pool = list(range(1, len(logical) + 1))
         rng.shuffle(pool)
         vids = pool
+    elif placement == "mixed":
+        vid_of = {}
+        used = set()
+        for c, i in logical:
+            if c % 2 == 0:
+                vid = affinity_vid(c, i, nparts)
+                vid_of[(c, i)] = vid
+                used.add(vid)
+        rest_keys = [(c, i) for c, i in logical if c % 2 == 1]
+        rest_vids = [v for v in natural if v not in used]
+        rng.shuffle(rest_vids)
+        for key, vid in zip(rest_keys, rest_vids):
+            vid_of[key] = vid
+        vids = [vid_of[key] for key in logical]
+    else:
+        raise ValueError(placement)
     vid_of = {logical[k]: vids[k] for k in range(len(logical))}
     edges = []  # (src, dst, rank)
     for c, i in logical:
@@ -44,7 +70,8 @@ def build(nparts, community_size, degree, seed, affinity):
     seeds = [vid_of[(c, 0)] for c in range(nparts)]
     return {
         "nparts": nparts,
-        "affinity": affinity,
+        "affinity": placement == "affinity",
+        "placement": placement,
         "vids": vids,
         "edges": edges,
         "seeds": seeds,

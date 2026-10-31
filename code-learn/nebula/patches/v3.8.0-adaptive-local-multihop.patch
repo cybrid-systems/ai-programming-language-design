@@ -1,0 +1,1253 @@
+--- a/conf/nebula-graphd.conf.default	2026-10-31 04:24:26.930149468 +0000
++++ b/conf/nebula-graphd.conf.default	2026-10-31 03:50:21.173126001 +0000
+@@ -142,3 +142,11 @@
+ # --local_multihop_max_frontier=10000
+ # --local_multihop_row_budget=1000000
+ # --local_multihop_frontier_budget=10000
++# Adaptive multi-hop is a separate switch. It does not use affinity.
++# assumed_rtt_us is only the one-arm cost model, not a measured RTT.
++# --enable_adaptive_local_multihop=false
++# --local_multihop_min_local_ratio=0.6
++# --local_multihop_explore_rate=0.05
++# --local_multihop_ewma_alpha=0.2
++# --local_multihop_assumed_rtt_us=5000
++# --local_multihop_trace=false
+--- a/src/clients/storage/StorageClient.cpp	2026-10-31 04:24:26.930149468 +0000
++++ b/src/clients/storage/StorageClient.cpp	2026-10-31 03:50:13.301151402 +0000
+@@ -118,7 +118,8 @@
+     int32_t maxSteps,
+     int32_t minYieldStep,
+     int32_t rowBudget,
+-    int32_t frontierBudget) {
++    int32_t frontierBudget,
++    double minLocalRatio) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -146,6 +147,7 @@
+       req.min_yield_step_ref() = minYieldStep;
+       req.row_budget_ref() = rowBudget;
+       req.frontier_budget_ref() = frontierBudget;
++      req.min_local_ratio_ref() = minLocalRatio;
+     }
+   }
+ 
+--- a/src/clients/storage/StorageClient.h	2026-10-31 04:24:26.930149468 +0000
++++ b/src/clients/storage/StorageClient.h	2026-10-31 03:50:13.049152215 +0000
+@@ -91,7 +91,8 @@
+       int32_t maxSteps = 1,
+       int32_t minYieldStep = 1,
+       int32_t rowBudget = 0,
+-      int32_t frontierBudget = 0);
++      int32_t frontierBudget = 0,
++      double minLocalRatio = 0);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+--- a/src/common/algorithm/AdaptiveMultiHop.h	2026-10-30 07:23:59.291594768 +0000
++++ b/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 03:50:13.117151995 +0000
+@@ -0,0 +1,266 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef COMMON_ALGORITHM_ADAPTIVEMULTIHOP_H_
++#define COMMON_ALGORITHM_ADAPTIVEMULTIHOP_H_
++
++#include <algorithm>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <random>
++#include <utility>
++#include <vector>
++
++#include "common/algorithm/LocalMultiHop.h"
++
++namespace nebula {
++namespace algorithm {
++
++// Query shape for the in-process controller. 3.8's Expand node has no tag:
++// a simple GO is space + edge types + hop count, plus whether every hop is
++// yielded (GO M TO N) or only the last one. Two spaces that share an edge
++// name do not share stats.
++struct AdaptiveShape {
++  int32_t space{0};
++  std::vector<int32_t> edges;
++  int32_t steps{0};
++  bool yieldAll{false};
++
++  bool operator<(const AdaptiveShape& other) const {
++    if (space != other.space) return space < other.space;
++    if (steps != other.steps) return steps < other.steps;
++    if (yieldAll != other.yieldAll) return yieldAll < other.yieldAll;
++    return edges < other.edges;
++  }
++};
++
++inline AdaptiveShape makeAdaptiveShape(int32_t space,
++                                      const std::vector<int32_t>& edgeTypes,
++                                      int32_t steps,
++                                      bool yieldAll) {
++  AdaptiveShape shape;
++  shape.space = space;
++  shape.edges = edgeTypes;
++  std::sort(shape.edges.begin(), shape.edges.end());
++  shape.edges.erase(std::unique(shape.edges.begin(), shape.edges.end()), shape.edges.end());
++  shape.steps = steps;
++  shape.yieldAll = yieldAll;
++  return shape;
++}
++
++// rttUs is a configured stand-in for the cost model, used only while one of
++// the two arms has no latency sample. It is not a measured round trip.
++// Once both arms have samples, choose() compares those latencies and ignores
++// rttUs.
++struct AdaptiveConfig {
++  double exploreRate{0.05};
++  double ewmaAlpha{0.2};
++  double minLocalRatio{0.6};
++  double rttUs{5000};
++};
++
++struct AdaptiveSnapshot {
++  int32_t multiN{0};
++  int32_t baseN{0};
++  int32_t ratioN{0};
++  double multiLat{0};
++  double baseLat{0};
++  double multiRatio{0};
++  bool lastEarly{false};
++  int32_t lastHop{0};
++};
++
++// In-process, per graphd. Not shared across graphd processes and not
++// recovered from meta. A restart is a cold start.
++class AdaptiveController {
++ public:
++  // draw is uniform in [0, 1). exploreRate flips the exploit choice.
++  bool choose(const AdaptiveShape& shape, const AdaptiveConfig& cfg, double draw) {
++    std::lock_guard<std::mutex> guard(mu_);
++    const Slot& slot = slots_[shape];
++    bool exploit = exploitOf(slot, shape, cfg);
++    const double rate = clampRate(cfg.exploreRate);
++    if (draw < rate) return !exploit;
++    return exploit;
++  }
++
++  void observe(const AdaptiveShape& shape,
++               const AdaptiveConfig& cfg,
++               bool usedMulti,
++               double latencyUs,
++               double localRatio,
++               bool earlyStop,
++               int32_t continueHop) {
++    std::lock_guard<std::mutex> guard(mu_);
++    Slot& slot = slots_[shape];
++    const double alpha = clampAlpha(cfg.ewmaAlpha);
++    if (usedMulti) {
++      ewma(slot.multiLat, slot.multiN, latencyUs, alpha);
++      if (localRatio >= 0.0) {
++        ewma(slot.multiRatio, slot.ratioN, localRatio, alpha);
++      }
++      slot.lastEarly = earlyStop;
++      slot.lastHop = continueHop;
++    } else {
++      ewma(slot.baseLat, slot.baseN, latencyUs, alpha);
++    }
++  }
++
++  AdaptiveSnapshot snapshot(const AdaptiveShape& shape) const {
++    std::lock_guard<std::mutex> guard(mu_);
++    AdaptiveSnapshot out;
++    auto it = slots_.find(shape);
++    if (it == slots_.end()) return out;
++    const Slot& slot = it->second;
++    out.multiN = slot.multiN;
++    out.baseN = slot.baseN;
++    out.ratioN = slot.ratioN;
++    out.multiLat = slot.multiLat;
++    out.baseLat = slot.baseLat;
++    out.multiRatio = slot.multiRatio;
++    out.lastEarly = slot.lastEarly;
++    out.lastHop = slot.lastHop;
++    return out;
++  }
++
++  void clear() {
++    std::lock_guard<std::mutex> guard(mu_);
++    slots_.clear();
++  }
++
++  double nextDraw() {
++    std::lock_guard<std::mutex> guard(mu_);
++    std::uniform_real_distribution<double> dist(0.0, 1.0);
++    return dist(rng_);
++  }
++
++ private:
++  struct Slot {
++    double multiLat{0};
++    double baseLat{0};
++    double multiRatio{0};
++    int32_t multiN{0};
++    int32_t baseN{0};
++    int32_t ratioN{0};
++    bool lastEarly{false};
++    int32_t lastHop{0};
++  };
++
++  static void ewma(double& acc, int32_t& n, double sample, double alpha) {
++    if (n <= 0) acc = sample;
++    else acc = alpha * sample + (1.0 - alpha) * acc;
++    if (n < 1000000000) ++n;
++  }
++
++  static double clampRate(double rate) {
++    if (rate < 0.0) return 0.0;
++    if (rate > 1.0) return 1.0;
++    return rate;
++  }
++
++  static double clampAlpha(double alpha) {
++    if (!(alpha > 0.0 && alpha <= 1.0)) return 0.2;
++    return alpha;
++  }
++
++  // Cold start is an optimistic multi-hop try. The storaged guard is the
++  // safety net: a low local-dst ratio returns after one hop, so that try
++  // costs about the same number of round trips as the single-hop baseline.
++  //
++  // With only multi-hop samples:
++  //   - guard fired at hop 1: saved round trips are 0. Prefer baseline.
++  //   - guard fired later: saved round trips are (hop - 1). Keep multi-hop
++  //     when that beats a small bookkeeping overhead.
++  //   - guard did not fire: saved = (steps-1)*localRatio, extra waves from
++  //     the remote fringe = (1-localRatio)*(steps-1). Keep multi-hop when
++  //     the saved term is larger. rttUs cancels as long as it is positive.
++  //
++  // With both samples, the lower EWMA latency wins. A tie prefers baseline.
++  static bool exploitOf(const Slot& slot, const AdaptiveShape& shape, const AdaptiveConfig& cfg) {
++    if (slot.multiN == 0 && slot.baseN == 0) return true;
++    if (slot.multiN > 0 && slot.baseN > 0) {
++      return slot.multiLat + 1.0 < slot.baseLat;
++    }
++    if (slot.multiN > 0) {
++      const double rtt = cfg.rttUs > 0.0 ? cfg.rttUs : 1.0;
++      if (slot.lastEarly && slot.lastHop <= 1) return false;
++      if (slot.lastEarly && slot.lastHop > 1) {
++        const double saved = static_cast<double>(slot.lastHop - 1);
++        const double benefit = saved * rtt;
++        const double overhead = 0.05 * rtt;
++        return benefit > overhead;
++      }
++      if (slot.ratioN == 0) return true;
++      const double steps = static_cast<double>(shape.steps > 0 ? shape.steps : 1);
++      const double ratio = slot.multiRatio;
++      const double saved = (steps - 1.0) * ratio;
++      const double extra = (1.0 - ratio) * (steps - 1.0);
++      return saved * rtt > extra * rtt;
++    }
++    // Baseline samples only. Distribution may have changed, and the guard
++    // bounds a wrong multi-hop try. Try it again; epsilon covers the rest.
++    return true;
++  }
++
++  mutable std::mutex mu_;
++  std::map<AdaptiveShape, Slot> slots_;
++  std::mt19937 rng_{std::random_device{}()};
++};
++
++inline AdaptiveController& adaptiveController() {
++  static AdaptiveController inst;
++  return inst;
++}
++
++struct WalkLaunch {
++  bool useDriver{false};
++  bool adaptive{false};
++  bool choseMulti{false};
++  AdaptiveShape shape{};
++};
++
++// Adaptive replaces the static affinity gate for this launch. Static
++// multi-hop still requires enable + affinity, and it does not turn the
++// per-hop guard on (the caller sends min_local_ratio 0).
++inline WalkLaunch planLocalWalk(bool adaptiveEnabled,
++                                bool staticEnabled,
++                                double staticAffinity,
++                                double affinityThreshold,
++                                int32_t hops,
++                                int32_t frontier,
++                                int32_t maxFrontier,
++                                int32_t maxSteps,
++                                const AdaptiveShape& shape,
++                                const AdaptiveConfig& cfg,
++                                AdaptiveController& ctl,
++                                double draw) {
++  WalkLaunch out;
++  out.shape = shape;
++  const bool hopsOk = shouldLocalMultiHop(true, 1.0, 0.0, hops, frontier, maxFrontier, maxSteps);
++  if (!hopsOk) return out;
++  if (adaptiveEnabled) {
++    out.useDriver = true;
++    out.adaptive = true;
++    out.choseMulti = ctl.choose(shape, cfg, draw);
++    return out;
++  }
++  if (shouldLocalMultiHop(staticEnabled,
++                          staticAffinity,
++                          affinityThreshold,
++                          hops,
++                          frontier,
++                          maxFrontier,
++                          maxSteps)) {
++    out.useDriver = true;
++    out.choseMulti = true;
++  }
++  return out;
++}
++
++}  // namespace algorithm
++}  // namespace nebula
++
++#endif  // COMMON_ALGORITHM_ADAPTIVEMULTIHOP_H_
+--- a/src/common/algorithm/LocalMultiHop.h	2026-10-31 04:24:26.930149468 +0000
++++ b/src/common/algorithm/LocalMultiHop.h	2026-10-31 04:34:14.160113722 +0000
+@@ -7,6 +7,7 @@
+ #define COMMON_ALGORITHM_LOCALMULTIHOP_H_
+ 
+ #include <cstdint>
++#include <iterator>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+@@ -63,6 +64,16 @@
+   int32_t stepsDone{0};
+   bool truncated{false};
+   bool failed{false};
++  // Per-hop guard. earlyStop means hop continueHop finished, but its dsts were
++  // not expanded here. They sit in carry (local and remote together) and
++  // remoteVids only still holds frontiers from earlier depths. truncated is
++  // also set so the caller does not send that frontier back into multi-hop.
++  // localRatio is the minimum dst-local fraction seen on a hop that produced
++  // at least one dst. hasLocalRatio is false when every hop was empty.
++  bool earlyStop{false};
++  int32_t continueHop{0};
++  double localRatio{0};
++  bool hasLocalRatio{false};
+ };
+ 
+ // Local BFS.
+@@ -73,6 +84,9 @@
+ // maxOutDegree <= 0 disables the per-vertex degree cap (3.8's existing
+ // per-vertex edge limit still applies inside the scan callback).
+ // rowBudget / frontierBudget <= 0 disable those caps.
++// minLocalRatio <= 0 disables the per-hop guard. The static multi-hop path
++// passes 0 so a low-affinity graph still walks every requested hop inside
++// this process (the regression the adaptive path is there to avoid).
+ template <typename Vid, typename IsLocal, typename Neighbors>
+ LocalMultiHopResult<Vid> runLocalMultiHop(const std::vector<Vid>& starts,
+                                           int32_t maxSteps,
+@@ -81,7 +95,8 @@
+                                           int32_t frontierBudget,
+                                           int32_t maxOutDegree,
+                                           IsLocal isLocal,
+-                                          Neighbors neighbors) {
++                                          Neighbors neighbors,
++                                          double minLocalRatio = 0.0) {
+   LocalMultiHopResult<Vid> result;
+   if (maxSteps <= 0) return result;
+ 
+@@ -106,6 +121,9 @@
+     std::unordered_set<Vid> yieldedThisStep;
+     std::unordered_set<Vid> seenRemote;
+     bool budgetHit = false;
++    // Dsts only. A frontier vid that lost leadership mid-walk is not a dst
++    // of this hop and must not move the ratio.
++    size_t remoteDsts = 0;
+     for (const auto& vid : frontier) {
+       if (!isLocal(vid)) {
+         rememberRemote(seenRemote, vid, step - 1);
+@@ -135,7 +153,11 @@
+           break;
+         }
+         if (!isLocal(dst)) {
+-          rememberRemote(seenRemote, dst, step);
++          if (seenRemote.insert(dst).second) {
++            result.remoteVids.push_back(dst);
++            result.remoteDepth.push_back(step);
++            ++remoteDsts;
++          }
+           continue;
+         }
+         if (!next.insert(dst).second) {
+@@ -157,6 +179,41 @@
+       return result;
+     }
+     result.stepsDone = step;
++    const size_t localDsts = next.size();
++    if (localDsts + remoteDsts > 0) {
++      const double hopRatio =
++          static_cast<double>(localDsts) / static_cast<double>(localDsts + remoteDsts);
++      if (!result.hasLocalRatio || hopRatio < result.localRatio) {
++        result.localRatio = hopRatio;
++        result.hasLocalRatio = true;
++      }
++      // The last hop is the result. Stopping there would only add a marker
++      // and another round trip for dsts this process has already produced.
++      if (minLocalRatio > 0.0 && step < maxSteps && hopRatio < minLocalRatio) {
++        result.earlyStop = true;
++        result.continueHop = step;
++        result.truncated = true;
++        result.carry.assign(next.begin(), next.end());
++        std::vector<Vid> keptVids;
++        std::vector<int32_t> keptDepth;
++        keptVids.reserve(result.remoteVids.size());
++        keptDepth.reserve(result.remoteDepth.size());
++        for (size_t i = 0; i < result.remoteVids.size() && i < result.remoteDepth.size(); ++i) {
++          if (result.remoteDepth[i] == step) {
++            result.carry.push_back(std::move(result.remoteVids[i]));
++            if (step >= minYield && yieldedThisStep.insert(result.carry.back()).second) {
++              result.yielded.push_back(result.carry.back());
++            }
++          } else {
++            keptVids.push_back(std::move(result.remoteVids[i]));
++            keptDepth.push_back(result.remoteDepth[i]);
++          }
++        }
++        result.remoteVids.swap(keptVids);
++        result.remoteDepth.swap(keptDepth);
++        return result;
++      }
++    }
+     if (frontierBudget > 0 && static_cast<int32_t>(next.size()) > frontierBudget) {
+       result.truncated = true;
+       result.carry.assign(next.begin(), next.end());
+@@ -184,6 +241,22 @@
+   std::vector<HopWave<Vid>> waves;
+ };
+ 
++// One GetDstBySrc fans out to every leader. Replies for the same remaining
++// depth must be one frontier again. Leaving each host as its own job turns
++// a 3-hop baseline into a chain of sequential RPCs.
++template <typename Job>
++inline void mergeSameHop(std::vector<Job>& jobs, Job next) {
++  for (auto& existing : jobs) {
++    if (existing.hopsLeft == next.hopsLeft && existing.allowMulti == next.allowMulti) {
++      existing.vids.insert(existing.vids.end(),
++                           std::make_move_iterator(next.vids.begin()),
++                           std::make_move_iterator(next.vids.end()));
++      return;
++    }
++  }
++  jobs.push_back(std::move(next));
++}
++
+ // Turn one storage response into "rows to emit" and "frontiers still to walk".
+ // applied=false means the server ignored multi-hop fields (old storaged, or
+ // storaged_accept_local_multihop=false) and dsts are a single hop.
+--- a/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 04:24:26.930149468 +0000
++++ b/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 04:34:08.736132531 +0000
+@@ -9,6 +9,7 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ 
++#include "common/algorithm/AdaptiveMultiHop.h"
+ #include "common/algorithm/LocalMultiHop.h"
+ 
+ namespace nebula {
+@@ -171,6 +172,35 @@
+   EXPECT_FALSE(result.truncated);
+ }
+ 
++TEST(LocalMultiHopConsumeTest, SameHopFromSeveralHostsIsOneJob) {
++  struct Job {
++    int32_t hopsLeft{0};
++    bool allowMulti{false};
++    std::vector<int64_t> vids;
++  };
++  std::vector<Job> jobs;
++  Job a;
++  a.hopsLeft = 2;
++  a.allowMulti = false;
++  a.vids = {1, 2};
++  Job b;
++  b.hopsLeft = 2;
++  b.allowMulti = false;
++  b.vids = {2, 3};
++  Job c;
++  c.hopsLeft = 1;
++  c.allowMulti = false;
++  c.vids = {9};
++  mergeSameHop(jobs, std::move(a));
++  mergeSameHop(jobs, std::move(b));
++  mergeSameHop(jobs, std::move(c));
++  ASSERT_EQ(2, jobs.size());
++  EXPECT_EQ(2, jobs[0].hopsLeft);
++  EXPECT_EQ(std::vector<int64_t>({1, 2, 2, 3}), jobs[0].vids);
++  EXPECT_EQ(1, jobs[1].hopsLeft);
++  EXPECT_EQ(asSet({9}), asSet(jobs[1].vids));
++}
++
+ TEST(LocalMultiHopConsumeTest, OldServerIsOneHop) {
+   auto out = consumeLocalMultiHop<int64_t>(3, false, false, 0, false, {2, 3}, {}, {}, {});
+   EXPECT_TRUE(out.yieldNow.empty());
+@@ -205,6 +235,329 @@
+   EXPECT_EQ(asSet({8}), asSet(out.waves[0].vids));
+ }
+ 
++TEST(LocalMultiHopTest, AllLocalAboveThresholdDoesNotStop) {
++  Graph g{{1, {2, 3}}, {2, {4}}, {3, {4}}, {4, {5}}};
++  auto allLocal = [](int64_t) { return true; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_FALSE(result.earlyStop);
++  EXPECT_FALSE(result.truncated);
++  EXPECT_EQ(3, result.stepsDone);
++  EXPECT_EQ(asSet({5}), asSet(result.yielded));
++  EXPECT_TRUE(result.hasLocalRatio);
++  EXPECT_DOUBLE_EQ(1.0, result.localRatio);
++}
++
++TEST(LocalMultiHopTest, LowRatioStopsAfterHopAndKeepsEveryDst) {
++  // 2 is local, 10 and 11 are not. 1/3 is below 0.6, so hop 1 is not expanded.
++  Graph g{{1, {2, 10, 11, 10}}, {2, {3}}, {10, {12}}, {11, {13}}};
++  auto local = [](int64_t v) { return v < 10; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_TRUE(result.earlyStop);
++  EXPECT_TRUE(result.truncated);
++  EXPECT_EQ(1, result.continueHop);
++  EXPECT_EQ(1, result.stepsDone);
++  EXPECT_TRUE(result.yielded.empty());
++  EXPECT_TRUE(result.remoteVids.empty());
++  EXPECT_EQ(asSet({2, 10, 11}), asSet(result.carry));
++  EXPECT_NEAR(1.0 / 3.0, result.localRatio, 1e-9);
++
++  auto out = consumeLocalMultiHop<int64_t>(3, false, true, result.stepsDone, result.truncated,
++                                           result.yielded, result.remoteVids, result.remoteDepth,
++                                           result.carry);
++  EXPECT_TRUE(out.yieldNow.empty());
++  ASSERT_EQ(1, out.waves.size());
++  EXPECT_FALSE(out.waves[0].allowMulti);
++  EXPECT_EQ(2, out.waves[0].hopsLeft);
++  EXPECT_EQ(asSet({2, 10, 11}), asSet(out.waves[0].vids));
++}
++
++TEST(LocalMultiHopTest, ThresholdKeepsTheHopWhenRatioIsEqual) {
++  Graph g{{1, {2, 3, 4, 10, 11}}};
++  auto local = [](int64_t v) { return v < 10; };
++  auto kept = runLocalMultiHop<int64_t>(
++      {1}, 2, 2, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_FALSE(kept.earlyStop);
++  EXPECT_EQ(asSet({10, 11}), asSet(kept.remoteVids));
++  EXPECT_NEAR(0.6, kept.localRatio, 1e-9);
++
++  auto stopped = runLocalMultiHop<int64_t>(
++      {1}, 2, 2, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.61);
++  EXPECT_TRUE(stopped.earlyStop);
++  EXPECT_EQ(asSet({2, 3, 4, 10, 11}), asSet(stopped.carry));
++  EXPECT_TRUE(stopped.remoteVids.empty());
++}
++
++TEST(LocalMultiHopTest, LastHopIsNotAnEarlyStop) {
++  Graph g{{1, {10, 11}}};
++  auto local = [](int64_t v) { return v < 10; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 1, 1, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_FALSE(result.earlyStop);
++  EXPECT_FALSE(result.truncated);
++  EXPECT_EQ(asSet({10, 11}), asSet(result.remoteVids));
++  EXPECT_TRUE(result.carry.empty());
++}
++
++TEST(LocalMultiHopTest, ZeroRatioDisablesTheGuard) {
++  Graph g{{1, {10, 11}}, {10, {12}}};
++  auto local = [](int64_t v) { return v < 10; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.0);
++  EXPECT_FALSE(result.earlyStop);
++  EXPECT_EQ(asSet({10, 11}), asSet(result.remoteVids));
++  EXPECT_TRUE(result.carry.empty());
++}
++
++TEST(LocalMultiHopTest, EarlyStopKeepsEarlierRemoteAndBothDepths) {
++  // Hop 1 ratio is 0.5, above 0.4, so 4 at depth 1 stays remote.
++  // Hop 2 is only remote 4, below 0.4, so that copy goes to carry.
++  // Both distances of 4 are still present. 5 is not dropped: graphd expands
++  // each copy for the hops that remain.
++  Graph g{{1, {2, 4}}, {2, {4}}, {4, {5}}};
++  auto local = [](int64_t v) { return v != 4 && v != 5; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.4);
++  EXPECT_TRUE(result.earlyStop);
++  EXPECT_EQ(2, result.continueHop);
++  EXPECT_EQ(asSet({4}), asSet(result.carry));
++  ASSERT_EQ(1, result.remoteVids.size());
++  EXPECT_EQ(4, result.remoteVids[0]);
++  EXPECT_EQ(1, result.remoteDepth[0]);
++
++  auto out = consumeLocalMultiHop<int64_t>(3, false, true, result.stepsDone, true, result.yielded,
++                                           result.remoteVids, result.remoteDepth, result.carry);
++  bool sawTwo = false;
++  bool sawOne = false;
++  for (const auto& wave : out.waves) {
++    EXPECT_FALSE(wave.allowMulti);
++    if (wave.hopsLeft == 2 && asSet(wave.vids).count(4)) sawTwo = true;
++    if (wave.hopsLeft == 1 && asSet(wave.vids).count(4)) sawOne = true;
++  }
++  EXPECT_TRUE(sawTwo);
++  EXPECT_TRUE(sawOne);
++  EXPECT_TRUE(out.yieldNow.empty());
++}
++
++TEST(LocalMultiHopTest, YieldAllEarlyStopEmitsThisHopOnce) {
++  Graph g{{1, {2, 10}}};
++  auto local = [](int64_t v) { return v < 10; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 1, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_TRUE(result.earlyStop);
++  EXPECT_EQ(asSet({2, 10}), asSet(result.yielded));
++  EXPECT_EQ(asSet({2, 10}), asSet(result.carry));
++  auto out = consumeLocalMultiHop<int64_t>(3, true, true, result.stepsDone, true, result.yielded,
++                                           result.remoteVids, result.remoteDepth, result.carry);
++  EXPECT_EQ(asSet({2, 10}), asSet(out.yieldNow));
++  ASSERT_EQ(1, out.waves.size());
++  EXPECT_EQ(asSet({2, 10}), asSet(out.waves[0].vids));
++  EXPECT_EQ(2, out.waves[0].hopsLeft);
++}
++
++TEST(LocalMultiHopTest, FrontierRemoteIsNotADstOfThisHop) {
++  // 9 is a start that is not local. It is not a dst, so the ratio stays 1
++  // and the walk continues. 9 remains at depth 0.
++  Graph g{{1, {2}}, {2, {3}}};
++  auto local = [](int64_t v) { return v != 9; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1, 9}, 2, 2, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_FALSE(result.earlyStop);
++  EXPECT_EQ(asSet({3}), asSet(result.yielded));
++  EXPECT_EQ(asSet({9}), asSet(result.remoteVids));
++  ASSERT_EQ(1, result.remoteDepth.size());
++  EXPECT_EQ(0, result.remoteDepth[0]);
++}
++
++std::unordered_set<int64_t> singleHopFinal(const Graph& graph,
++                                           const std::vector<int64_t>& seeds,
++                                           int32_t steps) {
++  std::unordered_set<int64_t> frontier(seeds.begin(), seeds.end());
++  for (int32_t step = 0; step < steps; ++step) {
++    std::unordered_set<int64_t> next;
++    for (auto vid : frontier) {
++      auto it = graph.find(vid);
++      if (it == graph.end()) continue;
++      next.insert(it->second.begin(), it->second.end());
++    }
++    frontier.swap(next);
++  }
++  return frontier;
++}
++
++// Replay what graphd does after an early stop: carry and earlier remotes are
++// expanded one hop at a time, with no second multi-hop call.
++std::unordered_set<int64_t> resumeSingleHop(const Graph& graph,
++                                            int32_t hopsLeft,
++                                            const LocalMultiHopResult<int64_t>& walked,
++                                            bool requireSingle) {
++  auto consumed = consumeLocalMultiHop<int64_t>(hopsLeft,
++                                                false,
++                                                true,
++                                                walked.stepsDone,
++                                                walked.truncated || walked.earlyStop,
++                                                walked.yielded,
++                                                walked.remoteVids,
++                                                walked.remoteDepth,
++                                                walked.carry);
++  std::unordered_set<int64_t> finals(consumed.yieldNow.begin(), consumed.yieldNow.end());
++  std::vector<HopWave<int64_t>> waves = std::move(consumed.waves);
++  while (!waves.empty()) {
++    auto wave = std::move(waves.back());
++    waves.pop_back();
++    if (requireSingle) {
++      EXPECT_FALSE(wave.allowMulti);
++    }
++    if (wave.hopsLeft <= 0) {
++      finals.insert(wave.vids.begin(), wave.vids.end());
++      continue;
++    }
++    std::unordered_set<int64_t> dsts;
++    for (auto vid : wave.vids) {
++      auto it = graph.find(vid);
++      if (it == graph.end()) continue;
++      dsts.insert(it->second.begin(), it->second.end());
++    }
++    if (wave.hopsLeft == 1) {
++      finals.insert(dsts.begin(), dsts.end());
++    } else {
++      HopWave<int64_t> next;
++      next.hopsLeft = wave.hopsLeft - 1;
++      next.allowMulti = false;
++      next.vids.assign(dsts.begin(), dsts.end());
++      waves.push_back(std::move(next));
++    }
++  }
++  return finals;
++}
++
++TEST(LocalMultiHopTest, EarlyStopMatchesSingleHopOnTwoDepths) {
++  // 5 is only three hops along 1-2-4-5. Dropping the local dst 2 at the
++  // guard would lose 5 and keep only 6.
++  Graph g{{1, {2, 4}}, {2, {4}}, {4, {5}}, {5, {6}}};
++  auto local = [](int64_t v) { return v < 4; };
++  auto expect = singleHopFinal(g, {1}, 3);
++  EXPECT_EQ(asSet({5, 6}), expect);
++  auto guarded = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.6);
++  EXPECT_TRUE(guarded.earlyStop);
++  EXPECT_EQ(1, guarded.continueHop);
++  EXPECT_EQ(asSet({2, 4}), asSet(guarded.carry));
++  EXPECT_EQ(expect, resumeSingleHop(g, 3, guarded, true));
++
++  auto unguarded = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); }, 0.0);
++  EXPECT_FALSE(unguarded.earlyStop);
++  EXPECT_EQ(expect, resumeSingleHop(g, 3, unguarded, false));
++}
++
++TEST(AdaptiveMultiHopTest, ColdStartExploresAndIsolatesShapes) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  auto shape = makeAdaptiveShape(1, {4, 2, 2}, 3, false);
++  EXPECT_EQ(std::vector<int32_t>({2, 4}), shape.edges);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.0));
++  cfg.exploreRate = 0;
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.0));
++  cfg.exploreRate = 1;
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
++  cfg.exploreRate = 0.05;
++
++  ctl.observe(shape, cfg, true, 1000, 1.0, false, 0);
++  ctl.observe(shape, cfg, false, 5000, -1, false, 0);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  auto other = makeAdaptiveShape(2, {2, 4}, 3, false);
++  EXPECT_TRUE(ctl.choose(other, cfg, 0.5));
++  EXPECT_EQ(0, ctl.snapshot(other).multiN);
++}
++
++TEST(AdaptiveMultiHopTest, Hop1GuardPrefersBaselineUntilBothArmsSayOtherwise) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  auto shape = makeAdaptiveShape(1, {1}, 3, false);
++  ctl.observe(shape, cfg, true, 24000, 0.3, true, 1);
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
++  cfg.exploreRate = 0.05;
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.01));
++  cfg.exploreRate = 0;
++
++  // Only a baseline sample would try multi-hop again. After the hop-1
++  // observation above, a baseline sample makes both arms exist, and the
++  // guarded multi-hop latency is not better.
++  ctl.observe(shape, cfg, false, 24000, -1, false, 0);
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
++}
++
++TEST(AdaptiveMultiHopTest, LaterGuardAndHighRatioStayOnMultiHop) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  cfg.rttUs = 5000;
++  auto shape = makeAdaptiveShape(1, {1}, 3, false);
++  ctl.observe(shape, cfg, true, 12000, 0.4, true, 2);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++
++  AdaptiveController full;
++  full.observe(shape, cfg, true, 7000, 1.0, false, 0);
++  EXPECT_TRUE(full.choose(shape, cfg, 0.5));
++  EXPECT_NEAR(1.0, full.snapshot(shape).multiRatio, 1e-9);
++}
++
++TEST(AdaptiveMultiHopTest, BothArmsFollowMeasuredLatency) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  auto shape = makeAdaptiveShape(1, {9}, 3, false);
++  ctl.observe(shape, cfg, true, 1000, 1.0, false, 0);
++  ctl.observe(shape, cfg, false, 5000, -1, false, 0);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  // alpha 0.2: 1000 -> 4800 -> 7840. 7840 is no longer under 5000.
++  ctl.observe(shape, cfg, true, 20000, 0.2, true, 1);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  ctl.observe(shape, cfg, true, 20000, 0.2, true, 1);
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
++  EXPECT_GT(ctl.snapshot(shape).multiLat, ctl.snapshot(shape).baseLat);
++
++  AdaptiveController tie;
++  tie.observe(shape, cfg, true, 4000, 1.0, false, 0);
++  tie.observe(shape, cfg, false, 4000, -1, false, 0);
++  EXPECT_FALSE(tie.choose(shape, cfg, 0.5));
++}
++
++TEST(AdaptiveMultiHopTest, LowRatioWithoutAGuardPrefersBaseline) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  auto shape = makeAdaptiveShape(1, {3}, 3, false);
++  ctl.observe(shape, cfg, true, 80000, 0.2, false, 0);
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
++}
++
++TEST(AdaptiveMultiHopTest, PlanLaunchUsesAdaptiveBeforeStaticAffinity) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  auto shape = makeAdaptiveShape(4, {8}, 3, false);
++  auto adaptive = planLocalWalk(true, false, 0.0, 0.6, 3, 10, 10000, 3, shape, cfg, ctl, 0.5);
++  EXPECT_TRUE(adaptive.useDriver);
++  EXPECT_TRUE(adaptive.adaptive);
++  EXPECT_TRUE(adaptive.choseMulti);
++
++  auto baseline = planLocalWalk(false, true, 0.0, 0.6, 3, 10, 10000, 3, shape, cfg, ctl, 0.5);
++  EXPECT_FALSE(baseline.useDriver);
++
++  auto stat = planLocalWalk(false, true, 1.0, 0.6, 3, 10, 10000, 3, shape, cfg, ctl, 0.5);
++  EXPECT_TRUE(stat.useDriver);
++  EXPECT_FALSE(stat.adaptive);
++  EXPECT_TRUE(stat.choseMulti);
++
++  auto oneHop = planLocalWalk(true, true, 1.0, 0.6, 1, 10, 10000, 3, shape, cfg, ctl, 0.5);
++  EXPECT_FALSE(oneHop.useDriver);
++}
++
+ TEST(LocalMultiHopConsumeTest, TruncatedCarryStaysOnSingleHop) {
+   auto out = consumeLocalMultiHop<int64_t>(3, false, true, 1, true, {}, {}, {}, {2, 3});
+   EXPECT_TRUE(out.yieldNow.empty());
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 04:24:26.930149468 +0000
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 03:50:44.477050637 +0000
+@@ -4,6 +4,7 @@
+ 
+ #include "graph/executor/query/ExpandAllExecutor.h"
+ 
++#include "common/algorithm/AdaptiveMultiHop.h"
+ #include "common/algorithm/LocalMultiHop.h"
+ #include "common/algorithm/ReservoirSampling.h"
+ #include "graph/service/GraphFlags.h"
+@@ -74,22 +75,34 @@
+ 
+ folly::Future<Status> ExpandAllExecutor::GetDstBySrc() {
+   const int32_t hops = static_cast<int32_t>(maxSteps_ - expand_->minSteps() + 1);
+-  if (!joinInput_ && stepLimits_.empty() && !sample_ && currentStep_ == expand_->minSteps() &&
+-      algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
+-                                     FLAGS_local_multihop_affinity,
+-                                     FLAGS_local_multihop_affinity_threshold,
+-                                     hops,
+-                                     static_cast<int32_t>(nextStepVids_.size()),
+-                                     FLAGS_local_multihop_max_frontier,
+-                                     FLAGS_local_multihop_max_steps)) {
+-    auto state = std::make_shared<DstWalkState>();
+-    state->yieldAll = true;
+-    DstWalkState::Job job;
+-    job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
+-    job.hopsLeft = hops;
+-    job.allowMulti = true;
+-    state->jobs.push_back(std::move(job));
+-    return driveDstWalk(state);
++  if (!joinInput_ && stepLimits_.empty() && !sample_ && currentStep_ == expand_->minSteps()) {
++    auto shape = algorithm::makeAdaptiveShape(expand_->space(), expand_->edgeTypes(), hops, true);
++    const double draw = algorithm::adaptiveController().nextDraw();
++    auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
++                                           FLAGS_enable_local_multihop,
++                                           FLAGS_local_multihop_affinity,
++                                           FLAGS_local_multihop_affinity_threshold,
++                                           hops,
++                                           static_cast<int32_t>(nextStepVids_.size()),
++                                           FLAGS_local_multihop_max_frontier,
++                                           FLAGS_local_multihop_max_steps,
++                                           shape,
++                                           adaptiveRuntimeConfig(),
++                                           algorithm::adaptiveController(),
++                                           draw);
++    if (launch.useDriver) {
++      auto state = std::make_shared<DstWalkState>();
++      state->yieldAll = true;
++      state->adaptive = launch.adaptive;
++      state->choseMulti = launch.choseMulti;
++      state->shape = std::move(launch.shape);
++      DstWalkState::Job job;
++      job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++      job.hopsLeft = hops;
++      job.allowMulti = true;
++      state->jobs.push_back(std::move(job));
++      return driveDstWalk(state);
++    }
+   }
+   currentStep_++;
+   time::Duration getDstTime;
+--- a/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 04:24:26.930149468 +0000
++++ b/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 03:50:44.477050637 +0000
+@@ -4,6 +4,7 @@
+ 
+ #include "graph/executor/query/ExpandExecutor.h"
+ 
++#include "common/algorithm/AdaptiveMultiHop.h"
+ #include "common/algorithm/LocalMultiHop.h"
+ #include "common/algorithm/ReservoirSampling.h"
+ #include "graph/service/GraphFlags.h"
+@@ -72,21 +73,34 @@
+ }
+ 
+ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
+-  if (currentStep_ == 0 && stepLimits_.empty() && !sample_ &&
+-      algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
+-                                     FLAGS_local_multihop_affinity,
+-                                     FLAGS_local_multihop_affinity_threshold,
+-                                     static_cast<int32_t>(maxSteps_),
+-                                     static_cast<int32_t>(nextStepVids_.size()),
+-                                     FLAGS_local_multihop_max_frontier,
+-                                     FLAGS_local_multihop_max_steps)) {
+-    auto state = std::make_shared<DstWalkState>();
+-    DstWalkState::Job job;
+-    job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
+-    job.hopsLeft = static_cast<int32_t>(maxSteps_);
+-    job.allowMulti = true;
+-    state->jobs.push_back(std::move(job));
+-    return driveDstWalk(state);
++  if (currentStep_ == 0 && stepLimits_.empty() && !sample_) {
++    const int32_t hops = static_cast<int32_t>(maxSteps_);
++    auto shape = algorithm::makeAdaptiveShape(expand_->space(), expand_->edgeTypes(), hops, false);
++    const double draw = algorithm::adaptiveController().nextDraw();
++    auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
++                                           FLAGS_enable_local_multihop,
++                                           FLAGS_local_multihop_affinity,
++                                           FLAGS_local_multihop_affinity_threshold,
++                                           hops,
++                                           static_cast<int32_t>(nextStepVids_.size()),
++                                           FLAGS_local_multihop_max_frontier,
++                                           FLAGS_local_multihop_max_steps,
++                                           shape,
++                                           adaptiveRuntimeConfig(),
++                                           algorithm::adaptiveController(),
++                                           draw);
++    if (launch.useDriver) {
++      auto state = std::make_shared<DstWalkState>();
++      state->adaptive = launch.adaptive;
++      state->choseMulti = launch.choseMulti;
++      state->shape = std::move(launch.shape);
++      DstWalkState::Job job;
++      job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++      job.hopsLeft = hops;
++      job.allowMulti = true;
++      state->jobs.push_back(std::move(job));
++      return driveDstWalk(state);
++    }
+   }
+   currentStep_++;
+   time::Duration getDstTime;
+--- a/src/graph/executor/query/LocalMultiHopDriveBody.inl	2026-10-31 04:24:26.930149468 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriveBody.inl	2026-10-31 04:34:08.888132004 +0000
+@@ -3,6 +3,10 @@
+ if (qctx()->isKilled()) {
+   return folly::makeFuture<Status>(Status::Error("Execution had been killed"));
+ }
++if (state->adaptive && !state->noted) {
++  state->noted = true;
++  addState("adaptive_choice", state->choseMulti ? "multi" : "base");
++}
+ while (!state->jobs.empty() && state->jobs.back().vids.empty()) {
+   state->jobs.pop_back();
+ }
+@@ -25,6 +29,34 @@
+     }
+   }
+   finish(ResultBuilder().value(Value(std::move(ds))).build());
++  if (state->adaptive) {
++    bool early = state->sawEarlyStop;
++    int32_t hop = state->earliestContinue;
++    double ratio = state->sawLocalRatio ? state->worstLocalRatio : -1.0;
++    if (state->choseMulti && !state->sawApplied) {
++      // Old storaged, or the accept flag is off. The walk already fell back
++      // to single-hop. Treat it as a hop-1 guard so the next query prefers
++      // baseline instead of paying the multi-hop request again.
++      early = true;
++      hop = 1;
++      ratio = -1.0;
++    }
++    const double walkUs = static_cast<double>(state->clock.elapsedInUSec());
++    algorithm::adaptiveController().observe(state->shape,
++                                            adaptiveRuntimeConfig(),
++                                            state->choseMulti,
++                                            walkUs,
++                                            ratio,
++                                            early,
++                                            hop);
++    if (FLAGS_local_multihop_trace) {
++      LOG(INFO) << "adaptive_multihop"
++                << " choice=" << (state->choseMulti ? "multi" : "base")
++                << " walk_us=" << static_cast<int64_t>(walkUs)
++                << " ratio=" << ratio << " early=" << (early ? 1 : 0)                 << " hop=" << hop << " rpc=" << state->rpc
++                << " steps=" << state->shape.steps << " space=" << state->shape.space;
++    }
++  }
+   return folly::makeFuture<Status>(Status::OK());
+ }
+ 
+@@ -43,14 +75,27 @@
+   return driveDstWalk(state);
+ }
+ 
+-const bool multi =
+-    job.allowMulti && algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
+-                                                     FLAGS_local_multihop_affinity,
+-                                                     FLAGS_local_multihop_affinity_threshold,
+-                                                     job.hopsLeft,
+-                                                     static_cast<int32_t>(job.vids.size()),
+-                                                     FLAGS_local_multihop_max_frontier,
+-                                                     FLAGS_local_multihop_max_steps);
++bool multi = false;
++if (job.allowMulti && state->choseMulti) {
++  if (state->adaptive) {
++    multi = algorithm::shouldLocalMultiHop(true,
++                                           1.0,
++                                           0.0,
++                                           job.hopsLeft,
++                                           static_cast<int32_t>(job.vids.size()),
++                                           FLAGS_local_multihop_max_frontier,
++                                           FLAGS_local_multihop_max_steps);
++  } else {
++    multi = algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
++                                           FLAGS_local_multihop_affinity,
++                                           FLAGS_local_multihop_affinity_threshold,
++                                           job.hopsLeft,
++                                           static_cast<int32_t>(job.vids.size()),
++                                           FLAGS_local_multihop_max_frontier,
++                                           FLAGS_local_multihop_max_steps);
++  }
++}
++const double minLocalRatio = (multi && state->adaptive) ? FLAGS_local_multihop_min_local_ratio : 0.0;
+ const int32_t reqSteps =
+     multi ? algorithm::clipLocalMultiHopSteps(job.hopsLeft, FLAGS_local_multihop_max_steps) : 1;
+ int32_t minYield = state->yieldAll ? 1 : job.hopsLeft;
+@@ -72,7 +117,8 @@
+                   reqSteps,
+                   minYield,
+                   FLAGS_local_multihop_row_budget,
+-                  FLAGS_local_multihop_frontier_budget)
++                  FLAGS_local_multihop_frontier_budget,
++                  minLocalRatio)
+     .via(runner())
+     .ensure([this, rpcTime]() {
+       SCOPED_TIMER(&execTime_);
+@@ -109,17 +155,40 @@
+         int32_t stepsDone = 0;
+         bool truncated = false;
+         if (applied) {
++          state->sawApplied = true;
+           if (one.remote_vids_ref().has_value()) remote = one.remote_vids_ref().value();
+           if (one.remote_depth_ref().has_value()) depth = one.remote_depth_ref().value();
+           if (one.carry_vids_ref().has_value()) carry = one.carry_vids_ref().value();
+           stepsDone = one.steps_done_ref().value_or(0);
+           truncated = one.truncated_ref().value_or(false);
++          const bool earlyStop = one.early_stop_ref().value_or(false);
++          const int32_t continueHop = one.continue_hop_ref().value_or(0);
++          if (earlyStop) {
++            truncated = true;
++            state->sawEarlyStop = true;
++            if (state->earliestContinue == 0 || continueHop < state->earliestContinue) {
++              state->earliestContinue = continueHop;
++            }
++          }
++          if (one.local_ratio_ref().has_value()) {
++            const double ratio = one.local_ratio_ref().value();
++            if (!state->sawLocalRatio || ratio < state->worstLocalRatio) {
++              state->worstLocalRatio = ratio;
++              state->sawLocalRatio = true;
++            }
++          }
+           addState(folly::sformat("local_multihop[{}]", rpcIndex),
+-                   folly::sformat("applied=1 steps_done={} remote={} carry={} truncated={}",
++                   folly::sformat("applied=1 steps_done={} remote={} carry={} truncated={} "
++                                  "early_stop={} continue_hop={} local_ratio={}",
+                                   stepsDone,
+                                   remote.size(),
+                                   carry.size(),
+-                                  truncated ? 1 : 0));
++                                  truncated ? 1 : 0,
++                                  earlyStop ? 1 : 0,
++                                  continueHop,
++                                  one.local_ratio_ref().has_value()
++                                      ? folly::sformat("{}", one.local_ratio_ref().value())
++                                      : std::string("-")));
+         }
+         auto consumed = algorithm::consumeLocalMultiHop<Value>(job.hopsLeft,
+                                                               state->yieldAll,
+@@ -141,7 +210,7 @@
+           next.vids = std::move(wave.vids);
+           next.hopsLeft = wave.hopsLeft;
+           next.allowMulti = wave.allowMulti;
+-          state->jobs.push_back(std::move(next));
++          algorithm::mergeSameHop(state->jobs, std::move(next));
+         }
+       }
+       return driveDstWalk(state);
+--- a/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 04:24:26.930149468 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 03:50:33.257086953 +0000
+@@ -10,11 +10,23 @@
+ #include <unordered_set>
+ #include <vector>
+ 
++#include "common/algorithm/AdaptiveMultiHop.h"
+ #include "common/datatypes/Value.h"
++#include "common/time/Duration.h"
++#include "graph/service/GraphFlags.h"
+ 
+ namespace nebula {
+ namespace graph {
+ 
++inline algorithm::AdaptiveConfig adaptiveRuntimeConfig() {
++  algorithm::AdaptiveConfig cfg;
++  cfg.exploreRate = FLAGS_local_multihop_explore_rate;
++  cfg.ewmaAlpha = FLAGS_local_multihop_ewma_alpha;
++  cfg.minLocalRatio = FLAGS_local_multihop_min_local_ratio;
++  cfg.rttUs = static_cast<double>(FLAGS_local_multihop_assumed_rtt_us);
++  return cfg;
++}
++
+ struct DstWalkState {
+   struct Job {
+     std::vector<Value> vids;
+@@ -26,6 +38,18 @@
+   std::vector<Value> yielded;
+   bool yieldAll{false};
+   int32_t rpc{0};
++  // adaptive distinguishes the EWMA arm from static multi-hop.
++  // choseMulti is the decision for the whole walk, not for one wave.
++  bool adaptive{false};
++  bool choseMulti{false};
++  bool noted{false};
++  bool sawApplied{false};
++  bool sawEarlyStop{false};
++  bool sawLocalRatio{false};
++  int32_t earliestContinue{0};
++  double worstLocalRatio{1.0};
++  algorithm::AdaptiveShape shape{};
++  time::Duration clock;
+ };
+ 
+ }  // namespace graph
+--- a/src/graph/service/GraphFlags.cpp	2026-10-31 04:24:26.930149468 +0000
++++ b/src/graph/service/GraphFlags.cpp	2026-10-31 03:50:21.181125975 +0000
+@@ -137,6 +137,30 @@
+              10000,
+              "Local frontier size that forces the rest of the walk back to graphd.");
+ 
++DEFINE_bool(enable_adaptive_local_multihop,
++            false,
++            "Pick multi-hop vs single-hop per query shape from EWMA latency. "
++            "Cold start tries multi-hop. Storaged stops a hop whose local-dst "
++            "fraction is below local_multihop_min_local_ratio.");
++DEFINE_double(local_multihop_min_local_ratio,
++              0.6,
++              "Per-hop guard sent with adaptive multi-hop. <=0 disables it. "
++              "Static multi-hop always sends 0.");
++DEFINE_double(local_multihop_explore_rate,
++              0.05,
++              "Probability of taking the opposite arm so a drifted distribution "
++              "is observed again.");
++DEFINE_double(local_multihop_ewma_alpha,
++              0.2,
++              "EWMA weight of the newest latency and local-ratio sample.");
++DEFINE_int64(local_multihop_assumed_rtt_us,
++             5000,
++             "Cost-model stand-in used only while one arm has no latency "
++             "sample. Not a measured RTT. Ignored once both arms have samples.");
++DEFINE_bool(local_multihop_trace,
++            false,
++            "Log one adaptive_multihop line per finished adaptive walk.");
++
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+     gc_worker_size,
+--- a/src/graph/service/GraphFlags.h	2026-10-31 04:24:26.930149468 +0000
++++ b/src/graph/service/GraphFlags.h	2026-10-31 03:50:21.181125975 +0000
+@@ -84,4 +84,13 @@
+ DECLARE_int32(local_multihop_row_budget);
+ DECLARE_int32(local_multihop_frontier_budget);
+ 
++// Adaptive choice over the static affinity gate. The per-hop guard threshold
++// is sent only on the adaptive multi-hop arm. Static multi-hop sends 0.
++DECLARE_bool(enable_adaptive_local_multihop);
++DECLARE_double(local_multihop_min_local_ratio);
++DECLARE_double(local_multihop_explore_rate);
++DECLARE_double(local_multihop_ewma_alpha);
++DECLARE_int64(local_multihop_assumed_rtt_us);
++DECLARE_bool(local_multihop_trace);
++
+ #endif  // GRAPH_GRAPHFLAGS_H_
+--- a/src/interface/storage.thrift	2026-10-31 04:24:26.930149468 +0000
++++ b/src/interface/storage.thrift	2026-10-31 03:50:13.301151402 +0000
+@@ -254,6 +254,10 @@
+     6: optional i32                               min_yield_step,
+     7: optional i32                               row_budget,
+     8: optional i32                               frontier_budget,
++    // Per-hop guard. Absent or <= 0 walks every requested hop. When the
++    // fraction of this hop's dsts whose leader is local falls below the
++    // value, storaged stops and returns that hop's frontier.
++    9: optional double                            min_local_ratio,
+ }
+ 
+ struct GetDstBySrcResponse {
+@@ -270,7 +274,14 @@
+     // leave it unset.
+     7: optional bool                              multihop_applied,
+     // Local vids at depth steps_done that were not expanded further.
++    // On early_stop this is every dst of hop continue_hop, local and remote.
+     8: optional list<common.Value>              carry_vids,
++    // continue_hop is finished. Graphd resumes single-hop from carry_vids.
++    // Earlier remote frontiers stay in remote_vids / remote_depth.
++    9: optional bool                              early_stop,
++    10: optional i32                              continue_hop,
++    // Minimum local-dst fraction observed on a hop that had at least one dst.
++    11: optional double                           local_ratio,
+ }
+ 
+ 
+--- a/src/storage/query/GetDstBySrcProcessor.cpp	2026-10-31 04:24:26.930149468 +0000
++++ b/src/storage/query/GetDstBySrcProcessor.cpp	2026-10-31 03:50:21.529124851 +0000
+@@ -88,6 +88,7 @@
+   const int32_t minYield = req.min_yield_step_ref().value_or(maxSteps);
+   const int32_t rowBudget = req.row_budget_ref().value_or(0);
+   const int32_t frontierBudget = req.frontier_budget_ref().value_or(0);
++  const double minLocalRatio = req.min_local_ratio_ref().value_or(0.0);
+   auto* store = dynamic_cast<kvstore::NebulaStore*>(env_->kvstore_);
+ 
+   auto keyOf = [this](const Value& vid) {
+@@ -163,7 +164,8 @@
+                                                    frontierBudget,
+                                                    /*maxOutDegree=*/0,
+                                                    isLocal,
+-                                                   neighbors);
++                                                   neighbors,
++                                                   minLocalRatio);
+   if (walked.failed || failedCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     onFinished();
+     return;
+@@ -187,9 +189,17 @@
+   resp_.steps_done_ref() = stepsDone;
+   resp_.truncated_ref() = walked.truncated;
+   resp_.multihop_applied_ref() = true;
++  resp_.early_stop_ref() = walked.earlyStop;
++  if (walked.earlyStop) {
++    resp_.continue_hop_ref() = walked.continueHop;
++  }
++  if (walked.hasLocalRatio) {
++    resp_.local_ratio_ref() = walked.localRatio;
++  }
+   if (UNLIKELY(profileDetailFlag_)) {
+     profileDetail("LocalMultiHopSteps", stepsDone);
+     profileDetail("LocalMultiHopRemote", remoteCount);
++    profileDetail("LocalMultiHopEarlyStop", walked.earlyStop ? 1 : 0);
+   }
+   onFinished();
+ }

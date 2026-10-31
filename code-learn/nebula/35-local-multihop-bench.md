@@ -1,6 +1,6 @@
 # 35 — 子图亲和与随机分布：LocalMultiHop 实测
 
-> 实现和与 [33](33-local-multihop-design.md) 的差别在 [34](34-local-multihop-impl.md)。
+> 实现和与 [33](33-local-multihop-design.md) 的差别在 [34](34-local-multihop-impl.md)。自适应层怎么避免这篇里随机放置的回退，在 [36](36-adaptive-multihop-design-impl.md) 和 [37](37-adaptive-multihop-bench.md)。
 > 脚本：[`bench/local_multihop/`](bench/local_multihop/)。原始 JSON 在 [`results/`](bench/local_multihop/results/)。
 > 二进制是 `v3.8.0` `fa928930` 加上 [`v3.8.0-local-multihop.patch`](patches/v3.8.0-local-multihop.patch)。4 vCPU，`Linux 6.12.94+`。
 > 日期：2026-10-31。

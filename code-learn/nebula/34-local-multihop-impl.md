@@ -1,6 +1,6 @@
 # 34 — LocalMultiHop：按 3.8 源码落地的一阶段
 
-> 设计稿是 [33](33-local-multihop-design.md)。压测在 [35](35-local-multihop-bench.md)。
+> 设计稿是 [33](33-local-multihop-design.md)。压测在 [35](35-local-multihop-bench.md)。自适应层（逐跳本地比例守卫 + EWMA）在 [36](36-adaptive-multihop-design-impl.md)。
 > 补丁 [`patches/v3.8.0-local-multihop.patch`](patches/v3.8.0-local-multihop.patch) 打在 `v3.8.0` `fa928930` 上，不依赖 16 的部分聚合补丁。
 > 日期：2026-10-31。
 

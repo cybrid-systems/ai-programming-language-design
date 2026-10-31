@@ -1,7 +1,7 @@
 # 33-local-multihop-design — 子图亲和前提下的 LocalMultiHop 详细设计
 
 > 基线源码：<https://github.com/vesoft-inc/nebula>，tag `v3.8.0` `fa928930ab34f150db522933323aa610e54f26e7`
-> 性质：设计稿。按 3.8 源码落地的一阶段（Expand 的 dst 多跳，不是 PathPrefix）在 [34](34-local-multihop-impl.md)，实测在 [35](35-local-multihop-bench.md)。
+> 性质：设计稿。按 3.8 源码落地的一阶段（Expand 的 dst 多跳，不是 PathPrefix）在 [34](34-local-multihop-impl.md)，实测在 [35](35-local-multihop-bench.md)。分布不确定时的自适应层在 [36](36-adaptive-multihop-design-impl.md)，那一层的实测在 [37](37-adaptive-multihop-bench.md)。
 > 前提：分区器已经做了社区/子图划分，meta 能提供“partition group / 亲和性”元数据
 > 分析日期：2026-10-31
 
