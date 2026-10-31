@@ -37,6 +37,10 @@
 | 21 | [中间表示方案](21-ir-optimization-design.md) | 按收益和风险分的通用改法：P0 不改对外协议，P1 改 storage 可选字段，P2 改调度；含 v3.8.0 上的 PoC patch |
 | 22 | [中间表示收益实测](22-ir-bench.md) | 同一棵 `fa928930` 上原版对 P0：P50/P95/P99、QPS、RSS、水位；P1/P2 只给估算 |
 | 23 | [下推 patch 验证报告](23-patch-verification.md) | `v3.8.0` 上两份下推 patch 与 poc-repr 的 apply / 编译 / gtest / ctest 结果，修掉的三个缺陷，以及 storage 专项测试 |
+| 24 | [Raft 复制](24-raft-replication.md) | `RaftPart` 状态、PreVote 选举、Leader/Follower 日志提交、快照与成员变更 |
+| 25 | [WAL 格式与恢复](25-wal-format-and-recovery.md) | `<LogID>.wal` 文件布局、`appendLogInternal`、尾部截断、`commitLogId` 恢复 |
+| 26 | [RocksDB 存储引擎](26-rocksdb-storage-engine.md) | 每 space 一个 DB、`Part::commitLogs` → `WriteBatch`、读路径、checkpoint |
+| 27 | [Meta 服务](27-meta-service.md) | Handler → Processor、BaseProcessor 锁、心跳、索引 DDL |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -49,6 +53,8 @@
 [20](20-intermediate-representation.md) 接在 11–14 后面：用场景二的 40415 条边、382 个商品、4000 个用户，写每个算子吐出的 `DataSet` 和 Thrift 字节。12 有时延和行数，没有这组字节。[21](21-ir-optimization-design.md) 把这些字节收成 graphd、storaged 和两边协议的分阶段改法。写 21 时 origin/main 上还没有 15–19，下推重叠以 [10](10-pushdown-capability.md) 为准。15–17 是后来补上的下推实现，不改 20/21 里的字节计数。[22](22-ir-bench.md) 是 P0 补丁在场景二上的时延实测，二进制不含 16 的部分聚合补丁。[23](23-patch-verification.md) 不是分析章节，是 15/16/21 三组 patch 的验证记录：pristine `v3.8.0` 上的 apply、aarch64 编译配方、gtest/ctest 结果，以及仍未覆盖的边界。
 
 ---
+
+24–27 是存储与元数据子系列：24 讲 Raft 副本组，25 讲 WAL 的文件格式与恢复，26 讲 RocksDB 如何承接 apply，27 讲 Meta 的 processor / 心跳 / 索引 DDL。它们不重复 01–22 的查询优化与下推内容，只补写路径和服务侧；14 里提到的 Raft 现在有了独立章节。
 
 ## 主线
 
