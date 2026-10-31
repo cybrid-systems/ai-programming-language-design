@@ -3,7 +3,7 @@
 > v1 的守卫和整句 EWMA 在 [36](36-adaptive-multihop-design-impl.md)，整句实测在 [37](37-adaptive-multihop-bench.md)。
 > 补丁 [`patches/v3.8.0-adaptive-local-multihop-v2.patch`](patches/v3.8.0-adaptive-local-multihop-v2.patch) 打在 `v3.8.0-adaptive-local-multihop.patch` 之上。
 > 脚本仍是 [`bench/local_multihop/run_adaptive.sh`](bench/local_multihop/run_adaptive.sh)。这次的 JSON 前缀是 `bridge_*`、`rtt5_*`、`drift_v1_rtt5`、`drift_v2_bridge`、`drift_v2_rtt5`。
-> 日期：2026-10-31。表里的数都是这次测到的。
+> 日期：2026-10-31。表里的数都是这次测到的。39 篇重跑覆盖了顶层同名 JSON；38 的表对应 `2b82ac2`。
 
 v1 把整句 `GO` 收成一个形状键。混合图里亲和社区和打乱社区共用这个键，控制器只能选一边。37 篇的 mixed 因此停在基线，亲和的那一半也没有被收成一跳。漂移到随机之后，守卫把多跳延迟压到和基线一样，EWMA 还记着亲和时的 7ms，40 条查询都没改投基线。
 
