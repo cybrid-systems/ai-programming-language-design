@@ -1,0 +1,1010 @@
+--- a/conf/nebula-graphd.conf.default	2026-10-31 05:16:57.439699734 +0000
++++ b/conf/nebula-graphd.conf.default	2026-10-31 05:17:35.747576686 +0000
+@@ -154,3 +154,6 @@
+ # Set both false to restore the v1 whole-query controller.
+ # --local_multihop_per_part=true
+ # --local_multihop_early_flip=true
++# v3 batches multihop partitions by leader and reads the heartbeat sample.
++# --local_multihop_host_batch=true
++# --local_multihop_heartbeat_prior=true
+--- a/conf/nebula-storaged.conf.default	2026-10-31 05:16:57.439699734 +0000
++++ b/conf/nebula-storaged.conf.default	2026-10-31 05:18:18.939435280 +0000
+@@ -145,3 +145,8 @@
+ # Set to false to emulate an old storaged: GetDstBySrc stays one hop and
+ # multihop_applied is left unset so graphd falls back.
+ # --storaged_accept_local_multihop=true
++# Background sample of per-part local-dst ratio, published on heartbeat.
++# interval 0 disables the scan. Each pass is capped by edges and parts.
++# --local_dst_ratio_sample_interval_secs=10
++# --local_dst_ratio_sample_edges=64
++# --local_dst_ratio_sample_parts=32
+--- a/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 05:16:57.431699759 +0000
++++ b/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 05:17:22.407619797 +0000
+@@ -12,6 +12,7 @@
+ #include <map>
+ #include <mutex>
+ #include <random>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -76,6 +77,10 @@
+   // When true, two hop-1 early-stops override a stale latency average.
+   // A later full multi-hop (no early-stop, ratio at the threshold) clears it.
+   bool earlyFlip{false};
++  // Heartbeat prior. Cold start skips multihop when the sample is below
++  // minLocalRatio. A hop-1 streak tries multihop again when the sample is
++  // back at the threshold, without waiting for epsilon.
++  bool usePrior{false};
+ };
+ 
+ struct AdaptiveSnapshot {
+@@ -97,10 +102,14 @@
+ class AdaptiveController {
+  public:
+   // draw is uniform in [0, 1). exploreRate flips the exploit choice.
+-  bool choose(const AdaptiveShape& shape, const AdaptiveConfig& cfg, double draw) {
++  bool choose(const AdaptiveShape& shape,
++              const AdaptiveConfig& cfg,
++              double draw,
++              bool hasPrior = false,
++              double priorRatio = -1.0) {
+     std::lock_guard<std::mutex> guard(mu_);
+     const Slot& slot = slots_[shape];
+-    bool exploit = exploitOf(slot, shape, cfg);
++    bool exploit = exploitOf(slot, shape, cfg, hasPrior, priorRatio);
+     const double rate = clampRate(cfg.exploreRate);
+     if (draw < rate) return !exploit;
+     return exploit;
+@@ -220,13 +229,28 @@
+   //     the saved term is larger. rttUs cancels as long as it is positive.
+   //
+   // With both samples, the lower EWMA latency wins. A tie prefers baseline.
+-  static bool exploitOf(const Slot& slot, const AdaptiveShape& shape, const AdaptiveConfig& cfg) {
+-    if (slot.multiN == 0 && slot.baseN == 0) return true;
++  static bool exploitOf(const Slot& slot,
++                        const AdaptiveShape& shape,
++                        const AdaptiveConfig& cfg,
++                        bool hasPrior,
++                        double priorRatio) {
++    const bool priorOk = cfg.usePrior && hasPrior && priorRatio >= 0.0;
++    if (slot.multiN == 0 && slot.baseN == 0) {
++      if (priorOk && priorRatio < cfg.minLocalRatio) return false;
++      return true;
++    }
+     // Repeated hop-1 guards mean this key is not saving a round trip.
+     // Latency EWMA still remembers the old affinity samples, so it would
+-    // keep picking multi-hop. The streak wins until a full local walk clears it.
+-    if (cfg.earlyFlip && slot.hop1Streak >= 2) return false;
+-    if (cfg.earlyFlip && slot.earlyN >= 2 && slot.earlyRate >= 0.5) return false;
++    // keep picking multi-hop. The streak wins until a full local walk clears
++    // it, or a fresh heartbeat sample says the partition is local again.
++    if (cfg.earlyFlip && slot.hop1Streak >= 2) {
++      if (priorOk && priorRatio + 1e-12 >= cfg.minLocalRatio) return true;
++      return false;
++    }
++    if (cfg.earlyFlip && slot.earlyN >= 2 && slot.earlyRate >= 0.5) {
++      if (priorOk && priorRatio + 1e-12 >= cfg.minLocalRatio) return true;
++      return false;
++    }
+     if (slot.multiN > 0 && slot.baseN > 0) {
+       return slot.multiLat + 1.0 < slot.baseLat;
+     }
+@@ -306,6 +330,52 @@
+   return out;
+ }
+ 
++struct RpcGroup {
++  bool multi{false};
++  std::vector<int32_t> parts;
++};
++
++// Multihop parts that share a leader host share one RPC when hostBatch is set.
++// An empty host key stays alone. Every baseline part shares one single-hop
++// RPC: that request does not run the guard, so mixing those parts is safe.
++inline std::vector<RpcGroup> hostBatchGroups(const std::vector<int32_t>& parts,
++                                            const std::vector<char>& multi,
++                                            const std::vector<std::string>& hosts,
++                                            bool hostBatch) {
++  std::vector<RpcGroup> out;
++  std::map<std::string, size_t> multiByHost;
++  RpcGroup base;
++  bool anyBase = false;
++  for (size_t i = 0; i < parts.size(); ++i) {
++    const bool isMulti = i < multi.size() && multi[i];
++    if (!isMulti) {
++      anyBase = true;
++      base.parts.push_back(parts[i]);
++      continue;
++    }
++    const std::string host = i < hosts.size() ? hosts[i] : std::string();
++    if (!hostBatch || host.empty()) {
++      RpcGroup one;
++      one.multi = true;
++      one.parts.push_back(parts[i]);
++      out.push_back(std::move(one));
++      continue;
++    }
++    auto it = multiByHost.find(host);
++    if (it == multiByHost.end()) {
++      RpcGroup group;
++      group.multi = true;
++      group.parts.push_back(parts[i]);
++      multiByHost.emplace(host, out.size());
++      out.push_back(std::move(group));
++    } else {
++      out[it->second].parts.push_back(parts[i]);
++    }
++  }
++  if (anyBase) out.push_back(std::move(base));
++  return out;
++}
++
+ }  // namespace algorithm
+ }  // namespace nebula
+ 
+--- a/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 05:16:57.431699759 +0000
++++ b/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 05:18:31.439393864 +0000
+@@ -564,6 +564,48 @@
+   EXPECT_EQ(0, ctl.snapshot(other).multiN);
+ }
+ 
++TEST(AdaptiveMultiHopTest, HeartbeatPriorSkipsColdMultiAndRestoresIt) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  cfg.earlyFlip = true;
++  cfg.usePrior = true;
++  cfg.minLocalRatio = 0.6;
++  auto shape = makeAdaptiveShape(3, {1}, 3, false);
++  shape.part = 2;
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5, true, 0.2));
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5, false, -1));
++  ctl.observe(shape, cfg, true, 7000, 1.0, false, 0);
++  ctl.observe(shape, cfg, false, 22000, -1, false, 0);
++  ctl.observe(shape, cfg, true, 22000, 0.2, true, 1);
++  ctl.observe(shape, cfg, true, 22000, 0.2, true, 1);
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5, true, 0.2));
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5, true, 0.95));
++}
++
++TEST(AdaptiveMultiHopTest, HostBatchSharesALeader) {
++  std::vector<int32_t> parts{1, 2, 3, 4};
++  std::vector<char> multi{1, 1, 1, 0};
++  std::vector<std::string> hosts{"a", "a", "b", "a"};
++  auto grouped = hostBatchGroups(parts, multi, hosts, true);
++  ASSERT_EQ(3, grouped.size());
++  EXPECT_TRUE(grouped[0].multi);
++  EXPECT_EQ(std::vector<int32_t>({1, 2}), grouped[0].parts);
++  EXPECT_TRUE(grouped[1].multi);
++  EXPECT_EQ(std::vector<int32_t>({3}), grouped[1].parts);
++  EXPECT_FALSE(grouped[2].multi);
++  EXPECT_EQ(std::vector<int32_t>({4}), grouped[2].parts);
++
++  auto split = hostBatchGroups(parts, multi, hosts, false);
++  ASSERT_EQ(4, split.size());
++  EXPECT_TRUE(split[0].multi);
++  EXPECT_EQ(std::vector<int32_t>({1}), split[0].parts);
++  EXPECT_TRUE(split[1].multi);
++  EXPECT_EQ(std::vector<int32_t>({2}), split[1].parts);
++  EXPECT_TRUE(split[2].multi);
++  EXPECT_FALSE(split[3].multi);
++}
++
+ TEST(AdaptiveMultiHopTest, IntVidPartMatchesMetaRule) {
+   EXPECT_EQ(1, partOfIntVid(0, 9));
+   EXPECT_EQ(4, partOfIntVid(3, 9));
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 05:16:57.431699759 +0000
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 05:17:35.783576569 +0000
+@@ -92,13 +92,30 @@
+       }
+       auto state = std::make_shared<DstWalkState>();
+       state->yieldAll = true;
+-      if (fillPerPartJobs(*state,
+-                          nextStepVids_,
+-                          hops,
+-                          numParts,
+-                          shape,
+-                          adaptiveRuntimeConfig(),
+-                          algorithm::adaptiveController())) {
++      auto* meta = qctx()->getMetaClient();
++      const GraphSpaceID space = expand_->space();
++      if (fillPerPartJobs(
++              *state,
++              nextStepVids_,
++              hops,
++              numParts,
++              shape,
++              adaptiveRuntimeConfig(),
++              algorithm::adaptiveController(),
++              FLAGS_local_multihop_host_batch,
++              [&](int32_t part) {
++                if (meta == nullptr) return std::string();
++                auto leader = meta->getStorageLeaderFromCache(space, part);
++                if (!leader.ok()) return std::string();
++                return leader.value().toString();
++              },
++              [&](int32_t part, double& ratio) {
++                if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
++                auto sample = meta->localDstRatio(space, part);
++                if (!sample.ok()) return false;
++                ratio = sample.value();
++                return true;
++              })) {
+         return driveDstWalk(state);
+       }
+     }
+--- a/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 05:16:57.431699759 +0000
++++ b/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 05:17:35.783576569 +0000
+@@ -90,13 +90,30 @@
+         numParts = spaceInfo.spaceDesc.partition_num_ref().value();
+       }
+       auto state = std::make_shared<DstWalkState>();
+-      if (fillPerPartJobs(*state,
+-                          nextStepVids_,
+-                          hops,
+-                          numParts,
+-                          shape,
+-                          adaptiveRuntimeConfig(),
+-                          algorithm::adaptiveController())) {
++      auto* meta = qctx()->getMetaClient();
++      const GraphSpaceID space = expand_->space();
++      if (fillPerPartJobs(
++              *state,
++              nextStepVids_,
++              hops,
++              numParts,
++              shape,
++              adaptiveRuntimeConfig(),
++              algorithm::adaptiveController(),
++              FLAGS_local_multihop_host_batch,
++              [&](int32_t part) {
++                if (meta == nullptr) return std::string();
++                auto leader = meta->getStorageLeaderFromCache(space, part);
++                if (!leader.ok()) return std::string();
++                return leader.value().toString();
++              },
++              [&](int32_t part, double& ratio) {
++                if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
++                auto sample = meta->localDstRatio(space, part);
++                if (!sample.ok()) return false;
++                ratio = sample.value();
++                return true;
++              })) {
+         return driveDstWalk(state);
+       }
+     }
+--- a/src/graph/executor/query/LocalMultiHopDriveBody.inl	2026-10-31 05:16:57.431699759 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriveBody.inl	2026-10-31 05:21:08.474857012 +0000
+@@ -288,7 +288,35 @@
+                 state->sawLocalRatio = true;
+               }
+             }
+-            if (state->perPart) {
++            if (state->perPart && one.part_ids_ref().has_value()) {
++              const auto& ids = one.part_ids_ref().value();
++              const auto* partEarly = one.part_early_stop_ref().has_value()
++                                          ? &one.part_early_stop_ref().value()
++                                          : nullptr;
++              const auto* partRatio = one.part_local_ratio_ref().has_value()
++                                          ? &one.part_local_ratio_ref().value()
++                                          : nullptr;
++              const auto* partHop = one.part_continue_hop_ref().has_value()
++                                        ? &one.part_continue_hop_ref().value()
++                                        : nullptr;
++              for (size_t p = 0; p < ids.size(); ++p) {
++                auto& obs = state->partObs[ids[p]];
++                obs.sawApplied = true;
++                if (partEarly != nullptr && p < partEarly->size() && (*partEarly)[p]) {
++                  obs.sawEarly = true;
++                  int32_t hop = continueHop;
++                  if (partHop != nullptr && p < partHop->size()) hop = (*partHop)[p];
++                  if (obs.hop == 0 || hop < obs.hop) obs.hop = hop;
++                }
++                if (partRatio != nullptr && p < partRatio->size()) {
++                  const double ratio = (*partRatio)[p];
++                  if (!obs.sawRatio || ratio < obs.ratio) {
++                    obs.ratio = ratio;
++                    obs.sawRatio = true;
++                  }
++                }
++              }
++            } else if (state->perPart) {
+               for (int32_t part : job.parts) {
+                 auto& obs = state->partObs[part];
+                 obs.sawApplied = true;
+--- a/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 05:16:57.431699759 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 05:17:22.539619371 +0000
+@@ -26,6 +26,7 @@
+   cfg.minLocalRatio = FLAGS_local_multihop_min_local_ratio;
+   cfg.rttUs = static_cast<double>(FLAGS_local_multihop_assumed_rtt_us);
+   cfg.earlyFlip = FLAGS_local_multihop_early_flip;
++  cfg.usePrior = FLAGS_local_multihop_heartbeat_prior;
+   return cfg;
+ }
+ 
+@@ -71,17 +72,21 @@
+   time::Duration batchClock;
+ };
+ 
+-// One multi-hop RPC per source partition, and one shared single-hop job for
+-// the partitions that chose baseline. All of those jobs are parallel, so the
+-// first hop is still one round trip. Returns false when the vids are not
+-// INT64 or the space has no partition count; the caller uses the v1 key.
++// hostBatch folds multihop partitions that share a leader into one job.
++// StorageClient then sends one GetDstBySrc per host. prior(part, ratio)
++// returns false when this graphd has no heartbeat sample for the part.
++// Returns false when the vids are not INT64; the caller uses the v1 key.
++template <typename HostOf, typename Prior>
+ inline bool fillPerPartJobs(DstWalkState& state,
+                             const std::unordered_set<Value>& vids,
+                             int32_t hops,
+                             int32_t numParts,
+                             const algorithm::AdaptiveShape& shape,
+                             const algorithm::AdaptiveConfig& cfg,
+-                            algorithm::AdaptiveController& ctl) {
++                            algorithm::AdaptiveController& ctl,
++                            bool hostBatch,
++                            HostOf hostOf,
++                            Prior prior) {
+   if (numParts <= 0 || vids.empty()) return false;
+   std::map<int32_t, std::vector<Value>> byPart;
+   for (const auto& vid : vids) {
+@@ -91,36 +96,36 @@
+   state.perPart = true;
+   state.adaptive = true;
+   state.shape = shape;
+-  DstWalkState::Job base;
+-  base.hopsLeft = hops;
+-  base.allowMulti = true;
+-  base.choseMulti = false;
+-  base.parallel = true;
+-  bool anyBase = false;
++  std::vector<int32_t> parts;
++  std::vector<char> multiFlags;
++  std::vector<std::string> hosts;
++  parts.reserve(byPart.size());
+   for (auto& entry : byPart) {
+     auto shapePart = shape;
+     shapePart.part = entry.first;
+-    const bool multi = ctl.choose(shapePart, cfg, ctl.nextDraw());
++    double ratio = -1.0;
++    const bool hasPrior = prior(entry.first, ratio);
++    const bool multi = ctl.choose(shapePart, cfg, ctl.nextDraw(), hasPrior, ratio);
+     DstWalkState::PartObs obs;
+     obs.choseMulti = multi;
+     state.partObs.emplace(entry.first, obs);
+-    if (multi) {
+-      DstWalkState::Job job;
+-      job.vids = std::move(entry.second);
+-      job.hopsLeft = hops;
+-      job.allowMulti = true;
+-      job.choseMulti = true;
+-      job.parallel = true;
+-      job.parts.push_back(entry.first);
+-      state.jobs.push_back(std::move(job));
+-    } else {
+-      anyBase = true;
+-      base.vids.insert(base.vids.end(), entry.second.begin(), entry.second.end());
+-      base.parts.push_back(entry.first);
+-    }
++    parts.push_back(entry.first);
++    multiFlags.push_back(multi ? 1 : 0);
++    hosts.push_back(hostOf(entry.first));
+   }
+-  if (anyBase) {
+-    state.jobs.push_back(std::move(base));
++  const auto groups = algorithm::hostBatchGroups(parts, multiFlags, hosts, hostBatch);
++  for (const auto& group : groups) {
++    DstWalkState::Job job;
++    job.hopsLeft = hops;
++    job.allowMulti = true;
++    job.choseMulti = group.multi;
++    job.parallel = true;
++    job.parts = group.parts;
++    for (int32_t part : group.parts) {
++      auto& vidsForPart = byPart[part];
++      job.vids.insert(job.vids.end(), vidsForPart.begin(), vidsForPart.end());
++    }
++    state.jobs.push_back(std::move(job));
+   }
+   return !state.jobs.empty();
+ }
+--- a/src/graph/service/GraphFlags.cpp	2026-10-31 05:16:57.435699747 +0000
++++ b/src/graph/service/GraphFlags.cpp	2026-10-31 05:17:35.783576569 +0000
+@@ -168,6 +168,14 @@
+             true,
+             "After two hop-1 early-stops, prefer baseline until a full "
+             "local multi-hop clears the streak. Off keeps the v1 latency EWMA.");
++DEFINE_bool(local_multihop_host_batch,
++            true,
++            "Put multihop partitions that share a leader into one GetDstBySrc. "
++            "Storaged still guards each part. Off is one RPC per partition.");
++DEFINE_bool(local_multihop_heartbeat_prior,
++            true,
++            "Use the heartbeat local-dst sample for cold start and to retry "
++            "multihop after a hop-1 streak without waiting for exploration.");
+ 
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+--- a/src/graph/service/GraphFlags.h	2026-10-31 05:16:57.435699747 +0000
++++ b/src/graph/service/GraphFlags.h	2026-10-31 05:17:35.759576648 +0000
+@@ -97,5 +97,9 @@
+ // setting them off is the v1 controller.
+ DECLARE_bool(local_multihop_per_part);
+ DECLARE_bool(local_multihop_early_flip);
++// v3. host_batch sends every multihop partition on one leader in one RPC.
++// heartbeat_prior reads the storaged sample for cold start and switch-back.
++DECLARE_bool(local_multihop_host_batch);
++DECLARE_bool(local_multihop_heartbeat_prior);
+ 
+ #endif  // GRAPH_GRAPHFLAGS_H_
+--- a/src/storage/query/GetDstBySrcProcessor.cpp	2026-10-31 05:16:57.435699747 +0000
++++ b/src/storage/query/GetDstBySrcProcessor.cpp	2026-10-31 05:18:01.499492702 +0000
+@@ -7,6 +7,8 @@
+ 
+ #include <robin_hood.h>
+ 
++#include <unordered_map>
++
+ #include "common/memory/MemoryTracker.h"
+ #include "common/thread/GenericThreadPool.h"
+ #include "storage/StorageFlags.h"
+@@ -157,49 +159,123 @@
+     return scan;
+   };
+ 
+-  auto walked = algorithm::runLocalMultiHop<Value>(starts,
+-                                                   maxSteps,
+-                                                   minYield,
+-                                                   rowBudget,
+-                                                   frontierBudget,
+-                                                   /*maxOutDegree=*/0,
+-                                                   isLocal,
+-                                                   neighbors,
+-                                                   minLocalRatio);
+-  if (walked.failed || failedCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
+-    onFinished();
+-    return;
++  // One walk per source part when the guard is on and this host owns more
++  // than one part of the request. A low ratio then stops only that part.
++  // The guard-off path stays one walk so static multihop is unchanged.
++  std::vector<std::vector<Value>> partStarts;
++  std::vector<PartitionID> partOrder;
++  if (minLocalRatio > 0.0 && req.get_parts().size() > 1) {
++    std::unordered_map<PartitionID, size_t> index;
++    for (const auto& vid : starts) {
++      auto part = env_->metaClient_->partId(numParts, keyOf(vid));
++      auto it = index.find(part);
++      if (it == index.end()) {
++        index.emplace(part, partStarts.size());
++        partOrder.push_back(part);
++        partStarts.emplace_back();
++        partStarts.back().push_back(vid);
++      } else {
++        partStarts[it->second].push_back(vid);
++      }
++    }
++  } else {
++    partOrder.push_back(0);
++    partStarts.push_back(std::move(starts));
++  }
++
++  std::vector<Value> yielded;
++  std::vector<Value> remoteVids;
++  std::vector<int32_t> remoteDepth;
++  std::vector<Value> carry;
++  bool anyEarly = false;
++  bool anyTrunc = false;
++  int32_t stepsDone = 0;
++  int32_t continueHop = 0;
++  bool hasRatio = false;
++  double minRatio = 0;
++  std::vector<int32_t> respParts;
++  std::vector<bool> respEarly;
++  std::vector<double> respRatio;
++  std::vector<int32_t> respHop;
++  for (size_t i = 0; i < partStarts.size(); ++i) {
++    auto walked = algorithm::runLocalMultiHop<Value>(partStarts[i],
++                                                     maxSteps,
++                                                     minYield,
++                                                     rowBudget,
++                                                     frontierBudget,
++                                                     /*maxOutDegree=*/0,
++                                                     isLocal,
++                                                     neighbors,
++                                                     minLocalRatio);
++    if (walked.failed || failedCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
++      onFinished();
++      return;
++    }
++    yielded.insert(yielded.end(), walked.yielded.begin(), walked.yielded.end());
++    remoteVids.insert(remoteVids.end(), walked.remoteVids.begin(), walked.remoteVids.end());
++    remoteDepth.insert(remoteDepth.end(), walked.remoteDepth.begin(), walked.remoteDepth.end());
++    if (walked.stepsDone > stepsDone) stepsDone = walked.stepsDone;
++    anyTrunc = anyTrunc || walked.truncated;
++    if (walked.hasLocalRatio && (!hasRatio || walked.localRatio < minRatio)) {
++      minRatio = walked.localRatio;
++      hasRatio = true;
++    }
++    if (partOrder[i] != 0 || req.get_parts().size() > 1) {
++      respParts.push_back(partOrder[i]);
++      respEarly.push_back(walked.earlyStop);
++      respRatio.push_back(walked.hasLocalRatio ? walked.localRatio : -1.0);
++      respHop.push_back(walked.earlyStop ? walked.continueHop : walked.stepsDone);
++    }
++    if (walked.earlyStop) {
++      anyEarly = true;
++      if (continueHop == 0 || walked.continueHop < continueHop) {
++        continueHop = walked.continueHop;
++      }
++      // Depth on the remote list is how many hops were already taken.
++      // Carry dsts of an early-stopped part continue as single-hop from there.
++      for (const auto& vid : walked.carry) {
++        remoteVids.push_back(vid);
++        remoteDepth.push_back(walked.continueHop);
++      }
++    } else {
++      carry.insert(carry.end(), walked.carry.begin(), walked.carry.end());
++    }
+   }
+ 
+-  const auto remoteCount = static_cast<int32_t>(walked.remoteVids.size());
+-  const auto stepsDone = walked.stepsDone;
++  const auto remoteCount = static_cast<int32_t>(remoteVids.size());
+   resultDataSet_.rows.clear();
+-  resultDataSet_.rows.reserve(walked.yielded.size());
+-  for (const auto& vid : walked.yielded) {
++  resultDataSet_.rows.reserve(yielded.size());
++  for (const auto& vid : yielded) {
+     resultDataSet_.rows.emplace_back(Row({vid}));
+   }
+   resp_.dsts_ref() = std::move(resultDataSet_);
+-  if (!walked.remoteVids.empty()) {
+-    resp_.remote_vids_ref() = std::move(walked.remoteVids);
+-    resp_.remote_depth_ref() = std::move(walked.remoteDepth);
++  if (!remoteVids.empty()) {
++    resp_.remote_vids_ref() = std::move(remoteVids);
++    resp_.remote_depth_ref() = std::move(remoteDepth);
+   }
+-  if (!walked.carry.empty()) {
+-    resp_.carry_vids_ref() = std::move(walked.carry);
++  if (!carry.empty()) {
++    resp_.carry_vids_ref() = std::move(carry);
+   }
+   resp_.steps_done_ref() = stepsDone;
+-  resp_.truncated_ref() = walked.truncated;
++  resp_.truncated_ref() = anyTrunc || anyEarly;
+   resp_.multihop_applied_ref() = true;
+-  resp_.early_stop_ref() = walked.earlyStop;
+-  if (walked.earlyStop) {
+-    resp_.continue_hop_ref() = walked.continueHop;
+-  }
+-  if (walked.hasLocalRatio) {
+-    resp_.local_ratio_ref() = walked.localRatio;
++  resp_.early_stop_ref() = anyEarly;
++  if (anyEarly) {
++    resp_.continue_hop_ref() = continueHop;
++  }
++  if (hasRatio) {
++    resp_.local_ratio_ref() = minRatio;
++  }
++  if (!respParts.empty()) {
++    resp_.part_ids_ref() = std::move(respParts);
++    resp_.part_early_stop_ref() = std::move(respEarly);
++    resp_.part_local_ratio_ref() = std::move(respRatio);
++    resp_.part_continue_hop_ref() = std::move(respHop);
+   }
+   if (UNLIKELY(profileDetailFlag_)) {
+     profileDetail("LocalMultiHopSteps", stepsDone);
+     profileDetail("LocalMultiHopRemote", remoteCount);
+-    profileDetail("LocalMultiHopEarlyStop", walked.earlyStop ? 1 : 0);
++    profileDetail("LocalMultiHopEarlyStop", anyEarly ? 1 : 0);
+   }
+   onFinished();
+ }
+--- a/src/clients/meta/MetaClient.h	2026-10-31 05:16:57.435699747 +0000
++++ b/src/clients/meta/MetaClient.h	2026-10-31 05:18:50.999328630 +0000
+@@ -15,6 +15,7 @@
+ #include <gtest/gtest_prod.h>
+ 
+ #include <atomic>
++#include <functional>
+ #include <cstdint>
+ 
+ #include "common/base/Base.h"
+@@ -662,6 +663,14 @@
+     return heartbeatTime_;
+   }
+ 
++  // Storaged publishes a sample. Graphd reads the copy meta echoes back.
++  using LocalDstRatioMap =
++      std::unordered_map<GraphSpaceID, std::unordered_map<PartitionID, double>>;
++  // Storaged sample that the next heartbeat will send.
++  void publishLocalDstRatio(LocalDstRatioMap sample);
++  // Latest sample echoed by metad. Empty until a heartbeat returns it.
++  StatusOr<double> localDstRatio(GraphSpaceID spaceId, PartitionID partId) const;
++
+   std::string getLocalIp() {
+     return options_.localHost_.toString();
+   }
+@@ -862,6 +871,10 @@
+   SessionMap sessionMap_;
+   folly::F14FastSet<std::pair<SessionID, ExecutionPlanID>> killedPlans_;
+   std::atomic<MetaData*> metadata_;
++
++  mutable folly::SharedMutex localDstRatioLock_;
++  LocalDstRatioMap localDstRatio_;
++  LocalDstRatioMap localDstRatioToSend_;
+ };
+ 
+ }  // namespace meta
+--- a/src/clients/meta/MetaClient.cpp	2026-10-31 05:16:57.435699747 +0000
++++ b/src/clients/meta/MetaClient.cpp	2026-10-31 05:21:08.278857699 +0000
+@@ -2643,6 +2643,14 @@
+     } else {
+       req.disk_parts_ref() = diskParts;
+     }
++    LocalDstRatioMap sample;
++    {
++      folly::SharedMutex::ReadHolder holder(localDstRatioLock_);
++      sample = localDstRatioToSend_;
++    }
++    if (!sample.empty()) {
++      req.local_dst_ratio_ref() = std::move(sample);
++    }
+   }
+ 
+   // info used in the agent, only set once
+@@ -2681,6 +2689,10 @@
+         metadLastUpdateTime_ = resp.get_last_update_time_in_ms();
+         VLOG(1) << "Metad last update time: " << metadLastUpdateTime_;
+         metaServerVersion_ = resp.get_meta_version();
++        if (resp.local_dst_ratio_ref().has_value()) {
++          folly::SharedMutex::WriteHolder holder(localDstRatioLock_);
++          localDstRatio_ = resp.local_dst_ratio_ref().value();
++        }
+ 
+         bool succeeded = resp.get_code() == nebula::cpp2::ErrorCode::SUCCEEDED;
+         if (succeeded) {
+@@ -2693,6 +2705,24 @@
+   return future;
+ }
+ 
++void MetaClient::publishLocalDstRatio(LocalDstRatioMap sample) {
++  folly::SharedMutex::WriteHolder holder(localDstRatioLock_);
++  localDstRatioToSend_ = std::move(sample);
++}
++
++StatusOr<double> MetaClient::localDstRatio(GraphSpaceID spaceId, PartitionID partId) const {
++  folly::SharedMutex::ReadHolder holder(localDstRatioLock_);
++  auto space = localDstRatio_.find(spaceId);
++  if (space == localDstRatio_.end()) {
++    return Status::Error("no local-dst sample");
++  }
++  auto part = space->second.find(partId);
++  if (part == space->second.end()) {
++    return Status::Error("no local-dst sample");
++  }
++  return part->second;
++}
++
+ folly::Future<StatusOr<bool>> MetaClient::createUser(std::string account,
+                                                      std::string password,
+                                                      bool ifNotExists) {
+--- a/src/meta/processors/admin/HBProcessor.cpp	2026-10-31 05:16:57.435699747 +0000
++++ b/src/meta/processors/admin/HBProcessor.cpp	2026-10-31 05:21:08.266857741 +0000
+@@ -10,6 +10,15 @@
+ #include "meta/KVBasedClusterIdMan.h"
+ #include "meta/MetaVersionMan.h"
+ 
++#include <mutex>
++#include <unordered_map>
++
++namespace {
++std::mutex gLocalDstRatioMu;
++std::unordered_map<nebula::GraphSpaceID, std::unordered_map<nebula::PartitionID, double>>
++    gLocalDstRatio;
++}  // namespace
++
+ namespace nebula {
+ namespace meta {
+ 
+@@ -58,6 +67,15 @@
+       return;
+     }
+ 
++    if (req.local_dst_ratio_ref().has_value()) {
++      std::lock_guard<std::mutex> guard(gLocalDstRatioMu);
++      for (const auto& spaceEntry : req.local_dst_ratio_ref().value()) {
++        for (const auto& partEntry : spaceEntry.second) {
++          gLocalDstRatio[spaceEntry.first][partEntry.first] = partEntry.second;
++        }
++      }
++    }
++
+     // set disk parts map
+     if (req.disk_parts_ref().has_value()) {
+       for (const auto& [spaceId, partDiskMap] : *req.get_disk_parts()) {
+@@ -117,6 +135,12 @@
+   }
+ 
+   resp_.meta_version_ref() = metaVersion_.load();
++  {
++    std::lock_guard<std::mutex> guard(gLocalDstRatioMu);
++    if (!gLocalDstRatio.empty()) {
++      resp_.local_dst_ratio_ref() = gLocalDstRatio;
++    }
++  }
+   ret = doSyncPut(std::move(data));
+   handleErrorCode(ret);
+   onFinished();
+--- a/src/interface/meta.thrift	2026-10-31 05:16:57.439699734 +0000
++++ b/src/interface/meta.thrift	2026-10-31 05:17:07.583667378 +0000
+@@ -546,6 +546,11 @@
+     3: ClusterID        cluster_id,
+     4: i64              last_update_time_in_ms,
+     5: i32              meta_version,
++    // Latest per-part local-dst ratios reported by storaged heartbeats.
++    // In memory on the meta leader. Old clients ignore it.
++    6: optional map<common.GraphSpaceID, map<common.PartitionID, double>
++        (cpp.template = "std::unordered_map")>
++        (cpp.template = "std::unordered_map") local_dst_ratio,
+ }
+ 
+ enum HostRole {
+@@ -579,6 +584,11 @@
+     7: optional common.DirInfo  dir,
+     // version of binary
+     8: optional binary          version,
++    // This host's sampled fraction of edge dsts whose leader is local.
++    // Only storaged sets it. Meta keeps the latest value per part.
++    9: optional map<common.GraphSpaceID, map<common.PartitionID, double>
++        (cpp.template = "std::unordered_map")>
++        (cpp.template = "std::unordered_map") local_dst_ratio,
+ }
+ 
+ // service(agent/metad/storaged/graphd) info
+--- a/src/interface/storage.thrift	2026-10-31 05:16:57.439699734 +0000
++++ b/src/interface/storage.thrift	2026-10-31 05:17:07.383668017 +0000
+@@ -282,6 +282,13 @@
+     10: optional i32                              continue_hop,
+     // Minimum local-dst fraction observed on a hop that had at least one dst.
+     11: optional double                           local_ratio,
++    // Per source partition, parallel to each other. Set when one request
++    // walked more than one part so a low ratio on one part does not describe
++    // the others. Absent on the single-part path.
++    12: optional list<i32>                        part_ids,
++    13: optional list<bool>                       part_early_stop,
++    14: optional list<double>                     part_local_ratio,
++    15: optional list<i32>                        part_continue_hop,
+ }
+ 
+ 
+--- a/src/storage/StorageServer.cpp	2026-10-31 05:16:57.439699734 +0000
++++ b/src/storage/StorageServer.cpp	2026-10-31 05:18:19.307434064 +0000
+@@ -5,6 +5,8 @@
+ 
+ #include "storage/StorageServer.h"
+ 
++#include "storage/LocalDstRatioSampler.h"
++
+ #include <thrift/lib/cpp/concurrency/ThreadManager.h>
+ 
+ #include <boost/filesystem.hpp>
+@@ -306,6 +308,9 @@
+     serverStatus_ = STATUS_RUNNING;
+   }
+ 
++  localDstRatioSampler_ = std::make_unique<LocalDstRatioSampler>(kvstore_.get(), metaClient_.get());
++  localDstRatioSampler_->start();
++
+   return setupMemoryMonitorThread().ok();
+ }
+ 
+@@ -332,6 +337,10 @@
+ }
+ 
+ void StorageServer::stop() {
++  if (localDstRatioSampler_) {
++    localDstRatioSampler_->stop();
++    localDstRatioSampler_.reset();
++  }
+   // Stop http service
+   webSvc_.reset();
+ 
+--- a/src/storage/StorageServer.h	2026-10-31 05:16:57.439699734 +0000
++++ b/src/storage/StorageServer.h	2026-10-31 05:18:31.587393373 +0000
+@@ -17,6 +17,7 @@
+ #include "kvstore/NebulaStore.h"
+ #include "storage/CommonUtils.h"
+ #include "storage/GraphStorageLocalServer.h"
++#include "storage/LocalDstRatioSampler.h"
+ #include "storage/admin/AdminTaskManager.h"
+ #include "storage/transaction/TransactionManager.h"
+ #include "webservice/WebService.h"
+@@ -126,6 +127,7 @@
+   std::condition_variable cvStop_;
+ 
+   std::unique_ptr<thread::GenericWorker> memoryMonitorThread_;
++  std::unique_ptr<LocalDstRatioSampler> localDstRatioSampler_;
+ };
+ 
+ }  // namespace storage
+--- a/src/storage/CMakeLists.txt	2026-10-31 05:16:57.439699734 +0000
++++ b/src/storage/CMakeLists.txt	2026-10-31 05:18:18.939435280 +0000
+@@ -99,6 +99,7 @@
+ nebula_add_library(
+     storage_server OBJECT
+     StorageServer.cpp
++    LocalDstRatioSampler.cpp
+ )
+ 
+ 
+--- a/src/storage/LocalDstRatioSampler.h	2026-10-30 07:23:59.291594768 +0000
++++ b/src/storage/LocalDstRatioSampler.h	2026-10-31 05:18:18.963435201 +0000
+@@ -0,0 +1,43 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef STORAGE_LOCALDSTRATIOSAMPLER_H_
++#define STORAGE_LOCALDSTRATIOSAMPLER_H_
++
++#include <atomic>
++#include <thread>
++
++#include "clients/meta/MetaClient.h"
++#include "kvstore/NebulaStore.h"
++
++namespace nebula {
++namespace storage {
++
++// Bounded background scan. Each pass reads at most
++// local_dst_ratio_sample_edges edges on each of at most
++// local_dst_ratio_sample_parts leader parts, then publishes the ratio
++// through the meta client's heartbeat provider.
++class LocalDstRatioSampler {
++ public:
++  LocalDstRatioSampler(kvstore::KVStore* store, meta::MetaClient* meta);
++  ~LocalDstRatioSampler();
++
++  void start();
++  void stop();
++
++ private:
++  void loop();
++  meta::MetaClient::LocalDstRatioMap sampleOnce(int64_t* edges, int64_t* parts);
++
++  kvstore::KVStore* store_{nullptr};
++  meta::MetaClient* meta_{nullptr};
++  std::atomic<bool> stopped_{false};
++  std::thread thread_;
++};
++
++}  // namespace storage
++}  // namespace nebula
++
++#endif
+--- a/src/storage/LocalDstRatioSampler.cpp	2026-10-30 07:23:59.291594768 +0000
++++ b/src/storage/LocalDstRatioSampler.cpp	2026-10-31 05:58:10.546920068 +0000
+@@ -0,0 +1,118 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "storage/LocalDstRatioSampler.h"
++
++#include <chrono>
++
++#include "common/time/Duration.h"
++#include "common/utils/NebulaKeyUtils.h"
++#include "kvstore/NebulaStore.h"
++
++DEFINE_int32(local_dst_ratio_sample_interval_secs,
++             10,
++             "Seconds between local-dst ratio samples. 0 disables the scan.");
++DEFINE_int32(local_dst_ratio_sample_edges,
++             64,
++             "Maximum edge keys read on one part in one sample pass.");
++DEFINE_int32(local_dst_ratio_sample_parts,
++             32,
++             "Maximum leader parts visited in one sample pass.");
++
++namespace nebula {
++namespace storage {
++
++LocalDstRatioSampler::LocalDstRatioSampler(kvstore::KVStore* store, meta::MetaClient* meta)
++    : store_(store), meta_(meta) {}
++
++LocalDstRatioSampler::~LocalDstRatioSampler() {
++  stop();
++}
++
++void LocalDstRatioSampler::start() {
++  if (FLAGS_local_dst_ratio_sample_interval_secs <= 0) {
++    LOG(INFO) << "local_dst_ratio sampler disabled";
++    return;
++  }
++  stopped_.store(false);
++  thread_ = std::thread([this] { loop(); });
++}
++
++void LocalDstRatioSampler::stop() {
++  stopped_.store(true);
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++}
++
++void LocalDstRatioSampler::loop() {
++  while (!stopped_.load()) {
++    for (int i = 0; i < FLAGS_local_dst_ratio_sample_interval_secs * 10; ++i) {
++      if (stopped_.load()) return;
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++    if (stopped_.load()) return;
++    int64_t edges = 0;
++    int64_t parts = 0;
++    time::Duration clock;
++    auto sample = sampleOnce(&edges, &parts);
++    const auto us = clock.elapsedInUSec();
++    LOG(INFO) << "local_dst_ratio_sample parts=" << parts << " edges=" << edges << " us=" << us
++              << " spaces=" << sample.size();
++    if (meta_ != nullptr) {
++      meta_->publishLocalDstRatio(std::move(sample));
++    }
++  }
++}
++
++meta::MetaClient::LocalDstRatioMap LocalDstRatioSampler::sampleOnce(int64_t* edges,
++                                                                    int64_t* parts) {
++  meta::MetaClient::LocalDstRatioMap out;
++  auto* store = dynamic_cast<kvstore::NebulaStore*>(store_);
++  if (store == nullptr || meta_ == nullptr) return out;
++  std::unordered_map<GraphSpaceID, std::vector<meta::cpp2::LeaderInfo>> leaders;
++  store->allLeader(leaders);
++  const int32_t edgeCap = std::max(1, FLAGS_local_dst_ratio_sample_edges);
++  const int32_t partCap = std::max(1, FLAGS_local_dst_ratio_sample_parts);
++  int32_t visitedParts = 0;
++  for (const auto& spaceEntry : leaders) {
++    if (visitedParts >= partCap) break;
++    const GraphSpaceID spaceId = spaceEntry.first;
++    auto vidLenRet = meta_->getSpaceVidLen(spaceId);
++    auto partsRet = meta_->partsNum(spaceId);
++    if (!vidLenRet.ok() || !partsRet.ok()) continue;
++    const int32_t vidLen = vidLenRet.value();
++    const int32_t numParts = partsRet.value();
++    for (const auto& leader : spaceEntry.second) {
++      if (visitedParts >= partCap) break;
++      const PartitionID partId = leader.get_part_id();
++      if (!store->isLeader(spaceId, partId)) continue;
++      std::unique_ptr<kvstore::KVIterator> iter;
++      auto edgePrefix = NebulaKeyUtils::edgePrefix(partId);
++      auto code = store_->prefix(spaceId, partId, edgePrefix, &iter);
++      if (code != nebula::cpp2::ErrorCode::SUCCEEDED || iter == nullptr) continue;
++      int32_t seen = 0;
++      int32_t local = 0;
++      for (; iter->valid() && seen < edgeCap; iter->next()) {
++        auto key = iter->key();
++        if (!NebulaKeyUtils::isEdge(vidLen, key)) continue;
++        auto dst = NebulaKeyUtils::getDstId(vidLen, key);
++        std::string dstId(dst.data(), dst.size());
++        auto dstPart = meta_->partId(numParts, dstId);
++        ++seen;
++        if (store->isLeader(spaceId, dstPart)) ++local;
++      }
++      ++visitedParts;
++      if (seen == 0) continue;
++      out[spaceId][partId] = static_cast<double>(local) / static_cast<double>(seen);
++      if (edges != nullptr) *edges += seen;
++      if (parts != nullptr) *parts += 1;
++    }
++  }
++  return out;
++}
++
++}  // namespace storage
++}  // namespace nebula

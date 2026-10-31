@@ -21,7 +21,7 @@ export APPEND_PUSHDOWN_FLAGS=false
 export NEBULA_BIN="${NEBULA_BIN:-/tmp/nebula-380/build/bin}"
 export NEBULA_CONF="${NEBULA_CONF:-/tmp/nebula-380/conf}"
 export GRAPH_WORKERS=4
-export EXTRA_STORAGE_FLAGS=$'--storaged_accept_local_multihop=true\n'
+export EXTRA_STORAGE_FLAGS=$'--storaged_accept_local_multihop=true\n--local_dst_ratio_sample_interval_secs=2\n--local_dst_ratio_sample_edges=64\n--local_dst_ratio_sample_parts=32\n--heartbeat_interval_secs=2\n'
 
 write_graph_flags() {
   local mode="$1"
@@ -41,7 +41,10 @@ drop = (
     "--local_multihop_trace=",
     "--local_multihop_per_part=",
     "--local_multihop_early_flip=",
+    "--local_multihop_host_batch=",
+    "--local_multihop_heartbeat_prior=",
     "--logbufsecs=",
+    "--heartbeat_interval_secs=",
 )
 lines = [ln for ln in text if not ln.startswith(drop)]
 if mode == "baseline":
@@ -49,12 +52,14 @@ if mode == "baseline":
         "--enable_local_multihop=false",
         "--local_multihop_affinity=0",
         "--enable_adaptive_local_multihop=false",
+        "--heartbeat_interval_secs=2",
     ]
 elif mode == "static":
     lines += [
         "--enable_local_multihop=true",
         "--local_multihop_affinity=1",
         "--enable_adaptive_local_multihop=false",
+        "--heartbeat_interval_secs=2",
     ]
 elif mode == "adaptive-v1":
     lines += [
@@ -67,7 +72,10 @@ elif mode == "adaptive-v1":
         "--local_multihop_assumed_rtt_us=5000",
         "--local_multihop_per_part=false",
         "--local_multihop_early_flip=false",
+        "--local_multihop_host_batch=false",
+        "--local_multihop_heartbeat_prior=false",
         "--local_multihop_trace=false",
+        "--heartbeat_interval_secs=2",
     ]
 elif mode == "adaptive-v2":
     lines += [
@@ -80,7 +88,10 @@ elif mode == "adaptive-v2":
         "--local_multihop_assumed_rtt_us=5000",
         "--local_multihop_per_part=true",
         "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=false",
+        "--local_multihop_heartbeat_prior=false",
         "--local_multihop_trace=false",
+        "--heartbeat_interval_secs=2",
     ]
 elif mode == "adaptive-v1-trace":
     lines += [
@@ -93,8 +104,44 @@ elif mode == "adaptive-v1-trace":
         "--local_multihop_assumed_rtt_us=5000",
         "--local_multihop_per_part=false",
         "--local_multihop_early_flip=false",
+        "--local_multihop_host_batch=false",
+        "--local_multihop_heartbeat_prior=false",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
+        "--heartbeat_interval_secs=2",
+    ]
+elif mode == "adaptive-v3":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=true",
+        "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_trace=false",
+        "--heartbeat_interval_secs=2",
+    ]
+elif mode == "adaptive-v3-trace":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=true",
+        "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_trace=true",
+        "--logbufsecs=0",
+        "--heartbeat_interval_secs=2",
     ]
 elif mode == "adaptive-v2-trace":
     lines += [
@@ -107,8 +154,11 @@ elif mode == "adaptive-v2-trace":
         "--local_multihop_assumed_rtt_us=5000",
         "--local_multihop_per_part=true",
         "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=false",
+        "--local_multihop_heartbeat_prior=false",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
+        "--heartbeat_interval_secs=2",
     ]
 else:
     raise SystemExit(mode)
@@ -151,7 +201,7 @@ measure() {
 phase() {
   local rtt="$1" conc="$2" loaded="${3:-0}"
   local mode placement skip
-  for mode in baseline static adaptive-v1 adaptive-v2; do
+  for mode in baseline static adaptive-v1 adaptive-v2 adaptive-v3; do
     restart_graph "$mode"
     for placement in affinity random mixed; do
       # Each placement is its own space. Skip only after that space was loaded
@@ -179,12 +229,14 @@ if [[ "${ADAPTIVE_SKIP_LOAD:-0}" == "1" ]]; then
 fi
 phase bridge "$CONC_BRIDGE" "$LOADED"
 
-restart_graph adaptive-v2-trace
+restart_graph adaptive-v3-trace
 python3 "$ROOT/drift.py" \
   --storage-hosts "$STORAGES" \
   --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 16 --random-queries 24 --return-queries 40 \
-  --tag drift_v2_bridge --results "$OUT"
+  --affinity-queries 8 --random-queries 12 --return-queries 12 \
+  --wait-before-return 8 \
+  --space ad_drift_v3b \
+  --tag drift_v3_bridge --results "$OUT"
 
 bash "$DIST" usdelay 2.5
 sleep 2
@@ -224,8 +276,16 @@ restart_graph adaptive-v2-trace
 python3 "$ROOT/drift.py" \
   --storage-hosts "$STORAGES" \
   --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 16 --random-queries 24 --return-queries 48 \
+  --affinity-queries 12 --random-queries 16 --return-queries 24 \
   --space ad_drift_v2 \
   --tag drift_v2_rtt5 --results "$OUT"
+restart_graph adaptive-v3-trace
+python3 "$ROOT/drift.py" \
+  --storage-hosts "$STORAGES" \
+  --community-size "$SIZE" --degree "$DEGREE" \
+  --affinity-queries 12 --random-queries 16 --return-queries 16 \
+  --wait-before-return 8 \
+  --space ad_drift_v3 \
+  --tag drift_v3_rtt5 --results "$OUT"
 
 echo ADAPTIVE_BENCH_OK

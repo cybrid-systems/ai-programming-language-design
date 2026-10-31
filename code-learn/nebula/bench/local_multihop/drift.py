@@ -32,6 +32,8 @@ def parse_args():
     p.add_argument("--random-queries", type=int, default=40)
     p.add_argument("--return-queries", type=int, default=40,
                    help="affinity queries after the random phase; 0 skips the return")
+    p.add_argument("--wait-before-return", type=float, default=0,
+                   help="seconds to sleep after restoring affinity so a heartbeat sample can land")
     p.add_argument("--window", type=int, default=10)
     p.add_argument("--log", default="/tmp/nebula-dist/graph1/logs/nebula-graphd.INFO")
     p.add_argument("--tag", default="drift")
@@ -175,6 +177,8 @@ def main():
         if args.return_queries > 0:
             delete_edges(session, rnd["edges"])
             load_graph(session, args, aff)
+            if args.wait_before_return > 0:
+                time.sleep(args.wait_before_return)
             report["return"] = run_phase(
                 session, args.space, aff_sql, aff_expect, args.return_queries, args.log
             )
