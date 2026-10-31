@@ -1,0 +1,21 @@
+{
+  "users": 150000,
+  "products": 10000,
+  "product_base": 1000001,
+  "alpha": 1.0,
+  "days": 60,
+  "seed": 42,
+  "now": 1761868800,
+  "edges": 2849966,
+  "window_30d": [
+    1759276800,
+    1761868800
+  ],
+  "window_7d": [
+    1761264000,
+    1761868800
+  ],
+  "purchases_per_user": "8 + (user % 23), distinct products",
+  "rank": "unix seconds, one edge per user-product",
+  "sales": "1000000 / (1 + permutation), independent of popularity"
+}

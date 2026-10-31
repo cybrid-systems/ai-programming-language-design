@@ -1,0 +1,831 @@
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -324,6 +324,11 @@
+     10: optional binary sales_prop,
+     11: optional RequestCommon common,
+     12: optional i64 exclude_user,
++    // 0 means "use the storaged flag". A positive value is this request's cap.
++    // Hitting a cap sets limit_hit and must not be treated as a complete answer.
++    13: optional i64 budget_us,
++    14: optional i64 max_edges,
++    15: optional i32 max_buyers,
+ }
+ 
+ struct CopurchaseResponse {
+@@ -338,6 +343,11 @@
+     7: optional list<CopurchaseUserRow> users,
+     8: optional i64 rows_scanned,
+     9: optional i64 rows_returned,
++    // Set together with copurchase_applied when a cap stopped the scan early.
++    // The ids/users in this response are incomplete.
++    10: optional bool limit_hit,
++    // 1 edges, 2 buyers, 3 time
++    11: optional i32 limit_code,
+ }
+ 
+ 
+--- a/src/storage/query/CopurchaseProcessor.cpp
++++ b/src/storage/query/CopurchaseProcessor.cpp
+@@ -7,8 +7,12 @@
+ 
+ #include <unordered_set>
+ 
++#include <mutex>
++
+ #include "codec/RowReaderWrapper.h"
+ #include "common/algorithm/Copurchase.h"
++#include "common/stats/StatsManager.h"
++#include "common/time/WallClock.h"
+ #include "common/utils/NebulaKeyUtils.h"
+ #include "kvstore/NebulaStore.h"
+ #include "storage/StorageFlags.h"
+@@ -20,6 +24,21 @@
+ 
+ namespace {
+ 
++stats::CounterId kCopurchaseEdges;
++stats::CounterId kCopurchaseLimits;
++
++void ensureCopurchaseStats() {
++  static std::once_flag once;
++  std::call_once(once, [] {
++    kCopurchaseEdges = stats::StatsManager::registerStats("copurchase_edges_scanned", "sum");
++    kCopurchaseLimits = stats::StatsManager::registerStats("copurchase_limit_hits", "sum");
++  });
++}
++
++}  // namespace
++
++namespace {
++
+ int64_t vidOf(const Value& vid) {
+   if (vid.isInt()) return vid.getInt();
+   if (vid.isStr() && vid.getStr().size() >= sizeof(int64_t)) {
+@@ -45,6 +64,7 @@
+ }  // namespace
+ 
+ void CopurchaseProcessor::process(const cpp2::CopurchaseRequest& req) {
++  ensureCopurchaseStats();
+   if (!FLAGS_storaged_accept_copurchase) {
+     onFinished();
+     return;
+@@ -84,6 +104,32 @@
+   const int64_t excludeUser = hasExclude ? req.exclude_user_ref().value() : 0;
+   std::unordered_set<int64_t> focus(req.get_product_ids().begin(), req.get_product_ids().end());
+   int64_t scanned = 0;
++  int32_t limitCode = 0;
++  const int64_t budgetUs =
++      req.budget_us_ref().has_value() && req.budget_us_ref().value() > 0
++          ? req.budget_us_ref().value()
++          : FLAGS_copurchase_budget_us;
++  const int64_t maxEdges =
++      req.max_edges_ref().has_value() && req.max_edges_ref().value() > 0
++          ? req.max_edges_ref().value()
++          : FLAGS_copurchase_max_edges;
++  const int32_t maxBuyers =
++      req.max_buyers_ref().has_value() && req.max_buyers_ref().value() > 0
++          ? req.max_buyers_ref().value()
++          : FLAGS_copurchase_max_buyers;
++  const int64_t started = time::WallClock::fastNowInMicroSec();
++  auto noteLimit = [&](int32_t code) {
++    if (limitCode == 0) limitCode = code;
++  };
++  auto stopForLimit = [&]() {
++    resp_.limit_hit_ref() = true;
++    resp_.limit_code_ref() = limitCode;
++    resp_.rows_scanned_ref() = scanned;
++    resp_.copurchase_applied_ref() = true;
++    stats::StatsManager::addValue(kCopurchaseLimits);
++    stats::StatsManager::addValue(kCopurchaseEdges, scanned);
++    onFinished();
++  };
+ 
+   auto scan = [&](PartitionID partId,
+                   int64_t srcVid,
+@@ -114,21 +160,35 @@
+       auto ts = NebulaKeyUtils::getRank(spaceVidLen_, key);
+       if (ts < windowStart) continue;
+       if (ts > windowEnd) break;
++      if (maxEdges > 0 && scanned >= maxEdges) {
++        noteLimit(1);
++        return false;
++      }
++      if (budgetUs > 0 && time::WallClock::fastNowInMicroSec() - started >= budgetUs) {
++        noteLimit(3);
++        return false;
++      }
+       scanned++;
+       edges->push_back(algorithm::EdgeFact{keyVid(NebulaKeyUtils::getDstId(spaceVidLen_, key)), ts});
+     }
+     return true;
+   };
++  auto afterScan = [&](bool ok) {
++    if (ok) return false;
++    if (limitCode != 0) {
++      stopForLimit();
++    } else {
++      onFinished();
++    }
++    return true;
++  };
+ 
+   if (phase == cpp2::CopurchasePhase::HOP1_TOP_PRODUCTS) {
+     std::vector<algorithm::ProductScore> products;
+     for (const auto& part : req.get_parts()) {
+       for (const auto& src : part.second) {
+         std::vector<algorithm::EdgeFact> edges;
+-        if (!scan(part.first, vidOf(src), edgeType, &edges)) {
+-          onFinished();
+-          return;
+-        }
++        if (afterScan(scan(part.first, vidOf(src), edgeType, &edges))) return;
+         auto top = algorithm::topProducts(edges, topK, windowStart, windowEnd);
+         products.insert(products.end(), top.begin(), top.end());
+       }
+@@ -148,24 +208,52 @@
+     resp_.latest_ts_ref() = std::move(latest);
+     resp_.rows_returned_ref() = static_cast<int64_t>(products.size());
+   } else if (phase == cpp2::CopurchasePhase::HOP2A_BUYERS) {
+-    std::unordered_set<int64_t> buyers;
++    struct Partial {
++      std::unordered_set<int64_t> pids;
++      int32_t purchases{0};
++      int64_t ts{std::numeric_limits<int64_t>::min()};
++    };
++    std::unordered_map<int64_t, Partial> buyers;
+     for (const auto& part : req.get_parts()) {
+       for (const auto& src : part.second) {
++        auto product = vidOf(src);
+         std::vector<algorithm::EdgeFact> edges;
+-        if (!scan(part.first, vidOf(src), -edgeType, &edges)) {
+-          onFinished();
+-          return;
+-        }
++        if (afterScan(scan(part.first, product, -edgeType, &edges))) return;
+         for (const auto& edge : edges) {
+           if (hasExclude && edge.other == excludeUser) continue;
+-          buyers.insert(edge.other);
++          auto& partial = buyers[edge.other];
++          if (partial.pids.empty() && maxBuyers > 0 &&
++              static_cast<int32_t>(buyers.size()) > maxBuyers) {
++            noteLimit(2);
++            stopForLimit();
++            return;
++          }
++          partial.pids.insert(product);
++          partial.purchases++;
++          if (edge.ts > partial.ts) partial.ts = edge.ts;
+         }
+       }
+     }
+-    std::vector<int64_t> ids(buyers.begin(), buyers.end());
++    std::vector<int64_t> ids;
++    std::vector<cpp2::CopurchaseUserRow> rows;
++    ids.reserve(buyers.size());
++    rows.reserve(buyers.size());
++    for (auto& item : buyers) {
++      ids.push_back(item.first);
++      cpp2::CopurchaseUserRow row;
++      row.user_ref() = item.first;
++      row.co_count_ref() = static_cast<int32_t>(item.second.pids.size());
++      row.purchase_count_ref() = item.second.purchases;
++      row.latest_ts_ref() = item.second.ts;
++      std::vector<int64_t> pids(item.second.pids.begin(), item.second.pids.end());
++      std::sort(pids.begin(), pids.end());
++      row.product_ids_ref() = std::move(pids);
++      rows.push_back(std::move(row));
++    }
+     std::sort(ids.begin(), ids.end());
+     resp_.rows_returned_ref() = static_cast<int64_t>(ids.size());
+     resp_.ids_ref() = std::move(ids);
++    resp_.users_ref() = std::move(rows);
+   } else if (phase == cpp2::CopurchasePhase::FUSED_COCOUNT ||
+              phase == cpp2::CopurchasePhase::NAIVE_PARTIAL) {
+     std::vector<algorithm::UserScore> users;
+@@ -175,10 +263,7 @@
+           auto user = vidOf(src);
+           if (hasExclude && user == excludeUser) continue;
+           std::vector<algorithm::EdgeFact> edges;
+-          if (!scan(part.first, user, edgeType, &edges)) {
+-            onFinished();
+-            return;
+-          }
++          if (afterScan(scan(part.first, user, edgeType, &edges))) return;
+           users.push_back(algorithm::scoreUser(user, edges, focus, windowStart, windowEnd));
+         }
+       }
+@@ -189,10 +274,7 @@
+         for (const auto& src : part.second) {
+           auto product = vidOf(src);
+           std::vector<algorithm::EdgeFact> edges;
+-          if (!scan(part.first, product, -edgeType, &edges)) {
+-            onFinished();
+-            return;
+-          }
++          if (afterScan(scan(part.first, product, -edgeType, &edges))) return;
+           for (const auto& edge : edges) {
+             if (hasExclude && edge.other == excludeUser) continue;
+             hits.push_back(algorithm::PartialHit{edge.other, product, edge.ts});
+@@ -268,6 +350,7 @@
+ 
+   resp_.rows_scanned_ref() = scanned;
+   resp_.copurchase_applied_ref() = true;
++  stats::StatsManager::addValue(kCopurchaseEdges, scanned);
+   onFinished();
+ }
+ 
+--- a/src/common/algorithm/Copurchase.h
++++ b/src/common/algorithm/Copurchase.h
+@@ -245,6 +245,52 @@
+   return rows;
+ }
+ 
++// One focus product lives on one partition. `lower` is the number of focus
++// products already observed. `upper` is lower plus focus products whose
++// partition has not reported yet. After every partition reports, upper == lower.
++//
++// threshold is the k-th highest lower bound (the k-th buyer when there are at
++// least k). A buyer with upper < threshold cannot enter the top k: at least k
++// buyers already have a strictly higher confirmed coCount, and coCount is the
++// primary key. purchaseCount and recency cannot repair that. Buyers with
++// upper >= threshold are kept, including every tie at the threshold, so the
++// later full scan can break ties. The kept set contains the true top k.
++struct CoBuyer {
++  int64_t user{0};
++  int32_t lower{0};
++  int32_t upper{0};
++};
++
++inline std::vector<int64_t> pruneCandidates(std::vector<CoBuyer> buyers, int k, int32_t* pruned) {
++  if (pruned != nullptr) *pruned = 0;
++  if (k < 1) k = 1;
++  std::vector<int64_t> keep;
++  if (buyers.empty()) return keep;
++  std::vector<int32_t> lowers;
++  lowers.reserve(buyers.size());
++  for (auto& buyer : buyers) {
++    if (buyer.upper < buyer.lower) buyer.upper = buyer.lower;
++    lowers.push_back(buyer.lower);
++  }
++  int32_t threshold = 0;
++  if (static_cast<int>(lowers.size()) > k) {
++    std::nth_element(
++        lowers.begin(), lowers.begin() + (k - 1), lowers.end(), std::greater<int32_t>());
++    threshold = lowers[static_cast<size_t>(k - 1)];
++  } else {
++    threshold = *std::min_element(lowers.begin(), lowers.end());
++  }
++  keep.reserve(buyers.size());
++  for (const auto& buyer : buyers) {
++    if (buyer.upper >= threshold) {
++      keep.push_back(buyer.user);
++    } else if (pruned != nullptr) {
++      ++(*pruned);
++    }
++  }
++  return keep;
++}
++
+ inline std::vector<SalesScore> mergeSales(const std::vector<std::vector<SalesScore>>& nodes, int k) {
+   std::vector<SalesScore> rows;
+   for (const auto& node : nodes) {
+--- a/src/common/algorithm/test/CopurchaseTest.cpp
++++ b/src/common/algorithm/test/CopurchaseTest.cpp
+@@ -125,6 +125,43 @@
+   EXPECT_EQ(3, survivor->purchaseCount);
+ }
+ 
++TEST(Copurchase, PruneKeepsExactTop) {
++  std::vector<UserScore> all;
++  std::vector<CoBuyer> buyers;
++  for (int i = 0; i < 80; ++i) {
++    UserScore row;
++    row.user = 1000 - i;
++    row.coCount = (i < 10) ? 4 : (i < 30) ? 2 : 1;
++    row.purchaseCount = 100 - (i % 17);
++    row.latestTs = 5000 - i;
++    all.push_back(row);
++    buyers.push_back(CoBuyer{row.user, row.coCount, row.coCount});
++  }
++  int32_t pruned = 0;
++  auto kept = pruneCandidates(buyers, 15, &pruned);
++  std::unordered_set<int64_t> keep(kept.begin(), kept.end());
++  auto global = localTopUsers(all, 15);
++  ASSERT_EQ(15, global.size());
++  for (const auto& row : global) {
++    EXPECT_TRUE(keep.count(row.user) != 0) << row.user;
++  }
++  EXPECT_GT(pruned, 0);
++  for (const auto& row : all) {
++    if (keep.count(row.user) == 0) {
++      EXPECT_LT(row.coCount, global.back().coCount);
++    }
++  }
++  // An unfinished partition must not drop a buyer who could still tie.
++  std::vector<CoBuyer> partial = {
++      {1, 3, 3},
++      {2, 3, 3},
++      {3, 1, 3},
++  };
++  auto still = pruneCandidates(partial, 2, nullptr);
++  std::unordered_set<int64_t> stillSet(still.begin(), still.end());
++  EXPECT_TRUE(stillSet.count(3) != 0);
++}
++
+ TEST(Copurchase, SalesLocalTopContainsGlobal) {
+   std::vector<std::vector<SalesScore>> nodes(3);
+   std::vector<SalesScore> all;
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -169,7 +169,10 @@
+     int32_t topK,
+     int64_t excludeUser,
+     int32_t productTagId,
+-    std::string salesProp) {
++    std::string salesProp,
++    int64_t budgetUs,
++    int64_t maxEdges,
++    int32_t maxBuyers) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::CopurchaseResponse>>(
+@@ -200,6 +203,9 @@
+       req.product_tag_id_ref() = productTagId;
+       req.sales_prop_ref() = salesProp;
+     }
++    if (budgetUs > 0) req.budget_us_ref() = budgetUs;
++    if (maxEdges > 0) req.max_edges_ref() = maxEdges;
++    if (maxBuyers > 0) req.max_buyers_ref() = maxBuyers;
+   }
+ 
+   return collectResponse(param.evb,
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -107,7 +107,10 @@
+       int32_t topK,
+       int64_t excludeUser,
+       int32_t productTagId = 0,
+-      std::string salesProp = "");
++      std::string salesProp = "",
++      int64_t budgetUs = 0,
++      int64_t maxEdges = 0,
++      int32_t maxBuyers = 0);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -204,13 +204,32 @@
+ 
+ DEFINE_bool(enable_copurchase,
+             false,
+-            "Accept COPURCHASE FROM <user> WINDOW <start>, <end> [NAIVE].");
++            "Accept COPURCHASE FROM <user> WINDOW <start>, <end> [NAIVE] [NOPRUNE].");
+ DEFINE_string(copurchase_edge, "buy", "Purchase edge name. Rank is the timestamp.");
+ DEFINE_string(copurchase_tag, "product", "Product tag that stores sales.");
+ DEFINE_string(copurchase_sales_prop, "sales", "Integer sales property on the product tag.");
+ DEFINE_int32(copurchase_top_products, 5, "Hop-1 product limit.");
+ DEFINE_int32(copurchase_top_users, 15, "Co-purchase user limit.");
+ DEFINE_int32(copurchase_top_sales, 20, "Final product limit by sales.");
++DEFINE_bool(copurchase_prune,
++            true,
++            "Drop buyers whose co-count cannot reach the top before hop 2b.");
++DEFINE_int32(copurchase_max_candidates,
++             0,
++             "Max buyers sent to hop 2b after pruning. 0 is unlimited. "
++             "Exceeding the cap follows copurchase_failure_policy.");
++DEFINE_int64(copurchase_max_edges, 0, "Per RPC edge cap forwarded to storaged. 0 is unlimited.");
++DEFINE_int64(copurchase_budget_us, 0, "Per RPC time cap in microseconds. 0 is unlimited.");
++DEFINE_int32(copurchase_max_buyers, 0, "Per RPC distinct-buyer cap. 0 is unlimited.");
++DEFINE_int64(copurchase_timeout_ms, 0, "Whole COPURCHASE timeout. 0 waits for the RPCs.");
++DEFINE_int64(copurchase_slow_us, 200000, "Log copurchase_slow at WARNING above this.");
++DEFINE_string(copurchase_failure_policy,
++              "fallback",
++              "fallback runs the exact getNeighbors path. error returns the failure. "
++              "Neither returns a truncated ranking.");
++DEFINE_string(copurchase_spaces,
++              "",
++              "Comma-separated space names. Empty allows every space.");
+ 
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -122,5 +122,14 @@
+ DECLARE_int32(copurchase_top_products);
+ DECLARE_int32(copurchase_top_users);
+ DECLARE_int32(copurchase_top_sales);
++DECLARE_bool(copurchase_prune);
++DECLARE_int32(copurchase_max_candidates);
++DECLARE_int64(copurchase_max_edges);
++DECLARE_int64(copurchase_budget_us);
++DECLARE_int32(copurchase_max_buyers);
++DECLARE_int64(copurchase_timeout_ms);
++DECLARE_int64(copurchase_slow_us);
++DECLARE_string(copurchase_failure_policy);
++DECLARE_string(copurchase_spaces);
+ 
+ #endif  // GRAPH_GRAPHFLAGS_H_
+--- a/src/graph/stats/GraphStats.cpp
++++ b/src/graph/stats/GraphStats.cpp
+@@ -34,6 +34,15 @@
+ stats::CounterId kNumSortExecutors;
+ stats::CounterId kNumIndexScanExecutors;
+ 
++stats::CounterId kNumCopurchase;
++stats::CounterId kNumCopurchaseFallback;
++stats::CounterId kNumCopurchaseFailure;
++stats::CounterId kCopurchasePruned;
++stats::CounterId kCopurchaseCandidates;
++stats::CounterId kCopurchaseRows;
++stats::CounterId kCopurchaseRounds;
++stats::CounterId kCopurchaseLatencyUs;
++
+ stats::CounterId kNumOpenedSessions;
+ stats::CounterId kNumAuthFailedSessions;
+ stats::CounterId kNumAuthFailedSessionsBadUserNamePassword;
+@@ -66,6 +75,18 @@
+   kNumIndexScanExecutors =
+       stats::StatsManager::registerStats("num_indexscan_executors", "rate, sum");
+ 
++  kNumCopurchase = stats::StatsManager::registerStats("num_copurchase", "rate, sum");
++  kNumCopurchaseFallback =
++      stats::StatsManager::registerStats("num_copurchase_fallback", "rate, sum");
++  kNumCopurchaseFailure =
++      stats::StatsManager::registerStats("num_copurchase_failure", "rate, sum");
++  kCopurchasePruned = stats::StatsManager::registerStats("copurchase_pruned", "sum");
++  kCopurchaseCandidates = stats::StatsManager::registerStats("copurchase_candidates", "sum");
++  kCopurchaseRows = stats::StatsManager::registerStats("copurchase_rows_scanned", "sum");
++  kCopurchaseRounds = stats::StatsManager::registerStats("copurchase_rounds", "sum");
++  kCopurchaseLatencyUs = stats::StatsManager::registerHisto(
++      "copurchase_latency_us", 1000, 0, 2000, "avg, p75, p95, p99, p999");
++
+   kNumOpenedSessions = stats::StatsManager::registerStats("num_opened_sessions", "rate, sum");
+   kNumAuthFailedSessions =
+       stats::StatsManager::registerStats("num_auth_failed_sessions", "rate, sum");
+--- a/src/graph/stats/GraphStats.h
++++ b/src/graph/stats/GraphStats.h
+@@ -35,6 +35,15 @@
+ extern stats::CounterId kNumSortExecutors;
+ extern stats::CounterId kNumIndexScanExecutors;
+ 
++extern stats::CounterId kNumCopurchase;
++extern stats::CounterId kNumCopurchaseFallback;
++extern stats::CounterId kNumCopurchaseFailure;
++extern stats::CounterId kCopurchasePruned;
++extern stats::CounterId kCopurchaseCandidates;
++extern stats::CounterId kCopurchaseRows;
++extern stats::CounterId kCopurchaseRounds;
++extern stats::CounterId kCopurchaseLatencyUs;
++
+ // Server client traffic
+ // extern stats::CounterId kReceivedBytes;
+ // extern stats::CounterId kSentBytes;
+--- a/src/storage/StorageFlags.cpp
++++ b/src/storage/StorageFlags.cpp
+@@ -57,3 +57,13 @@
+ DEFINE_bool(storaged_accept_copurchase,
+             true,
+             "Run CopurchaseRequest. Turn off to leave copurchase_applied unset.");
++
++DEFINE_int64(copurchase_max_edges,
++             0,
++             "Per copurchase RPC edge cap. 0 is unlimited. A hit sets limit_hit.");
++DEFINE_int64(copurchase_budget_us,
++             0,
++             "Per copurchase RPC time cap in microseconds. 0 is unlimited.");
++DEFINE_int32(copurchase_max_buyers,
++             0,
++             "Per copurchase RPC distinct-buyer cap. 0 is unlimited.");
+--- a/src/storage/StorageFlags.h
++++ b/src/storage/StorageFlags.h
+@@ -43,5 +43,8 @@
+ // When false, copurchase returns success without copurchase_applied so graphd
+ // falls back the way an old storaged (no method) does.
+ DECLARE_bool(storaged_accept_copurchase);
++DECLARE_int64(copurchase_max_edges);
++DECLARE_int64(copurchase_budget_us);
++DECLARE_int32(copurchase_max_buyers);
+ 
+ #endif  // STORAGE_STORAGEFLAGS_H_
+--- a/src/graph/executor/query/CopurchaseDriver.cpp
++++ b/src/graph/executor/query/CopurchaseDriver.cpp
+@@ -6,6 +6,7 @@
+ #include "graph/executor/query/CopurchaseDriver.h"
+ 
+ #include <cctype>
++#include <chrono>
+ #include <sstream>
+ #include <unordered_set>
+ 
+@@ -15,9 +16,12 @@
+ #include "clients/storage/StorageClient.h"
+ #include "common/algorithm/Copurchase.h"
+ #include "common/base/Base.h"
++#include "common/stats/StatsManager.h"
++#include "common/time/WallClock.h"
+ #include "graph/context/QueryContext.h"
+ #include "graph/service/GraphFlags.h"
+ #include "graph/session/ClientSession.h"
++#include "graph/stats/GraphStats.h"
+ 
+ namespace nebula {
+ namespace graph {
+@@ -29,6 +33,7 @@
+   int64_t windowStart{0};
+   int64_t windowEnd{0};
+   bool naive{false};
++  bool noprune{false};
+ };
+ 
+ struct HopStat {
+@@ -58,6 +63,10 @@
+   HopStat hops[4];
+   int rounds{0};
+   int64_t buyers{0};
++  int32_t pruned{0};
++  int64_t sent{0};
++  int64_t startedUs{0};
++  std::string failure;
+ };
+ 
+ bool parseQuery(const std::string& text, Parsed* out) {
+@@ -75,14 +84,36 @@
+     return false;
+   }
+   if (kw != "COPURCHASE" || from != "FROM" || window != "WINDOW" || comma != ',') return false;
+-  if (in >> tail) {
+-    if (tail != "NAIVE") return false;
+-    out->naive = true;
+-    if (in >> tail) return false;
++  while (in >> tail) {
++    if (tail == "NAIVE" && !out->naive) {
++      out->naive = true;
++    } else if (tail == "NOPRUNE" && !out->noprune) {
++      out->noprune = true;
++    } else {
++      return false;
++    }
+   }
+   return true;
+ }
+ 
++bool spaceAllowed(const std::string& name) {
++  if (FLAGS_copurchase_spaces.empty()) return true;
++  size_t begin = 0;
++  const std::string& list = FLAGS_copurchase_spaces;
++  while (begin <= list.size()) {
++    auto comma = list.find(',', begin);
++    auto token = list.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
++    size_t left = 0;
++    while (left < token.size() && std::isspace(static_cast<unsigned char>(token[left]))) ++left;
++    size_t right = token.size();
++    while (right > left && std::isspace(static_cast<unsigned char>(token[right - 1]))) --right;
++    if (token.substr(left, right - left) == name) return true;
++    if (comma == std::string::npos) break;
++    begin = comma + 1;
++  }
++  return false;
++}
++
+ std::vector<Value> asValues(const std::vector<int64_t>& ids) {
+   std::vector<Value> values;
+   values.reserve(ids.size());
+@@ -111,6 +142,8 @@
+ struct Inspect {
+   bool applied{true};
+   bool ok{true};
++  bool limit{false};
++  bool partials{true};
+   HopStat stat;
+ };
+ 
+@@ -125,6 +158,8 @@
+     if (!resp.copurchase_applied_ref().has_value() || !resp.copurchase_applied_ref().value()) {
+       out.applied = false;
+     }
++    if (resp.limit_hit_ref().has_value() && resp.limit_hit_ref().value()) out.limit = true;
++    if (!resp.users_ref().has_value()) out.partials = false;
+     if (resp.rows_scanned_ref().has_value()) out.stat.scanned += resp.rows_scanned_ref().value();
+     if (resp.rows_returned_ref().has_value()) {
+       out.stat.returned += resp.rows_returned_ref().value();
+@@ -146,9 +181,24 @@
+     if (i != 0) products << ",";
+     products << state.sales[i].pid << ":" << state.sales[i].sales;
+   }
++  const bool prune = !state.query.naive && !state.query.noprune && FLAGS_copurchase_prune;
++  const int64_t elapsed = time::WallClock::fastNowInMicroSec() - state.startedUs;
++  int64_t scanned = 0;
++  for (const auto& hop : state.hops) scanned += hop.scanned;
++  stats::StatsManager::addValue(kNumCopurchase);
++  stats::StatsManager::addValue(kCopurchaseLatencyUs, elapsed);
++  stats::StatsManager::addValue(kCopurchasePruned, state.pruned);
++  stats::StatsManager::addValue(kCopurchaseCandidates, state.buyers);
++  stats::StatsManager::addValue(kCopurchaseRows, scanned);
++  stats::StatsManager::addValue(kCopurchaseRounds, state.rounds);
++  if (state.fallback) stats::StatsManager::addValue(kNumCopurchaseFallback);
++  if (elapsed >= FLAGS_copurchase_slow_us) {
++    LOG(WARNING) << "copurchase_slow us=" << elapsed << " failure=" << state.failure;
++  }
+   LOG(INFO) << "copurchase_plan mode=" << (state.query.naive ? "naive" : "exact")
+-            << " fallback=" << (state.fallback ? 1 : 0) << " rounds=" << state.rounds
+-            << " buyers=" << state.buyers
++            << " fallback=" << (state.fallback ? 1 : 0) << " prune=" << (prune ? 1 : 0)
++            << " pruned=" << state.pruned << " sent=" << state.sent << " rounds=" << state.rounds
++            << " buyers=" << state.buyers << " failure=" << (state.failure.empty() ? "-" : state.failure)
+             << " hop_rows=" << state.hops[0].returned << "," << state.hops[1].returned << ","
+             << state.hops[2].returned << "," << state.hops[3].returned
+             << " hop_hosts=" << state.hops[0].hosts << "," << state.hops[1].hosts << ","
+@@ -177,7 +227,10 @@
+                    topK,
+                    state->query.user,
+                    withSales ? state->tagId : 0,
+-                   withSales ? FLAGS_copurchase_sales_prop : "")
++                   withSales ? FLAGS_copurchase_sales_prop : "",
++                   FLAGS_copurchase_budget_us,
++                   FLAGS_copurchase_max_edges,
++                   FLAGS_copurchase_max_buyers)
+       .via(state->runner);
+ }
+ 
+@@ -274,6 +327,7 @@
+ 
+ folly::Future<StatusOr<DataSet>> finishWithSales(const std::shared_ptr<State>& state,
+                                                  std::vector<int64_t> pids);
++folly::Future<StatusOr<DataSet>> fail(const std::shared_ptr<State>& state, const char* reason);
+ 
+ folly::Future<StatusOr<DataSet>> fallback(const std::shared_ptr<State>& state) {
+   state->fallback = true;
+@@ -447,10 +501,9 @@
+         auto seen = inspect(rpc);
+         state->hops[3] = seen.stat;
+         state->rounds++;
+-        if (!seen.applied) return fallback(state);
+-        if (!seen.ok) {
+-          return folly::makeFuture<StatusOr<DataSet>>(Status::Error("copurchase hop4 failed"));
+-        }
++        if (seen.limit) return fail(state, "limit");
++        if (!seen.applied) return fail(state, "not_applied");
++        if (!seen.ok) return fail(state, "rpc");
+         std::vector<std::vector<algorithm::SalesScore>> nodes;
+         for (const auto& resp : rpc.responses()) {
+           if (!resp.ids_ref().has_value()) continue;
+@@ -469,6 +522,17 @@
+       });
+ }
+ 
++folly::Future<StatusOr<DataSet>> fail(const std::shared_ptr<State>& state, const char* reason) {
++  state->failure = reason;
++  LOG(WARNING) << "copurchase_failure reason=" << reason
++               << " policy=" << FLAGS_copurchase_failure_policy;
++  stats::StatsManager::addValue(kNumCopurchaseFailure);
++  if (state->fallback || FLAGS_copurchase_failure_policy != "fallback") {
++    return folly::makeFuture<StatusOr<DataSet>>(Status::Error("copurchase %s", reason));
++  }
++  return fallback(state);
++}
++
+ folly::Future<StatusOr<DataSet>> afterBuyers(const std::shared_ptr<State>& state) {
+   if (state->query.naive) {
+     return callPhase(state,
+@@ -482,10 +546,9 @@
+           auto seen = inspect(rpc);
+           state->hops[2] = seen.stat;
+           state->rounds++;
+-          if (!seen.applied) return fallback(state);
+-          if (!seen.ok) {
+-            return folly::makeFuture<StatusOr<DataSet>>(Status::Error("copurchase naive failed"));
+-          }
++          if (seen.limit) return fail(state, "limit");
++          if (!seen.applied) return fail(state, "not_applied");
++          if (!seen.ok) return fail(state, "rpc");
+           std::vector<std::vector<algorithm::UserScore>> nodes;
+           for (const auto& resp : rpc.responses()) {
+             std::vector<algorithm::UserScore> node;
+@@ -527,11 +590,9 @@
+                 auto seen = inspect(rpc);
+                 state->hops[2] = seen.stat;
+                 state->rounds++;
+-                if (!seen.applied) return fallback(state);
+-                if (!seen.ok) {
+-                  return folly::makeFuture<StatusOr<DataSet>>(
+-                      Status::Error("copurchase naive products failed"));
+-                }
++                if (seen.limit) return fail(state, "limit");
++                if (!seen.applied) return fail(state, "not_applied");
++                if (!seen.ok) return fail(state, "rpc");
+                 std::unordered_map<int64_t, std::vector<int64_t>> products;
+                 for (const auto& resp : rpc.responses()) {
+                   if (!resp.users_ref().has_value()) continue;
+@@ -562,17 +623,41 @@
+         auto seen = inspect(rpc);
+         state->hops[1] = seen.stat;
+         state->rounds++;
+-        if (!seen.applied) return fallback(state);
+-        if (!seen.ok) {
+-          return folly::makeFuture<StatusOr<DataSet>>(Status::Error("copurchase hop2a failed"));
+-        }
++        if (seen.limit) return fail(state, "limit");
++        if (!seen.applied) return fail(state, "not_applied");
++        if (!seen.ok) return fail(state, "rpc");
++        std::unordered_map<int64_t, std::unordered_set<int64_t>> partials;
+         std::unordered_set<int64_t> buyers;
+         for (const auto& resp : rpc.responses()) {
+-          if (!resp.ids_ref().has_value()) continue;
+-          buyers.insert(resp.ids_ref().value().begin(), resp.ids_ref().value().end());
++          if (resp.ids_ref().has_value()) {
++            buyers.insert(resp.ids_ref().value().begin(), resp.ids_ref().value().end());
++          }
++          if (!resp.users_ref().has_value()) continue;
++          for (const auto& row : resp.users_ref().value()) {
++            auto& pids = partials[row.get_user()];
++            for (auto pid : row.get_product_ids()) pids.insert(pid);
++          }
+         }
+         std::vector<int64_t> ids(buyers.begin(), buyers.end());
+         state->buyers = static_cast<int64_t>(ids.size());
++        const bool canPrune = !state->query.noprune && FLAGS_copurchase_prune && seen.partials &&
++                              partials.size() == buyers.size();
++        if (canPrune) {
++          std::vector<algorithm::CoBuyer> scored;
++          scored.reserve(partials.size());
++          for (const auto& item : partials) {
++            auto count = static_cast<int32_t>(item.second.size());
++            scored.push_back(algorithm::CoBuyer{item.first, count, count});
++          }
++          int32_t pruned = 0;
++          ids = algorithm::pruneCandidates(scored, FLAGS_copurchase_top_users, &pruned);
++          state->pruned = pruned;
++        }
++        state->sent = static_cast<int64_t>(ids.size());
++        if (FLAGS_copurchase_max_candidates > 0 &&
++            state->sent > FLAGS_copurchase_max_candidates) {
++          return fail(state, "candidates");
++        }
+         if (ids.empty()) {
+           logPlan(*state);
+           return folly::makeFuture<StatusOr<DataSet>>(emptyResult());
+@@ -588,11 +673,9 @@
+               auto fusedSeen = inspect(fused);
+               state->hops[2] = fusedSeen.stat;
+               state->rounds++;
+-              if (!fusedSeen.applied) return fallback(state);
+-              if (!fusedSeen.ok) {
+-                return folly::makeFuture<StatusOr<DataSet>>(
+-                    Status::Error("copurchase fused failed"));
+-              }
++              if (fusedSeen.limit) return fail(state, "limit");
++              if (!fusedSeen.applied) return fail(state, "not_applied");
++              if (!fusedSeen.ok) return fail(state, "rpc");
+               std::vector<std::vector<algorithm::UserScore>> nodes;
+               for (const auto& resp : fused.responses()) {
+                 std::vector<algorithm::UserScore> node;
+@@ -631,10 +714,9 @@
+         auto seen = inspect(rpc);
+         state->hops[0] = seen.stat;
+         state->rounds++;
+-        if (!seen.applied) return fallback(state);
+-        if (!seen.ok) {
+-          return folly::makeFuture<StatusOr<DataSet>>(Status::Error("copurchase hop1 failed"));
+-        }
++        if (seen.limit) return fail(state, "limit");
++        if (!seen.applied) return fail(state, "not_applied");
++        if (!seen.ok) return fail(state, "rpc");
+         std::vector<algorithm::ProductScore> products;
+         for (const auto& resp : rpc.responses()) {
+           if (!resp.ids_ref().has_value()) continue;
+@@ -694,17 +776,31 @@
+   }
+   state->edgeType = edgeType.value();
+   state->tagId = tagId.value();
++  if (!spaceAllowed(space.name)) {
++    return folly::makeFuture<StatusOr<DataSet>>(
++        Status::Error("copurchase disabled for space %s", space.name.c_str()));
++  }
++  state->startedUs = time::WallClock::fastNowInMicroSec();
+   state->runner = qctx->rctx()->runner();
+   if (state->runner == nullptr) {
+     state->runner = &folly::InlineExecutor::instance();
+   }
+-  return pushdown(state).thenError(
++  auto result = pushdown(state).thenError(
+       folly::tag_t<std::exception>{}, [state](const std::exception& ex) {
+-        if (state->fallback) {
++        if (state->fallback || !state->failure.empty()) {
+           return folly::makeFuture<StatusOr<DataSet>>(Status::Error("%s", ex.what()));
+         }
+         LOG(WARNING) << "copurchase pushdown failed: " << ex.what();
+-        return fallback(state);
++        return fail(state, "rpc");
++      });
++  if (FLAGS_copurchase_timeout_ms <= 0) return result;
++  return std::move(result)
++      .within(std::chrono::milliseconds(FLAGS_copurchase_timeout_ms))
++      .thenError(folly::tag_t<std::exception>{}, [state](const std::exception& ex) {
++        if (state->fallback || !state->failure.empty()) {
++          return folly::makeFuture<StatusOr<DataSet>>(Status::Error("%s", ex.what()));
++        }
++        return fail(state, "timeout");
+       });
+ }
+ 

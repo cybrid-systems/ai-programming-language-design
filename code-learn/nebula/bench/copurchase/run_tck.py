@@ -203,7 +203,9 @@ def main():
         start, end = WINDOW
         for mode, stmt in (
             ("exact", f"COPURCHASE FROM 1 WINDOW {start}, {end}"),
+            ("noprune", f"COPURCHASE FROM 1 WINDOW {start}, {end} NOPRUNE"),
             ("naive", f"COPURCHASE FROM 1 WINDOW {start}, {end} NAIVE"),
+            ("naive_noprune", f"COPURCHASE FROM 1 WINDOW {start}, {end} NOPRUNE NAIVE"),
         ):
             resp = execute(session, stmt)
             got = rows(resp)
@@ -224,6 +226,15 @@ def main():
         print(f"  latency_us={resp.latency()}")
         base = baseline_products(session)
         if not check("ngql_baseline", base, EXPECT):
+            failed += 1
+        go = execute(session, "GO FROM 1 OVER buy YIELD buy._dst AS dst")
+        dsts = sorted(row[0] for row in rows(go))
+        if not check("non_matching_go", dsts, [10, 11, 12, 13, 14, 15]):
+            failed += 1
+        bad = session.execute("COPURCHASE FROM 1")
+        bad_ok = (not bad.is_succeeded()) and "COPURCHASE" in (bad.error_msg() or "")
+        print(f"bad_syntax: ok={bad_ok} msg={bad.error_msg()}")
+        if not bad_ok:
             failed += 1
         if failed:
             raise SystemExit(f"{failed} scenarios failed")

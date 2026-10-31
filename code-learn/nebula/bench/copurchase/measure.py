@@ -28,13 +28,15 @@ from nebula3.gclient.net import ConnectionPool
 from ground import exact, naive, overlap
 
 PLAN_RE = re.compile(
-    r"copurchase_plan mode=(\w+) fallback=(\d+) rounds=(\d+) buyers=(\d+) "
+    r"copurchase_plan mode=(\w+) fallback=(\d+) prune=(\d+) pruned=(\d+) sent=(\d+) "
+    r"rounds=(\d+) buyers=(\d+) failure=(\S+) "
     r"hop_rows=([0-9,]+) hop_hosts=([0-9,]+) scanned=([0-9,]+) "
     r"users=(\S*) products=(\S*)"
 )
 
 
 def percentile(values, pct):
+    """Nearest-rank percentile. With n <= 500, P999 is the sample maximum."""
     if not values:
         return None
     ordered = sorted(values)
@@ -44,7 +46,7 @@ def percentile(values, pct):
 
 def connect(host, port):
     cfg = Config()
-    cfg.max_connection_pool_size = 64
+    cfg.max_connection_pool_size = 160
     cfg.timeout = 180000
     pool = ConnectionPool()
     deadline = time.time() + 90
@@ -238,10 +240,12 @@ def baseline(session, user, start, end):
     }
 
 
-def pushdown(session, user, start, end, naive_mode):
+def pushdown(session, user, start, end, mode):
     stmt = f"COPURCHASE FROM {user} WINDOW {start}, {end}"
-    if naive_mode:
+    if mode == "naive":
         stmt += " NAIVE"
+    elif mode == "noprune":
+        stmt += " NOPRUNE"
     resp = execute(session, stmt)
     return table(resp), resp.latency()
 
@@ -280,13 +284,17 @@ def parse_plans(text):
             {
                 "mode": match.group(1),
                 "fallback": int(match.group(2)),
-                "rounds": int(match.group(3)),
-                "buyers": int(match.group(4)),
-                "hop_rows": [int(x) for x in match.group(5).split(",")],
-                "hop_hosts": [int(x) for x in match.group(6).split(",")],
-                "scanned": [int(x) for x in match.group(7).split(",")],
-                "users": match.group(8),
-                "products": match.group(9),
+                "prune": int(match.group(3)),
+                "pruned": int(match.group(4)),
+                "sent": int(match.group(5)),
+                "rounds": int(match.group(6)),
+                "buyers": int(match.group(7)),
+                "failure": match.group(8),
+                "hop_rows": [int(x) for x in match.group(9).split(",")],
+                "hop_hosts": [int(x) for x in match.group(10).split(",")],
+                "scanned": [int(x) for x in match.group(11).split(",")],
+                "users": match.group(12),
+                "products": match.group(13),
             }
         )
     return plans
@@ -304,11 +312,39 @@ def product_ids(plan):
     return [int(piece.split(":")[0]) for piece in plan["products"].split(",") if piece]
 
 
+def proc_sample(comm):
+    rows = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            got = open(f"/proc/{name}/comm", encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if got != comm:
+            continue
+        try:
+            raw = open(f"/proc/{name}/stat", encoding="utf-8").read()
+            fields = raw[raw.rfind(")") + 2 :].split()
+            cpu = int(fields[11]) + int(fields[12])
+            rss = None
+            for line in open(f"/proc/{name}/status", encoding="utf-8"):
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1])
+                    break
+        except (OSError, IndexError, ValueError):
+            continue
+        rows.append({"pid": int(name), "cpu_jiffies": cpu, "rss_kb": rss})
+    return rows
+
+
 def summarize(lat_us, wall_s, n):
     return {
         "n": n,
         "p50_ms": None if percentile(lat_us, 50) is None else percentile(lat_us, 50) / 1000.0,
         "p99_ms": None if percentile(lat_us, 99) is None else percentile(lat_us, 99) / 1000.0,
+        "p999_ms": None if percentile(lat_us, 99.9) is None else percentile(lat_us, 99.9) / 1000.0,
+        "p999_note": "nearest rank; equals the sample max when round(0.999*(n-1)) is the last index",
         "qps": None if wall_s <= 0 else n / wall_s,
         "wall_s": wall_s,
         "latency": "ResultSet.latency microseconds, reported in ms",
@@ -330,6 +366,9 @@ def main():
     parser.add_argument("--skip-accuracy", action="store_true")
     parser.add_argument("--accuracy-users", type=int, default=12)
     parser.add_argument("--latency-n", type=int, default=30)
+    parser.add_argument("--modes", default="exact,noprune,baseline")
+    parser.add_argument("--windows", default="30d,7d")
+    parser.add_argument("--concs", default="1,10,50,100")
     parser.add_argument("--label", default="bridge")
     args = parser.parse_args()
 
@@ -372,14 +411,14 @@ def main():
                 naive_truth = naive(
                     by_user, by_product, sales, user, start, end, args.parts
                 )
-                for mode in ("exact", "naive", "baseline"):
+                for mode in ("exact", "noprune", "naive", "baseline"):
                     t0 = time.perf_counter()
                     if mode == "baseline":
                         got_users, got_products, lat, rounds, hop_rows = baseline(
                             session, user, start, end
                         )
                     else:
-                        got, lat = pushdown(session, user, start, end, mode == "naive")
+                        got, lat = pushdown(session, user, start, end, mode)
                         got_products = [(row[0], row[1]) for row in got]
                         got_users = []
                         rounds = None
@@ -426,11 +465,20 @@ def main():
                     )
         text, offset = log_text(args.log_dir, offset)
         plans = parse_plans(text)
+        def plan_matches(plan, mode):
+            if mode == "naive":
+                return plan["mode"] == "naive"
+            if mode == "noprune":
+                return plan["mode"] == "exact" and plan["prune"] == 0
+            if mode == "exact":
+                return plan["mode"] == "exact" and plan["prune"] == 1
+            return False
+
         plan_i = 0
         for row in accuracy:
             if row["mode"] == "baseline":
                 continue
-            while plan_i < len(plans) and plans[plan_i]["mode"] != row["mode"]:
+            while plan_i < len(plans) and not plan_matches(plans[plan_i], row["mode"]):
                 plan_i += 1
             if plan_i >= len(plans):
                 row["plan"] = None
@@ -440,7 +488,11 @@ def main():
             row["plan"] = {
                 "rounds": plan["rounds"],
                 "fallback": plan["fallback"],
+                "prune": plan["prune"],
+                "pruned": plan["pruned"],
+                "sent": plan["sent"],
                 "buyers": plan["buyers"],
+                "failure": plan["failure"],
                 "hop_rows": plan["hop_rows"],
                 "hop_hosts": plan["hop_hosts"],
                 "scanned": plan["scanned"],
@@ -462,9 +514,14 @@ def main():
 
         latency = {}
         lat_users = [u for u in range(1, 400, 7) if u in by_user]
+        selected_windows = [name for name in args.windows.split(",") if name]
+        selected_modes = [name for name in args.modes.split(",") if name]
+        selected_concs = [int(item) for item in args.concs.split(",") if item]
         for window_name, (start, end) in windows.items():
-            for mode in ("exact", "naive", "baseline"):
-                for conc in (1, 10, 50):
+            if window_name not in selected_windows:
+                continue
+            for mode in selected_modes:
+                for conc in selected_concs:
                     n = args.latency_n if conc == 1 else conc
                     queries = [
                         (lat_users[(i * 3) % len(lat_users)], start, end, mode)
@@ -473,19 +530,22 @@ def main():
 
                     def one(job):
                         user, w0, w1, kind = job
-                        local = pool.get_session("root", "nebula")
+                        local = None
                         try:
+                            local = pool.get_session("root", "nebula")
                             execute(local, f"USE {args.space}")
                             if kind == "baseline":
                                 _u, _p, lat, rounds, hop_rows = baseline(local, user, w0, w1)
                                 return lat, rounds, hop_rows, None
-                            _rows, lat = pushdown(local, user, w0, w1, kind == "naive")
+                            _rows, lat = pushdown(local, user, w0, w1, kind)
                             return lat, None, None, None
                         except Exception as exc:
                             return None, None, None, str(exc)
                         finally:
-                            local.release()
+                            if local is not None:
+                                local.release()
 
+                    before = proc_sample("nebula-storaged")
                     t0 = time.perf_counter()
                     if conc == 1:
                         results = [one(job) for job in queries]
@@ -493,11 +553,26 @@ def main():
                         with ThreadPoolExecutor(max_workers=conc) as pool_exec:
                             results = list(pool_exec.map(one, queries))
                     wall = time.perf_counter() - t0
+                    after = proc_sample("nebula-storaged")
+                    by_pid = {row["pid"]: row for row in before}
+                    cpu_rows = []
+                    for row in after:
+                        prev = by_pid.get(row["pid"])
+                        if prev is None:
+                            continue
+                        cpu_rows.append(
+                            {
+                                "pid": row["pid"],
+                                "cpu_jiffies": row["cpu_jiffies"] - prev["cpu_jiffies"],
+                                "rss_kb": row["rss_kb"],
+                            }
+                        )
                     errors = [item[3] for item in results if item[3]]
                     lats = [item[0] for item in results if item[0] is not None]
                     key = f"{mode}:{window_name}:c{conc}"
                     cell_report = summarize(lats, wall, len(lats))
                     cell_report["errors"] = len(errors)
+                    cell_report["storaged"] = cpu_rows
                     if errors:
                         cell_report["error_example"] = errors[0][:400]
                     ok = next((item for item in results if item[0] is not None), None)
