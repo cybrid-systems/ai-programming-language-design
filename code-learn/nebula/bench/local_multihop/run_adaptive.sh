@@ -21,7 +21,7 @@ export APPEND_PUSHDOWN_FLAGS=false
 export NEBULA_BIN="${NEBULA_BIN:-/tmp/nebula-380/build/bin}"
 export NEBULA_CONF="${NEBULA_CONF:-/tmp/nebula-380/conf}"
 export GRAPH_WORKERS=4
-export EXTRA_STORAGE_FLAGS=$'--storaged_accept_local_multihop=true\n--local_dst_ratio_sample_interval_secs=2\n--local_dst_ratio_sample_edges=64\n--local_dst_ratio_sample_scan=4096\n--local_dst_ratio_sample_parts=64\n--heartbeat_interval_secs=2\n'
+export EXTRA_STORAGE_FLAGS=$'--storaged_accept_local_multihop=true\n--local_dst_ratio_sample_interval_secs=2\n--local_dst_ratio_sample_edges=64\n--local_dst_ratio_sample_incremental=true\n--local_dst_ratio_sample_tick_ms=100\n--local_dst_ratio_sample_budget_us=1500\n--local_dst_ratio_sample_edges_per_tick=2048\n--local_dst_ratio_sample_parts_per_tick=4\n--heartbeat_interval_secs=2\n'
 
 write_graph_flags() {
   local mode="$1"
@@ -48,6 +48,8 @@ drop = (
     "--local_multihop_prior_high=",
     "--local_multihop_prior_low=",
     "--local_multihop_prior_stale_ms=",
+    "--local_multihop_prior_per_entry=",
+    "--local_multihop_plain_baseline=",
     "--logbufsecs=",
     "--heartbeat_interval_secs=",
 )
@@ -157,6 +159,31 @@ elif mode == "adaptive-v4":
         "--local_multihop_prior_high=0.8",
         "--local_multihop_prior_low=0.4",
         "--local_multihop_prior_stale_ms=30000",
+        "--local_multihop_prior_per_entry=false",
+        "--local_multihop_plain_baseline=false",
+        "--local_multihop_trace=false",
+        "--heartbeat_interval_secs=2",
+    ]
+elif mode == "adaptive-v5":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=true",
+        "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_skip_confident_explore=true",
+        "--local_multihop_collapse_mixed=true",
+        "--local_multihop_prior_high=0.8",
+        "--local_multihop_prior_low=0.4",
+        "--local_multihop_prior_stale_ms=30000",
+        "--local_multihop_prior_per_entry=true",
+        "--local_multihop_plain_baseline=true",
         "--local_multihop_trace=false",
         "--heartbeat_interval_secs=2",
     ]
@@ -178,6 +205,32 @@ elif mode == "adaptive-v4-trace":
         "--local_multihop_prior_high=0.8",
         "--local_multihop_prior_low=0.4",
         "--local_multihop_prior_stale_ms=30000",
+        "--local_multihop_prior_per_entry=false",
+        "--local_multihop_plain_baseline=false",
+        "--local_multihop_trace=true",
+        "--logbufsecs=0",
+        "--heartbeat_interval_secs=2",
+    ]
+elif mode == "adaptive-v5-trace":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=true",
+        "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_skip_confident_explore=true",
+        "--local_multihop_collapse_mixed=true",
+        "--local_multihop_prior_high=0.8",
+        "--local_multihop_prior_low=0.4",
+        "--local_multihop_prior_stale_ms=30000",
+        "--local_multihop_prior_per_entry=true",
+        "--local_multihop_plain_baseline=true",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
         "--heartbeat_interval_secs=2",
@@ -264,7 +317,7 @@ measure() {
 phase() {
   local rtt="$1" conc="$2" loaded="${3:-0}"
   local mode placement skip
-  for mode in baseline static adaptive-v1 adaptive-v2 adaptive-v3 adaptive-v4; do
+  for mode in baseline static adaptive-v4 adaptive-v5; do
     restart_graph "$mode"
     for placement in affinity random mixed; do
       # Each placement is its own space. Skip only after that space was loaded
@@ -292,14 +345,6 @@ if [[ "${ADAPTIVE_SKIP_LOAD:-0}" == "1" ]]; then
 fi
 phase bridge "$CONC_BRIDGE" "$LOADED"
 
-restart_graph adaptive-v3-trace
-python3 "$ROOT/drift.py" \
-  --storage-hosts "$STORAGES" \
-  --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 8 --random-queries 12 --return-queries 12 \
-  --wait-before-return 8 \
-  --space ad_drift_v3b \
-  --tag drift_v3_bridge --results "$OUT"
 restart_graph adaptive-v4-trace
 python3 "$ROOT/drift.py" \
   --storage-hosts "$STORAGES" \
@@ -308,6 +353,14 @@ python3 "$ROOT/drift.py" \
   --wait-before-return 8 \
   --space ad_drift_v4b \
   --tag drift_v4_bridge --results "$OUT"
+restart_graph adaptive-v5-trace
+python3 "$ROOT/drift.py" \
+  --storage-hosts "$STORAGES" \
+  --community-size "$SIZE" --degree "$DEGREE" \
+  --affinity-queries 8 --random-queries 12 --return-queries 8 \
+  --wait-before-return 8 \
+  --space ad_drift_v5b \
+  --tag drift_v5_bridge --results "$OUT"
 
 bash "$DIST" usdelay 2.5
 sleep 2
@@ -336,28 +389,6 @@ sudo -n ip netns exec ns-graph1 ping -n -c 20 -i 0.05 -W 2 -q 10.88.0.21 | tee "
 
 phase rtt5 "$CONC_RTT" 1
 
-restart_graph adaptive-v1-trace
-python3 "$ROOT/drift.py" \
-  --storage-hosts "$STORAGES" \
-  --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 12 --random-queries 20 --return-queries 0 \
-  --space ad_drift_v1 \
-  --tag drift_v1_rtt5 --results "$OUT"
-restart_graph adaptive-v2-trace
-python3 "$ROOT/drift.py" \
-  --storage-hosts "$STORAGES" \
-  --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 12 --random-queries 16 --return-queries 24 \
-  --space ad_drift_v2 \
-  --tag drift_v2_rtt5 --results "$OUT"
-restart_graph adaptive-v3-trace
-python3 "$ROOT/drift.py" \
-  --storage-hosts "$STORAGES" \
-  --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 12 --random-queries 16 --return-queries 16 \
-  --wait-before-return 8 \
-  --space ad_drift_v3 \
-  --tag drift_v3_rtt5 --results "$OUT"
 restart_graph adaptive-v4-trace
 python3 "$ROOT/drift.py" \
   --storage-hosts "$STORAGES" \
@@ -366,5 +397,98 @@ python3 "$ROOT/drift.py" \
   --wait-before-return 8 \
   --space ad_drift_v4 \
   --tag drift_v4_rtt5 --results "$OUT"
+restart_graph adaptive-v5-trace
+python3 "$ROOT/drift.py" \
+  --storage-hosts "$STORAGES" \
+  --community-size "$SIZE" --degree "$DEGREE" \
+  --affinity-queries 12 --random-queries 16 --return-queries 12 \
+  --wait-before-return 8 \
+  --space ad_drift_v5 \
+  --tag drift_v5_rtt5 --results "$OUT"
+
+# c=50 sampler on/off/full. CPU is storaged utime+stime over the measure.
+set_storage_sampler() {
+  local mode="$1"
+  python3 - "$mode" <<'PY'
+import pathlib, sys
+mode = sys.argv[1]
+drop = (
+    "--local_dst_ratio_sample_interval_secs=",
+    "--local_dst_ratio_sample_edges=",
+    "--local_dst_ratio_sample_incremental=",
+    "--local_dst_ratio_sample_tick_ms=",
+    "--local_dst_ratio_sample_budget_us=",
+    "--local_dst_ratio_sample_edges_per_tick=",
+    "--local_dst_ratio_sample_parts_per_tick=",
+    "--local_dst_ratio_sample_scan=",
+    "--local_dst_ratio_sample_parts=",
+)
+if mode == "off":
+    extra = ["--local_dst_ratio_sample_interval_secs=0"]
+elif mode == "full":
+    extra = [
+        "--local_dst_ratio_sample_interval_secs=2",
+        "--local_dst_ratio_sample_edges=64",
+        "--local_dst_ratio_sample_incremental=false",
+    ]
+else:
+    extra = [
+        "--local_dst_ratio_sample_interval_secs=2",
+        "--local_dst_ratio_sample_edges=64",
+        "--local_dst_ratio_sample_incremental=true",
+        "--local_dst_ratio_sample_tick_ms=100",
+        "--local_dst_ratio_sample_budget_us=1500",
+        "--local_dst_ratio_sample_edges_per_tick=2048",
+        "--local_dst_ratio_sample_parts_per_tick=4",
+    ]
+for i in (1, 2, 3):
+    path = pathlib.Path(f"/tmp/nebula-dist/stor{i}/nebula-storaged.conf")
+    lines = [ln for ln in path.read_text().splitlines() if not ln.startswith(drop)]
+    lines.extend(extra)
+    path.write_text("\n".join(lines) + "\n")
+print("storage sampler", mode)
+PY
+  bash "$DIST" restart-storage 1
+  bash "$DIST" restart-storage 2
+  bash "$DIST" restart-storage 3
+  sleep 4
+}
+
+cpu_jiffies() {
+  local pid="$1"
+  awk '{print $14+$15}' "/proc/${pid}/stat"
+}
+
+impact_one() {
+  local mode="$1" placement="$2"
+  set_storage_sampler "$mode"
+  local pid
+  pid="$(cat /tmp/nebula-dist/stor1/pids/daemon.pid)"
+  local before after
+  before="$(cpu_jiffies "$pid")"
+  local start
+  start="$(date +%s.%N)"
+  measure "impact_${mode}_${placement}" "$placement" "--skip-load" 50
+  local end
+  end="$(date +%s.%N)"
+  after="$(cpu_jiffies "$pid")"
+  python3 - "$mode" "$placement" "$before" "$after" "$start" "$end" "$(getconf CLK_TCK)" <<'PY'
+import sys
+mode, placement, before, after, start, end, hz_s = sys.argv[1:]
+ticks = int(after) - int(before)
+hz = int(hz_s)
+wall = float(end) - float(start)
+cores = (ticks / hz) / wall if wall > 0 else 0
+print(f"SAMPLER_CPU mode={mode} placement={placement} stor1_jiffies={ticks} wall_s={wall:.3f} cores={cores:.4f}")
+PY
+}
+
+restart_graph adaptive-v5
+impact_one off affinity
+impact_one off random
+impact_one incremental affinity
+impact_one incremental random
+impact_one full affinity
+impact_one full random
 
 echo ADAPTIVE_BENCH_OK

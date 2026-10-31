@@ -4,6 +4,7 @@
 > 补丁 [`patches/v3.8.0-adaptive-local-multihop-v4.patch`](patches/v3.8.0-adaptive-local-multihop-v4.patch) 打在 v3 补丁之上。
 > 这篇的延迟表是同一次六路重跑。v4 的漂移是这之后又跑的一轮，原因写在第 6 节。
 > 日期：2026-10-31。查询时延都是测到的。抽样耗时单独标了。`--local_multihop_assumed_rtt_us=5000` 仍是配置值。
+> v5 在 [41](41-adaptive-multihop-v5.md)。v5 重跑覆盖了顶层 JSON，这篇的数字以正文为准。
 
 v3 有三处实测退步。亲和在约 5ms、c=1 的 P50 是 17.9ms，因为 9 个分区各 5% 探索，PROFILE 经常是 `multi_parts=8 base_parts=1`，整句被拖回 3 个 wave。随机图的心跳样本是每个 part 前缀上的前 64 条边，比例偏高，v3 不肯留在基线。混合查询在 c=10 是 49.3ms，基线是 28.2ms，PROFILE 是 5 个 wave、17 条 host 回复。
 

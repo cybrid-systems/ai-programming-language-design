@@ -1,0 +1,18 @@
+=== before ===
+Sat Oct 31 08:55:51 UTC 2026
+meta1 pid 92655 was receiving heartbeats (leader).
+meta2 pid 92726
+meta3 pid 92805
+USE ad_random; GO 3 STEPS FROM 1,2,3,4,5,6,7,8,9
+before_query succeeded rows=1760 latency_us=23224
+adaptive_multihop choice=base multi_parts=0 base_parts=9 early_parts=0 rpc=3 steps=3 space=6
+
+KILL meta1 pid 92655
+
+=== after ===
+meta2 loaded the table: local_dst_ratio_kv_load entries=171 at 2026-10-31 08:56:00
+meta2 then received storage heartbeats.
+after_query succeeded rows=1760 latency_us=24802
+adaptive_multihop choice=base multi_parts=0 base_parts=9 early_parts=0 rpc=3 steps=3 space=6
+
+Follower prefix attempts before the election finished returned E_LEADER_CHANGED (-4) and did not mark the table loaded.

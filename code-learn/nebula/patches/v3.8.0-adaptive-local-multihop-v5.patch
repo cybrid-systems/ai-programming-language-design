@@ -1,0 +1,1504 @@
+--- a/conf/nebula-graphd.conf.default	2026-10-31 08:59:04.635757748 +0000
++++ b/conf/nebula-graphd.conf.default	2026-10-31 07:57:47.918240247 +0000
+@@ -164,3 +164,7 @@
+ # --local_multihop_prior_high=0.8
+ # --local_multihop_prior_low=0.4
+ # --local_multihop_prior_stale_ms=30000
++# v5 expires each ratio on its own timestamp. plain_baseline sends an
++# all-baseline plan through the normal one-hop RPC.
++# --local_multihop_prior_per_entry=true
++# --local_multihop_plain_baseline=true
+--- a/conf/nebula-storaged.conf.default	2026-10-31 08:59:04.635757748 +0000
++++ b/conf/nebula-storaged.conf.default	2026-10-31 07:57:47.886240403 +0000
+@@ -153,3 +153,10 @@
+ # --local_dst_ratio_sample_edges=64
+ # --local_dst_ratio_sample_scan=4096
+ # --local_dst_ratio_sample_parts=32
++# v5 ticks under a time budget and resumes each part. A finished part's
++# ratio counts every out-edge. interval 0 still disables the thread.
++# --local_dst_ratio_sample_incremental=true
++# --local_dst_ratio_sample_tick_ms=200
++# --local_dst_ratio_sample_budget_us=2000
++# --local_dst_ratio_sample_edges_per_tick=512
++# --local_dst_ratio_sample_parts_per_tick=1
+--- a/src/clients/meta/MetaClient.cpp	2026-10-31 08:59:04.635757748 +0000
++++ b/src/clients/meta/MetaClient.cpp	2026-10-31 07:55:48.954433551 +0000
+@@ -5,6 +5,8 @@
+ 
+ #include "clients/meta/MetaClient.h"
+ 
++#include "common/algorithm/AdaptiveMultiHop.h"
++
+ #include <folly/ScopeGuard.h>
+ #include <folly/executors/Async.h>
+ #include <folly/futures/Future.h>
+@@ -2643,13 +2645,34 @@
+     } else {
+       req.disk_parts_ref() = diskParts;
+     }
+-    LocalDstRatioMap sample;
++    std::vector<LocalDstRatioSample> samples;
+     {
+       folly::SharedMutex::ReadHolder holder(localDstRatioLock_);
+-      sample = localDstRatioToSend_;
++      samples = localDstEntriesToSend_;
+     }
+-    if (!sample.empty()) {
+-      req.local_dst_ratio_ref() = std::move(sample);
++    if (!samples.empty()) {
++      std::vector<cpp2::LocalDstRatioEntry> entries;
++      LocalDstRatioMap ratios;
++      std::unordered_map<GraphSpaceID, std::unordered_map<PartitionID, bool>> have;
++      entries.reserve(samples.size());
++      for (const auto& sample : samples) {
++        cpp2::LocalDstRatioEntry entry;
++        entry.space_id_ref() = sample.space;
++        entry.part_id_ref() = sample.part;
++        entry.edge_type_ref() = sample.edge;
++        entry.ratio_ref() = sample.ratio;
++        entry.ts_ms_ref() = sample.tsMs;
++        entry.version_ref() = sample.version;
++        entries.push_back(std::move(entry));
++        if (!have[sample.space][sample.part]) {
++          ratios[sample.space][sample.part] = sample.ratio;
++          have[sample.space][sample.part] = true;
++        } else if (sample.ratio < ratios[sample.space][sample.part]) {
++          ratios[sample.space][sample.part] = sample.ratio;
++        }
++      }
++      req.local_dst_ratio_entries_ref() = std::move(entries);
++      req.local_dst_ratio_ref() = std::move(ratios);
+     }
+   }
+ 
+@@ -2689,14 +2712,74 @@
+         metadLastUpdateTime_ = resp.get_last_update_time_in_ms();
+         VLOG(1) << "Metad last update time: " << metadLastUpdateTime_;
+         metaServerVersion_ = resp.get_meta_version();
+-        if (resp.local_dst_ratio_ref().has_value() && !resp.local_dst_ratio_ref().value().empty()) {
++        if (resp.local_dst_ratio_entries_ref().has_value() &&
++            !resp.local_dst_ratio_entries_ref().value().empty()) {
+           int32_t nParts = 0;
+           double minRatio = 1;
+           double maxRatio = 0;
+           folly::SharedMutex::WriteHolder holder(localDstRatioLock_);
++          for (const auto& entry : resp.local_dst_ratio_entries_ref().value()) {
++            LocalDstRatioSample sample;
++            sample.space = entry.get_space_id();
++            sample.part = entry.get_part_id();
++            sample.edge = entry.get_edge_type();
++            sample.ratio = entry.get_ratio();
++            sample.tsMs = entry.get_ts_ms();
++            sample.version = entry.get_version();
++            bool replaced = false;
++            for (auto& cached : localDstEntries_) {
++              if (cached.space == sample.space && cached.part == sample.part &&
++                  cached.edge == sample.edge) {
++                cached = sample;
++                replaced = true;
++                break;
++              }
++            }
++            if (!replaced) localDstEntries_.push_back(sample);
++            auto& slot = localDstRatio_[sample.space][sample.part];
++            // Recompute the part minimum from the entries we kept.
++            bool any = false;
++            double partMin = 0;
++            for (const auto& cached : localDstEntries_) {
++              if (cached.space != sample.space || cached.part != sample.part) continue;
++              if (!any || cached.ratio < partMin) partMin = cached.ratio;
++              any = true;
++            }
++            if (any) slot = partMin;
++            ++nParts;
++            if (sample.ratio < minRatio) minRatio = sample.ratio;
++            if (sample.ratio > maxRatio) maxRatio = sample.ratio;
++          }
++          localDstRatioAtMs_ = time::WallClock::fastNowInMilliSec();
++          LOG(INFO) << "local_dst_ratio_hb parts=" << nParts << " min=" << minRatio
++                    << " max=" << maxRatio << " entries=" << localDstEntries_.size();
++        } else if (resp.local_dst_ratio_ref().has_value() &&
++                   !resp.local_dst_ratio_ref().value().empty()) {
++          int32_t nParts = 0;
++          double minRatio = 1;
++          double maxRatio = 0;
++          const int64_t now = time::WallClock::fastNowInMilliSec();
++          folly::SharedMutex::WriteHolder holder(localDstRatioLock_);
+           for (const auto& spaceEntry : resp.local_dst_ratio_ref().value()) {
+             for (const auto& partEntry : spaceEntry.second) {
+               localDstRatio_[spaceEntry.first][partEntry.first] = partEntry.second;
++              LocalDstRatioSample sample;
++              sample.space = spaceEntry.first;
++              sample.part = partEntry.first;
++              sample.edge = 0;
++              sample.ratio = partEntry.second;
++              sample.tsMs = now;
++              bool replaced = false;
++              for (auto& cached : localDstEntries_) {
++                if (cached.space == sample.space && cached.part == sample.part &&
++                    cached.edge == 0) {
++                  sample.version = cached.version;
++                  cached = sample;
++                  replaced = true;
++                  break;
++                }
++              }
++              if (!replaced) localDstEntries_.push_back(sample);
+               ++nParts;
+               if (partEntry.second < minRatio) minRatio = partEntry.second;
+               if (partEntry.second > maxRatio) maxRatio = partEntry.second;
+@@ -2718,9 +2801,20 @@
+   return future;
+ }
+ 
+-void MetaClient::publishLocalDstRatio(LocalDstRatioMap sample) {
++void MetaClient::publishLocalDstRatio(std::vector<LocalDstRatioSample> samples) {
+   folly::SharedMutex::WriteHolder holder(localDstRatioLock_);
+-  localDstRatioToSend_ = std::move(sample);
++  for (auto& sample : samples) {
++    bool replaced = false;
++    for (auto& cached : localDstEntriesToSend_) {
++      if (cached.space == sample.space && cached.part == sample.part &&
++          cached.edge == sample.edge) {
++        cached = sample;
++        replaced = true;
++        break;
++      }
++    }
++    if (!replaced) localDstEntriesToSend_.push_back(std::move(sample));
++  }
+ }
+ 
+ bool MetaClient::localDstRatioFresh(int64_t maxAgeMs) const {
+@@ -2744,6 +2838,53 @@
+   return part->second;
+ }
+ 
++StatusOr<double> MetaClient::localDstRatioForEdges(GraphSpaceID spaceId,
++                                                  PartitionID partId,
++                                                  const std::vector<int32_t>& edgeTypes,
++                                                  int64_t maxAgeMs,
++                                                  bool perEntry) const {
++  folly::SharedMutex::ReadHolder holder(localDstRatioLock_);
++  const int64_t now = time::WallClock::fastNowInMilliSec();
++  auto find = [&](int32_t edge) -> const LocalDstRatioSample* {
++    for (const auto& entry : localDstEntries_) {
++      if (entry.space == spaceId && entry.part == partId && entry.edge == edge) return &entry;
++    }
++    return nullptr;
++  };
++  if (edgeTypes.empty()) {
++    bool any = false;
++    double minRatio = 0;
++    for (const auto& entry : localDstEntries_) {
++      if (entry.space != spaceId || entry.part != partId) continue;
++      if (perEntry && !algorithm::ratioEntryFresh(entry.tsMs, now, maxAgeMs)) {
++        return Status::Error("stale local-dst sample");
++      }
++      if (!any || entry.ratio < minRatio) minRatio = entry.ratio;
++      any = true;
++    }
++    if (!any) return Status::Error("no local-dst sample");
++    return minRatio;
++  }
++  bool haveTyped = false;
++  for (int32_t edge : edgeTypes) {
++    if (find(edge) != nullptr) haveTyped = true;
++  }
++  bool any = false;
++  double minRatio = 0;
++  for (int32_t edge : edgeTypes) {
++    const LocalDstRatioSample* entry = find(edge);
++    if (entry == nullptr && !haveTyped) entry = find(0);
++    if (entry == nullptr) return Status::Error("no local-dst sample");
++    if (perEntry && !algorithm::ratioEntryFresh(entry->tsMs, now, maxAgeMs)) {
++      return Status::Error("stale local-dst sample");
++    }
++    if (!any || entry->ratio < minRatio) minRatio = entry->ratio;
++    any = true;
++  }
++  if (!any) return Status::Error("no local-dst sample");
++  return minRatio;
++}
++
+ folly::Future<StatusOr<bool>> MetaClient::createUser(std::string account,
+                                                      std::string password,
+                                                      bool ifNotExists) {
+--- a/src/clients/meta/MetaClient.h	2026-10-31 08:59:04.639757764 +0000
++++ b/src/clients/meta/MetaClient.h	2026-10-31 07:55:27.014409554 +0000
+@@ -15,8 +15,9 @@
+ #include <gtest/gtest_prod.h>
+ 
+ #include <atomic>
+-#include <functional>
+ #include <cstdint>
++#include <functional>
++#include <vector>
+ 
+ #include "common/base/Base.h"
+ #include "common/base/ObjectPool.h"
+@@ -666,12 +667,27 @@
+   // Storaged publishes a sample. Graphd reads the copy meta echoes back.
+   using LocalDstRatioMap =
+       std::unordered_map<GraphSpaceID, std::unordered_map<PartitionID, double>>;
+-  // Storaged sample that the next heartbeat will send.
+-  void publishLocalDstRatio(LocalDstRatioMap sample);
++  struct LocalDstRatioSample {
++    GraphSpaceID space{0};
++    PartitionID part{0};
++    int32_t edge{0};
++    double ratio{0};
++    int64_t tsMs{0};
++    int64_t version{0};
++  };
++  // Storaged sample that the next heartbeat will send. Entries replace the
++  // previous sample for the same space, part, and edge type.
++  void publishLocalDstRatio(std::vector<LocalDstRatioSample> samples);
+   // Latest sample echoed by metad. Empty until a heartbeat returns it.
+-  // Incoming heartbeats merge into the cache. An empty reply does not wipe it,
+-  // so a meta leader change does not drop graphd's last view.
++  // Incoming heartbeats merge into the cache. An empty reply does not wipe it.
++  // perEntry uses each sample's own timestamp. A stale entry is missing, which
++  // the caller treats as an uncertain prior. edge 0 is the legacy all-type value.
+   StatusOr<double> localDstRatio(GraphSpaceID spaceId, PartitionID partId) const;
++  StatusOr<double> localDstRatioForEdges(GraphSpaceID spaceId,
++                                         PartitionID partId,
++                                         const std::vector<int32_t>& edgeTypes,
++                                         int64_t maxAgeMs,
++                                         bool perEntry) const;
+   bool localDstRatioFresh(int64_t maxAgeMs) const;
+ 
+   std::string getLocalIp() {
+@@ -877,7 +893,10 @@
+ 
+   mutable folly::SharedMutex localDstRatioLock_;
+   LocalDstRatioMap localDstRatio_;
+-  LocalDstRatioMap localDstRatioToSend_;
++  std::vector<LocalDstRatioSample> localDstEntries_;
++  std::vector<LocalDstRatioSample> localDstEntriesToSend_;
++  // Receive time of the last non-empty heartbeat. Used only when per-entry
++  // timestamps are off.
+   int64_t localDstRatioAtMs_{0};
+ };
+ 
+--- a/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 08:59:04.639757764 +0000
++++ b/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 07:55:04.218668395 +0000
+@@ -306,6 +306,16 @@
+   std::mt19937 rng_{std::random_device{}()};
+ };
+ 
++// A sample timestamp is stale when it is older than maxAgeMs. maxAgeMs <= 0
++// never expires. A missing timestamp is stale. The caller treats stale as
++// uncertain, not as a confident baseline or a confident multihop.
++inline bool ratioEntryFresh(int64_t tsMs, int64_t nowMs, int64_t maxAgeMs) {
++  if (tsMs <= 0) return false;
++  if (maxAgeMs <= 0) return true;
++  if (nowMs < tsMs) return true;
++  return nowMs - tsMs <= maxAgeMs;
++}
++
+ inline AdaptiveController& adaptiveController() {
+   static AdaptiveController inst;
+   return inst;
+--- a/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 08:59:04.639757764 +0000
++++ b/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 07:57:41.606270475 +0000
+@@ -583,6 +583,34 @@
+   EXPECT_TRUE(ctl.choose(shape, cfg, 0.5, true, 0.95));
+ }
+ 
++TEST(AdaptiveMultiHopTest, ChunkedReservoirMatchesOnePass) {
++  std::vector<std::pair<bool, int32_t>> items = {
++      {true, 1}, {false, 1}, {true, 1}, {false, 2}, {true, 1}, {false, 4}};
++  std::vector<char> once;
++  std::vector<char> chunked;
++  int32_t seenOnce = 0, localOnce = 0, seenChunk = 0, localChunk = 0;
++  for (const auto& item : items) {
++    reservoirConsider(once, seenOnce, localOnce, item.first, 2, item.second);
++  }
++  for (size_t i = 0; i < 3; ++i) {
++    reservoirConsider(chunked, seenChunk, localChunk, items[i].first, 2, items[i].second);
++  }
++  for (size_t i = 3; i < items.size(); ++i) {
++    reservoirConsider(chunked, seenChunk, localChunk, items[i].first, 2, items[i].second);
++  }
++  EXPECT_EQ(once, chunked);
++  EXPECT_EQ(seenOnce, seenChunk);
++  EXPECT_EQ(localOnce, localChunk);
++}
++
++TEST(AdaptiveMultiHopTest, StaleRatioEntryIsUncertain) {
++  EXPECT_TRUE(ratioEntryFresh(1000, 1500, 1000));
++  EXPECT_FALSE(ratioEntryFresh(1000, 2500, 1000));
++  EXPECT_FALSE(ratioEntryFresh(0, 1500, 1000));
++  EXPECT_TRUE(ratioEntryFresh(1000, 9000, 0));
++  EXPECT_TRUE(ratioEntryFresh(5000, 1000, 1000));
++}
++
+ TEST(AdaptiveMultiHopTest, ReservoirReplacesByDraw) {
+   std::vector<char> slot;
+   int32_t seen = 0;
+--- a/src/common/utils/MetaKeyUtils.cpp	2024-05-17 10:31:24.000000000 +0000
++++ b/src/common/utils/MetaKeyUtils.cpp	2026-10-31 07:54:22.323131467 +0000
+@@ -5,6 +5,8 @@
+ 
+ #include "common/utils/MetaKeyUtils.h"
+ 
++#include <cstring>
++
+ #include <thrift/lib/cpp/util/EnumUtils.h>
+ #include <thrift/lib/cpp2/protocol/CompactProtocol.h>
+ #include <thrift/lib/cpp2/protocol/Serializer.h>
+@@ -56,7 +58,8 @@
+                  {"ft_index", {"__ft_index__", nullptr}},
+                  {"local_id", {"__local_id__", MetaKeyUtils::parseLocalIdSpace}},
+                  {"disk_parts", {"__disk_parts__", MetaKeyUtils::parseDiskPartsSpace}},
+-                 {"job_manager", {"__job_mgr__", nullptr}}};
++                 {"job_manager", {"__job_mgr__", nullptr}},
++                 {"local_dst_ratio", {"__local_dst_ratio__", nullptr}}};
+ 
+ // clang-format off
+ static const std::string kSpacesTable         = tableMaps.at("spaces").first;         // NOLINT
+@@ -80,6 +83,7 @@
+ static const std::string kZonesTable          = systemTableMaps.at("zones").first;    // NOLINT
+ static const std::string kListenerTable       = tableMaps.at("listener").first;       // NOLINT
+ static const std::string kDiskPartsTable      = tableMaps.at("disk_parts").first;     // NOLINT
++static const std::string kLocalDstRatioTable  = tableMaps.at("local_dst_ratio").first; // NOLINT
+ 
+ /*
+  * There will be one job, and a bunch of tasks use this prefix.
+@@ -1547,4 +1551,61 @@
+   return std::make_tuple(host, status, tStart, tStop, errCode);
+ }
+ 
++const std::string& MetaKeyUtils::localDstRatioPrefix() {
++  return kLocalDstRatioTable;
++}
++
++std::string MetaKeyUtils::localDstRatioKey(GraphSpaceID spaceId,
++                                           PartitionID partId,
++                                           int32_t edgeType) {
++  std::string key;
++  key.reserve(kLocalDstRatioTable.size() + sizeof(GraphSpaceID) + sizeof(PartitionID) +
++              sizeof(int32_t));
++  key.append(kLocalDstRatioTable.data(), kLocalDstRatioTable.size())
++      .append(reinterpret_cast<const char*>(&spaceId), sizeof(GraphSpaceID))
++      .append(reinterpret_cast<const char*>(&partId), sizeof(PartitionID))
++      .append(reinterpret_cast<const char*>(&edgeType), sizeof(int32_t));
++  return key;
++}
++
++std::string MetaKeyUtils::localDstRatioVal(double ratio, int64_t tsMs, int64_t version) {
++  std::string val;
++  val.resize(sizeof(double) + sizeof(int64_t) * 2);
++  char* p = &val[0];
++  memcpy(p, &ratio, sizeof(double));
++  p += sizeof(double);
++  memcpy(p, &tsMs, sizeof(int64_t));
++  p += sizeof(int64_t);
++  memcpy(p, &version, sizeof(int64_t));
++  return val;
++}
++
++bool MetaKeyUtils::parseLocalDstRatioKey(folly::StringPiece rawKey, LocalDstRatioRecord* out) {
++  const size_t need = kLocalDstRatioTable.size() + sizeof(GraphSpaceID) + sizeof(PartitionID) +
++                      sizeof(int32_t);
++  if (out == nullptr || rawKey.size() < need) return false;
++  if (memcmp(rawKey.data(), kLocalDstRatioTable.data(), kLocalDstRatioTable.size()) != 0) {
++    return false;
++  }
++  size_t offset = kLocalDstRatioTable.size();
++  out->space = *reinterpret_cast<const GraphSpaceID*>(rawKey.data() + offset);
++  offset += sizeof(GraphSpaceID);
++  out->part = *reinterpret_cast<const PartitionID*>(rawKey.data() + offset);
++  offset += sizeof(PartitionID);
++  out->edge = *reinterpret_cast<const int32_t*>(rawKey.data() + offset);
++  return true;
++}
++
++bool MetaKeyUtils::parseLocalDstRatioVal(folly::StringPiece rawVal, LocalDstRatioRecord* out) {
++  const size_t need = sizeof(double) + sizeof(int64_t) * 2;
++  if (out == nullptr || rawVal.size() < need) return false;
++  size_t offset = 0;
++  memcpy(&out->ratio, rawVal.data() + offset, sizeof(double));
++  offset += sizeof(double);
++  memcpy(&out->tsMs, rawVal.data() + offset, sizeof(int64_t));
++  offset += sizeof(int64_t);
++  memcpy(&out->version, rawVal.data() + offset, sizeof(int64_t));
++  return true;
++}
++
+ }  // namespace nebula
+--- a/src/common/utils/MetaKeyUtils.h	2024-05-17 10:31:24.000000000 +0000
++++ b/src/common/utils/MetaKeyUtils.h	2026-10-31 07:54:17.443183884 +0000
+@@ -433,6 +433,22 @@
+ 
+   static meta::cpp2::PartitionList parseDiskPartsVal(const folly::StringPiece& rawData);
+ 
++  // Completed local-dst sample. Key is table + space + part + edge type.
++  // Value is ratio, sample timestamp, and a per-entry version.
++  struct LocalDstRatioRecord {
++    GraphSpaceID space{0};
++    PartitionID part{0};
++    int32_t edge{0};
++    double ratio{0};
++    int64_t tsMs{0};
++    int64_t version{0};
++  };
++  static const std::string& localDstRatioPrefix();
++  static std::string localDstRatioKey(GraphSpaceID spaceId, PartitionID partId, int32_t edgeType);
++  static std::string localDstRatioVal(double ratio, int64_t tsMs, int64_t version);
++  static bool parseLocalDstRatioKey(folly::StringPiece rawKey, LocalDstRatioRecord* out);
++  static bool parseLocalDstRatioVal(folly::StringPiece rawVal, LocalDstRatioRecord* out);
++
+   // job related
+   static const std::string& jobPrefix();
+ 
+--- a/src/common/utils/test/MetaKeyUtilsTest.cpp	2024-05-17 10:31:24.000000000 +0000
++++ b/src/common/utils/test/MetaKeyUtilsTest.cpp	2026-10-31 07:57:47.926240207 +0000
+@@ -230,6 +230,23 @@
+   ASSERT_EQ(path, MetaKeyUtils::parseDiskPartsPath(diskPartsKey));
+ }
+ 
++TEST(MetaKeyUtilsTest, LocalDstRatioRoundTrip) {
++  auto key = MetaKeyUtils::localDstRatioKey(6, 3, 12);
++  ASSERT_EQ(0, key.find(MetaKeyUtils::localDstRatioPrefix()));
++  MetaKeyUtils::LocalDstRatioRecord rec;
++  ASSERT_TRUE(MetaKeyUtils::parseLocalDstRatioKey(key, &rec));
++  EXPECT_EQ(6, rec.space);
++  EXPECT_EQ(3, rec.part);
++  EXPECT_EQ(12, rec.edge);
++  auto val = MetaKeyUtils::localDstRatioVal(0.320117, 123456789, 4);
++  ASSERT_TRUE(MetaKeyUtils::parseLocalDstRatioVal(val, &rec));
++  EXPECT_DOUBLE_EQ(0.320117, rec.ratio);
++  EXPECT_EQ(123456789, rec.tsMs);
++  EXPECT_EQ(4, rec.version);
++  EXPECT_FALSE(MetaKeyUtils::parseLocalDstRatioKey("nope", &rec));
++  EXPECT_FALSE(MetaKeyUtils::parseLocalDstRatioVal("short", &rec));
++}
++
+ }  // namespace nebula
+ 
+ int main(int argc, char** argv) {
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 08:59:04.639757764 +0000
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 08:53:05.223165488 +0000
+@@ -94,57 +94,105 @@
+       state->yieldAll = true;
+       auto* meta = qctx()->getMetaClient();
+       const GraphSpaceID space = expand_->space();
+-      if (fillPerPartJobs(
+-              *state,
+-              nextStepVids_,
+-              hops,
+-              numParts,
+-              shape,
+-              adaptiveRuntimeConfig(),
+-              algorithm::adaptiveController(),
+-              FLAGS_local_multihop_host_batch,
+-              [&](int32_t part) {
+-                if (meta == nullptr) return std::string();
+-                auto leader = meta->getStorageLeaderFromCache(space, part);
+-                if (!leader.ok()) return std::string();
+-                return leader.value().toString();
+-              },
+-              [&](int32_t part, double& ratio) {
+-                if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
+-                if (!meta->localDstRatioFresh(FLAGS_local_multihop_prior_stale_ms)) return false;
+-                auto sample = meta->localDstRatio(space, part);
+-                if (!sample.ok()) return false;
+-                ratio = sample.value();
+-                return true;
+-              })) {
++      const auto plan = fillPerPartJobs(
++          *state,
++          nextStepVids_,
++          hops,
++          numParts,
++          shape,
++          adaptiveRuntimeConfig(),
++          algorithm::adaptiveController(),
++          FLAGS_local_multihop_host_batch,
++          [&](int32_t part) {
++            if (meta == nullptr) return std::string();
++            auto leader = meta->getStorageLeaderFromCache(space, part);
++            if (!leader.ok()) return std::string();
++            return leader.value().toString();
++          },
++          [&](int32_t part, double& ratio) {
++            if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
++            if (FLAGS_local_multihop_prior_per_entry) {
++              auto sample = meta->localDstRatioForEdges(space,
++                                                        part,
++                                                        shape.edges,
++                                                        FLAGS_local_multihop_prior_stale_ms,
++                                                        true);
++              if (!sample.ok()) return false;
++              ratio = sample.value();
++              return true;
++            }
++            if (!meta->localDstRatioFresh(FLAGS_local_multihop_prior_stale_ms)) return false;
++            auto sample = meta->localDstRatio(space, part);
++            if (!sample.ok()) return false;
++            ratio = sample.value();
++            return true;
++          });
++      if (plan == PartPlan::kDriver) {
++        return driveDstWalk(state);
++      }
++      if (plan == PartPlan::kPlainBaseline) {
++        addState("adaptive_choice",
++                 folly::sformat("multi_parts=0 base_parts={}", state->partObs.size()));
++        if (FLAGS_local_multihop_trace) {
++          LOG(INFO) << "adaptive_multihop choice=base"
++                    << " multi_parts=0 base_parts=" << state->partObs.size()
++                    << " early_parts=0 rpc=3 steps=" << hops << " space=" << shape.space;
++        }
++      } else {
++        const double draw = algorithm::adaptiveController().nextDraw();
++        auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
++                                               FLAGS_enable_local_multihop,
++                                               FLAGS_local_multihop_affinity,
++                                               FLAGS_local_multihop_affinity_threshold,
++                                               hops,
++                                               static_cast<int32_t>(nextStepVids_.size()),
++                                               FLAGS_local_multihop_max_frontier,
++                                               FLAGS_local_multihop_max_steps,
++                                               shape,
++                                               adaptiveRuntimeConfig(),
++                                               algorithm::adaptiveController(),
++                                               draw);
++        if (launch.useDriver) {
++          auto whole = std::make_shared<DstWalkState>();
++          whole->yieldAll = true;
++          whole->adaptive = launch.adaptive;
++          whole->choseMulti = launch.choseMulti;
++          whole->shape = std::move(launch.shape);
++          DstWalkState::Job job;
++          job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++          job.hopsLeft = hops;
++          job.allowMulti = true;
++          whole->jobs.push_back(std::move(job));
++          return driveDstWalk(whole);
++        }
++      }
++    } else {
++      const double draw = algorithm::adaptiveController().nextDraw();
++      auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
++                                             FLAGS_enable_local_multihop,
++                                             FLAGS_local_multihop_affinity,
++                                             FLAGS_local_multihop_affinity_threshold,
++                                             hops,
++                                             static_cast<int32_t>(nextStepVids_.size()),
++                                             FLAGS_local_multihop_max_frontier,
++                                             FLAGS_local_multihop_max_steps,
++                                             shape,
++                                             adaptiveRuntimeConfig(),
++                                             algorithm::adaptiveController(),
++                                             draw);
++      if (launch.useDriver) {
++        auto state = std::make_shared<DstWalkState>();
++        state->yieldAll = true;
++        state->adaptive = launch.adaptive;
++        state->choseMulti = launch.choseMulti;
++        state->shape = std::move(launch.shape);
++        DstWalkState::Job job;
++        job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++        job.hopsLeft = hops;
++        job.allowMulti = true;
++        state->jobs.push_back(std::move(job));
+         return driveDstWalk(state);
+       }
+-    }
+-    const double draw = algorithm::adaptiveController().nextDraw();
+-    auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
+-                                           FLAGS_enable_local_multihop,
+-                                           FLAGS_local_multihop_affinity,
+-                                           FLAGS_local_multihop_affinity_threshold,
+-                                           hops,
+-                                           static_cast<int32_t>(nextStepVids_.size()),
+-                                           FLAGS_local_multihop_max_frontier,
+-                                           FLAGS_local_multihop_max_steps,
+-                                           shape,
+-                                           adaptiveRuntimeConfig(),
+-                                           algorithm::adaptiveController(),
+-                                           draw);
+-    if (launch.useDriver) {
+-      auto state = std::make_shared<DstWalkState>();
+-      state->yieldAll = true;
+-      state->adaptive = launch.adaptive;
+-      state->choseMulti = launch.choseMulti;
+-      state->shape = std::move(launch.shape);
+-      DstWalkState::Job job;
+-      job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
+-      job.hopsLeft = hops;
+-      job.allowMulti = true;
+-      state->jobs.push_back(std::move(job));
+-      return driveDstWalk(state);
+     }
+   }
+   currentStep_++;
+--- a/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 08:59:04.639757764 +0000
++++ b/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 08:53:05.219165513 +0000
+@@ -92,56 +92,103 @@
+       auto state = std::make_shared<DstWalkState>();
+       auto* meta = qctx()->getMetaClient();
+       const GraphSpaceID space = expand_->space();
+-      if (fillPerPartJobs(
+-              *state,
+-              nextStepVids_,
+-              hops,
+-              numParts,
+-              shape,
+-              adaptiveRuntimeConfig(),
+-              algorithm::adaptiveController(),
+-              FLAGS_local_multihop_host_batch,
+-              [&](int32_t part) {
+-                if (meta == nullptr) return std::string();
+-                auto leader = meta->getStorageLeaderFromCache(space, part);
+-                if (!leader.ok()) return std::string();
+-                return leader.value().toString();
+-              },
+-              [&](int32_t part, double& ratio) {
+-                if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
+-                if (!meta->localDstRatioFresh(FLAGS_local_multihop_prior_stale_ms)) return false;
+-                auto sample = meta->localDstRatio(space, part);
+-                if (!sample.ok()) return false;
+-                ratio = sample.value();
+-                return true;
+-              })) {
++      const auto plan = fillPerPartJobs(
++          *state,
++          nextStepVids_,
++          hops,
++          numParts,
++          shape,
++          adaptiveRuntimeConfig(),
++          algorithm::adaptiveController(),
++          FLAGS_local_multihop_host_batch,
++          [&](int32_t part) {
++            if (meta == nullptr) return std::string();
++            auto leader = meta->getStorageLeaderFromCache(space, part);
++            if (!leader.ok()) return std::string();
++            return leader.value().toString();
++          },
++          [&](int32_t part, double& ratio) {
++            if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
++            if (FLAGS_local_multihop_prior_per_entry) {
++              auto sample = meta->localDstRatioForEdges(space,
++                                                        part,
++                                                        shape.edges,
++                                                        FLAGS_local_multihop_prior_stale_ms,
++                                                        true);
++              if (!sample.ok()) return false;
++              ratio = sample.value();
++              return true;
++            }
++            if (!meta->localDstRatioFresh(FLAGS_local_multihop_prior_stale_ms)) return false;
++            auto sample = meta->localDstRatio(space, part);
++            if (!sample.ok()) return false;
++            ratio = sample.value();
++            return true;
++          });
++      if (plan == PartPlan::kDriver) {
++        return driveDstWalk(state);
++      }
++      if (plan == PartPlan::kPlainBaseline) {
++        addState("adaptive_choice",
++                 folly::sformat("multi_parts=0 base_parts={}", state->partObs.size()));
++        if (FLAGS_local_multihop_trace) {
++          LOG(INFO) << "adaptive_multihop choice=base"
++                    << " multi_parts=0 base_parts=" << state->partObs.size()
++                    << " early_parts=0 rpc=3 steps=" << hops << " space=" << shape.space;
++        }
++      } else {
++        const double draw = algorithm::adaptiveController().nextDraw();
++        auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
++                                               FLAGS_enable_local_multihop,
++                                               FLAGS_local_multihop_affinity,
++                                               FLAGS_local_multihop_affinity_threshold,
++                                               hops,
++                                               static_cast<int32_t>(nextStepVids_.size()),
++                                               FLAGS_local_multihop_max_frontier,
++                                               FLAGS_local_multihop_max_steps,
++                                               shape,
++                                               adaptiveRuntimeConfig(),
++                                               algorithm::adaptiveController(),
++                                               draw);
++        if (launch.useDriver) {
++          auto whole = std::make_shared<DstWalkState>();
++          whole->adaptive = launch.adaptive;
++          whole->choseMulti = launch.choseMulti;
++          whole->shape = std::move(launch.shape);
++          DstWalkState::Job job;
++          job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++          job.hopsLeft = hops;
++          job.allowMulti = true;
++          whole->jobs.push_back(std::move(job));
++          return driveDstWalk(whole);
++        }
++      }
++    } else {
++      const double draw = algorithm::adaptiveController().nextDraw();
++      auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
++                                             FLAGS_enable_local_multihop,
++                                             FLAGS_local_multihop_affinity,
++                                             FLAGS_local_multihop_affinity_threshold,
++                                             hops,
++                                             static_cast<int32_t>(nextStepVids_.size()),
++                                             FLAGS_local_multihop_max_frontier,
++                                             FLAGS_local_multihop_max_steps,
++                                             shape,
++                                             adaptiveRuntimeConfig(),
++                                             algorithm::adaptiveController(),
++                                             draw);
++      if (launch.useDriver) {
++        auto state = std::make_shared<DstWalkState>();
++        state->adaptive = launch.adaptive;
++        state->choseMulti = launch.choseMulti;
++        state->shape = std::move(launch.shape);
++        DstWalkState::Job job;
++        job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++        job.hopsLeft = hops;
++        job.allowMulti = true;
++        state->jobs.push_back(std::move(job));
+         return driveDstWalk(state);
+       }
+-    }
+-    const double draw = algorithm::adaptiveController().nextDraw();
+-    auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
+-                                           FLAGS_enable_local_multihop,
+-                                           FLAGS_local_multihop_affinity,
+-                                           FLAGS_local_multihop_affinity_threshold,
+-                                           hops,
+-                                           static_cast<int32_t>(nextStepVids_.size()),
+-                                           FLAGS_local_multihop_max_frontier,
+-                                           FLAGS_local_multihop_max_steps,
+-                                           shape,
+-                                           adaptiveRuntimeConfig(),
+-                                           algorithm::adaptiveController(),
+-                                           draw);
+-    if (launch.useDriver) {
+-      auto state = std::make_shared<DstWalkState>();
+-      state->adaptive = launch.adaptive;
+-      state->choseMulti = launch.choseMulti;
+-      state->shape = std::move(launch.shape);
+-      DstWalkState::Job job;
+-      job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
+-      job.hopsLeft = hops;
+-      job.allowMulti = true;
+-      state->jobs.push_back(std::move(job));
+-      return driveDstWalk(state);
+     }
+   }
+   currentStep_++;
+--- a/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 08:59:04.639757764 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 08:02:52.711789033 +0000
+@@ -76,12 +76,20 @@
+   time::Duration batchClock;
+ };
+ 
++enum class PartPlan {
++  // Vids are not INT64, or there is nothing to send. Caller uses the v1 key.
++  kFallback,
++  // At least one part walks locally. Caller runs the adaptive driver.
++  kDriver,
++  // Every part is baseline. Caller uses the normal one-hop GetDstBySrc.
++  kPlainBaseline,
++};
++
+ // hostBatch folds multihop partitions that share a leader into one job.
+ // StorageClient then sends one GetDstBySrc per host. prior(part, ratio)
+-// returns false when this graphd has no heartbeat sample for the part.
+-// Returns false when the vids are not INT64; the caller uses the v1 key.
++// returns false when this graphd has no fresh heartbeat sample for the part.
+ template <typename HostOf, typename Prior>
+-inline bool fillPerPartJobs(DstWalkState& state,
++inline PartPlan fillPerPartJobs(DstWalkState& state,
+                             const std::unordered_set<Value>& vids,
+                             int32_t hops,
+                             int32_t numParts,
+@@ -91,10 +99,10 @@
+                             bool hostBatch,
+                             HostOf hostOf,
+                             Prior prior) {
+-  if (numParts <= 0 || vids.empty()) return false;
++  if (numParts <= 0 || vids.empty()) return PartPlan::kFallback;
+   std::map<int32_t, std::vector<Value>> byPart;
+   for (const auto& vid : vids) {
+-    if (!vid.isInt()) return false;
++    if (!vid.isInt()) return PartPlan::kFallback;
+     byPart[algorithm::partOfIntVid(vid.getInt(), numParts)].push_back(vid);
+   }
+   state.perPart = true;
+@@ -122,12 +130,17 @@
+     hosts.push_back(hostOf(entry.first));
+   }
+   algorithm::reconcilePartChoices(decisions, cfg.collapseMixed);
++  bool anyMulti = false;
+   for (const auto& decision : decisions) {
++    if (decision.multi) anyMulti = true;
+     multiFlags.push_back(decision.multi ? 1 : 0);
+     DstWalkState::PartObs obs;
+     obs.choseMulti = decision.multi;
+     state.partObs.emplace(decision.part, obs);
+   }
++  if (!anyMulti && FLAGS_local_multihop_plain_baseline) {
++    return PartPlan::kPlainBaseline;
++  }
+   const auto groups = algorithm::hostBatchGroups(parts, multiFlags, hosts, hostBatch);
+   for (const auto& group : groups) {
+     DstWalkState::Job job;
+@@ -142,7 +155,8 @@
+     }
+     state.jobs.push_back(std::move(job));
+   }
+-  return !state.jobs.empty();
++  if (state.jobs.empty()) return PartPlan::kFallback;
++  return PartPlan::kDriver;
+ }
+ 
+ }  // namespace graph
+--- a/src/graph/service/GraphFlags.cpp	2026-10-31 08:59:04.639757764 +0000
++++ b/src/graph/service/GraphFlags.cpp	2026-10-31 07:56:38.530466301 +0000
+@@ -193,6 +193,14 @@
+ DEFINE_int64(local_multihop_prior_stale_ms,
+              30000,
+              "Ignore a cached heartbeat ratio older than this. 0 never expires.");
++DEFINE_bool(local_multihop_prior_per_entry,
++            true,
++            "Use each ratio entry's own timestamp. A stale entry is an uncertain "
++            "prior. Off uses one timestamp for the whole cache.");
++DEFINE_bool(local_multihop_plain_baseline,
++            true,
++            "When every source part is baseline, use the normal one-hop "
++            "GetDstBySrc path.");
+ 
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+--- a/src/graph/service/GraphFlags.h	2026-10-31 08:59:04.639757764 +0000
++++ b/src/graph/service/GraphFlags.h	2026-10-31 07:56:38.530466301 +0000
+@@ -108,5 +108,10 @@
+ DECLARE_double(local_multihop_prior_high);
+ DECLARE_double(local_multihop_prior_low);
+ DECLARE_int64(local_multihop_prior_stale_ms);
++// v5. Each ratio entry expires on its own timestamp. A stale entry is
++// uncertain. plain_baseline sends an all-baseline plan through the normal
++// one-hop RPC instead of the adaptive driver.
++DECLARE_bool(local_multihop_prior_per_entry);
++DECLARE_bool(local_multihop_plain_baseline);
+ 
+ #endif  // GRAPH_GRAPHFLAGS_H_
+--- a/src/interface/meta.thrift	2026-10-31 08:59:04.635757748 +0000
++++ b/src/interface/meta.thrift	2026-10-31 07:54:00.071366919 +0000
+@@ -540,6 +540,17 @@
+     3: i64              segment_id,
+ }
+ 
++// One completed out-edge sample. edge_type is the positive type in the key.
++// ts_ms is when the pass finished, not when the heartbeat was forwarded.
++struct LocalDstRatioEntry {
++    1: common.GraphSpaceID space_id,
++    2: common.PartitionID part_id,
++    3: i32                  edge_type,
++    4: double               ratio,
++    5: i64                  ts_ms,
++    6: i64                  version,
++}
++
+ struct HBResp {
+     1: common.ErrorCode code,
+     2: common.HostAddr  leader,
+@@ -547,10 +558,13 @@
+     4: i64              last_update_time_in_ms,
+     5: i32              meta_version,
+     // Latest per-part local-dst ratios reported by storaged heartbeats.
+-    // In memory on the meta leader. Old clients ignore it.
++    // Derived from local_dst_ratio_entries (minimum ratio across edge types).
++    // Old clients ignore it.
+     6: optional map<common.GraphSpaceID, map<common.PartitionID, double>
+         (cpp.template = "std::unordered_map")>
+         (cpp.template = "std::unordered_map") local_dst_ratio,
++    // Persisted on the meta leader. Each entry has its own timestamp.
++    7: optional list<LocalDstRatioEntry> local_dst_ratio_entries,
+ }
+ 
+ enum HostRole {
+@@ -586,9 +600,11 @@
+     8: optional binary          version,
+     // This host's sampled fraction of edge dsts whose leader is local.
+     // Only storaged sets it. Meta keeps the latest value per part.
++    // Minimum across edge types. local_dst_ratio_entries is the source of truth.
+     9: optional map<common.GraphSpaceID, map<common.PartitionID, double>
+         (cpp.template = "std::unordered_map")>
+         (cpp.template = "std::unordered_map") local_dst_ratio,
++    10: optional list<LocalDstRatioEntry> local_dst_ratio_entries,
+ }
+ 
+ // service(agent/metad/storaged/graphd) info
+--- a/src/meta/processors/admin/HBProcessor.cpp	2026-10-31 08:59:04.635757748 +0000
++++ b/src/meta/processors/admin/HBProcessor.cpp	2026-10-31 08:56:55.791095843 +0000
+@@ -6,6 +6,7 @@
+ #include "meta/processors/admin/HBProcessor.h"
+ 
+ #include "common/time/WallClock.h"
++#include "common/utils/MetaKeyUtils.h"
+ #include "meta/ActiveHostsMan.h"
+ #include "meta/KVBasedClusterIdMan.h"
+ #include "meta/MetaVersionMan.h"
+@@ -15,8 +16,55 @@
+ 
+ namespace {
+ std::mutex gLocalDstRatioMu;
+-std::unordered_map<nebula::GraphSpaceID, std::unordered_map<nebula::PartitionID, double>>
++bool gLocalDstRatioLoaded = false;
++struct LocalDstRec {
++  double ratio{0};
++  int64_t tsMs{0};
++  int64_t version{0};
++};
++std::unordered_map<nebula::GraphSpaceID,
++                   std::unordered_map<nebula::PartitionID, std::unordered_map<int32_t, LocalDstRec>>>
+     gLocalDstRatio;
++
++void loadLocalDstRatio(nebula::kvstore::KVStore* kv) {
++  if (gLocalDstRatioLoaded || kv == nullptr) return;
++  std::string prefix = nebula::MetaKeyUtils::localDstRatioPrefix();
++  std::unique_ptr<nebula::kvstore::KVIterator> iter;
++  auto code = kv->prefix(nebula::kDefaultSpaceId, nebula::kDefaultPartId, prefix, &iter);
++  if (code == nebula::cpp2::ErrorCode::E_LEADER_CHANGED) {
++    // Followers see the request before the client has followed the leader.
++    return;
++  }
++  if (code != nebula::cpp2::ErrorCode::SUCCEEDED || iter == nullptr) {
++    LOG(WARNING) << "local_dst_ratio_kv_load failed code=" << static_cast<int>(code);
++    return;
++  }
++  int32_t n = 0;
++  for (; iter->valid(); iter->next()) {
++    nebula::MetaKeyUtils::LocalDstRatioRecord rec;
++    if (!nebula::MetaKeyUtils::parseLocalDstRatioKey(iter->key(), &rec)) continue;
++    if (!nebula::MetaKeyUtils::parseLocalDstRatioVal(iter->val(), &rec)) continue;
++    gLocalDstRatio[rec.space][rec.part][rec.edge] =
++        LocalDstRec{rec.ratio, rec.tsMs, rec.version};
++    ++n;
++  }
++  gLocalDstRatioLoaded = true;
++  LOG(INFO) << "local_dst_ratio_kv_load entries=" << n;
++}
++
++void rememberRatio(nebula::GraphSpaceID space,
++                   nebula::PartitionID part,
++                   int32_t edge,
++                   double ratio,
++                   int64_t tsMs,
++                   int64_t version,
++                   std::vector<nebula::kvstore::KV>* data) {
++  gLocalDstRatio[space][part][edge] = LocalDstRec{ratio, tsMs, version};
++  if (data != nullptr) {
++    data->emplace_back(nebula::MetaKeyUtils::localDstRatioKey(space, part, edge),
++                       nebula::MetaKeyUtils::localDstRatioVal(ratio, tsMs, version));
++  }
++}
+ }  // namespace
+ 
+ namespace nebula {
+@@ -44,6 +92,10 @@
+ 
+   std::vector<kvstore::KV> data;
+   folly::SharedMutex::WriteHolder holder(LockUtils::lock());
++  {
++    std::lock_guard<std::mutex> guard(gLocalDstRatioMu);
++    loadLocalDstRatio(kvstore_);
++  }
+   if (role == cpp2::HostRole::STORAGE || role == cpp2::HostRole::STORAGE_LISTENER) {
+     if (role == cpp2::HostRole::STORAGE) {
+       if (!ActiveHostsMan::machineRegistered(kvstore_, host)) {
+@@ -67,11 +119,25 @@
+       return;
+     }
+ 
+-    if (req.local_dst_ratio_ref().has_value()) {
++    if (req.local_dst_ratio_entries_ref().has_value()) {
++      std::lock_guard<std::mutex> guard(gLocalDstRatioMu);
++      for (const auto& entry : req.local_dst_ratio_entries_ref().value()) {
++        rememberRatio(entry.get_space_id(),
++                      entry.get_part_id(),
++                      entry.get_edge_type(),
++                      entry.get_ratio(),
++                      entry.get_ts_ms(),
++                      entry.get_version(),
++                      &data);
++      }
++    } else if (req.local_dst_ratio_ref().has_value()) {
++      const int64_t now = time::WallClock::fastNowInMilliSec();
+       std::lock_guard<std::mutex> guard(gLocalDstRatioMu);
+       for (const auto& spaceEntry : req.local_dst_ratio_ref().value()) {
+         for (const auto& partEntry : spaceEntry.second) {
+-          gLocalDstRatio[spaceEntry.first][partEntry.first] = partEntry.second;
++          auto& slot = gLocalDstRatio[spaceEntry.first][partEntry.first][0];
++          int64_t version = slot.version + 1;
++          rememberRatio(spaceEntry.first, partEntry.first, 0, partEntry.second, now, version, &data);
+         }
+       }
+     }
+@@ -138,7 +204,31 @@
+   {
+     std::lock_guard<std::mutex> guard(gLocalDstRatioMu);
+     if (!gLocalDstRatio.empty()) {
+-      resp_.local_dst_ratio_ref() = gLocalDstRatio;
++      std::vector<cpp2::LocalDstRatioEntry> entries;
++      std::unordered_map<GraphSpaceID, std::unordered_map<PartitionID, double>> mins;
++      std::unordered_map<GraphSpaceID, std::unordered_map<PartitionID, bool>> have;
++      for (const auto& spaceEntry : gLocalDstRatio) {
++        for (const auto& partEntry : spaceEntry.second) {
++          for (const auto& edgeEntry : partEntry.second) {
++            cpp2::LocalDstRatioEntry entry;
++            entry.space_id_ref() = spaceEntry.first;
++            entry.part_id_ref() = partEntry.first;
++            entry.edge_type_ref() = edgeEntry.first;
++            entry.ratio_ref() = edgeEntry.second.ratio;
++            entry.ts_ms_ref() = edgeEntry.second.tsMs;
++            entry.version_ref() = edgeEntry.second.version;
++            entries.push_back(std::move(entry));
++            if (!have[spaceEntry.first][partEntry.first]) {
++              mins[spaceEntry.first][partEntry.first] = edgeEntry.second.ratio;
++              have[spaceEntry.first][partEntry.first] = true;
++            } else if (edgeEntry.second.ratio < mins[spaceEntry.first][partEntry.first]) {
++              mins[spaceEntry.first][partEntry.first] = edgeEntry.second.ratio;
++            }
++          }
++        }
++      }
++      resp_.local_dst_ratio_entries_ref() = std::move(entries);
++      resp_.local_dst_ratio_ref() = std::move(mins);
+     }
+   }
+   ret = doSyncPut(std::move(data));
+--- a/src/storage/LocalDstRatioSampler.cpp	2026-10-31 08:59:04.639757764 +0000
++++ b/src/storage/LocalDstRatioSampler.cpp	2026-10-31 08:42:41.139020845 +0000
+@@ -7,32 +7,72 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <limits>
+ #include <map>
+ #include <random>
++#include <tuple>
++#include <utility>
+ 
+ #include "common/algorithm/AdaptiveMultiHop.h"
+ #include "common/time/Duration.h"
++#include "common/time/WallClock.h"
+ #include "common/utils/NebulaKeyUtils.h"
+ #include "kvstore/NebulaStore.h"
+ 
+ DEFINE_int32(local_dst_ratio_sample_interval_secs,
+              10,
+-             "Seconds between local-dst ratio samples. 0 disables the scan.");
++             "0 disables the sampler. When tick_ms is 0, this is the sleep between ticks.");
+ DEFINE_int32(local_dst_ratio_sample_edges,
+              64,
+-             "Reservoir size per part. The ratio is uniform over the edges scanned.");
++             "Reservoir size kept while a part is scanned. The published ratio is the exact "
++             "count once the part finishes.");
+ DEFINE_int32(local_dst_ratio_sample_scan,
+              4096,
+-             "Maximum edge keys visited per part while filling the reservoir.");
++             "Unused by the incremental scanner. Kept so v4 flag files still parse.");
+ DEFINE_int32(local_dst_ratio_sample_parts,
+              32,
+-             "Maximum leader parts visited in one sample pass.");
++             "Unused by the incremental scanner. Kept so v4 flag files still parse.");
++DEFINE_bool(local_dst_ratio_sample_incremental,
++            true,
++            "Resume a per-part cursor under the tick budget. Off scans every leader part in one tick.");
++DEFINE_int32(local_dst_ratio_sample_tick_ms,
++             200,
++             "Milliseconds between incremental ticks. 0 uses sample_interval_secs.");
++DEFINE_int32(local_dst_ratio_sample_budget_us,
++             2000,
++             "Stop a tick after this many microseconds. 0 means no time limit.");
++DEFINE_int32(local_dst_ratio_sample_edges_per_tick,
++             512,
++             "Maximum out-edges read in one tick.");
++DEFINE_int32(local_dst_ratio_sample_parts_per_tick,
++             1,
++             "Maximum parts opened in one tick.");
+ 
+ namespace nebula {
+ namespace storage {
+ 
++struct LocalDstRatioSampler::Impl {
++  struct EdgeAccum {
++    int64_t seen{0};
++    int64_t local{0};
++    std::vector<char> slot;
++    int32_t slotSeen{0};
++    int32_t slotLocal{0};
++  };
++  struct PartScan {
++    std::string cursor;
++    bool started{false};
++    std::map<int32_t, EdgeAccum> edges;
++    std::mt19937 rng{std::random_device{}()};
++  };
++
++  std::map<std::pair<GraphSpaceID, PartitionID>, PartScan> scans;
++  std::map<std::tuple<GraphSpaceID, PartitionID, int32_t>, int64_t> versions;
++  size_t rr{0};
++};
++
+ LocalDstRatioSampler::LocalDstRatioSampler(kvstore::KVStore* store, meta::MetaClient* meta)
+-    : store_(store), meta_(meta) {}
++    : store_(store), meta_(meta), impl_(std::make_unique<Impl>()) {}
+ 
+ LocalDstRatioSampler::~LocalDstRatioSampler() {
+   stop();
+@@ -54,133 +94,192 @@
+   }
+ }
+ 
++namespace {
++
++struct PartId {
++  GraphSpaceID space{0};
++  PartitionID part{0};
++  bool operator<(const PartId& other) const {
++    if (space != other.space) return space < other.space;
++    return part < other.part;
++  }
++  bool operator==(const PartId& other) const { return space == other.space && part == other.part; }
++};
++
++}  // namespace
++
+ void LocalDstRatioSampler::loop() {
++  auto* store = dynamic_cast<kvstore::NebulaStore*>(store_);
+   while (!stopped_.load()) {
+-    for (int i = 0; i < FLAGS_local_dst_ratio_sample_interval_secs * 10; ++i) {
+-      if (stopped_.load()) return;
+-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-    }
+-    if (stopped_.load()) return;
+-    int64_t edges = 0;
+-    int64_t parts = 0;
+-    int64_t scanned = 0;
+-    time::Duration clock;
+-    auto sample = sampleOnce(&edges, &parts, &scanned);
+-    const auto us = clock.elapsedInUSec();
+-    LOG(INFO) << "local_dst_ratio_sample_us us=" << us;
+-    if (meta_ != nullptr) {
+-      meta_->publishLocalDstRatio(std::move(sample));
++    const int32_t tickMs = FLAGS_local_dst_ratio_sample_incremental
++                               ? (FLAGS_local_dst_ratio_sample_tick_ms > 0
++                                      ? FLAGS_local_dst_ratio_sample_tick_ms
++                                      : FLAGS_local_dst_ratio_sample_interval_secs * 1000)
++                               : FLAGS_local_dst_ratio_sample_interval_secs * 1000;
++    const int32_t slice = std::max(1, std::min(tickMs, 50));
++    for (int slept = 0; slept < tickMs && !stopped_.load(); slept += slice) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(std::min(slice, tickMs - slept)));
+     }
+-  }
+-}
++    if (stopped_.load() || store == nullptr || meta_ == nullptr) return;
+ 
+-meta::MetaClient::LocalDstRatioMap LocalDstRatioSampler::sampleOnce(int64_t* edges,
+-                                                                    int64_t* parts,
+-                                                                    int64_t* scannedOut) {
+-  meta::MetaClient::LocalDstRatioMap out;
+-  auto* store = dynamic_cast<kvstore::NebulaStore*>(store_);
+-  if (store == nullptr || meta_ == nullptr) return out;
+-  std::unordered_map<GraphSpaceID, std::vector<meta::cpp2::LeaderInfo>> leaders;
+-  store->allLeader(leaders);
+-  const int32_t edgeCap = std::max(1, FLAGS_local_dst_ratio_sample_edges);
+-  const int32_t scanCap = std::max(edgeCap, FLAGS_local_dst_ratio_sample_scan);
+-  const int32_t visitCap = scanCap * 8;
+-  const int32_t partCap = std::max(1, FLAGS_local_dst_ratio_sample_parts);
+-  std::mt19937 rng{std::random_device{}()};
+-  int32_t visitedParts = 0;
+-  int32_t exactParts = 0;
+-  int32_t cappedParts = 0;
+-  std::vector<double> ratios;
+-  struct SpaceAgg {
+-    int32_t n{0};
+-    int32_t exact{0};
+-    double min{1};
+-    double max{0};
+-  };
+-  std::map<GraphSpaceID, SpaceAgg> bySpace;
+-  for (const auto& spaceEntry : leaders) {
+-    if (visitedParts >= partCap) break;
+-    const GraphSpaceID spaceId = spaceEntry.first;
+-    auto vidLenRet = meta_->getSpaceVidLen(spaceId);
+-    auto partsRet = meta_->partsNum(spaceId);
+-    if (!vidLenRet.ok() || !partsRet.ok()) continue;
+-    const int32_t vidLen = vidLenRet.value();
+-    const int32_t numParts = partsRet.value();
+-    for (const auto& leader : spaceEntry.second) {
+-      if (visitedParts >= partCap) break;
+-      const PartitionID partId = leader.get_part_id();
+-      if (!store->isLeader(spaceId, partId)) continue;
++    const bool full = !FLAGS_local_dst_ratio_sample_incremental;
++    const int32_t edgeBudget = full ? std::numeric_limits<int32_t>::max() / 4
++                                    : std::max(1, FLAGS_local_dst_ratio_sample_edges_per_tick);
++    const int32_t partBudget = full ? std::numeric_limits<int32_t>::max() / 4
++                                    : std::max(1, FLAGS_local_dst_ratio_sample_parts_per_tick);
++    const int64_t timeBudget = full || FLAGS_local_dst_ratio_sample_budget_us <= 0
++                                   ? std::numeric_limits<int64_t>::max() / 4
++                                   : FLAGS_local_dst_ratio_sample_budget_us;
++    const int32_t keep = std::max(1, FLAGS_local_dst_ratio_sample_edges);
++
++    std::unordered_map<GraphSpaceID, std::vector<meta::cpp2::LeaderInfo>> leaders;
++    store->allLeader(leaders);
++    std::vector<PartId> roster;
++    for (const auto& spaceEntry : leaders) {
++      for (const auto& leader : spaceEntry.second) {
++        PartId id{spaceEntry.first, leader.get_part_id()};
++        if (!store->isLeader(id.space, id.part)) continue;
++        roster.push_back(id);
++      }
++    }
++    std::sort(roster.begin(), roster.end());
++    roster.erase(std::unique(roster.begin(), roster.end()), roster.end());
++    std::vector<PartId> order;
++    for (const auto& scan : impl_->scans) {
++      if (!scan.second.started || scan.second.cursor.empty()) continue;
++      order.push_back(PartId{scan.first.first, scan.first.second});
++    }
++    if (!roster.empty()) {
++      const size_t start = impl_->rr % roster.size();
++      for (size_t n = 0; n < roster.size() && order.size() < static_cast<size_t>(partBudget); ++n) {
++        const PartId id = roster[(start + n) % roster.size()];
++        bool already = false;
++        for (const auto& queued : order) {
++          if (queued == id) already = true;
++        }
++        if (!already) order.push_back(id);
++      }
++      impl_->rr = (start + std::max<size_t>(1, order.size())) % roster.size();
++    }
++
++    time::Duration clock;
++    int32_t scannedEdges = 0;
++    int32_t touched = 0;
++    int32_t finished = 0;
++    bool budgetHit = false;
++    std::vector<meta::MetaClient::LocalDstRatioSample> done;
++
++    for (const auto& id : order) {
++      if (touched >= partBudget) break;
++      if (touched > 0 && clock.elapsedInUSec() >= timeBudget) {
++        budgetHit = true;
++        break;
++      }
++      if (!store->isLeader(id.space, id.part)) {
++        impl_->scans.erase(std::make_pair(id.space, id.part));
++        continue;
++      }
++      auto vidLenRet = meta_->getSpaceVidLen(id.space);
++      auto partsRet = meta_->partsNum(id.space);
++      if (!vidLenRet.ok() || !partsRet.ok()) continue;
++      const int32_t vidLen = vidLenRet.value();
++      const int32_t numParts = partsRet.value();
++      auto& scan = impl_->scans[std::make_pair(id.space, id.part)];
++      std::string edgePrefix = NebulaKeyUtils::edgePrefix(id.part);
+       std::unique_ptr<kvstore::KVIterator> iter;
+-      auto edgePrefix = NebulaKeyUtils::edgePrefix(partId);
+-      auto code = store_->prefix(spaceId, partId, edgePrefix, &iter);
+-      if (code != nebula::cpp2::ErrorCode::SUCCEEDED || iter == nullptr) continue;
+-      std::vector<char> slot;
+-      int32_t seen = 0;
+-      int32_t local = 0;
+-      int32_t scanned = 0;
++      nebula::cpp2::ErrorCode code = nebula::cpp2::ErrorCode::SUCCEEDED;
++      if (scan.cursor.empty()) {
++        code = store_->prefix(id.space, id.part, edgePrefix, &iter);
++      } else {
++        code = store_->rangeWithPrefix(id.space, id.part, scan.cursor, edgePrefix, &iter);
++      }
++      if (code != nebula::cpp2::ErrorCode::SUCCEEDED || iter == nullptr) {
++        scan.cursor.clear();
++        scan.started = false;
++        continue;
++      }
++      ++touched;
++      scan.started = true;
++      const int32_t visitCap = edgeBudget > 1000000 ? std::numeric_limits<int32_t>::max() / 4
++                                                    : edgeBudget * 8;
+       int32_t visited = 0;
+-      int32_t outLocal = 0;
+-      // Out-edges only. Negative types are the incoming copy; their key dst is
+-      // the original src, which is not the walk's local-dst ratio.
+-      for (; iter->valid() && scanned < scanCap && visited < visitCap; iter->next()) {
++      while (iter->valid() && scannedEdges < edgeBudget && visited < visitCap) {
++        if ((visited & 31) == 0 && clock.elapsedInUSec() >= timeBudget) {
++          budgetHit = true;
++          break;
++        }
+         ++visited;
+         auto key = iter->key();
+-        if (!NebulaKeyUtils::isEdge(vidLen, key)) continue;
+-        if (NebulaKeyUtils::getEdgeType(vidLen, key) <= 0) continue;
++        if (!NebulaKeyUtils::isEdge(vidLen, key) ||
++            NebulaKeyUtils::getEdgeType(vidLen, key) <= 0) {
++          iter->next();
++          continue;
++        }
++        const int32_t edgeType = NebulaKeyUtils::getEdgeType(vidLen, key);
+         auto dst = NebulaKeyUtils::getDstId(vidLen, key);
+         std::string dstId(dst.data(), dst.size());
+-        auto dstPart = meta_->partId(numParts, dstId);
+-        const bool isLocal = store->isLeader(spaceId, dstPart);
+-        if (isLocal) ++outLocal;
++        const PartitionID dstPart = meta_->partId(numParts, dstId);
++        const bool isLocal = store->isLeader(id.space, dstPart);
++        auto& acc = scan.edges[edgeType];
++        ++acc.seen;
++        if (isLocal) ++acc.local;
+         int32_t draw = 1;
+-        if (seen + 1 > edgeCap) {
+-          std::uniform_int_distribution<int32_t> dist(1, seen + 1);
+-          draw = dist(rng);
+-        }
+-        algorithm::reservoirConsider(slot, seen, local, isLocal, edgeCap, draw);
+-        ++scanned;
+-      }
+-      const bool capped = iter->valid();
+-      ++visitedParts;
+-      if (scanned == 0) continue;
+-      // The part fit in the cap: the ratio is exact. A capped scan publishes
+-      // the reservoir, which is uniform over the out-edges visited.
+-      const double ratio = capped ? static_cast<double>(local) / static_cast<double>(slot.size())
+-                                  : static_cast<double>(outLocal) / static_cast<double>(scanned);
+-      out[spaceId][partId] = ratio;
+-      ratios.push_back(ratio);
+-      auto& agg = bySpace[spaceId];
+-      ++agg.n;
+-      if (!capped) ++agg.exact;
+-      if (ratio < agg.min) agg.min = ratio;
+-      if (ratio > agg.max) agg.max = ratio;
+-      if (capped) ++cappedParts;
+-      else ++exactParts;
+-      if (edges != nullptr) *edges += static_cast<int64_t>(capped ? slot.size() : scanned);
+-      if (scannedOut != nullptr) *scannedOut += scanned;
+-      if (parts != nullptr) *parts += 1;
++        if (acc.slotSeen + 1 > keep) {
++          std::uniform_int_distribution<int32_t> dist(1, acc.slotSeen + 1);
++          draw = dist(scan.rng);
++        }
++        algorithm::reservoirConsider(acc.slot, acc.slotSeen, acc.slotLocal, isLocal, keep, draw);
++        ++scannedEdges;
++        iter->next();
++      }
++      if (budgetHit || scannedEdges >= edgeBudget) {
++        if (iter->valid()) {
++          scan.cursor.assign(iter->key().begin(), iter->key().end());
++          break;
++        }
++      }
++      if (!iter->valid()) {
++        const int64_t now = time::WallClock::fastNowInMilliSec();
++        for (const auto& edgeEntry : scan.edges) {
++          if (edgeEntry.second.seen <= 0) continue;
++          const double exact = static_cast<double>(edgeEntry.second.local) /
++                               static_cast<double>(edgeEntry.second.seen);
++          double reservoir = exact;
++          if (!edgeEntry.second.slot.empty()) {
++            reservoir = static_cast<double>(edgeEntry.second.slotLocal) /
++                        static_cast<double>(edgeEntry.second.slot.size());
++          }
++          auto verKey = std::make_tuple(id.space, id.part, edgeEntry.first);
++          int64_t version = ++impl_->versions[verKey];
++          meta::MetaClient::LocalDstRatioSample sample;
++          sample.space = id.space;
++          sample.part = id.part;
++          sample.edge = edgeEntry.first;
++          sample.ratio = exact;
++          sample.tsMs = now;
++          sample.version = version;
++          done.push_back(sample);
++          LOG(INFO) << "local_dst_ratio_pass space=" << id.space << " part=" << id.part
++                    << " edge=" << edgeEntry.first << " ratio=" << exact
++                    << " reservoir=" << reservoir << " seen=" << edgeEntry.second.seen
++                    << " version=" << version;
++        }
++        impl_->scans.erase(std::make_pair(id.space, id.part));
++        ++finished;
++      } else {
++        scan.cursor.assign(iter->key().begin(), iter->key().end());
++      }
++      if (budgetHit || scannedEdges >= edgeBudget) break;
++    }
++
++    const auto us = clock.elapsedInUSec();
++    LOG(INFO) << "local_dst_ratio_tick us=" << us << " scanned=" << scannedEdges
++              << " parts=" << touched << " finished=" << finished
++              << " budget_hit=" << (budgetHit ? 1 : 0) << " full=" << (full ? 1 : 0);
++    if (!done.empty()) {
++      meta_->publishLocalDstRatio(std::move(done));
+     }
+   }
+-  std::sort(ratios.begin(), ratios.end());
+-  double ratioMin = 0;
+-  double ratioP50 = 0;
+-  double ratioMax = 0;
+-  if (!ratios.empty()) {
+-    ratioMin = ratios.front();
+-    ratioMax = ratios.back();
+-    ratioP50 = ratios[ratios.size() / 2];
+-  }
+-  LOG(INFO) << "local_dst_ratio_sample parts=" << (parts != nullptr ? *parts : 0)
+-            << " kept=" << (edges != nullptr ? *edges : 0)
+-            << " scanned=" << (scannedOut != nullptr ? *scannedOut : 0) << " exact=" << exactParts
+-            << " capped=" << cappedParts << " ratio_min=" << ratioMin << " ratio_p50=" << ratioP50
+-            << " ratio_max=" << ratioMax << " spaces=" << bySpace.size();
+-  for (const auto& entry : bySpace) {
+-    LOG(INFO) << "local_dst_ratio_space space=" << entry.first << " parts=" << entry.second.n
+-              << " exact=" << entry.second.exact << " min=" << entry.second.min
+-              << " max=" << entry.second.max;
+-  }
+-  return out;
+ }
+ 
+ }  // namespace storage
+--- a/src/storage/LocalDstRatioSampler.h	2026-10-31 08:59:04.639757764 +0000
++++ b/src/storage/LocalDstRatioSampler.h	2026-10-31 07:56:04.586466432 +0000
+@@ -7,6 +7,7 @@
+ #define STORAGE_LOCALDSTRATIOSAMPLER_H_
+ 
+ #include <atomic>
++#include <memory>
+ #include <thread>
+ 
+ #include "clients/meta/MetaClient.h"
+@@ -15,11 +16,10 @@
+ namespace nebula {
+ namespace storage {
+ 
+-// Bounded background scan of out-edges. A part that fits in
+-// local_dst_ratio_sample_scan publishes the exact local-dst ratio.
+-// A larger part publishes a reservoir of local_dst_ratio_sample_edges
+-// drawn uniformly from the out-edges visited. At most
+-// local_dst_ratio_sample_parts leader parts are visited per pass.
++// Incremental out-edge scan. Each tick is capped by a time budget, an edge
++// count, and a part count. A part keeps its cursor and reservoir until the
++// prefix is exhausted, so the finished ratio counts every out-edge, not a
++// key prefix. interval 0 disables the thread.
+ class LocalDstRatioSampler {
+  public:
+   LocalDstRatioSampler(kvstore::KVStore* store, meta::MetaClient* meta);
+@@ -29,13 +29,12 @@
+   void stop();
+ 
+  private:
++  struct Impl;
+   void loop();
+-  meta::MetaClient::LocalDstRatioMap sampleOnce(int64_t* edges,
+-                                                int64_t* parts,
+-                                                int64_t* scanned);
+ 
+   kvstore::KVStore* store_{nullptr};
+   meta::MetaClient* meta_{nullptr};
++  std::unique_ptr<Impl> impl_;
+   std::atomic<bool> stopped_{false};
+   std::thread thread_;
+ };
