@@ -46,6 +46,7 @@
 | 30 | [查询算子](30-query-operators.md) | Filter / Project / Aggregate / Sort / TopN / Limit / Join / Union 的实现与 iterator 约束 |
 | 31 | [调度与生命周期](31-scheduler-and-lifetime.md) | Promise/Future 依赖图、Select/Loop、userCount drop、MemoryCheckGuard |
 | 32 | [算法算子](32-algo-executors.md) | ShortestPath / BFS 双向 / Multi / AllPaths / Subgraph |
+| 33 | [LocalMultiHop 设计](33-local-multihop-design.md) | 子图亲和前提下的本地多跳、`remote_frontier`、PathPrefix、降级与测试 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -62,6 +63,8 @@
 24–27 是存储与元数据子系列：24 讲 Raft 副本组，25 讲 WAL 的文件格式与恢复，26 讲 RocksDB 如何承接 apply，27 讲 Meta 的 processor / 心跳 / 索引 DDL。它们不重复 01–22 的查询优化与下推内容，只补写路径和服务侧；14 里提到的 Raft 现在有了独立章节。
 
 28–32 是执行引擎子系列：28 讲 Executor 框架（PlanNode 树 → 异步 DAG、open/execute/close、finish 与生命周期），29 讲 GetNeighbors / Expand / Traverse 三件套，30 讲 Filter / Project / Aggregate / Sort / TopN / Limit / Join，31 讲 Promise/Future 调度、Select/Loop 与内存水位，32 讲最短路 / 全路径 / 子图。13–14 是控制流与数据流总览，这一组补的是 executor 内部实现和关键分支。
+
+33 是设计稿，不是 3.8 已实现的功能：前提是分区器已经做了社区/子图划分并暴露亲和性元数据；核心是 storaged 内 `MultiHopProcessor` 做有界本地 BFS，把远程边界以 `remote_frontier` 交回 graphd，路径只返回紧凑 `PathPrefix`。默认关闭、旧 storaged 自动回退。
 
 ## 主线
 
