@@ -14,6 +14,11 @@ STORAGE_N="${STORAGE_N:-3}"
 GRAPH_N="${GRAPH_N:-1}"
 ENABLE_DST_ONLY="${ENABLE_DST_ONLY:-true}"
 ENABLE_PARTIAL_EDGE_AGG="${ENABLE_PARTIAL_EDGE_AGG:-true}"
+# Clean v3.8.0 binaries do not know the pushdown flags. Set this false and
+# pass EXTRA_GRAPH_FLAGS / EXTRA_STORAGE_FLAGS instead.
+APPEND_PUSHDOWN_FLAGS="${APPEND_PUSHDOWN_FLAGS:-true}"
+EXTRA_GRAPH_FLAGS="${EXTRA_GRAPH_FLAGS:-}"
+EXTRA_STORAGE_FLAGS="${EXTRA_STORAGE_FLAGS:-}"
 GRAPH_WORKERS="${GRAPH_WORKERS:-4}"
 STORAGE_WORKERS="${STORAGE_WORKERS:-4}"
 BLOCK_CACHE_MB="${BLOCK_CACHE_MB:-64}"
@@ -26,8 +31,10 @@ else
   SUDO=(sudo -n)
 fi
 
-ip() { "${SUDO[@]}" /usr/sbin/ip "$@"; }
-tc() { "${SUDO[@]}" /usr/sbin/tc "$@"; }
+IP_BIN="$(command -v ip)"
+TC_BIN="$(command -v tc || true)"
+ip() { "${SUDO[@]}" "$IP_BIN" "$@"; }
+tc() { "${SUDO[@]}" "${TC_BIN:-tc}" "$@"; }
 
 meta_ip() { printf '10.88.0.%s' "$((10 + $1))"; }     # 1 -> .11
 stor_ip() { printf '10.88.0.%s' "$((20 + $1))"; }     # 1 -> .21
@@ -49,10 +56,12 @@ write_conf() {
   mkdir -p "$dir"/{logs,pids,data}
   python3 - "$SRC_CONF" "$dir" "$role" "$ipaddr" "$(meta_addrs)" \
     "$ENABLE_DST_ONLY" "$ENABLE_PARTIAL_EDGE_AGG" "$GRAPH_WORKERS" \
-    "$STORAGE_WORKERS" "$BLOCK_CACHE_MB" "$TZ" <<'PY'
+    "$STORAGE_WORKERS" "$BLOCK_CACHE_MB" "$TZ" "$APPEND_PUSHDOWN_FLAGS" \
+    "$EXTRA_GRAPH_FLAGS" "$EXTRA_STORAGE_FLAGS" <<'PY'
 import sys
 from pathlib import Path
-src, dst, role, ipaddr, metas, dst_only, partial, gworkers, sworkers, cache, tz = sys.argv[1:]
+(src, dst, role, ipaddr, metas, dst_only, partial, gworkers, sworkers, cache, tz,
+ append_pushdown, extra_graph, extra_storage) = sys.argv[1:]
 src, dst = Path(src), Path(dst)
 name = {"meta": "nebula-metad", "storage": "nebula-storaged", "graph": "nebula-graphd"}[role]
 text = (src / f"{name}.conf.default").read_text()
@@ -76,10 +85,19 @@ text += f"\n--timezone_file={tz}\n"
 text += f"--rocksdb_block_cache={cache}\n"
 if role == "storage":
     text += f"--num_worker_threads={sworkers}\n"
+    if extra_storage:
+        text += extra_storage
+        if not extra_storage.endswith("\n"):
+            text += "\n"
 if role == "graph":
-    text += f"--enable_dst_only_edge_filter={dst_only}\n"
-    text += f"--enable_partial_edge_agg={partial}\n"
+    if append_pushdown == "true":
+        text += f"--enable_dst_only_edge_filter={dst_only}\n"
+        text += f"--enable_partial_edge_agg={partial}\n"
     text += f"--num_worker_threads={gworkers}\n"
+    if extra_graph:
+        text += extra_graph
+        if not extra_graph.endswith("\n"):
+            text += "\n"
 (dst / f"{name}.conf").write_text(text)
 print(f"conf {role} {ipaddr} -> {dst}")
 PY

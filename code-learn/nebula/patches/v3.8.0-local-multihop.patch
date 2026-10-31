@@ -1,0 +1,1254 @@
+diff --git a/conf/nebula-graphd.conf.default b/conf/nebula-graphd.conf.default
+index d57d3f8..9b70e5d 100644
+--- a/conf/nebula-graphd.conf.default
++++ b/conf/nebula-graphd.conf.default
+@@ -132,3 +132,13 @@
+ --optimize_appendvertices=false
+ # number of paths constructed by each thread
+ --path_batch_size=10000
++
++# Local multi-hop is off unless both the enable flag and an affinity estimate
++# are set. 3.8 has no partition-group metadata, so affinity defaults to 0.
++# --enable_local_multihop=false
++# --local_multihop_affinity=0.0
++# --local_multihop_affinity_threshold=0.6
++# --local_multihop_max_steps=3
++# --local_multihop_max_frontier=10000
++# --local_multihop_row_budget=1000000
++# --local_multihop_frontier_budget=10000
+diff --git a/conf/nebula-storaged.conf.default b/conf/nebula-storaged.conf.default
+index 0d29f55..8d64420 100644
+--- a/conf/nebula-storaged.conf.default
++++ b/conf/nebula-storaged.conf.default
+@@ -141,3 +141,7 @@
+ --memory_purge_enabled=true
+ # memory background purge interval in seconds
+ --memory_purge_interval_seconds=10
++
++# Set to false to emulate an old storaged: GetDstBySrc stays one hop and
++# multihop_applied is left unset so graphd falls back.
++# --storaged_accept_local_multihop=true
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index a86032b..27c7556 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -114,7 +114,11 @@ StorageRpcRespFuture<cpp2::GetNeighborsResponse> StorageClient::getNeighbors(
+ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     const CommonRequestParam& param,
+     const std::vector<Value>& vertices,
+-    const std::vector<EdgeType>& edgeTypes) {
++    const std::vector<EdgeType>& edgeTypes,
++    int32_t maxSteps,
++    int32_t minYieldStep,
++    int32_t rowBudget,
++    int32_t frontierBudget) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -137,6 +141,12 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     req.parts_ref() = std::move(c.second);
+     req.edge_types_ref() = edgeTypes;
+     req.common_ref() = common;
++    if (maxSteps > 1) {
++      req.max_steps_ref() = maxSteps;
++      req.min_yield_step_ref() = minYieldStep;
++      req.row_budget_ref() = rowBudget;
++      req.frontier_budget_ref() = frontierBudget;
++    }
+   }
+ 
+   return collectResponse(param.evb,
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index f60dc77..be02c52 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -81,10 +81,17 @@ class StorageClient
+       const Expression* filter = nullptr,
+       const Expression* tagFilter = nullptr);
+ 
++  // maxSteps <= 1 is the historical one-hop request. Larger values ask
++  // storaged to walk locally and set multihop_applied. Old storaged ignores
++  // the extra fields and leaves the bit unset.
+   StorageRpcRespFuture<cpp2::GetDstBySrcResponse> getDstBySrc(
+       const CommonRequestParam& param,
+       const std::vector<Value>& vertices,
+-      const std::vector<EdgeType>& edgeTypes);
++      const std::vector<EdgeType>& edgeTypes,
++      int32_t maxSteps = 1,
++      int32_t minYieldStep = 1,
++      int32_t rowBudget = 0,
++      int32_t frontierBudget = 0);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+diff --git a/src/common/algorithm/LocalMultiHop.h b/src/common/algorithm/LocalMultiHop.h
+new file mode 100644
+index 0000000..758b685
+--- /dev/null
++++ b/src/common/algorithm/LocalMultiHop.h
+@@ -0,0 +1,261 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef COMMON_ALGORITHM_LOCALMULTIHOP_H_
++#define COMMON_ALGORITHM_LOCALMULTIHOP_H_
++
++#include <cstdint>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++namespace nebula {
++namespace algorithm {
++
++// Gate used by Expand / ExpandAll. There is no OptRule: 3.8 already plans
++// multi-step GO as a hop loop inside the executor. This predicate is the
++// whole "should we collapse the loop" decision.
++inline bool shouldLocalMultiHop(bool enabled,
++                                double affinity,
++                                double affinityThreshold,
++                                int32_t hopsLeft,
++                                int32_t frontierSize,
++                                int32_t maxFrontier,
++                                int32_t maxSteps) {
++  if (!enabled) return false;
++  if (hopsLeft <= 1) return false;
++  if (frontierSize <= 0) return false;
++  if (maxFrontier > 0 && frontierSize > maxFrontier) return false;
++  if (maxSteps > 0 && hopsLeft > maxSteps) {
++    // Still worth a capped call. The caller clips the request to maxSteps
++    // and continues. Rejecting the whole query here would skip the affinity
++    // win on GO 4+ STEPS.
++  }
++  if (affinity < affinityThreshold) return false;
++  return true;
++}
++
++// How many hops to ask storage for. Never more than maxSteps, never more
++// than hopsLeft, and at least 1 when the caller has already decided to try.
++inline int32_t clipLocalMultiHopSteps(int32_t hopsLeft, int32_t maxSteps) {
++  if (hopsLeft < 1) return 0;
++  if (maxSteps > 0 && hopsLeft > maxSteps) return maxSteps;
++  return hopsLeft;
++}
++
++template <typename Vid>
++struct NeighborScan {
++  std::vector<Vid> dsts;
++  // A real storage error. Not the same as "this dst lives on another host".
++  bool failed{false};
++};
++
++template <typename Vid>
++struct LocalMultiHopResult {
++  std::vector<Vid> yielded;
++  std::vector<Vid> remoteVids;
++  std::vector<int32_t> remoteDepth;
++  // Local vids at depth stepsDone that still need expansion (budget, or the
++  // caller asked for more hops than maxSteps). Not yielded here.
++  std::vector<Vid> carry;
++  int32_t stepsDone{0};
++  bool truncated{false};
++  bool failed{false};
++};
++
++// Local BFS.
++// isLocal(vid) is true when this storaged leads vid's partition.
++// neighbors(vid) scans one vertex. A failed scan aborts the walk.
++// minYield > maxSteps means "walk maxSteps but yield nothing"; the last
++// local frontier is returned in carry.
++// maxOutDegree <= 0 disables the per-vertex degree cap (3.8's existing
++// per-vertex edge limit still applies inside the scan callback).
++// rowBudget / frontierBudget <= 0 disable those caps.
++template <typename Vid, typename IsLocal, typename Neighbors>
++LocalMultiHopResult<Vid> runLocalMultiHop(const std::vector<Vid>& starts,
++                                          int32_t maxSteps,
++                                          int32_t minYield,
++                                          int32_t rowBudget,
++                                          int32_t frontierBudget,
++                                          int32_t maxOutDegree,
++                                          IsLocal isLocal,
++                                          Neighbors neighbors) {
++  LocalMultiHopResult<Vid> result;
++  if (maxSteps <= 0) return result;
++
++  std::unordered_set<Vid> frontier(starts.begin(), starts.end());
++  int32_t scanned = 0;
++
++  // Dedup only inside one hop. The same vid reached again at a deeper hop
++  // is a different distance and must be expanded again, matching GetDstBySrc.
++  auto rememberRemote = [&](std::unordered_set<Vid>& seen, const Vid& vid, int32_t depth) {
++    if (seen.insert(vid).second) {
++      result.remoteVids.push_back(vid);
++      result.remoteDepth.push_back(depth);
++    }
++  };
++
++  for (int32_t step = 1; step <= maxSteps; ++step) {
++    if (frontier.empty()) {
++      result.stepsDone = step - 1;
++      return result;
++    }
++    std::unordered_set<Vid> next;
++    std::unordered_set<Vid> yieldedThisStep;
++    std::unordered_set<Vid> seenRemote;
++    bool budgetHit = false;
++    for (const auto& vid : frontier) {
++      if (!isLocal(vid)) {
++        rememberRemote(seenRemote, vid, step - 1);
++        continue;
++      }
++      NeighborScan<Vid> scan = neighbors(vid);
++      if (scan.failed) {
++        result.failed = true;
++        result.stepsDone = step - 1;
++        return result;
++      }
++      if (maxOutDegree > 0 && static_cast<int32_t>(scan.dsts.size()) > maxOutDegree) {
++        // Hand the vertex back unexpanded. Redo this hop on graphd so the
++        // cap does not drop edges the single-hop path would have returned.
++        result.truncated = true;
++        result.stepsDone = step - 1;
++        result.carry.assign(frontier.begin(), frontier.end());
++        result.remoteVids.clear();
++        result.remoteDepth.clear();
++        result.yielded.clear();
++        return result;
++      }
++      for (const auto& dst : scan.dsts) {
++        ++scanned;
++        if (rowBudget > 0 && scanned > rowBudget) {
++          budgetHit = true;
++          break;
++        }
++        if (!isLocal(dst)) {
++          rememberRemote(seenRemote, dst, step);
++          continue;
++        }
++        if (!next.insert(dst).second) {
++          continue;
++        }
++        if (step >= minYield && yieldedThisStep.insert(dst).second) {
++          result.yielded.push_back(dst);
++        }
++      }
++      if (budgetHit) break;
++    }
++    if (budgetHit) {
++      result.truncated = true;
++      result.stepsDone = step - 1;
++      result.carry.assign(frontier.begin(), frontier.end());
++      result.remoteVids.clear();
++      result.remoteDepth.clear();
++      result.yielded.clear();
++      return result;
++    }
++    result.stepsDone = step;
++    if (frontierBudget > 0 && static_cast<int32_t>(next.size()) > frontierBudget) {
++      result.truncated = true;
++      result.carry.assign(next.begin(), next.end());
++      return result;
++    }
++    frontier.swap(next);
++  }
++
++  if (minYield > maxSteps) {
++    result.carry.assign(frontier.begin(), frontier.end());
++  }
++  return result;
++}
++
++template <typename Vid>
++struct HopWave {
++  int32_t hopsLeft{0};
++  bool allowMulti{false};
++  std::vector<Vid> vids;
++};
++
++template <typename Vid>
++struct ConsumeResult {
++  std::vector<Vid> yieldNow;
++  std::vector<HopWave<Vid>> waves;
++};
++
++// Turn one storage response into "rows to emit" and "frontiers still to walk".
++// applied=false means the server ignored multi-hop fields (old storaged, or
++// storaged_accept_local_multihop=false) and dsts are a single hop.
++// truncated frontiers must not be sent back into multi-hop.
++template <typename Vid>
++ConsumeResult<Vid> consumeLocalMultiHop(int32_t hopsLeft,
++                                        bool yieldAll,
++                                        bool applied,
++                                        int32_t stepsDone,
++                                        bool truncated,
++                                        const std::vector<Vid>& dsts,
++                                        const std::vector<Vid>& remoteVids,
++                                        const std::vector<int32_t>& remoteDepth,
++                                        const std::vector<Vid>& carry) {
++  ConsumeResult<Vid> out;
++  auto push = [&](int32_t left, bool multi, const Vid& vid) {
++    if (left <= 0) {
++      out.yieldNow.push_back(vid);
++      return;
++    }
++    for (auto& wave : out.waves) {
++      if (wave.hopsLeft == left && wave.allowMulti == multi) {
++        wave.vids.push_back(vid);
++        return;
++      }
++    }
++    HopWave<Vid> wave;
++    wave.hopsLeft = left;
++    wave.allowMulti = multi;
++    wave.vids.push_back(vid);
++    out.waves.push_back(std::move(wave));
++  };
++
++  if (!applied) {
++    for (const auto& vid : dsts) {
++      if (yieldAll || hopsLeft <= 1) {
++        out.yieldNow.push_back(vid);
++      }
++      if (hopsLeft > 1) {
++        push(hopsLeft - 1, true, vid);
++      }
++    }
++    return out;
++  }
++
++  out.yieldNow = dsts;
++  const bool multi = !truncated;
++  auto handle = [&](const Vid& vid, int32_t depth) {
++    const int32_t left = hopsLeft - depth;
++    if (left > 0) {
++      if (yieldAll && depth > 0) {
++        out.yieldNow.push_back(vid);
++      }
++      push(left, multi, vid);
++    } else if (left == 0) {
++      out.yieldNow.push_back(vid);
++    }
++  };
++  const size_t n = std::min(remoteVids.size(), remoteDepth.size());
++  for (size_t i = 0; i < n; ++i) {
++    handle(remoteVids[i], remoteDepth[i]);
++  }
++  for (const auto& vid : carry) {
++    const int32_t left = hopsLeft - stepsDone;
++    if (left > 0) {
++      push(left, multi, vid);
++    }
++  }
++  return out;
++}
++
++}  // namespace algorithm
++}  // namespace nebula
++
++#endif  // COMMON_ALGORITHM_LOCALMULTIHOP_H_
+diff --git a/src/common/algorithm/test/CMakeLists.txt b/src/common/algorithm/test/CMakeLists.txt
+index ea38a32..51fd24e 100644
+--- a/src/common/algorithm/test/CMakeLists.txt
++++ b/src/common/algorithm/test/CMakeLists.txt
+@@ -8,3 +8,10 @@ nebula_add_test(
+     OBJECTS $<TARGET_OBJECTS:time_obj>
+     LIBRARIES gtest gtest_main
+ )
++
++nebula_add_test(
++    NAME local_multihop_test
++    SOURCES LocalMultiHopTest.cpp
++    OBJECTS $<TARGET_OBJECTS:base_obj>
++    LIBRARIES gtest gtest_main
++)
+diff --git a/src/common/algorithm/test/LocalMultiHopTest.cpp b/src/common/algorithm/test/LocalMultiHopTest.cpp
+new file mode 100644
+index 0000000..d0adef6
+--- /dev/null
++++ b/src/common/algorithm/test/LocalMultiHopTest.cpp
+@@ -0,0 +1,219 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <unordered_map>
++#include <unordered_set>
++
++#include "common/algorithm/LocalMultiHop.h"
++
++namespace nebula {
++namespace algorithm {
++namespace {
++
++using Graph = std::unordered_map<int64_t, std::vector<int64_t>>;
++
++std::unordered_set<int64_t> asSet(const std::vector<int64_t>& vals) {
++  return std::unordered_set<int64_t>(vals.begin(), vals.end());
++}
++
++NeighborScan<int64_t> scanOf(const Graph& graph, int64_t vid, bool failAt = false) {
++  NeighborScan<int64_t> scan;
++  if (failAt) {
++    scan.failed = true;
++    return scan;
++  }
++  auto it = graph.find(vid);
++  if (it != graph.end()) scan.dsts = it->second;
++  return scan;
++}
++
++TEST(LocalMultiHopDecisionTest, FlagAffinityFrontierAndSteps) {
++  EXPECT_FALSE(shouldLocalMultiHop(false, 1.0, 0.6, 3, 10, 10000, 3));
++  EXPECT_FALSE(shouldLocalMultiHop(true, 1.0, 0.6, 1, 10, 10000, 3));
++  EXPECT_FALSE(shouldLocalMultiHop(true, 0.0, 0.6, 3, 10, 10000, 3));
++  EXPECT_FALSE(shouldLocalMultiHop(true, 0.59, 0.6, 3, 10, 10000, 3));
++  EXPECT_FALSE(shouldLocalMultiHop(true, 1.0, 0.6, 3, 0, 10000, 3));
++  EXPECT_FALSE(shouldLocalMultiHop(true, 1.0, 0.6, 3, 10001, 10000, 3));
++  EXPECT_TRUE(shouldLocalMultiHop(true, 0.6, 0.6, 3, 10, 10000, 3));
++  // hopsLeft above maxSteps is still allowed; the request is clipped.
++  EXPECT_TRUE(shouldLocalMultiHop(true, 1.0, 0.6, 5, 10, 10000, 3));
++  EXPECT_EQ(3, clipLocalMultiHopSteps(5, 3));
++  EXPECT_EQ(2, clipLocalMultiHopSteps(2, 3));
++  EXPECT_EQ(0, clipLocalMultiHopSteps(0, 3));
++}
++
++TEST(LocalMultiHopTest, ThreeHopAllLocalYieldsOnlyFinal) {
++  Graph g{{1, {2, 3}}, {2, {4}}, {3, {4}}, {4, {5}}};
++  auto allLocal = [](int64_t) { return true; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(g, v); });
++  EXPECT_FALSE(result.failed);
++  EXPECT_FALSE(result.truncated);
++  EXPECT_EQ(3, result.stepsDone);
++  EXPECT_EQ(asSet({5}), asSet(result.yielded));
++  EXPECT_TRUE(result.remoteVids.empty());
++  EXPECT_TRUE(result.carry.empty());
++}
++
++TEST(LocalMultiHopTest, EmptyAndNoEdges) {
++  auto allLocal = [](int64_t) { return true; };
++  Graph empty;
++  auto none = runLocalMultiHop<int64_t>(
++      {}, 3, 3, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(empty, v); });
++  EXPECT_EQ(0, none.stepsDone);
++  EXPECT_TRUE(none.yielded.empty());
++
++  auto island = runLocalMultiHop<int64_t>(
++      {7}, 3, 3, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(empty, v); });
++  EXPECT_EQ(1, island.stepsDone);
++  EXPECT_TRUE(island.yielded.empty());
++  EXPECT_TRUE(island.remoteVids.empty());
++}
++
++TEST(LocalMultiHopTest, DedupWithinHopAndCycle) {
++  Graph multi{{1, {2, 2, 3}}, {2, {3}}, {3, {}}};
++  auto allLocal = [](int64_t) { return true; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 1, 1, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(multi, v); });
++  EXPECT_EQ(asSet({2, 3}), asSet(result.yielded));
++
++  Graph cycle{{1, {2}}, {2, {1}}};
++  auto two = runLocalMultiHop<int64_t>(
++      {1}, 2, 2, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(cycle, v); });
++  EXPECT_EQ(asSet({1}), asSet(two.yielded));
++  EXPECT_EQ(2, two.stepsDone);
++}
++
++TEST(LocalMultiHopTest, RemoteBoundaryStopsThatBranch) {
++  // 4 lives on another partition. 2 and 3 stay local and both point at 4.
++  Graph g{{1, {2, 3}}, {2, {4}}, {3, {4}}, {4, {5}}};
++  auto local = [](int64_t v) { return v != 4 && v != 5; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); });
++  EXPECT_FALSE(result.truncated);
++  EXPECT_TRUE(result.yielded.empty());
++  EXPECT_EQ(asSet({4}), asSet(result.remoteVids));
++  ASSERT_EQ(1, result.remoteDepth.size());
++  EXPECT_EQ(2, result.remoteDepth[0]);
++  EXPECT_EQ(2, result.stepsDone);
++}
++
++TEST(LocalMultiHopTest, SameVidAtTwoDepthsIsExpandedTwice) {
++  // 4 is remote both one hop and two hops from 1. GO 3 must still yield 5,
++  // which is only three hops on the longer path (1-2-4-5).
++  Graph g{{1, {2, 4}}, {2, {4}}, {4, {5}}};
++  auto local = [](int64_t v) { return v != 4 && v != 5; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 3, 0, 0, 0, local, [&](int64_t v) { return scanOf(g, v); });
++  ASSERT_EQ(2, result.remoteVids.size());
++  EXPECT_EQ(4, result.remoteVids[0]);
++  EXPECT_EQ(4, result.remoteVids[1]);
++  std::vector<int32_t> depths = result.remoteDepth;
++  std::sort(depths.begin(), depths.end());
++  EXPECT_EQ(std::vector<int32_t>({1, 2}), depths);
++  auto shallow = consumeLocalMultiHop<int64_t>(3, false, true, result.stepsDone, false,
++                                               result.yielded, result.remoteVids,
++                                               result.remoteDepth, result.carry);
++  bool sawOne = false;
++  bool sawTwo = false;
++  for (const auto& wave : shallow.waves) {
++    if (wave.hopsLeft == 2) sawTwo = true;
++    if (wave.hopsLeft == 1) sawOne = true;
++  }
++  EXPECT_TRUE(sawOne);
++  EXPECT_TRUE(sawTwo);
++}
++
++TEST(LocalMultiHopTest, YieldEveryHopForMToN) {
++  Graph g{{1, {2}}, {2, {3}}, {3, {4}}};
++  auto allLocal = [](int64_t) { return true; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 3, 1, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(g, v); });
++  EXPECT_EQ(asSet({2, 3, 4}), asSet(result.yielded));
++  EXPECT_EQ(3, result.stepsDone);
++}
++
++TEST(LocalMultiHopTest, CappedStepsReturnCarry) {
++  Graph g{{1, {2}}, {2, {3}}, {3, {4}}};
++  auto allLocal = [](int64_t) { return true; };
++  // minYield > maxSteps: walk 2 hops, yield nothing, carry the frontier.
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 2, 5, 0, 0, 0, allLocal, [&](int64_t v) { return scanOf(g, v); });
++  EXPECT_TRUE(result.yielded.empty());
++  EXPECT_EQ(2, result.stepsDone);
++  EXPECT_EQ(asSet({3}), asSet(result.carry));
++  EXPECT_FALSE(result.truncated);
++}
++
++TEST(LocalMultiHopTest, RowBudgetDropsPartialStep) {
++  Graph g{{1, {2, 3}}, {2, {4}}, {3, {5}}};
++  auto allLocal = [](int64_t) { return true; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 2, 2, /*rowBudget=*/1, 0, 0, allLocal, [&](int64_t v) { return scanOf(g, v); });
++  EXPECT_TRUE(result.truncated);
++  EXPECT_TRUE(result.yielded.empty());
++  EXPECT_EQ(asSet({1}), asSet(result.carry));
++  EXPECT_EQ(0, result.stepsDone);
++}
++
++TEST(LocalMultiHopTest, ScanFailureIsNotARemoteBoundary) {
++  Graph g{{1, {2}}};
++  auto allLocal = [](int64_t) { return true; };
++  auto result = runLocalMultiHop<int64_t>(
++      {1}, 2, 2, 0, 0, 0, allLocal, [&](int64_t) { return scanOf(g, 1, true); });
++  EXPECT_TRUE(result.failed);
++  EXPECT_TRUE(result.yielded.empty());
++  EXPECT_FALSE(result.truncated);
++}
++
++TEST(LocalMultiHopConsumeTest, OldServerIsOneHop) {
++  auto out = consumeLocalMultiHop<int64_t>(3, false, false, 0, false, {2, 3}, {}, {}, {});
++  EXPECT_TRUE(out.yieldNow.empty());
++  ASSERT_EQ(1, out.waves.size());
++  EXPECT_EQ(2, out.waves[0].hopsLeft);
++  EXPECT_TRUE(out.waves[0].allowMulti);
++  EXPECT_EQ(asSet({2, 3}), asSet(out.waves[0].vids));
++
++  auto last = consumeLocalMultiHop<int64_t>(1, false, false, 0, false, {9}, {}, {}, {});
++  EXPECT_EQ(asSet({9}), asSet(last.yieldNow));
++  EXPECT_TRUE(last.waves.empty());
++}
++
++TEST(LocalMultiHopConsumeTest, RemoteContinuesAndFinalRemoteIsYielded) {
++  auto mid = consumeLocalMultiHop<int64_t>(3, false, true, 2, false, {}, {4}, {2}, {});
++  EXPECT_TRUE(mid.yieldNow.empty());
++  ASSERT_EQ(1, mid.waves.size());
++  EXPECT_EQ(1, mid.waves[0].hopsLeft);
++  EXPECT_TRUE(mid.waves[0].allowMulti);
++  EXPECT_EQ(asSet({4}), asSet(mid.waves[0].vids));
++
++  auto done = consumeLocalMultiHop<int64_t>(3, false, true, 3, false, {5}, {9}, {3}, {});
++  EXPECT_EQ(asSet({5, 9}), asSet(done.yieldNow));
++  EXPECT_TRUE(done.waves.empty());
++}
++
++TEST(LocalMultiHopConsumeTest, MToNYieldsRemoteAtIntermediateDepth) {
++  auto out = consumeLocalMultiHop<int64_t>(3, true, true, 2, false, {2}, {8}, {1}, {});
++  EXPECT_EQ(asSet({2, 8}), asSet(out.yieldNow));
++  ASSERT_EQ(1, out.waves.size());
++  EXPECT_EQ(2, out.waves[0].hopsLeft);
++  EXPECT_EQ(asSet({8}), asSet(out.waves[0].vids));
++}
++
++TEST(LocalMultiHopConsumeTest, TruncatedCarryStaysOnSingleHop) {
++  auto out = consumeLocalMultiHop<int64_t>(3, false, true, 1, true, {}, {}, {}, {2, 3});
++  EXPECT_TRUE(out.yieldNow.empty());
++  ASSERT_EQ(1, out.waves.size());
++  EXPECT_FALSE(out.waves[0].allowMulti);
++  EXPECT_EQ(2, out.waves[0].hopsLeft);
++  EXPECT_EQ(asSet({2, 3}), asSet(out.waves[0].vids));
++}
++
++}  // namespace
++}  // namespace algorithm
++}  // namespace nebula
+diff --git a/src/graph/executor/query/ExpandAllExecutor.cpp b/src/graph/executor/query/ExpandAllExecutor.cpp
+index 73aa338..5139238 100644
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "graph/executor/query/ExpandAllExecutor.h"
+ 
++#include "common/algorithm/LocalMultiHop.h"
+ #include "common/algorithm/ReservoirSampling.h"
+ #include "graph/service/GraphFlags.h"
+ #include "graph/util/SchemaUtil.h"
+@@ -67,7 +68,29 @@ folly::Future<Status> ExpandAllExecutor::execute() {
+   return getNeighbors();
+ }
+ 
++folly::Future<Status> ExpandAllExecutor::driveDstWalk(std::shared_ptr<DstWalkState> state) {
++#include "graph/executor/query/LocalMultiHopDriveBody.inl"
++}
++
+ folly::Future<Status> ExpandAllExecutor::GetDstBySrc() {
++  const int32_t hops = static_cast<int32_t>(maxSteps_ - expand_->minSteps() + 1);
++  if (!joinInput_ && stepLimits_.empty() && !sample_ && currentStep_ == expand_->minSteps() &&
++      algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
++                                     FLAGS_local_multihop_affinity,
++                                     FLAGS_local_multihop_affinity_threshold,
++                                     hops,
++                                     static_cast<int32_t>(nextStepVids_.size()),
++                                     FLAGS_local_multihop_max_frontier,
++                                     FLAGS_local_multihop_max_steps)) {
++    auto state = std::make_shared<DstWalkState>();
++    state->yieldAll = true;
++    DstWalkState::Job job;
++    job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++    job.hopsLeft = hops;
++    job.allowMulti = true;
++    state->jobs.push_back(std::move(job));
++    return driveDstWalk(state);
++  }
+   currentStep_++;
+   time::Duration getDstTime;
+   StorageClient* storageClient = qctx_->getStorageClient();
+diff --git a/src/graph/executor/query/ExpandAllExecutor.h b/src/graph/executor/query/ExpandAllExecutor.h
+index 388d434..414bdb5 100644
+--- a/src/graph/executor/query/ExpandAllExecutor.h
++++ b/src/graph/executor/query/ExpandAllExecutor.h
+@@ -6,6 +6,7 @@
+ #define GRAPH_EXECUTOR_QUERY_EXPAND_ALL_H_
+ 
+ #include "graph/executor/StorageAccessExecutor.h"
++#include "graph/executor/query/LocalMultiHopDriver.h"
+ #include "graph/planner/plan/Query.h"
+ 
+ // The go statement is divided into two operators, expand operator and expandAll operator.
+@@ -61,6 +62,8 @@ class ExpandAllExecutor final : public StorageAccessExecutor {
+ 
+   folly::Future<Status> GetDstBySrc();
+ 
++  folly::Future<Status> driveDstWalk(std::shared_ptr<DstWalkState> state);
++
+   void getNeighborsFromCache(std::unordered_map<Value, std::unordered_set<Value>>& dst2VidsMap,
+                              std::unordered_set<Value>& visitedVids,
+                              std::vector<int64_t>& samples);
+diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
+index edb388f..775603b 100644
+--- a/src/graph/executor/query/ExpandExecutor.cpp
++++ b/src/graph/executor/query/ExpandExecutor.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "graph/executor/query/ExpandExecutor.h"
+ 
++#include "common/algorithm/LocalMultiHop.h"
+ #include "common/algorithm/ReservoirSampling.h"
+ #include "graph/service/GraphFlags.h"
+ #include "graph/util/SchemaUtil.h"
+@@ -66,7 +67,27 @@ folly::Future<Status> ExpandExecutor::execute() {
+   return GetDstBySrc();
+ }
+ 
++folly::Future<Status> ExpandExecutor::driveDstWalk(std::shared_ptr<DstWalkState> state) {
++#include "graph/executor/query/LocalMultiHopDriveBody.inl"
++}
++
+ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
++  if (currentStep_ == 0 && stepLimits_.empty() && !sample_ &&
++      algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
++                                     FLAGS_local_multihop_affinity,
++                                     FLAGS_local_multihop_affinity_threshold,
++                                     static_cast<int32_t>(maxSteps_),
++                                     static_cast<int32_t>(nextStepVids_.size()),
++                                     FLAGS_local_multihop_max_frontier,
++                                     FLAGS_local_multihop_max_steps)) {
++    auto state = std::make_shared<DstWalkState>();
++    DstWalkState::Job job;
++    job.vids.assign(nextStepVids_.begin(), nextStepVids_.end());
++    job.hopsLeft = static_cast<int32_t>(maxSteps_);
++    job.allowMulti = true;
++    state->jobs.push_back(std::move(job));
++    return driveDstWalk(state);
++  }
+   currentStep_++;
+   time::Duration getDstTime;
+   StorageClient* storageClient = qctx_->getStorageClient();
+diff --git a/src/graph/executor/query/ExpandExecutor.h b/src/graph/executor/query/ExpandExecutor.h
+index 8ac3dfa..0fcd86f 100644
+--- a/src/graph/executor/query/ExpandExecutor.h
++++ b/src/graph/executor/query/ExpandExecutor.h
+@@ -6,6 +6,7 @@
+ #define GRAPH_EXECUTOR_QUERY_EXPAND_H_
+ 
+ #include "graph/executor/StorageAccessExecutor.h"
++#include "graph/executor/query/LocalMultiHopDriver.h"
+ #include "graph/planner/plan/Query.h"
+ 
+ // The go statement is divided into two operators, expand operator and expandAll operator.
+@@ -43,6 +44,8 @@ class ExpandExecutor final : public StorageAccessExecutor {
+ 
+   folly::Future<Status> GetDstBySrc();
+ 
++  folly::Future<Status> driveDstWalk(std::shared_ptr<DstWalkState> state);
++
+   void getNeighborsFromCache(std::unordered_map<Value, std::unordered_set<Value>>& dst2VidMap,
+                              std::unordered_set<Value>& visitedVids,
+                              std::vector<int64_t>& samples);
+diff --git a/src/graph/executor/query/LocalMultiHopDriveBody.inl b/src/graph/executor/query/LocalMultiHopDriveBody.inl
+new file mode 100644
+index 0000000..9bc6daf
+--- /dev/null
++++ b/src/graph/executor/query/LocalMultiHopDriveBody.inl
+@@ -0,0 +1,148 @@
++// Included inside ExpandExecutor::driveDstWalk and ExpandAllExecutor::driveDstWalk.
++// Both classes provide expand_, handleCompleteness, qctx, runner, addState, finish.
++if (qctx()->isKilled()) {
++  return folly::makeFuture<Status>(Status::Error("Execution had been killed"));
++}
++while (!state->jobs.empty() && state->jobs.back().vids.empty()) {
++  state->jobs.pop_back();
++}
++if (state->jobs.empty()) {
++  DataSet ds;
++  ds.colNames = expand_->colNames();
++  if (state->yieldAll) {
++    ds.rows.reserve(state->yielded.size());
++    for (const auto& vid : state->yielded) {
++      Row row;
++      row.values.emplace_back(vid);
++      ds.rows.emplace_back(std::move(row));
++    }
++  } else {
++    ds.rows.reserve(state->finals.size());
++    for (const auto& vid : state->finals) {
++      Row row;
++      row.values.emplace_back(vid);
++      ds.rows.emplace_back(std::move(row));
++    }
++  }
++  finish(ResultBuilder().value(Value(std::move(ds))).build());
++  return folly::makeFuture<Status>(Status::OK());
++}
++
++auto job = std::move(state->jobs.back());
++state->jobs.pop_back();
++{
++  std::unordered_set<Value> uniq(job.vids.begin(), job.vids.end());
++  job.vids.assign(uniq.begin(), uniq.end());
++}
++if (job.hopsLeft <= 0) {
++  if (state->yieldAll) {
++    state->yielded.insert(state->yielded.end(), job.vids.begin(), job.vids.end());
++  } else {
++    state->finals.insert(job.vids.begin(), job.vids.end());
++  }
++  return driveDstWalk(state);
++}
++
++const bool multi =
++    job.allowMulti && algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
++                                                     FLAGS_local_multihop_affinity,
++                                                     FLAGS_local_multihop_affinity_threshold,
++                                                     job.hopsLeft,
++                                                     static_cast<int32_t>(job.vids.size()),
++                                                     FLAGS_local_multihop_max_frontier,
++                                                     FLAGS_local_multihop_max_steps);
++const int32_t reqSteps =
++    multi ? algorithm::clipLocalMultiHopSteps(job.hopsLeft, FLAGS_local_multihop_max_steps) : 1;
++int32_t minYield = state->yieldAll ? 1 : job.hopsLeft;
++if (multi && minYield > reqSteps) {
++  minYield = reqSteps + 1;
++}
++
++time::Duration rpcTime;
++StorageClient* storageClient = qctx_->getStorageClient();
++StorageClient::CommonRequestParam param(expand_->space(),
++                                        qctx_->rctx()->session()->id(),
++                                        qctx_->plan()->id(),
++                                        qctx_->plan()->isProfileEnabled());
++const int32_t rpcIndex = state->rpc++;
++return storageClient
++    ->getDstBySrc(param,
++                  job.vids,
++                  expand_->edgeTypes(),
++                  reqSteps,
++                  minYield,
++                  FLAGS_local_multihop_row_budget,
++                  FLAGS_local_multihop_frontier_budget)
++    .via(runner())
++    .ensure([this, rpcTime]() {
++      SCOPED_TIMER(&execTime_);
++      addState("total_rpc_time", rpcTime);
++    })
++    .thenValue([this, state, job, multi, rpcIndex](auto&& resps) {
++      memory::MemoryCheckGuard guard;
++      SCOPED_TIMER(&execTime_);
++      auto& hostLatency = resps.hostLatency();
++      for (size_t i = 0; i < hostLatency.size(); ++i) {
++        size_t size = 0;
++        auto& one = resps.responses()[i];
++        if (one.dsts_ref().has_value()) {
++          size = one.get_dsts()->rows.size();
++        }
++        auto info = util::collectRespProfileData(one.result, hostLatency[i], size);
++        addState(folly::sformat("step{} resp [{}]", rpcIndex, i), info);
++      }
++      auto completeness = handleCompleteness(resps, FLAGS_accept_partial_success);
++      if (!completeness.ok()) {
++        return folly::makeFuture<Status>(completeness.status());
++      }
++      for (auto& one : resps.responses()) {
++        const bool applied = multi && one.multihop_applied_ref().value_or(false);
++        std::vector<Value> dsts;
++        if (one.dsts_ref().has_value()) {
++          for (const auto& row : one.get_dsts()->rows) {
++            if (!row.values.empty()) dsts.push_back(row.values[0]);
++          }
++        }
++        std::vector<Value> remote;
++        std::vector<int32_t> depth;
++        std::vector<Value> carry;
++        int32_t stepsDone = 0;
++        bool truncated = false;
++        if (applied) {
++          if (one.remote_vids_ref().has_value()) remote = one.remote_vids_ref().value();
++          if (one.remote_depth_ref().has_value()) depth = one.remote_depth_ref().value();
++          if (one.carry_vids_ref().has_value()) carry = one.carry_vids_ref().value();
++          stepsDone = one.steps_done_ref().value_or(0);
++          truncated = one.truncated_ref().value_or(false);
++          addState(folly::sformat("local_multihop[{}]", rpcIndex),
++                   folly::sformat("applied=1 steps_done={} remote={} carry={} truncated={}",
++                                  stepsDone,
++                                  remote.size(),
++                                  carry.size(),
++                                  truncated ? 1 : 0));
++        }
++        auto consumed = algorithm::consumeLocalMultiHop<Value>(job.hopsLeft,
++                                                              state->yieldAll,
++                                                              applied,
++                                                              stepsDone,
++                                                              truncated,
++                                                              dsts,
++                                                              remote,
++                                                              depth,
++                                                              carry);
++        if (state->yieldAll) {
++          state->yielded.insert(
++              state->yielded.end(), consumed.yieldNow.begin(), consumed.yieldNow.end());
++        } else {
++          state->finals.insert(consumed.yieldNow.begin(), consumed.yieldNow.end());
++        }
++        for (auto& wave : consumed.waves) {
++          DstWalkState::Job next;
++          next.vids = std::move(wave.vids);
++          next.hopsLeft = wave.hopsLeft;
++          next.allowMulti = wave.allowMulti;
++          state->jobs.push_back(std::move(next));
++        }
++      }
++      return driveDstWalk(state);
++    });
+diff --git a/src/graph/executor/query/LocalMultiHopDriver.h b/src/graph/executor/query/LocalMultiHopDriver.h
+new file mode 100644
+index 0000000..0db07d5
+--- /dev/null
++++ b/src/graph/executor/query/LocalMultiHopDriver.h
+@@ -0,0 +1,34 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_EXECUTOR_QUERY_LOCALMULTIHOPDRIVER_H_
++#define GRAPH_EXECUTOR_QUERY_LOCALMULTIHOPDRIVER_H_
++
++#include <cstdint>
++#include <unordered_set>
++#include <vector>
++
++#include "common/datatypes/Value.h"
++
++namespace nebula {
++namespace graph {
++
++struct DstWalkState {
++  struct Job {
++    std::vector<Value> vids;
++    int32_t hopsLeft{0};
++    bool allowMulti{true};
++  };
++  std::vector<Job> jobs;
++  std::unordered_set<Value> finals;
++  std::vector<Value> yielded;
++  bool yieldAll{false};
++  int32_t rpc{0};
++};
++
++}  // namespace graph
++}  // namespace nebula
++
++#endif
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 662d7a5..343d3e6 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -111,6 +111,32 @@ DEFINE_int32(min_batch_size,
+              "max_job_size is greater than 1.");
+ DEFINE_int32(max_job_size, 1, "The max job size in multi job mode.");
+ 
++DEFINE_bool(enable_local_multihop,
++            false,
++            "Collapse a multi-step GO dst walk into one GetDstBySrc when the "
++            "affinity estimate is high enough. Default off.");
++DEFINE_double(local_multihop_affinity,
++              0.0,
++              "Static affinity estimate in [0,1]. 3.8 meta has no partition "
++              "group, so the default 0 keeps single-hop even if the enable "
++              "flag is on.");
++DEFINE_double(local_multihop_affinity_threshold,
++              0.6,
++              "Minimum affinity required before local multi-hop is attempted.");
++DEFINE_int32(local_multihop_max_steps,
++             3,
++             "Maximum hops requested in one local multi-hop RPC. Longer GO "
++             "walks are clipped and continued.");
++DEFINE_int32(local_multihop_max_frontier,
++             10000,
++             "Skip local multi-hop when the frontier is larger than this.");
++DEFINE_int32(local_multihop_row_budget,
++             1000000,
++             "Edge scans allowed inside one local multi-hop RPC.");
++DEFINE_int32(local_multihop_frontier_budget,
++             10000,
++             "Local frontier size that forces the rest of the walk back to graphd.");
++
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+     gc_worker_size,
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index 8713911..8cc534f 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -74,4 +74,14 @@ DECLARE_uint32(gc_worker_size);
+ 
+ DECLARE_bool(graph_use_vertex_key);
+ 
++// Local multi-hop. Default off. 3.8 has no partition-group metadata, so
++// affinity stays 0 unless set explicitly and the executor keeps single-hop.
++DECLARE_bool(enable_local_multihop);
++DECLARE_double(local_multihop_affinity);
++DECLARE_double(local_multihop_affinity_threshold);
++DECLARE_int32(local_multihop_max_steps);
++DECLARE_int32(local_multihop_max_frontier);
++DECLARE_int32(local_multihop_row_budget);
++DECLARE_int32(local_multihop_frontier_budget);
++
+ #endif  // GRAPH_GRAPHFLAGS_H_
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index 2a95ba3..af44c23 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -247,12 +247,30 @@ struct GetDstBySrcRequest {
+         (cpp.template = "std::unordered_map")   parts,
+     3: list<common.EdgeType>                    edge_types,
+     4: optional RequestCommon                   common,
++    // Optional local multi-hop. Absent or <= 1 keeps the historical one-hop
++    // reply. An old storaged ignores these fields; graphd then treats the
++    // reply as one hop because multihop_applied is not set.
++    5: optional i32                               max_steps,
++    6: optional i32                               min_yield_step,
++    7: optional i32                               row_budget,
++    8: optional i32                               frontier_budget,
+ }
+ 
+ struct GetDstBySrcResponse {
+     1: required ResponseCommon                  result,
+     // Only one dst column, each row is a dst
+     2: optional common.DataSet                  dsts,
++    // Dsts whose partition leader is not this storaged, with the hop depth
++    // at which they were reached (1-based within this request).
++    3: optional list<common.Value>              remote_vids,
++    4: optional list<i32>                       remote_depth,
++    5: optional i32                               steps_done,
++    6: optional bool                              truncated,
++    // Set only when this process actually walked max_steps. Old binaries
++    // leave it unset.
++    7: optional bool                              multihop_applied,
++    // Local vids at depth steps_done that were not expanded further.
++    8: optional list<common.Value>              carry_vids,
+ }
+ 
+ 
+diff --git a/src/storage/StorageFlags.cpp b/src/storage/StorageFlags.cpp
+index bd10019..9432e40 100644
+--- a/src/storage/StorageFlags.cpp
++++ b/src/storage/StorageFlags.cpp
+@@ -48,3 +48,8 @@ DEFINE_bool(query_concurrently,
+             "go are supported");
+ 
+ DEFINE_bool(use_vertex_key, false, "whether allow insert or query the vertex key");
++
++DEFINE_bool(storaged_accept_local_multihop,
++            true,
++            "Honor GetDstBySrcRequest.max_steps. Turn off to emulate an old "
++            "storaged that only returns one hop and does not set multihop_applied.");
+diff --git a/src/storage/StorageFlags.h b/src/storage/StorageFlags.h
+index 197f931..990eb69 100644
+--- a/src/storage/StorageFlags.h
++++ b/src/storage/StorageFlags.h
+@@ -36,4 +36,8 @@ DECLARE_bool(query_concurrently);
+ 
+ DECLARE_bool(use_vertex_key);
+ 
++// When false, GetDstBySrc ignores max_steps and answers one hop without
++// setting multihop_applied. That is the old-storaged behavior.
++DECLARE_bool(storaged_accept_local_multihop);
++
+ #endif  // STORAGE_STORAGEFLAGS_H_
+diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
+index 9c89662..4b3e205 100644
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -10,6 +10,8 @@
+ #include "common/memory/MemoryTracker.h"
+ #include "common/thread/GenericThreadPool.h"
+ #include "storage/StorageFlags.h"
++#include "common/algorithm/LocalMultiHop.h"
++#include "kvstore/NebulaStore.h"
+ #include "storage/exec/EdgeNode.h"
+ #include "storage/exec/GetDstBySrcNode.h"
+ 
+@@ -59,6 +61,11 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+     return;
+   }
+ 
++  if (FLAGS_storaged_accept_local_multihop && req.max_steps_ref().value_or(1) > 1) {
++    runMultiHop(req);
++    return;
++  }
++
+   if (!FLAGS_query_concurrently) {
+     runInSingleThread(req);
+   } else {
+@@ -66,6 +73,127 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+   }
+ }
+ 
++void GetDstBySrcProcessor::runMultiHop(const cpp2::GetDstBySrcRequest& req) {
++  memory::MemoryCheckGuard guard;
++  auto partsNumRet = env_->metaClient_->partsNum(spaceId_);
++  if (!partsNumRet.ok()) {
++    for (const auto& partEntry : req.get_parts()) {
++      pushResultCode(nebula::cpp2::ErrorCode::E_SPACE_NOT_FOUND, partEntry.first);
++    }
++    onFinished();
++    return;
++  }
++  const int32_t numParts = partsNumRet.value();
++  const int32_t maxSteps = *req.get_max_steps();
++  const int32_t minYield = req.min_yield_step_ref().value_or(maxSteps);
++  const int32_t rowBudget = req.row_budget_ref().value_or(0);
++  const int32_t frontierBudget = req.frontier_budget_ref().value_or(0);
++  auto* store = dynamic_cast<kvstore::NebulaStore*>(env_->kvstore_);
++
++  auto keyOf = [this](const Value& vid) {
++    if (this->isIntId_) {
++      int64_t raw = vid.getInt();
++      return std::string(reinterpret_cast<const char*>(&raw), sizeof(raw));
++    }
++    return vid.getStr();
++  };
++  auto asValue = [this](const Value& vid) {
++    if (this->isIntId_ && vid.isStr() && vid.getStr().size() == sizeof(int64_t)) {
++      int64_t raw = 0;
++      memcpy(&raw, vid.getStr().data(), sizeof(raw));
++      return Value(raw);
++    }
++    return vid;
++  };
++  auto isLocal = [&](const Value& vid) {
++    if (store == nullptr) return false;
++    auto part = env_->metaClient_->partId(numParts, keyOf(vid));
++    return store->isLeader(spaceId_, part);
++  };
++
++  std::vector<Value> starts;
++  bool leaderMiss = false;
++  for (const auto& partEntry : req.get_parts()) {
++    for (const auto& src : partEntry.second) {
++      Value vid = asValue(src);
++      if (!isLocal(vid)) {
++        auto part = env_->metaClient_->partId(numParts, keyOf(vid));
++        handleLeaderChanged(spaceId_, part);
++        leaderMiss = true;
++      } else {
++        starts.emplace_back(std::move(vid));
++      }
++    }
++  }
++  if (leaderMiss) {
++    onFinished();
++    return;
++  }
++
++  contexts_.emplace_back(RuntimeContext(planContext_.get()));
++  std::deque<Value> buf;
++  auto plan = buildPlan(&contexts_.front(), &buf);
++  PartitionID failedPart = 0;
++  nebula::cpp2::ErrorCode failedCode = nebula::cpp2::ErrorCode::SUCCEEDED;
++  auto neighbors = [&](const Value& vid) {
++    algorithm::NeighborScan<Value> scan;
++    if (failedCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
++      scan.failed = true;
++      return scan;
++    }
++    buf.clear();
++    auto key = keyOf(vid);
++    auto part = env_->metaClient_->partId(numParts, key);
++    auto code = plan.go(part, key);
++    if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++      failedCode = code;
++      failedPart = part;
++      handleErrorCode(code, spaceId_, part);
++      scan.failed = true;
++      return scan;
++    }
++    scan.dsts.assign(buf.begin(), buf.end());
++    return scan;
++  };
++
++  auto walked = algorithm::runLocalMultiHop<Value>(starts,
++                                                   maxSteps,
++                                                   minYield,
++                                                   rowBudget,
++                                                   frontierBudget,
++                                                   /*maxOutDegree=*/0,
++                                                   isLocal,
++                                                   neighbors);
++  if (walked.failed || failedCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
++    onFinished();
++    return;
++  }
++
++  const auto remoteCount = static_cast<int32_t>(walked.remoteVids.size());
++  const auto stepsDone = walked.stepsDone;
++  resultDataSet_.rows.clear();
++  resultDataSet_.rows.reserve(walked.yielded.size());
++  for (const auto& vid : walked.yielded) {
++    resultDataSet_.rows.emplace_back(Row({vid}));
++  }
++  resp_.dsts_ref() = std::move(resultDataSet_);
++  if (!walked.remoteVids.empty()) {
++    resp_.remote_vids_ref() = std::move(walked.remoteVids);
++    resp_.remote_depth_ref() = std::move(walked.remoteDepth);
++  }
++  if (!walked.carry.empty()) {
++    resp_.carry_vids_ref() = std::move(walked.carry);
++  }
++  resp_.steps_done_ref() = stepsDone;
++  resp_.truncated_ref() = walked.truncated;
++  resp_.multihop_applied_ref() = true;
++  if (UNLIKELY(profileDetailFlag_)) {
++    profileDetail("LocalMultiHopSteps", stepsDone);
++    profileDetail("LocalMultiHopRemote", remoteCount);
++  }
++  onFinished();
++}
++
+ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req) {
+   memory::MemoryCheckGuard guard;
+   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
+index 11e9944..1e3e236 100644
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -42,6 +42,8 @@ class GetDstBySrcProcessor
+  private:
+   void doProcess(const cpp2::GetDstBySrcRequest& req);
+ 
++  void runMultiHop(const cpp2::GetDstBySrcRequest& req);
++
+   nebula::cpp2::ErrorCode buildEdgeContext(const cpp2::GetDstBySrcRequest& req);
+ 
+   void runInSingleThread(const cpp2::GetDstBySrcRequest& req);
+diff --git a/tests/tck/features/go/LocalMultiHop.feature b/tests/tck/features/go/LocalMultiHop.feature
+new file mode 100644
+index 0000000..dee8a34
+--- /dev/null
++++ b/tests/tck/features/go/LocalMultiHop.feature
+@@ -0,0 +1,57 @@
++# Copyright (c) 2026 vesoft inc. All rights reserved.
++#
++# This source code is licensed under Apache 2.0 License.
++#
++# Run against a v3.8.0 build with --enable_local_multihop=true and
++# --local_multihop_affinity=1. The python runner is
++# code-learn/nebula/bench/local_multihop/run_tck.py. Filter scenarios stay on
++# the existing GetNeighbors path; the runner checks the result, not a new plan node.
++Feature: Local multi-hop dst walk
++
++  Background:
++    Given space local_multihop_tck partition_num=3 vid_type=INT64
++    And edge know(w int)
++    # vids with vid % 3 == 0 share partition 1. vid 4,7,10 are partition 2.
++    And edges 3->6@0, 3->6@1, 6->9, 6->15, 9->12, 3->4, 4->7, 7->10
++
++  Scenario: three steps yields only the final dst and dedups ranks
++    When query:
++      """
++      GO 3 STEPS FROM 3 OVER know YIELD DISTINCT know._dst AS dst
++      """
++    Then the result should be, in any order:
++      | dst |
++      | 12  |
++      | 10  |
++
++  Scenario: m to n yields every depth in the range
++    When query:
++      """
++      GO 2 TO 3 STEPS FROM 3 OVER know YIELD DISTINCT know._dst AS dst
++      """
++    Then the result should be, in any order:
++      | dst |
++      | 9   |
++      | 15  |
++      | 7   |
++      | 12  |
++      | 10  |
++
++  Scenario: empty frontier
++    When query:
++      """
++      GO 3 STEPS FROM 100 OVER know YIELD DISTINCT know._dst AS dst
++      """
++    Then the result should be, in any order:
++      | dst |
++
++  Scenario: edge filter stays correct
++    When query:
++      """
++      GO 2 STEPS FROM 3 OVER know WHERE know.w > 0 YIELD DISTINCT know._dst AS dst
++      """
++    Then the result should be, in any order:
++      | dst |
++      | 9   |
++      | 15  |
++      | 7   |

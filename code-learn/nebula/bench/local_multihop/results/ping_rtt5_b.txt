@@ -1,0 +1,5 @@
+PING 10.88.0.21 (10.88.0.21) 56(84) bytes of data.
+
+--- 10.88.0.21 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 959ms
+rtt min/avg/max/mdev = 5.125/5.319/5.466/0.115 ms
