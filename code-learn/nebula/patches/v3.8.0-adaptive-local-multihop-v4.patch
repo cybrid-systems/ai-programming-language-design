@@ -1,0 +1,596 @@
+--- a/conf/nebula-graphd.conf.default	2026-10-31 06:14:42.599458955 +0000
++++ b/conf/nebula-graphd.conf.default	2026-10-31 07:02:55.843963437 +0000
+@@ -157,3 +157,10 @@
+ # v3 batches multihop partitions by leader and reads the heartbeat sample.
+ # --local_multihop_host_batch=true
+ # --local_multihop_heartbeat_prior=true
++# v4 skips probes when the heartbeat ratio is outside [prior_low, prior_high).
++# Any baseline part collapses the query to one baseline RPC.
++# --local_multihop_skip_confident_explore=true
++# --local_multihop_collapse_mixed=true
++# --local_multihop_prior_high=0.8
++# --local_multihop_prior_low=0.4
++# --local_multihop_prior_stale_ms=30000
+--- a/conf/nebula-storaged.conf.default	2026-10-31 06:14:42.599458955 +0000
++++ b/conf/nebula-storaged.conf.default	2026-10-31 06:53:04.819155748 +0000
+@@ -145,8 +145,11 @@
+ # Set to false to emulate an old storaged: GetDstBySrc stays one hop and
+ # multihop_applied is left unset so graphd falls back.
+ # --storaged_accept_local_multihop=true
+-# Background sample of per-part local-dst ratio, published on heartbeat.
+-# interval 0 disables the scan. Each pass is capped by edges and parts.
++# Background sample of per-part out-edge local-dst ratio, published on heartbeat.
++# interval 0 disables the scan. A part that fits in sample_scan publishes the
++# exact ratio. A larger part publishes a reservoir of sample_edges drawn from
++# the out-edges visited. sample_parts caps leader parts per pass.
+ # --local_dst_ratio_sample_interval_secs=10
+ # --local_dst_ratio_sample_edges=64
++# --local_dst_ratio_sample_scan=4096
+ # --local_dst_ratio_sample_parts=32
+--- a/src/clients/meta/MetaClient.cpp	2026-10-31 06:14:42.595458969 +0000
++++ b/src/clients/meta/MetaClient.cpp	2026-10-31 06:50:58.615622678 +0000
+@@ -2689,9 +2689,22 @@
+         metadLastUpdateTime_ = resp.get_last_update_time_in_ms();
+         VLOG(1) << "Metad last update time: " << metadLastUpdateTime_;
+         metaServerVersion_ = resp.get_meta_version();
+-        if (resp.local_dst_ratio_ref().has_value()) {
++        if (resp.local_dst_ratio_ref().has_value() && !resp.local_dst_ratio_ref().value().empty()) {
++          int32_t nParts = 0;
++          double minRatio = 1;
++          double maxRatio = 0;
+           folly::SharedMutex::WriteHolder holder(localDstRatioLock_);
+-          localDstRatio_ = resp.local_dst_ratio_ref().value();
++          for (const auto& spaceEntry : resp.local_dst_ratio_ref().value()) {
++            for (const auto& partEntry : spaceEntry.second) {
++              localDstRatio_[spaceEntry.first][partEntry.first] = partEntry.second;
++              ++nParts;
++              if (partEntry.second < minRatio) minRatio = partEntry.second;
++              if (partEntry.second > maxRatio) maxRatio = partEntry.second;
++            }
++          }
++          localDstRatioAtMs_ = time::WallClock::fastNowInMilliSec();
++          LOG(INFO) << "local_dst_ratio_hb parts=" << nParts << " min=" << minRatio
++                    << " max=" << maxRatio;
+         }
+ 
+         bool succeeded = resp.get_code() == nebula::cpp2::ErrorCode::SUCCEEDED;
+@@ -2710,6 +2723,14 @@
+   localDstRatioToSend_ = std::move(sample);
+ }
+ 
++bool MetaClient::localDstRatioFresh(int64_t maxAgeMs) const {
++  folly::SharedMutex::ReadHolder holder(localDstRatioLock_);
++  if (localDstRatioAtMs_ <= 0) return false;
++  if (maxAgeMs <= 0) return true;
++  const int64_t now = time::WallClock::fastNowInMilliSec();
++  return now - localDstRatioAtMs_ <= maxAgeMs;
++}
++
+ StatusOr<double> MetaClient::localDstRatio(GraphSpaceID spaceId, PartitionID partId) const {
+   folly::SharedMutex::ReadHolder holder(localDstRatioLock_);
+   auto space = localDstRatio_.find(spaceId);
+--- a/src/clients/meta/MetaClient.h	2026-10-31 06:14:42.595458969 +0000
++++ b/src/clients/meta/MetaClient.h	2026-10-31 06:15:05.935372841 +0000
+@@ -669,7 +669,10 @@
+   // Storaged sample that the next heartbeat will send.
+   void publishLocalDstRatio(LocalDstRatioMap sample);
+   // Latest sample echoed by metad. Empty until a heartbeat returns it.
++  // Incoming heartbeats merge into the cache. An empty reply does not wipe it,
++  // so a meta leader change does not drop graphd's last view.
+   StatusOr<double> localDstRatio(GraphSpaceID spaceId, PartitionID partId) const;
++  bool localDstRatioFresh(int64_t maxAgeMs) const;
+ 
+   std::string getLocalIp() {
+     return options_.localHost_.toString();
+@@ -875,6 +878,7 @@
+   mutable folly::SharedMutex localDstRatioLock_;
+   LocalDstRatioMap localDstRatio_;
+   LocalDstRatioMap localDstRatioToSend_;
++  int64_t localDstRatioAtMs_{0};
+ };
+ 
+ }  // namespace meta
+--- a/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 06:14:42.591458984 +0000
++++ b/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 07:15:35.855929193 +0000
+@@ -81,6 +81,14 @@
+   // minLocalRatio. A hop-1 streak tries multihop again when the sample is
+   // back at the threshold, without waiting for epsilon.
+   bool usePrior{false};
++  // Confident priors skip epsilon. Between priorLow and priorHigh the
++  // sample is uncertain and exploration stays on.
++  bool skipConfidentExplore{false};
++  // A mixed plan does not shorten the critical path: baseline parts still
++  // take one wave per hop. Collapse that plan to a single baseline RPC.
++  bool collapseMixed{false};
++  double priorHigh{0.8};
++  double priorLow{0.4};
+ };
+ 
+ struct AdaptiveSnapshot {
+@@ -110,8 +118,13 @@
+     std::lock_guard<std::mutex> guard(mu_);
+     const Slot& slot = slots_[shape];
+     bool exploit = exploitOf(slot, shape, cfg, hasPrior, priorRatio);
+-    const double rate = clampRate(cfg.exploreRate);
+-    if (draw < rate) return !exploit;
++    const bool priorOk = cfg.usePrior && hasPrior && priorRatio >= 0.0;
++    const bool confident = cfg.skipConfidentExplore && priorOk &&
++                           (priorRatio >= cfg.priorHigh || priorRatio <= cfg.priorLow);
++    if (!confident) {
++      const double rate = clampRate(cfg.exploreRate);
++      if (draw < rate) return !exploit;
++    }
+     return exploit;
+   }
+ 
+@@ -235,6 +248,17 @@
+                         bool hasPrior,
+                         double priorRatio) {
+     const bool priorOk = cfg.usePrior && hasPrior && priorRatio >= 0.0;
++    // A confident heartbeat sample is the decision, including after this
++    // part has baseline samples. Otherwise one baseline observation falls
++    // through to "try multi again" and a skipped explore locks that in.
++    if (cfg.skipConfidentExplore && priorOk && priorRatio <= cfg.priorLow) {
++      return false;
++    }
++    if (cfg.skipConfidentExplore && priorOk && priorRatio >= cfg.priorHigh) {
++      // Trust the sample. A hop-1 streak from the previous distribution
++      // must not stick, or the part can never walk again to clear it.
++      return true;
++    }
+     if (slot.multiN == 0 && slot.baseN == 0) {
+       if (priorOk && priorRatio < cfg.minLocalRatio) return false;
+       return true;
+@@ -270,8 +294,10 @@
+       const double extra = (1.0 - ratio) * (steps - 1.0);
+       return saved * rtt > extra * rtt;
+     }
+-    // Baseline samples only. Distribution may have changed, and the guard
+-    // bounds a wrong multi-hop try. Try it again; epsilon covers the rest.
++    // Baseline samples only. A prior under the guard threshold will early-stop,
++    // so retrying multihop does not shorten the critical path. Without that
++    // prior, try multihop again; epsilon covers the rest.
++    if (cfg.skipConfidentExplore && priorOk && priorRatio < cfg.minLocalRatio) return false;
+     return true;
+   }
+ 
+@@ -338,6 +364,49 @@
+ // Multihop parts that share a leader host share one RPC when hostBatch is set.
+ // An empty host key stays alone. Every baseline part shares one single-hop
+ // RPC: that request does not run the guard, so mixing those parts is safe.
++// Algorithm R. drawIn1ToSeen is uniform on [1, seen] after this item is counted.
++// Values outside 1..keep leave an already-full reservoir unchanged.
++inline void reservoirConsider(std::vector<char>& slot,
++                             int32_t& seen,
++                             int32_t& localCount,
++                             bool isLocal,
++                             int32_t keep,
++                             int32_t drawIn1ToSeen) {
++  ++seen;
++  if (keep < 1) keep = 1;
++  if (static_cast<int32_t>(slot.size()) < keep) {
++    slot.push_back(isLocal ? 1 : 0);
++    if (isLocal) ++localCount;
++    return;
++  }
++  if (drawIn1ToSeen >= 1 && drawIn1ToSeen <= keep) {
++    if (slot[drawIn1ToSeen - 1]) --localCount;
++    slot[drawIn1ToSeen - 1] = isLocal ? 1 : 0;
++    if (isLocal) ++localCount;
++  }
++}
++
++struct PartDecision {
++  int32_t part{0};
++  bool multi{false};
++  bool confident{false};
++};
++
++// A mixed plan does not shorten the critical path: any baseline part still
++// takes one wave per hop, and multihop parts that miss the guard add more
++// waves. Collapse the query to one baseline RPC. All-multihop stays.
++inline void reconcilePartChoices(std::vector<PartDecision>& parts, bool collapseMixed) {
++  if (!collapseMixed) return;
++  bool anyMulti = false;
++  bool anyBase = false;
++  for (const auto& part : parts) {
++    if (part.multi) anyMulti = true;
++    else anyBase = true;
++  }
++  if (!(anyMulti && anyBase)) return;
++  for (auto& part : parts) part.multi = false;
++}
++
+ inline std::vector<RpcGroup> hostBatchGroups(const std::vector<int32_t>& parts,
+                                             const std::vector<char>& multi,
+                                             const std::vector<std::string>& hosts,
+--- a/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 06:14:42.591458984 +0000
++++ b/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 07:15:35.851929212 +0000
+@@ -583,6 +583,96 @@
+   EXPECT_TRUE(ctl.choose(shape, cfg, 0.5, true, 0.95));
+ }
+ 
++TEST(AdaptiveMultiHopTest, ReservoirReplacesByDraw) {
++  std::vector<char> slot;
++  int32_t seen = 0;
++  int32_t local = 0;
++  reservoirConsider(slot, seen, local, true, 2, 1);
++  reservoirConsider(slot, seen, local, true, 2, 1);
++  EXPECT_EQ(2, seen);
++  EXPECT_EQ(2, local);
++  reservoirConsider(slot, seen, local, false, 2, 1);
++  EXPECT_EQ(3, seen);
++  EXPECT_EQ(1, local);
++  EXPECT_EQ(0, slot[0]);
++  EXPECT_EQ(1, slot[1]);
++  reservoirConsider(slot, seen, local, false, 2, 3);
++  EXPECT_EQ(4, seen);
++  EXPECT_EQ(1, local);
++}
++
++TEST(AdaptiveMultiHopTest, ConfidentLowPriorStaysBaselineAfterASample) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 1;
++  cfg.usePrior = true;
++  cfg.skipConfidentExplore = true;
++  cfg.earlyFlip = true;
++  cfg.priorHigh = 0.8;
++  cfg.priorLow = 0.4;
++  cfg.minLocalRatio = 0.6;
++  auto low = makeAdaptiveShape(1, {1}, 3, false);
++  low.part = 2;
++  EXPECT_FALSE(ctl.choose(low, cfg, 0.0, true, 0.33));
++  ctl.observe(low, cfg, false, 22000, -1, false, 0);
++  // exploreRate is 1, but a confident low sample must not retry multihop.
++  EXPECT_FALSE(ctl.choose(low, cfg, 0.0, true, 0.33));
++
++  auto high = makeAdaptiveShape(1, {1}, 3, false);
++  high.part = 3;
++  EXPECT_TRUE(ctl.choose(high, cfg, 0.0, true, 0.95));
++  ctl.observe(high, cfg, false, 22000, -1, false, 0);
++  EXPECT_TRUE(ctl.choose(high, cfg, 0.0, true, 0.95));
++  ctl.observe(high, cfg, true, 22000, 0.2, true, 1);
++  ctl.observe(high, cfg, true, 22000, 0.2, true, 1);
++  // The high sample wins over the hop-1 streak. Otherwise the streak can
++  // never clear, because the next decision would refuse the walk.
++  EXPECT_TRUE(ctl.choose(high, cfg, 0.0, true, 0.95));
++
++  cfg.exploreRate = 0;
++  auto mid = makeAdaptiveShape(1, {1}, 3, false);
++  mid.part = 4;
++  EXPECT_FALSE(ctl.choose(mid, cfg, 0.0, true, 0.5));
++  ctl.observe(mid, cfg, false, 22000, -1, false, 0);
++  EXPECT_FALSE(ctl.choose(mid, cfg, 0.0, true, 0.5));
++}
++
++TEST(AdaptiveMultiHopTest, ConfidentPriorDoesNotExplore) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 1;
++  cfg.usePrior = true;
++  cfg.skipConfidentExplore = true;
++  cfg.priorHigh = 0.8;
++  cfg.priorLow = 0.4;
++  auto shape = makeAdaptiveShape(1, {1}, 3, false);
++  shape.part = 1;
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.0, true, 0.95));
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.0, true, 0.2));
++  // 0.7 is above the cold-start cutoff and below prior_high, so exploration flips.
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.0, true, 0.7));
++}
++
++TEST(AdaptiveMultiHopTest, MixedPlanCollapsesUnlessEveryConfidentPartIsMulti) {
++  std::vector<PartDecision> mixed{{1, true, true}, {2, true, true}, {3, false, true}};
++  reconcilePartChoices(mixed, true);
++  for (const auto& part : mixed) EXPECT_FALSE(part.multi);
++
++  std::vector<PartDecision> oneUnsure{{1, true, true}, {2, true, true}, {3, false, false}};
++  reconcilePartChoices(oneUnsure, true);
++  for (const auto& part : oneUnsure) EXPECT_FALSE(part.multi);
++
++  std::vector<PartDecision> allMulti{{1, true, true}, {2, true, true}};
++  reconcilePartChoices(allMulti, true);
++  EXPECT_TRUE(allMulti[0].multi);
++  EXPECT_TRUE(allMulti[1].multi);
++
++  std::vector<PartDecision> keep{{1, true, true}, {2, false, true}};
++  reconcilePartChoices(keep, false);
++  EXPECT_TRUE(keep[0].multi);
++  EXPECT_FALSE(keep[1].multi);
++}
++
+ TEST(AdaptiveMultiHopTest, HostBatchSharesALeader) {
+   std::vector<int32_t> parts{1, 2, 3, 4};
+   std::vector<char> multi{1, 1, 1, 0};
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 06:14:42.591458984 +0000
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 06:15:19.811321591 +0000
+@@ -111,6 +111,7 @@
+               },
+               [&](int32_t part, double& ratio) {
+                 if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
++                if (!meta->localDstRatioFresh(FLAGS_local_multihop_prior_stale_ms)) return false;
+                 auto sample = meta->localDstRatio(space, part);
+                 if (!sample.ok()) return false;
+                 ratio = sample.value();
+--- a/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 06:14:42.591458984 +0000
++++ b/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 06:15:19.811321591 +0000
+@@ -109,6 +109,7 @@
+               },
+               [&](int32_t part, double& ratio) {
+                 if (meta == nullptr || !FLAGS_local_multihop_heartbeat_prior) return false;
++                if (!meta->localDstRatioFresh(FLAGS_local_multihop_prior_stale_ms)) return false;
+                 auto sample = meta->localDstRatio(space, part);
+                 if (!sample.ok()) return false;
+                 ratio = sample.value();
+--- a/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 06:14:42.591458984 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 07:01:18.732582246 +0000
+@@ -27,6 +27,10 @@
+   cfg.rttUs = static_cast<double>(FLAGS_local_multihop_assumed_rtt_us);
+   cfg.earlyFlip = FLAGS_local_multihop_early_flip;
+   cfg.usePrior = FLAGS_local_multihop_heartbeat_prior;
++  cfg.skipConfidentExplore = FLAGS_local_multihop_skip_confident_explore;
++  cfg.collapseMixed = FLAGS_local_multihop_collapse_mixed;
++  cfg.priorHigh = FLAGS_local_multihop_prior_high;
++  cfg.priorLow = FLAGS_local_multihop_prior_low;
+   return cfg;
+ }
+ 
+@@ -99,6 +103,7 @@
+   std::vector<int32_t> parts;
+   std::vector<char> multiFlags;
+   std::vector<std::string> hosts;
++  std::vector<algorithm::PartDecision> decisions;
+   parts.reserve(byPart.size());
+   for (auto& entry : byPart) {
+     auto shapePart = shape;
+@@ -106,13 +111,23 @@
+     double ratio = -1.0;
+     const bool hasPrior = prior(entry.first, ratio);
+     const bool multi = ctl.choose(shapePart, cfg, ctl.nextDraw(), hasPrior, ratio);
+-    DstWalkState::PartObs obs;
+-    obs.choseMulti = multi;
+-    state.partObs.emplace(entry.first, obs);
++    const bool confident = hasPrior && cfg.skipConfidentExplore &&
++                           (ratio >= cfg.priorHigh || ratio <= cfg.priorLow);
++    algorithm::PartDecision decision;
++    decision.part = entry.first;
++    decision.multi = multi;
++    decision.confident = confident;
++    decisions.push_back(decision);
+     parts.push_back(entry.first);
+-    multiFlags.push_back(multi ? 1 : 0);
+     hosts.push_back(hostOf(entry.first));
+   }
++  algorithm::reconcilePartChoices(decisions, cfg.collapseMixed);
++  for (const auto& decision : decisions) {
++    multiFlags.push_back(decision.multi ? 1 : 0);
++    DstWalkState::PartObs obs;
++    obs.choseMulti = decision.multi;
++    state.partObs.emplace(decision.part, obs);
++  }
+   const auto groups = algorithm::hostBatchGroups(parts, multiFlags, hosts, hostBatch);
+   for (const auto& group : groups) {
+     DstWalkState::Job job;
+--- a/src/graph/service/GraphFlags.cpp	2026-10-31 06:14:42.595458969 +0000
++++ b/src/graph/service/GraphFlags.cpp	2026-10-31 07:02:55.843963437 +0000
+@@ -176,6 +176,23 @@
+             true,
+             "Use the heartbeat local-dst sample for cold start and to retry "
+             "multihop after a hop-1 streak without waiting for exploration.");
++DEFINE_bool(local_multihop_skip_confident_explore,
++            true,
++            "Do not flip a part whose heartbeat ratio is outside "
++            "[prior_low, prior_high). Uncertain ratios still explore.");
++DEFINE_bool(local_multihop_collapse_mixed,
++            true,
++            "If any part would take single-hop, run the whole query as "
++            "baseline. The baseline parts already set the critical path.");
++DEFINE_double(local_multihop_prior_high,
++              0.8,
++              "Heartbeat ratio at or above this is confident multihop.");
++DEFINE_double(local_multihop_prior_low,
++              0.4,
++              "Heartbeat ratio at or below this is confident baseline.");
++DEFINE_int64(local_multihop_prior_stale_ms,
++             30000,
++             "Ignore a cached heartbeat ratio older than this. 0 never expires.");
+ 
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+--- a/src/graph/service/GraphFlags.h	2026-10-31 06:14:42.595458969 +0000
++++ b/src/graph/service/GraphFlags.h	2026-10-31 06:15:05.703373698 +0000
+@@ -101,5 +101,12 @@
+ // heartbeat_prior reads the storaged sample for cold start and switch-back.
+ DECLARE_bool(local_multihop_host_batch);
+ DECLARE_bool(local_multihop_heartbeat_prior);
++// v4. A confident heartbeat sample does not get an on-path probe.
++// A mixed plan collapses to baseline because it cannot shorten the hop loop.
++DECLARE_bool(local_multihop_skip_confident_explore);
++DECLARE_bool(local_multihop_collapse_mixed);
++DECLARE_double(local_multihop_prior_high);
++DECLARE_double(local_multihop_prior_low);
++DECLARE_int64(local_multihop_prior_stale_ms);
+ 
+ #endif  // GRAPH_GRAPHFLAGS_H_
+--- a/src/storage/LocalDstRatioSampler.cpp	2026-10-31 06:14:42.587458999 +0000
++++ b/src/storage/LocalDstRatioSampler.cpp	2026-10-31 06:50:58.595622752 +0000
+@@ -5,8 +5,12 @@
+ 
+ #include "storage/LocalDstRatioSampler.h"
+ 
++#include <algorithm>
+ #include <chrono>
++#include <map>
++#include <random>
+ 
++#include "common/algorithm/AdaptiveMultiHop.h"
+ #include "common/time/Duration.h"
+ #include "common/utils/NebulaKeyUtils.h"
+ #include "kvstore/NebulaStore.h"
+@@ -16,7 +20,10 @@
+              "Seconds between local-dst ratio samples. 0 disables the scan.");
+ DEFINE_int32(local_dst_ratio_sample_edges,
+              64,
+-             "Maximum edge keys read on one part in one sample pass.");
++             "Reservoir size per part. The ratio is uniform over the edges scanned.");
++DEFINE_int32(local_dst_ratio_sample_scan,
++             4096,
++             "Maximum edge keys visited per part while filling the reservoir.");
+ DEFINE_int32(local_dst_ratio_sample_parts,
+              32,
+              "Maximum leader parts visited in one sample pass.");
+@@ -56,11 +63,11 @@
+     if (stopped_.load()) return;
+     int64_t edges = 0;
+     int64_t parts = 0;
++    int64_t scanned = 0;
+     time::Duration clock;
+-    auto sample = sampleOnce(&edges, &parts);
++    auto sample = sampleOnce(&edges, &parts, &scanned);
+     const auto us = clock.elapsedInUSec();
+-    LOG(INFO) << "local_dst_ratio_sample parts=" << parts << " edges=" << edges << " us=" << us
+-              << " spaces=" << sample.size();
++    LOG(INFO) << "local_dst_ratio_sample_us us=" << us;
+     if (meta_ != nullptr) {
+       meta_->publishLocalDstRatio(std::move(sample));
+     }
+@@ -68,15 +75,29 @@
+ }
+ 
+ meta::MetaClient::LocalDstRatioMap LocalDstRatioSampler::sampleOnce(int64_t* edges,
+-                                                                    int64_t* parts) {
++                                                                    int64_t* parts,
++                                                                    int64_t* scannedOut) {
+   meta::MetaClient::LocalDstRatioMap out;
+   auto* store = dynamic_cast<kvstore::NebulaStore*>(store_);
+   if (store == nullptr || meta_ == nullptr) return out;
+   std::unordered_map<GraphSpaceID, std::vector<meta::cpp2::LeaderInfo>> leaders;
+   store->allLeader(leaders);
+   const int32_t edgeCap = std::max(1, FLAGS_local_dst_ratio_sample_edges);
++  const int32_t scanCap = std::max(edgeCap, FLAGS_local_dst_ratio_sample_scan);
++  const int32_t visitCap = scanCap * 8;
+   const int32_t partCap = std::max(1, FLAGS_local_dst_ratio_sample_parts);
++  std::mt19937 rng{std::random_device{}()};
+   int32_t visitedParts = 0;
++  int32_t exactParts = 0;
++  int32_t cappedParts = 0;
++  std::vector<double> ratios;
++  struct SpaceAgg {
++    int32_t n{0};
++    int32_t exact{0};
++    double min{1};
++    double max{0};
++  };
++  std::map<GraphSpaceID, SpaceAgg> bySpace;
+   for (const auto& spaceEntry : leaders) {
+     if (visitedParts >= partCap) break;
+     const GraphSpaceID spaceId = spaceEntry.first;
+@@ -93,24 +114,72 @@
+       auto edgePrefix = NebulaKeyUtils::edgePrefix(partId);
+       auto code = store_->prefix(spaceId, partId, edgePrefix, &iter);
+       if (code != nebula::cpp2::ErrorCode::SUCCEEDED || iter == nullptr) continue;
++      std::vector<char> slot;
+       int32_t seen = 0;
+       int32_t local = 0;
+-      for (; iter->valid() && seen < edgeCap; iter->next()) {
++      int32_t scanned = 0;
++      int32_t visited = 0;
++      int32_t outLocal = 0;
++      // Out-edges only. Negative types are the incoming copy; their key dst is
++      // the original src, which is not the walk's local-dst ratio.
++      for (; iter->valid() && scanned < scanCap && visited < visitCap; iter->next()) {
++        ++visited;
+         auto key = iter->key();
+         if (!NebulaKeyUtils::isEdge(vidLen, key)) continue;
++        if (NebulaKeyUtils::getEdgeType(vidLen, key) <= 0) continue;
+         auto dst = NebulaKeyUtils::getDstId(vidLen, key);
+         std::string dstId(dst.data(), dst.size());
+         auto dstPart = meta_->partId(numParts, dstId);
+-        ++seen;
+-        if (store->isLeader(spaceId, dstPart)) ++local;
++        const bool isLocal = store->isLeader(spaceId, dstPart);
++        if (isLocal) ++outLocal;
++        int32_t draw = 1;
++        if (seen + 1 > edgeCap) {
++          std::uniform_int_distribution<int32_t> dist(1, seen + 1);
++          draw = dist(rng);
++        }
++        algorithm::reservoirConsider(slot, seen, local, isLocal, edgeCap, draw);
++        ++scanned;
+       }
++      const bool capped = iter->valid();
+       ++visitedParts;
+-      if (seen == 0) continue;
+-      out[spaceId][partId] = static_cast<double>(local) / static_cast<double>(seen);
+-      if (edges != nullptr) *edges += seen;
++      if (scanned == 0) continue;
++      // The part fit in the cap: the ratio is exact. A capped scan publishes
++      // the reservoir, which is uniform over the out-edges visited.
++      const double ratio = capped ? static_cast<double>(local) / static_cast<double>(slot.size())
++                                  : static_cast<double>(outLocal) / static_cast<double>(scanned);
++      out[spaceId][partId] = ratio;
++      ratios.push_back(ratio);
++      auto& agg = bySpace[spaceId];
++      ++agg.n;
++      if (!capped) ++agg.exact;
++      if (ratio < agg.min) agg.min = ratio;
++      if (ratio > agg.max) agg.max = ratio;
++      if (capped) ++cappedParts;
++      else ++exactParts;
++      if (edges != nullptr) *edges += static_cast<int64_t>(capped ? slot.size() : scanned);
++      if (scannedOut != nullptr) *scannedOut += scanned;
+       if (parts != nullptr) *parts += 1;
+     }
+   }
++  std::sort(ratios.begin(), ratios.end());
++  double ratioMin = 0;
++  double ratioP50 = 0;
++  double ratioMax = 0;
++  if (!ratios.empty()) {
++    ratioMin = ratios.front();
++    ratioMax = ratios.back();
++    ratioP50 = ratios[ratios.size() / 2];
++  }
++  LOG(INFO) << "local_dst_ratio_sample parts=" << (parts != nullptr ? *parts : 0)
++            << " kept=" << (edges != nullptr ? *edges : 0)
++            << " scanned=" << (scannedOut != nullptr ? *scannedOut : 0) << " exact=" << exactParts
++            << " capped=" << cappedParts << " ratio_min=" << ratioMin << " ratio_p50=" << ratioP50
++            << " ratio_max=" << ratioMax << " spaces=" << bySpace.size();
++  for (const auto& entry : bySpace) {
++    LOG(INFO) << "local_dst_ratio_space space=" << entry.first << " parts=" << entry.second.n
++              << " exact=" << entry.second.exact << " min=" << entry.second.min
++              << " max=" << entry.second.max;
++  }
+   return out;
+ }
+ 
+--- a/src/storage/LocalDstRatioSampler.h	2026-10-31 06:14:42.587458999 +0000
++++ b/src/storage/LocalDstRatioSampler.h	2026-10-31 06:50:58.615622678 +0000
+@@ -15,10 +15,11 @@
+ namespace nebula {
+ namespace storage {
+ 
+-// Bounded background scan. Each pass reads at most
+-// local_dst_ratio_sample_edges edges on each of at most
+-// local_dst_ratio_sample_parts leader parts, then publishes the ratio
+-// through the meta client's heartbeat provider.
++// Bounded background scan of out-edges. A part that fits in
++// local_dst_ratio_sample_scan publishes the exact local-dst ratio.
++// A larger part publishes a reservoir of local_dst_ratio_sample_edges
++// drawn uniformly from the out-edges visited. At most
++// local_dst_ratio_sample_parts leader parts are visited per pass.
+ class LocalDstRatioSampler {
+  public:
+   LocalDstRatioSampler(kvstore::KVStore* store, meta::MetaClient* meta);
+@@ -29,7 +30,9 @@
+ 
+  private:
+   void loop();
+-  meta::MetaClient::LocalDstRatioMap sampleOnce(int64_t* edges, int64_t* parts);
++  meta::MetaClient::LocalDstRatioMap sampleOnce(int64_t* edges,
++                                                int64_t* parts,
++                                                int64_t* scanned);
+ 
+   kvstore::KVStore* store_{nullptr};
+   meta::MetaClient* meta_{nullptr};

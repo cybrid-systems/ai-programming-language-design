@@ -2,7 +2,8 @@
 
 > v2 按源分区各发一次 RPC，亲和在约 5ms 下比 v1 慢。那一版在 [38](38-adaptive-multihop-v2.md)。
 > 补丁 [`patches/v3.8.0-adaptive-local-multihop-v3.patch`](patches/v3.8.0-adaptive-local-multihop-v3.patch) 打在 v2 补丁之上。
-> 这次 JSON 是顶层 `bridge_*` / `rtt5_*` 里带 `adaptive-v3` 的文件，以及 `drift_v3_bridge.json`、`drift_v3_rtt5.json`。同一次重跑也覆盖了 baseline / static / v1 / v2 的顶层文件。38 篇的表仍以当时的提交为准。
+> 这篇的表对应提交 `a3f0970`（文档指针 `b9dc90a`）。v4 那次重跑覆盖了顶层 JSON，数字以这篇正文为准，不要回头读现在的文件。[40](40-adaptive-multihop-v4.md) 是下一版。
+> 当时的 JSON 是顶层 `bridge_*` / `rtt5_*` 里带 `adaptive-v3` 的文件，以及 `drift_v3_bridge.json`、`drift_v3_rtt5.json`。同一次重跑也覆盖了 baseline / static / v1 / v2 的顶层文件。38 篇的表仍以当时的提交为准。
 > 日期：2026-10-31。没有估出来的查询时延。抽样耗时单独标了。
 
 v2 的决策是对的，RPC 形状不对。9 个亲和分区各一次 `GetDstBySrc`，PROFILE 是 9 条 host 回复。v1 和静态是 3 条，因为 `StorageClient` 按 leader 扇出一次。v3 把**已经选了多跳**、并且 leader 相同的分区合成一个 job。`StorageClient` 再按 host 拆开，亲和图回到每台 storaged 一次请求。守卫仍按源分区算：`min_local_ratio > 0` 且请求里有多个 part 时，`GetDstBySrcProcessor::runMultiHop` 对每个 part 单独跑 `runLocalMultiHop`。一个 part 提前停，只把那个 part 的 carry 记成 `remote_depth = continue_hop`，别的 part 继续走完。响应里多了平行数组 `part_ids`、`part_early_stop`、`part_local_ratio`、`part_continue_hop`。graphd 用它们更新对应分区的 EWMA，不再把一台机器上的所有分区记成同一次提前停。

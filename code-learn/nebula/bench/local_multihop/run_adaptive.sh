@@ -21,7 +21,7 @@ export APPEND_PUSHDOWN_FLAGS=false
 export NEBULA_BIN="${NEBULA_BIN:-/tmp/nebula-380/build/bin}"
 export NEBULA_CONF="${NEBULA_CONF:-/tmp/nebula-380/conf}"
 export GRAPH_WORKERS=4
-export EXTRA_STORAGE_FLAGS=$'--storaged_accept_local_multihop=true\n--local_dst_ratio_sample_interval_secs=2\n--local_dst_ratio_sample_edges=64\n--local_dst_ratio_sample_parts=32\n--heartbeat_interval_secs=2\n'
+export EXTRA_STORAGE_FLAGS=$'--storaged_accept_local_multihop=true\n--local_dst_ratio_sample_interval_secs=2\n--local_dst_ratio_sample_edges=64\n--local_dst_ratio_sample_scan=4096\n--local_dst_ratio_sample_parts=64\n--heartbeat_interval_secs=2\n'
 
 write_graph_flags() {
   local mode="$1"
@@ -43,6 +43,11 @@ drop = (
     "--local_multihop_early_flip=",
     "--local_multihop_host_batch=",
     "--local_multihop_heartbeat_prior=",
+    "--local_multihop_skip_confident_explore=",
+    "--local_multihop_collapse_mixed=",
+    "--local_multihop_prior_high=",
+    "--local_multihop_prior_low=",
+    "--local_multihop_prior_stale_ms=",
     "--logbufsecs=",
     "--heartbeat_interval_secs=",
 )
@@ -74,6 +79,8 @@ elif mode == "adaptive-v1":
         "--local_multihop_early_flip=false",
         "--local_multihop_host_batch=false",
         "--local_multihop_heartbeat_prior=false",
+        "--local_multihop_skip_confident_explore=false",
+        "--local_multihop_collapse_mixed=false",
         "--local_multihop_trace=false",
         "--heartbeat_interval_secs=2",
     ]
@@ -90,6 +97,8 @@ elif mode == "adaptive-v2":
         "--local_multihop_early_flip=true",
         "--local_multihop_host_batch=false",
         "--local_multihop_heartbeat_prior=false",
+        "--local_multihop_skip_confident_explore=false",
+        "--local_multihop_collapse_mixed=false",
         "--local_multihop_trace=false",
         "--heartbeat_interval_secs=2",
     ]
@@ -106,6 +115,8 @@ elif mode == "adaptive-v1-trace":
         "--local_multihop_early_flip=false",
         "--local_multihop_host_batch=false",
         "--local_multihop_heartbeat_prior=false",
+        "--local_multihop_skip_confident_explore=false",
+        "--local_multihop_collapse_mixed=false",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
         "--heartbeat_interval_secs=2",
@@ -123,7 +134,52 @@ elif mode == "adaptive-v3":
         "--local_multihop_early_flip=true",
         "--local_multihop_host_batch=true",
         "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_skip_confident_explore=false",
+        "--local_multihop_collapse_mixed=false",
         "--local_multihop_trace=false",
+        "--heartbeat_interval_secs=2",
+    ]
+elif mode == "adaptive-v4":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=true",
+        "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_skip_confident_explore=true",
+        "--local_multihop_collapse_mixed=true",
+        "--local_multihop_prior_high=0.8",
+        "--local_multihop_prior_low=0.4",
+        "--local_multihop_prior_stale_ms=30000",
+        "--local_multihop_trace=false",
+        "--heartbeat_interval_secs=2",
+    ]
+elif mode == "adaptive-v4-trace":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_host_batch=true",
+        "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_skip_confident_explore=true",
+        "--local_multihop_collapse_mixed=true",
+        "--local_multihop_prior_high=0.8",
+        "--local_multihop_prior_low=0.4",
+        "--local_multihop_prior_stale_ms=30000",
+        "--local_multihop_trace=true",
+        "--logbufsecs=0",
         "--heartbeat_interval_secs=2",
     ]
 elif mode == "adaptive-v3-trace":
@@ -139,6 +195,8 @@ elif mode == "adaptive-v3-trace":
         "--local_multihop_early_flip=true",
         "--local_multihop_host_batch=true",
         "--local_multihop_heartbeat_prior=true",
+        "--local_multihop_skip_confident_explore=false",
+        "--local_multihop_collapse_mixed=false",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
         "--heartbeat_interval_secs=2",
@@ -156,6 +214,8 @@ elif mode == "adaptive-v2-trace":
         "--local_multihop_early_flip=true",
         "--local_multihop_host_batch=false",
         "--local_multihop_heartbeat_prior=false",
+        "--local_multihop_skip_confident_explore=false",
+        "--local_multihop_collapse_mixed=false",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
         "--heartbeat_interval_secs=2",
@@ -181,7 +241,10 @@ restart_graph() {
   fi
   local lib="/opt/vesoft/third-party/3.3/lib64:/opt/vesoft/third-party/3.3/lib"
   sudo -n ip netns exec ns-graph1 bash -c "ulimit -n 65535; export LD_LIBRARY_PATH='$lib'; setsid /tmp/nebula-380/build/bin/nebula-graphd --flagfile=/tmp/nebula-dist/graph1/nebula-graphd.conf >> /tmp/nebula-dist/graph1/logs/stdout.log 2>&1 < /dev/null & echo \$! > /tmp/nebula-dist/graph1/pids/daemon.pid"
-  sleep 3
+  # First heartbeat waits one interval (2s) plus up to 0.9s of jitter.
+  # The profile query is the steady-state decision, so wait until that
+  # reply can install the ratio cache.
+  sleep 6
 }
 
 measure() {
@@ -201,7 +264,7 @@ measure() {
 phase() {
   local rtt="$1" conc="$2" loaded="${3:-0}"
   local mode placement skip
-  for mode in baseline static adaptive-v1 adaptive-v2 adaptive-v3; do
+  for mode in baseline static adaptive-v1 adaptive-v2 adaptive-v3 adaptive-v4; do
     restart_graph "$mode"
     for placement in affinity random mixed; do
       # Each placement is its own space. Skip only after that space was loaded
@@ -237,6 +300,14 @@ python3 "$ROOT/drift.py" \
   --wait-before-return 8 \
   --space ad_drift_v3b \
   --tag drift_v3_bridge --results "$OUT"
+restart_graph adaptive-v4-trace
+python3 "$ROOT/drift.py" \
+  --storage-hosts "$STORAGES" \
+  --community-size "$SIZE" --degree "$DEGREE" \
+  --affinity-queries 8 --random-queries 12 --return-queries 8 \
+  --wait-before-return 8 \
+  --space ad_drift_v4b \
+  --tag drift_v4_bridge --results "$OUT"
 
 bash "$DIST" usdelay 2.5
 sleep 2
@@ -287,5 +358,13 @@ python3 "$ROOT/drift.py" \
   --wait-before-return 8 \
   --space ad_drift_v3 \
   --tag drift_v3_rtt5 --results "$OUT"
+restart_graph adaptive-v4-trace
+python3 "$ROOT/drift.py" \
+  --storage-hosts "$STORAGES" \
+  --community-size "$SIZE" --degree "$DEGREE" \
+  --affinity-queries 12 --random-queries 16 --return-queries 12 \
+  --wait-before-return 8 \
+  --space ad_drift_v4 \
+  --tag drift_v4_rtt5 --results "$OUT"
 
 echo ADAPTIVE_BENCH_OK
