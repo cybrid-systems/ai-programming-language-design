@@ -12,7 +12,7 @@ PARTS=9
 SIZE=300
 DEGREE=8
 STORAGES="10.88.0.21:9779,10.88.0.22:9779,10.88.0.23:9779"
-CONC_BRIDGE="${CONC_BRIDGE:-1,10}"
+CONC_BRIDGE="${CONC_BRIDGE:-1,10,50}"
 CONC_RTT="${CONC_RTT:-1,10,50}"
 ROUNDS="${ROUNDS:-8}"
 WARMUP="${WARMUP:-3}"
@@ -39,6 +39,9 @@ drop = (
     "--local_multihop_ewma_alpha=",
     "--local_multihop_assumed_rtt_us=",
     "--local_multihop_trace=",
+    "--local_multihop_per_part=",
+    "--local_multihop_early_flip=",
+    "--logbufsecs=",
 )
 lines = [ln for ln in text if not ln.startswith(drop)]
 if mode == "baseline":
@@ -53,7 +56,7 @@ elif mode == "static":
         "--local_multihop_affinity=1",
         "--enable_adaptive_local_multihop=false",
     ]
-elif mode == "adaptive":
+elif mode == "adaptive-v1":
     lines += [
         "--enable_local_multihop=false",
         "--local_multihop_affinity=0",
@@ -62,9 +65,11 @@ elif mode == "adaptive":
         "--local_multihop_explore_rate=0.05",
         "--local_multihop_ewma_alpha=0.2",
         "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=false",
+        "--local_multihop_early_flip=false",
         "--local_multihop_trace=false",
     ]
-elif mode == "adaptive-trace":
+elif mode == "adaptive-v2":
     lines += [
         "--enable_local_multihop=false",
         "--local_multihop_affinity=0",
@@ -73,6 +78,35 @@ elif mode == "adaptive-trace":
         "--local_multihop_explore_rate=0.05",
         "--local_multihop_ewma_alpha=0.2",
         "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
+        "--local_multihop_trace=false",
+    ]
+elif mode == "adaptive-v1-trace":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=false",
+        "--local_multihop_early_flip=false",
+        "--local_multihop_trace=true",
+        "--logbufsecs=0",
+    ]
+elif mode == "adaptive-v2-trace":
+    lines += [
+        "--enable_local_multihop=false",
+        "--local_multihop_affinity=0",
+        "--enable_adaptive_local_multihop=true",
+        "--local_multihop_min_local_ratio=0.6",
+        "--local_multihop_explore_rate=0.05",
+        "--local_multihop_ewma_alpha=0.2",
+        "--local_multihop_assumed_rtt_us=5000",
+        "--local_multihop_per_part=true",
+        "--local_multihop_early_flip=true",
         "--local_multihop_trace=true",
         "--logbufsecs=0",
     ]
@@ -117,7 +151,7 @@ measure() {
 phase() {
   local rtt="$1" conc="$2" loaded="${3:-0}"
   local mode placement skip
-  for mode in baseline static adaptive; do
+  for mode in baseline static adaptive-v1 adaptive-v2; do
     restart_graph "$mode"
     for placement in affinity random mixed; do
       # Each placement is its own space. Skip only after that space was loaded
@@ -145,12 +179,12 @@ if [[ "${ADAPTIVE_SKIP_LOAD:-0}" == "1" ]]; then
 fi
 phase bridge "$CONC_BRIDGE" "$LOADED"
 
-restart_graph adaptive-trace
+restart_graph adaptive-v2-trace
 python3 "$ROOT/drift.py" \
   --storage-hosts "$STORAGES" \
   --community-size "$SIZE" --degree "$DEGREE" \
-  --affinity-queries 20 --random-queries 30 \
-  --tag drift_bridge --results "$OUT"
+  --affinity-queries 16 --random-queries 24 --return-queries 40 \
+  --tag drift_v2_bridge --results "$OUT"
 
 bash "$DIST" usdelay 2.5
 sleep 2
@@ -179,10 +213,19 @@ sudo -n ip netns exec ns-graph1 ping -n -c 20 -i 0.05 -W 2 -q 10.88.0.21 | tee "
 
 phase rtt5 "$CONC_RTT" 1
 
-restart_graph adaptive-trace
+restart_graph adaptive-v1-trace
 python3 "$ROOT/drift.py" \
   --storage-hosts "$STORAGES" \
   --community-size "$SIZE" --degree "$DEGREE" \
-  --tag drift_rtt5 --results "$OUT"
+  --affinity-queries 12 --random-queries 20 --return-queries 0 \
+  --space ad_drift_v1 \
+  --tag drift_v1_rtt5 --results "$OUT"
+restart_graph adaptive-v2-trace
+python3 "$ROOT/drift.py" \
+  --storage-hosts "$STORAGES" \
+  --community-size "$SIZE" --degree "$DEGREE" \
+  --affinity-queries 16 --random-queries 24 --return-queries 48 \
+  --space ad_drift_v2 \
+  --tag drift_v2_rtt5 --results "$OUT"
 
 echo ADAPTIVE_BENCH_OK

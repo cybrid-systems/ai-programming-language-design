@@ -1,6 +1,7 @@
 # 37 — 自适应本地多跳实测
 
-> 设计和实现在 [36](36-adaptive-multihop-design-impl.md)。静态多跳上一轮的 83.5ms 在 [35](35-local-multihop-bench.md)，那一版还没有把同一深度的 host 回复合成一个 frontier。
+> 设计和实现在 [36](36-adaptive-multihop-design-impl.md)。按分区的 v2 和双向漂移在 [38](38-adaptive-multihop-v2.md)。
+> 38 篇重跑覆盖了顶层的 `bridge_*` / `rtt5_*` 里 baseline、static 和两份 ping。下面的表对应 `c0c2851` 里的那些文件。静态多跳上一轮的 83.5ms 在 [35](35-local-multihop-bench.md)，那一版还没有把同一深度的 host 回复合成一个 frontier。
 > 脚本：[`bench/local_multihop/run_adaptive.sh`](bench/local_multihop/run_adaptive.sh)、[`drift.py`](bench/local_multihop/drift.py)、[`measure.py`](bench/local_multihop/measure.py)。JSON 在 [`results/`](bench/local_multihop/results/)，前缀 `bridge_`、`rtt5_`、`drift_`。
 > 二进制是 `fa928930` 加上 [`v3.8.0-local-multihop.patch`](patches/v3.8.0-local-multihop.patch) 和 [`v3.8.0-adaptive-local-multihop.patch`](patches/v3.8.0-adaptive-local-multihop.patch)。4 vCPU，`Linux 6.12.94+`。
 > 日期：2026-10-31。下面每张表都是这次进程里测到的，不是估算。

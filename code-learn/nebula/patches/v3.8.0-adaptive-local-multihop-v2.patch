@@ -1,0 +1,858 @@
+--- a/conf/nebula-graphd.conf.default	2026-10-31 04:45:37.252654964 +0000
++++ b/conf/nebula-graphd.conf.default	2026-10-31 04:46:41.788232335 +0000
+@@ -150,3 +150,7 @@
+ # --local_multihop_ewma_alpha=0.2
+ # --local_multihop_assumed_rtt_us=5000
+ # --local_multihop_trace=false
++# v2 splits by source partition and flips off multi-hop after two hop-1 stops.
++# Set both false to restore the v1 whole-query controller.
++# --local_multihop_per_part=true
++# --local_multihop_early_flip=true
+--- a/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 04:45:37.248654991 +0000
++++ b/src/common/algorithm/AdaptiveMultiHop.h	2026-10-31 04:45:47.680585330 +0000
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstring>
+ #include <map>
+ #include <mutex>
+ #include <random>
+@@ -28,15 +29,27 @@
+   std::vector<int32_t> edges;
+   int32_t steps{0};
+   bool yieldAll{false};
++  // 0 is the whole-query key (v1). A positive part is one source partition.
++  int32_t part{0};
+ 
+   bool operator<(const AdaptiveShape& other) const {
+     if (space != other.space) return space < other.space;
++    if (part != other.part) return part < other.part;
+     if (steps != other.steps) return steps < other.steps;
+     if (yieldAll != other.yieldAll) return yieldAll < other.yieldAll;
+     return edges < other.edges;
+   }
+ };
+ 
++// Same rule as MetaClient::partId for an 8-byte INT64 vid:
++// memcpy to uint64, then vid % numParts + 1.
++inline int32_t partOfIntVid(int64_t vid, int32_t numParts) {
++  if (numParts <= 0) return 0;
++  uint64_t raw = 0;
++  memcpy(&raw, &vid, sizeof(raw));
++  return static_cast<int32_t>(raw % static_cast<uint64_t>(numParts) + 1);
++}
++
+ inline AdaptiveShape makeAdaptiveShape(int32_t space,
+                                       const std::vector<int32_t>& edgeTypes,
+                                       int32_t steps,
+@@ -60,6 +73,9 @@
+   double ewmaAlpha{0.2};
+   double minLocalRatio{0.6};
+   double rttUs{5000};
++  // When true, two hop-1 early-stops override a stale latency average.
++  // A later full multi-hop (no early-stop, ratio at the threshold) clears it.
++  bool earlyFlip{false};
+ };
+ 
+ struct AdaptiveSnapshot {
+@@ -71,6 +87,9 @@
+   double multiRatio{0};
+   bool lastEarly{false};
+   int32_t lastHop{0};
++  double earlyRate{0};
++  int32_t earlyN{0};
++  int32_t hop1Streak{0};
+ };
+ 
+ // In-process, per graphd. Not shared across graphd processes and not
+@@ -104,6 +123,22 @@
+       }
+       slot.lastEarly = earlyStop;
+       slot.lastHop = continueHop;
++      const bool hop1 = earlyStop && continueHop <= 1;
++      // A finished multi-hop at or above the guard threshold means this
++      // partition is local again. Drop the hop-1 streak immediately so the
++      // next decision can follow the latency sample from this probe.
++      if (!earlyStop && localRatio + 1e-12 >= cfg.minLocalRatio) {
++        slot.hop1Streak = 0;
++        slot.earlyRate = 0;
++        slot.earlyN = 0;
++      } else {
++        ewma(slot.earlyRate, slot.earlyN, hop1 ? 1.0 : 0.0, alpha);
++        if (hop1) {
++          if (slot.hop1Streak < 1000000000) ++slot.hop1Streak;
++        } else {
++          slot.hop1Streak = 0;
++        }
++      }
+     } else {
+       ewma(slot.baseLat, slot.baseN, latencyUs, alpha);
+     }
+@@ -123,6 +158,9 @@
+     out.multiRatio = slot.multiRatio;
+     out.lastEarly = slot.lastEarly;
+     out.lastHop = slot.lastHop;
++    out.earlyRate = slot.earlyRate;
++    out.earlyN = slot.earlyN;
++    out.hop1Streak = slot.hop1Streak;
+     return out;
+   }
+ 
+@@ -147,6 +185,9 @@
+     int32_t ratioN{0};
+     bool lastEarly{false};
+     int32_t lastHop{0};
++    double earlyRate{0};
++    int32_t earlyN{0};
++    int32_t hop1Streak{0};
+   };
+ 
+   static void ewma(double& acc, int32_t& n, double sample, double alpha) {
+@@ -181,6 +222,11 @@
+   // With both samples, the lower EWMA latency wins. A tie prefers baseline.
+   static bool exploitOf(const Slot& slot, const AdaptiveShape& shape, const AdaptiveConfig& cfg) {
+     if (slot.multiN == 0 && slot.baseN == 0) return true;
++    // Repeated hop-1 guards mean this key is not saving a round trip.
++    // Latency EWMA still remembers the old affinity samples, so it would
++    // keep picking multi-hop. The streak wins until a full local walk clears it.
++    if (cfg.earlyFlip && slot.hop1Streak >= 2) return false;
++    if (cfg.earlyFlip && slot.earlyN >= 2 && slot.earlyRate >= 0.5) return false;
+     if (slot.multiN > 0 && slot.baseN > 0) {
+       return slot.multiLat + 1.0 < slot.baseLat;
+     }
+--- a/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 04:45:37.248654991 +0000
++++ b/src/common/algorithm/test/LocalMultiHopTest.cpp	2026-10-31 04:46:54.968148357 +0000
+@@ -536,6 +536,42 @@
+   EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
+ }
+ 
++TEST(AdaptiveMultiHopTest, RepeatedHop1StopOverridesStaleLatency) {
++  AdaptiveController ctl;
++  AdaptiveConfig cfg;
++  cfg.exploreRate = 0;
++  cfg.earlyFlip = true;
++  cfg.minLocalRatio = 0.6;
++  auto shape = makeAdaptiveShape(1, {1}, 3, false);
++  shape.part = 4;
++  ctl.observe(shape, cfg, false, 22000, -1, false, 0);
++  ctl.observe(shape, cfg, true, 7000, 1.0, false, 0);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  ctl.observe(shape, cfg, true, 22000, 0.2, true, 1);
++  EXPECT_EQ(1, ctl.snapshot(shape).hop1Streak);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  ctl.observe(shape, cfg, true, 22000, 0.2, true, 1);
++  EXPECT_EQ(2, ctl.snapshot(shape).hop1Streak);
++  EXPECT_FALSE(ctl.choose(shape, cfg, 0.5));
++  // Affinity returns on the probe. The streak clears and the fast sample wins.
++  ctl.observe(shape, cfg, true, 7000, 1.0, false, 0);
++  EXPECT_EQ(0, ctl.snapshot(shape).hop1Streak);
++  EXPECT_EQ(0, ctl.snapshot(shape).earlyN);
++  EXPECT_TRUE(ctl.choose(shape, cfg, 0.5));
++  auto other = shape;
++  other.part = 5;
++  EXPECT_TRUE(ctl.choose(other, cfg, 0.5));
++  EXPECT_EQ(0, ctl.snapshot(other).multiN);
++}
++
++TEST(AdaptiveMultiHopTest, IntVidPartMatchesMetaRule) {
++  EXPECT_EQ(1, partOfIntVid(0, 9));
++  EXPECT_EQ(4, partOfIntVid(3, 9));
++  EXPECT_EQ(9, partOfIntVid(8, 9));
++  EXPECT_EQ(1, partOfIntVid(9, 9));
++  EXPECT_EQ(0, partOfIntVid(3, 0));
++}
++
+ TEST(AdaptiveMultiHopTest, PlanLaunchUsesAdaptiveBeforeStaticAffinity) {
+   AdaptiveController ctl;
+   AdaptiveConfig cfg;
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 04:45:37.252654964 +0000
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp	2026-10-31 05:03:30.319058808 +0000
+@@ -77,6 +77,31 @@
+   const int32_t hops = static_cast<int32_t>(maxSteps_ - expand_->minSteps() + 1);
+   if (!joinInput_ && stepLimits_.empty() && !sample_ && currentStep_ == expand_->minSteps()) {
+     auto shape = algorithm::makeAdaptiveShape(expand_->space(), expand_->edgeTypes(), hops, true);
++    if (FLAGS_enable_adaptive_local_multihop && FLAGS_local_multihop_per_part &&
++        algorithm::shouldLocalMultiHop(true,
++                                       1.0,
++                                       0.0,
++                                       hops,
++                                       static_cast<int32_t>(nextStepVids_.size()),
++                                       FLAGS_local_multihop_max_frontier,
++                                       FLAGS_local_multihop_max_steps)) {
++      int32_t numParts = 0;
++      const auto& spaceInfo = qctx()->rctx()->session()->space();
++      if (spaceInfo.spaceDesc.partition_num_ref().is_set()) {
++        numParts = spaceInfo.spaceDesc.partition_num_ref().value();
++      }
++      auto state = std::make_shared<DstWalkState>();
++      state->yieldAll = true;
++      if (fillPerPartJobs(*state,
++                          nextStepVids_,
++                          hops,
++                          numParts,
++                          shape,
++                          adaptiveRuntimeConfig(),
++                          algorithm::adaptiveController())) {
++        return driveDstWalk(state);
++      }
++    }
+     const double draw = algorithm::adaptiveController().nextDraw();
+     auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
+                                            FLAGS_enable_local_multihop,
+--- a/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 04:45:37.252654964 +0000
++++ b/src/graph/executor/query/ExpandExecutor.cpp	2026-10-31 05:03:30.327058773 +0000
+@@ -76,6 +76,30 @@
+   if (currentStep_ == 0 && stepLimits_.empty() && !sample_) {
+     const int32_t hops = static_cast<int32_t>(maxSteps_);
+     auto shape = algorithm::makeAdaptiveShape(expand_->space(), expand_->edgeTypes(), hops, false);
++    if (FLAGS_enable_adaptive_local_multihop && FLAGS_local_multihop_per_part &&
++        algorithm::shouldLocalMultiHop(true,
++                                       1.0,
++                                       0.0,
++                                       hops,
++                                       static_cast<int32_t>(nextStepVids_.size()),
++                                       FLAGS_local_multihop_max_frontier,
++                                       FLAGS_local_multihop_max_steps)) {
++      int32_t numParts = 0;
++      const auto& spaceInfo = qctx()->rctx()->session()->space();
++      if (spaceInfo.spaceDesc.partition_num_ref().is_set()) {
++        numParts = spaceInfo.spaceDesc.partition_num_ref().value();
++      }
++      auto state = std::make_shared<DstWalkState>();
++      if (fillPerPartJobs(*state,
++                          nextStepVids_,
++                          hops,
++                          numParts,
++                          shape,
++                          adaptiveRuntimeConfig(),
++                          algorithm::adaptiveController())) {
++        return driveDstWalk(state);
++      }
++    }
+     const double draw = algorithm::adaptiveController().nextDraw();
+     auto launch = algorithm::planLocalWalk(FLAGS_enable_adaptive_local_multihop,
+                                            FLAGS_enable_local_multihop,
+--- a/src/graph/executor/query/LocalMultiHopDriveBody.inl	2026-10-31 04:45:37.252654964 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriveBody.inl	2026-10-31 04:46:26.236332411 +0000
+@@ -5,7 +5,18 @@
+ }
+ if (state->adaptive && !state->noted) {
+   state->noted = true;
+-  addState("adaptive_choice", state->choseMulti ? "multi" : "base");
++  if (state->perPart) {
++    int32_t multiParts = 0;
++    int32_t baseParts = 0;
++    for (const auto& entry : state->partObs) {
++      if (entry.second.choseMulti) ++multiParts;
++      else ++baseParts;
++    }
++    addState("adaptive_choice",
++             folly::sformat("multi_parts={} base_parts={}", multiParts, baseParts));
++  } else {
++    addState("adaptive_choice", state->choseMulti ? "multi" : "base");
++  }
+ }
+ while (!state->jobs.empty() && state->jobs.back().vids.empty()) {
+   state->jobs.pop_back();
+@@ -30,187 +41,308 @@
+   }
+   finish(ResultBuilder().value(Value(std::move(ds))).build());
+   if (state->adaptive) {
+-    bool early = state->sawEarlyStop;
+-    int32_t hop = state->earliestContinue;
+-    double ratio = state->sawLocalRatio ? state->worstLocalRatio : -1.0;
+-    if (state->choseMulti && !state->sawApplied) {
+-      // Old storaged, or the accept flag is off. The walk already fell back
+-      // to single-hop. Treat it as a hop-1 guard so the next query prefers
+-      // baseline instead of paying the multi-hop request again.
+-      early = true;
+-      hop = 1;
+-      ratio = -1.0;
+-    }
+-    const double walkUs = static_cast<double>(state->clock.elapsedInUSec());
+-    algorithm::adaptiveController().observe(state->shape,
+-                                            adaptiveRuntimeConfig(),
+-                                            state->choseMulti,
+-                                            walkUs,
+-                                            ratio,
+-                                            early,
+-                                            hop);
+-    if (FLAGS_local_multihop_trace) {
+-      LOG(INFO) << "adaptive_multihop"
+-                << " choice=" << (state->choseMulti ? "multi" : "base")
+-                << " walk_us=" << static_cast<int64_t>(walkUs)
+-                << " ratio=" << ratio << " early=" << (early ? 1 : 0)                 << " hop=" << hop << " rpc=" << state->rpc
+-                << " steps=" << state->shape.steps << " space=" << state->shape.space;
++    const auto cfg = adaptiveRuntimeConfig();
++    if (state->perPart) {
++      int32_t multiParts = 0;
++      int32_t baseParts = 0;
++      int32_t earlyParts = 0;
++      for (const auto& entry : state->partObs) {
++        const auto& obs = entry.second;
++        auto shape = state->shape;
++        shape.part = entry.first;
++        bool early = obs.sawEarly;
++        int32_t hop = obs.hop;
++        double ratio = obs.sawRatio ? obs.ratio : -1.0;
++        if (obs.choseMulti && !obs.sawApplied) {
++          early = true;
++          hop = 1;
++          ratio = -1.0;
++        }
++        if (obs.choseMulti) ++multiParts;
++        else ++baseParts;
++        if (early && hop <= 1) ++earlyParts;
++        algorithm::adaptiveController().observe(
++            shape, cfg, obs.choseMulti, obs.us, ratio, early, hop);
++      }
++      if (FLAGS_local_multihop_trace) {
++        const char* choice = "mixed";
++        if (baseParts == 0) choice = "multi";
++        else if (multiParts == 0) choice = "base";
++        LOG(INFO) << "adaptive_multihop"
++                  << " choice=" << choice << " multi_parts=" << multiParts
++                  << " base_parts=" << baseParts << " early_parts=" << earlyParts
++                  << " rpc=" << state->rpc << " steps=" << state->shape.steps
++                  << " space=" << state->shape.space;
++      }
++    } else {
++      bool early = state->sawEarlyStop;
++      int32_t hop = state->earliestContinue;
++      double ratio = state->sawLocalRatio ? state->worstLocalRatio : -1.0;
++      if (state->choseMulti && !state->sawApplied) {
++        early = true;
++        hop = 1;
++        ratio = -1.0;
++      }
++      const double walkUs = static_cast<double>(state->clock.elapsedInUSec());
++      algorithm::adaptiveController().observe(state->shape,
++                                              cfg,
++                                              state->choseMulti,
++                                              walkUs,
++                                              ratio,
++                                              early,
++                                              hop);
++      if (FLAGS_local_multihop_trace) {
++        LOG(INFO) << "adaptive_multihop"
++                  << " choice=" << (state->choseMulti ? "multi" : "base")
++                  << " walk_us=" << static_cast<int64_t>(walkUs) << " ratio=" << ratio
++                  << " early=" << (early ? 1 : 0) << " hop=" << hop << " rpc=" << state->rpc
++                  << " steps=" << state->shape.steps << " space=" << state->shape.space;
++      }
+     }
+   }
+   return folly::makeFuture<Status>(Status::OK());
+ }
+ 
+-auto job = std::move(state->jobs.back());
++// One trailing non-parallel job, or every parallel job sitting on the stack.
++// Parallel jobs are the first wave: multi-hop parts and single-hop parts
++// share one round trip.
++std::vector<DstWalkState::Job> batch;
++batch.push_back(std::move(state->jobs.back()));
+ state->jobs.pop_back();
+-{
++if (batch.back().parallel) {
++  while (!state->jobs.empty() && state->jobs.back().parallel) {
++    batch.push_back(std::move(state->jobs.back()));
++    state->jobs.pop_back();
++  }
++}
++for (auto& job : batch) {
+   std::unordered_set<Value> uniq(job.vids.begin(), job.vids.end());
+   job.vids.assign(uniq.begin(), uniq.end());
+ }
+-if (job.hopsLeft <= 0) {
+-  if (state->yieldAll) {
+-    state->yielded.insert(state->yielded.end(), job.vids.begin(), job.vids.end());
+-  } else {
+-    state->finals.insert(job.vids.begin(), job.vids.end());
++{
++  std::vector<DstWalkState::Job> rpcJobs;
++  rpcJobs.reserve(batch.size());
++  for (auto& job : batch) {
++    if (job.hopsLeft <= 0 || job.vids.empty()) {
++      if (state->yieldAll) {
++        state->yielded.insert(state->yielded.end(), job.vids.begin(), job.vids.end());
++      } else if (job.hopsLeft <= 0) {
++        state->finals.insert(job.vids.begin(), job.vids.end());
++      }
++      continue;
++    }
++    rpcJobs.push_back(std::move(job));
+   }
++  batch.swap(rpcJobs);
++}
++if (batch.empty()) {
+   return driveDstWalk(state);
+ }
+ 
+-bool multi = false;
+-if (job.allowMulti && state->choseMulti) {
+-  if (state->adaptive) {
+-    multi = algorithm::shouldLocalMultiHop(true,
+-                                           1.0,
+-                                           0.0,
+-                                           job.hopsLeft,
+-                                           static_cast<int32_t>(job.vids.size()),
+-                                           FLAGS_local_multihop_max_frontier,
+-                                           FLAGS_local_multihop_max_steps);
+-  } else {
+-    multi = algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
+-                                           FLAGS_local_multihop_affinity,
+-                                           FLAGS_local_multihop_affinity_threshold,
+-                                           job.hopsLeft,
+-                                           static_cast<int32_t>(job.vids.size()),
+-                                           FLAGS_local_multihop_max_frontier,
+-                                           FLAGS_local_multihop_max_steps);
++auto enqueue = [state](DstWalkState::Job next) {
++  for (auto& existing : state->jobs) {
++    if (existing.hopsLeft == next.hopsLeft && existing.allowMulti == next.allowMulti &&
++        existing.parallel == next.parallel) {
++      existing.vids.insert(existing.vids.end(),
++                           std::make_move_iterator(next.vids.begin()),
++                           std::make_move_iterator(next.vids.end()));
++      existing.parts.insert(existing.parts.end(), next.parts.begin(), next.parts.end());
++      return;
++    }
+   }
+-}
+-const double minLocalRatio = (multi && state->adaptive) ? FLAGS_local_multihop_min_local_ratio : 0.0;
+-const int32_t reqSteps =
+-    multi ? algorithm::clipLocalMultiHopSteps(job.hopsLeft, FLAGS_local_multihop_max_steps) : 1;
+-int32_t minYield = state->yieldAll ? 1 : job.hopsLeft;
+-if (multi && minYield > reqSteps) {
+-  minYield = reqSteps + 1;
+-}
++  state->jobs.push_back(std::move(next));
++};
+ 
+-time::Duration rpcTime;
+ StorageClient* storageClient = qctx_->getStorageClient();
+ StorageClient::CommonRequestParam param(expand_->space(),
+                                         qctx_->rctx()->session()->id(),
+                                         qctx_->plan()->id(),
+                                         qctx_->plan()->isProfileEnabled());
+ const int32_t rpcIndex = state->rpc++;
+-return storageClient
+-    ->getDstBySrc(param,
+-                  job.vids,
+-                  expand_->edgeTypes(),
+-                  reqSteps,
+-                  minYield,
+-                  FLAGS_local_multihop_row_budget,
+-                  FLAGS_local_multihop_frontier_budget,
+-                  minLocalRatio)
++std::vector<folly::Future<storage::StorageRpcResponse<storage::cpp2::GetDstBySrcResponse>>> futs;
++futs.reserve(batch.size());
++std::vector<bool> jobMulti;
++jobMulti.reserve(batch.size());
++for (const auto& job : batch) {
++  const bool decided = state->perPart ? job.choseMulti : state->choseMulti;
++  bool multi = false;
++  if (job.allowMulti && decided) {
++    if (state->adaptive) {
++      multi = algorithm::shouldLocalMultiHop(true,
++                                             1.0,
++                                             0.0,
++                                             job.hopsLeft,
++                                             static_cast<int32_t>(job.vids.size()),
++                                             FLAGS_local_multihop_max_frontier,
++                                             FLAGS_local_multihop_max_steps);
++    } else {
++      multi = algorithm::shouldLocalMultiHop(FLAGS_enable_local_multihop,
++                                             FLAGS_local_multihop_affinity,
++                                             FLAGS_local_multihop_affinity_threshold,
++                                             job.hopsLeft,
++                                             static_cast<int32_t>(job.vids.size()),
++                                             FLAGS_local_multihop_max_frontier,
++                                             FLAGS_local_multihop_max_steps);
++    }
++  }
++  jobMulti.push_back(multi);
++  const double minLocalRatio =
++      (multi && state->adaptive) ? FLAGS_local_multihop_min_local_ratio : 0.0;
++  const int32_t reqSteps =
++      multi ? algorithm::clipLocalMultiHopSteps(job.hopsLeft, FLAGS_local_multihop_max_steps) : 1;
++  int32_t minYield = state->yieldAll ? 1 : job.hopsLeft;
++  if (multi && minYield > reqSteps) {
++    minYield = reqSteps + 1;
++  }
++  futs.push_back(storageClient
++                     ->getDstBySrc(param,
++                                   job.vids,
++                                   expand_->edgeTypes(),
++                                   reqSteps,
++                                   minYield,
++                                   FLAGS_local_multihop_row_budget,
++                                   FLAGS_local_multihop_frontier_budget,
++                                   minLocalRatio)
++                     .via(runner()));
++}
++
++state->batchClock.reset();
++time::Duration rpcTime;
++return folly::collectAll(std::move(futs))
+     .via(runner())
+     .ensure([this, rpcTime]() {
+       SCOPED_TIMER(&execTime_);
+       addState("total_rpc_time", rpcTime);
+     })
+-    .thenValue([this, state, job, multi, rpcIndex](auto&& resps) {
++    .thenValue([this, state, batch = std::move(batch), jobMulti = std::move(jobMulti), rpcIndex,
++                enqueue](auto&& tries) mutable {
+       memory::MemoryCheckGuard guard;
+       SCOPED_TIMER(&execTime_);
+-      auto& hostLatency = resps.hostLatency();
+-      for (size_t i = 0; i < hostLatency.size(); ++i) {
+-        size_t size = 0;
+-        auto& one = resps.responses()[i];
+-        if (one.dsts_ref().has_value()) {
+-          size = one.get_dsts()->rows.size();
+-        }
+-        auto info = util::collectRespProfileData(one.result, hostLatency[i], size);
+-        addState(folly::sformat("step{} resp [{}]", rpcIndex, i), info);
+-      }
+-      auto completeness = handleCompleteness(resps, FLAGS_accept_partial_success);
+-      if (!completeness.ok()) {
+-        return folly::makeFuture<Status>(completeness.status());
+-      }
+-      for (auto& one : resps.responses()) {
+-        const bool applied = multi && one.multihop_applied_ref().value_or(false);
+-        std::vector<Value> dsts;
+-        if (one.dsts_ref().has_value()) {
+-          for (const auto& row : one.get_dsts()->rows) {
+-            if (!row.values.empty()) dsts.push_back(row.values[0]);
+-          }
+-        }
+-        std::vector<Value> remote;
+-        std::vector<int32_t> depth;
+-        std::vector<Value> carry;
+-        int32_t stepsDone = 0;
+-        bool truncated = false;
+-        if (applied) {
+-          state->sawApplied = true;
+-          if (one.remote_vids_ref().has_value()) remote = one.remote_vids_ref().value();
+-          if (one.remote_depth_ref().has_value()) depth = one.remote_depth_ref().value();
+-          if (one.carry_vids_ref().has_value()) carry = one.carry_vids_ref().value();
+-          stepsDone = one.steps_done_ref().value_or(0);
+-          truncated = one.truncated_ref().value_or(false);
+-          const bool earlyStop = one.early_stop_ref().value_or(false);
+-          const int32_t continueHop = one.continue_hop_ref().value_or(0);
+-          if (earlyStop) {
+-            truncated = true;
+-            state->sawEarlyStop = true;
+-            if (state->earliestContinue == 0 || continueHop < state->earliestContinue) {
+-              state->earliestContinue = continueHop;
++      const double batchUs = static_cast<double>(state->batchClock.elapsedInUSec());
++      if (state->perPart) {
++        for (const auto& job : batch) {
++          std::unordered_set<int32_t> seen;
++          for (int32_t part : job.parts) {
++            if (!seen.insert(part).second) continue;
++            state->partObs[part].us += batchUs;
++          }
++        }
++      }
++      for (size_t j = 0; j < tries.size(); ++j) {
++        if (tries[j].hasException()) {
++          return folly::makeFuture<Status>(
++              Status::Error(std::string(tries[j].exception().what())));
++        }
++        auto resps = std::move(tries[j]).value();
++        auto& hostLatency = resps.hostLatency();
++        for (size_t i = 0; i < hostLatency.size(); ++i) {
++          size_t size = 0;
++          auto& one = resps.responses()[i];
++          if (one.dsts_ref().has_value()) {
++            size = one.get_dsts()->rows.size();
++          }
++          auto info = util::collectRespProfileData(one.result, hostLatency[i], size);
++          addState(folly::sformat("step{} resp [{}]", rpcIndex, j * 1000 + i), info);
++        }
++        auto completeness = handleCompleteness(resps, FLAGS_accept_partial_success);
++        if (!completeness.ok()) {
++          return folly::makeFuture<Status>(completeness.status());
++        }
++        const auto& job = batch[j];
++        const bool multi = jobMulti[j];
++        for (auto& one : resps.responses()) {
++          const bool applied = multi && one.multihop_applied_ref().value_or(false);
++          std::vector<Value> dsts;
++          if (one.dsts_ref().has_value()) {
++            for (const auto& row : one.get_dsts()->rows) {
++              if (!row.values.empty()) dsts.push_back(row.values[0]);
+             }
+           }
+-          if (one.local_ratio_ref().has_value()) {
+-            const double ratio = one.local_ratio_ref().value();
+-            if (!state->sawLocalRatio || ratio < state->worstLocalRatio) {
+-              state->worstLocalRatio = ratio;
+-              state->sawLocalRatio = true;
++          std::vector<Value> remote;
++          std::vector<int32_t> depth;
++          std::vector<Value> carry;
++          int32_t stepsDone = 0;
++          bool truncated = false;
++          bool earlyStop = false;
++          int32_t continueHop = 0;
++          if (applied) {
++            state->sawApplied = true;
++            if (one.remote_vids_ref().has_value()) remote = one.remote_vids_ref().value();
++            if (one.remote_depth_ref().has_value()) depth = one.remote_depth_ref().value();
++            if (one.carry_vids_ref().has_value()) carry = one.carry_vids_ref().value();
++            stepsDone = one.steps_done_ref().value_or(0);
++            truncated = one.truncated_ref().value_or(false);
++            earlyStop = one.early_stop_ref().value_or(false);
++            continueHop = one.continue_hop_ref().value_or(0);
++            if (earlyStop) {
++              truncated = true;
++              state->sawEarlyStop = true;
++              if (state->earliestContinue == 0 || continueHop < state->earliestContinue) {
++                state->earliestContinue = continueHop;
++              }
++            }
++            if (one.local_ratio_ref().has_value()) {
++              const double ratio = one.local_ratio_ref().value();
++              if (!state->sawLocalRatio || ratio < state->worstLocalRatio) {
++                state->worstLocalRatio = ratio;
++                state->sawLocalRatio = true;
++              }
++            }
++            if (state->perPart) {
++              for (int32_t part : job.parts) {
++                auto& obs = state->partObs[part];
++                obs.sawApplied = true;
++                if (earlyStop) {
++                  obs.sawEarly = true;
++                  if (obs.hop == 0 || continueHop < obs.hop) obs.hop = continueHop;
++                }
++                if (one.local_ratio_ref().has_value()) {
++                  const double ratio = one.local_ratio_ref().value();
++                  if (!obs.sawRatio || ratio < obs.ratio) {
++                    obs.ratio = ratio;
++                    obs.sawRatio = true;
++                  }
++                }
++              }
+             }
++            addState(folly::sformat("local_multihop[{}]", rpcIndex * 1000 + static_cast<int32_t>(j)),
++                     folly::sformat("applied=1 steps_done={} remote={} carry={} truncated={} "
++                                    "early_stop={} continue_hop={} local_ratio={}",
++                                    stepsDone,
++                                    remote.size(),
++                                    carry.size(),
++                                    truncated ? 1 : 0,
++                                    earlyStop ? 1 : 0,
++                                    continueHop,
++                                    one.local_ratio_ref().has_value()
++                                        ? folly::sformat("{}", one.local_ratio_ref().value())
++                                        : std::string("-")));
++          }
++          auto consumed = algorithm::consumeLocalMultiHop<Value>(job.hopsLeft,
++                                                                state->yieldAll,
++                                                                applied,
++                                                                stepsDone,
++                                                                truncated,
++                                                                dsts,
++                                                                remote,
++                                                                depth,
++                                                                carry);
++          if (state->yieldAll) {
++            state->yielded.insert(
++                state->yielded.end(), consumed.yieldNow.begin(), consumed.yieldNow.end());
++          } else {
++            state->finals.insert(consumed.yieldNow.begin(), consumed.yieldNow.end());
++          }
++          for (auto& wave : consumed.waves) {
++            DstWalkState::Job next;
++            next.vids = std::move(wave.vids);
++            next.hopsLeft = wave.hopsLeft;
++            next.allowMulti = wave.allowMulti;
++            next.choseMulti = wave.allowMulti && job.choseMulti;
++            next.parallel = false;
++            next.parts = job.parts;
++            enqueue(std::move(next));
+           }
+-          addState(folly::sformat("local_multihop[{}]", rpcIndex),
+-                   folly::sformat("applied=1 steps_done={} remote={} carry={} truncated={} "
+-                                  "early_stop={} continue_hop={} local_ratio={}",
+-                                  stepsDone,
+-                                  remote.size(),
+-                                  carry.size(),
+-                                  truncated ? 1 : 0,
+-                                  earlyStop ? 1 : 0,
+-                                  continueHop,
+-                                  one.local_ratio_ref().has_value()
+-                                      ? folly::sformat("{}", one.local_ratio_ref().value())
+-                                      : std::string("-")));
+-        }
+-        auto consumed = algorithm::consumeLocalMultiHop<Value>(job.hopsLeft,
+-                                                              state->yieldAll,
+-                                                              applied,
+-                                                              stepsDone,
+-                                                              truncated,
+-                                                              dsts,
+-                                                              remote,
+-                                                              depth,
+-                                                              carry);
+-        if (state->yieldAll) {
+-          state->yielded.insert(
+-              state->yielded.end(), consumed.yieldNow.begin(), consumed.yieldNow.end());
+-        } else {
+-          state->finals.insert(consumed.yieldNow.begin(), consumed.yieldNow.end());
+-        }
+-        for (auto& wave : consumed.waves) {
+-          DstWalkState::Job next;
+-          next.vids = std::move(wave.vids);
+-          next.hopsLeft = wave.hopsLeft;
+-          next.allowMulti = wave.allowMulti;
+-          algorithm::mergeSameHop(state->jobs, std::move(next));
+         }
+       }
+       return driveDstWalk(state);
+--- a/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 04:45:37.252654964 +0000
++++ b/src/graph/executor/query/LocalMultiHopDriver.h	2026-10-31 04:46:41.788232335 +0000
+@@ -7,6 +7,7 @@
+ #define GRAPH_EXECUTOR_QUERY_LOCALMULTIHOPDRIVER_H_
+ 
+ #include <cstdint>
++#include <map>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -24,6 +25,7 @@
+   cfg.ewmaAlpha = FLAGS_local_multihop_ewma_alpha;
+   cfg.minLocalRatio = FLAGS_local_multihop_min_local_ratio;
+   cfg.rttUs = static_cast<double>(FLAGS_local_multihop_assumed_rtt_us);
++  cfg.earlyFlip = FLAGS_local_multihop_early_flip;
+   return cfg;
+ }
+ 
+@@ -32,6 +34,20 @@
+     std::vector<Value> vids;
+     int32_t hopsLeft{0};
+     bool allowMulti{true};
++    // Per-part adaptive. parallel jobs in the queue are one round trip.
++    // parts lists the source partitions whose latency this job should update.
++    bool choseMulti{false};
++    bool parallel{false};
++    std::vector<int32_t> parts;
++  };
++  struct PartObs {
++    bool choseMulti{false};
++    double us{0};
++    bool sawApplied{false};
++    bool sawEarly{false};
++    int32_t hop{0};
++    bool sawRatio{false};
++    double ratio{1};
+   };
+   std::vector<Job> jobs;
+   std::unordered_set<Value> finals;
+@@ -41,6 +57,7 @@
+   // adaptive distinguishes the EWMA arm from static multi-hop.
+   // choseMulti is the decision for the whole walk, not for one wave.
+   bool adaptive{false};
++  bool perPart{false};
+   bool choseMulti{false};
+   bool noted{false};
+   bool sawApplied{false};
+@@ -49,9 +66,65 @@
+   int32_t earliestContinue{0};
+   double worstLocalRatio{1.0};
+   algorithm::AdaptiveShape shape{};
++  std::map<int32_t, PartObs> partObs;
+   time::Duration clock;
++  time::Duration batchClock;
+ };
+ 
++// One multi-hop RPC per source partition, and one shared single-hop job for
++// the partitions that chose baseline. All of those jobs are parallel, so the
++// first hop is still one round trip. Returns false when the vids are not
++// INT64 or the space has no partition count; the caller uses the v1 key.
++inline bool fillPerPartJobs(DstWalkState& state,
++                            const std::unordered_set<Value>& vids,
++                            int32_t hops,
++                            int32_t numParts,
++                            const algorithm::AdaptiveShape& shape,
++                            const algorithm::AdaptiveConfig& cfg,
++                            algorithm::AdaptiveController& ctl) {
++  if (numParts <= 0 || vids.empty()) return false;
++  std::map<int32_t, std::vector<Value>> byPart;
++  for (const auto& vid : vids) {
++    if (!vid.isInt()) return false;
++    byPart[algorithm::partOfIntVid(vid.getInt(), numParts)].push_back(vid);
++  }
++  state.perPart = true;
++  state.adaptive = true;
++  state.shape = shape;
++  DstWalkState::Job base;
++  base.hopsLeft = hops;
++  base.allowMulti = true;
++  base.choseMulti = false;
++  base.parallel = true;
++  bool anyBase = false;
++  for (auto& entry : byPart) {
++    auto shapePart = shape;
++    shapePart.part = entry.first;
++    const bool multi = ctl.choose(shapePart, cfg, ctl.nextDraw());
++    DstWalkState::PartObs obs;
++    obs.choseMulti = multi;
++    state.partObs.emplace(entry.first, obs);
++    if (multi) {
++      DstWalkState::Job job;
++      job.vids = std::move(entry.second);
++      job.hopsLeft = hops;
++      job.allowMulti = true;
++      job.choseMulti = true;
++      job.parallel = true;
++      job.parts.push_back(entry.first);
++      state.jobs.push_back(std::move(job));
++    } else {
++      anyBase = true;
++      base.vids.insert(base.vids.end(), entry.second.begin(), entry.second.end());
++      base.parts.push_back(entry.first);
++    }
++  }
++  if (anyBase) {
++    state.jobs.push_back(std::move(base));
++  }
++  return !state.jobs.empty();
++}
++
+ }  // namespace graph
+ }  // namespace nebula
+ 
+--- a/src/graph/service/GraphFlags.cpp	2026-10-31 04:45:37.252654964 +0000
++++ b/src/graph/service/GraphFlags.cpp	2026-10-31 04:46:41.780232386 +0000
+@@ -160,6 +160,14 @@
+ DEFINE_bool(local_multihop_trace,
+             false,
+             "Log one adaptive_multihop line per finished adaptive walk.");
++DEFINE_bool(local_multihop_per_part,
++            true,
++            "Choose multi-hop per source partition. Partitions that disagree "
++            "share the first round trip. Off keeps one decision for the query.");
++DEFINE_bool(local_multihop_early_flip,
++            true,
++            "After two hop-1 early-stops, prefer baseline until a full "
++            "local multi-hop clears the streak. Off keeps the v1 latency EWMA.");
+ 
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+--- a/src/graph/service/GraphFlags.h	2026-10-31 04:45:37.252654964 +0000
++++ b/src/graph/service/GraphFlags.h	2026-10-31 04:46:41.788232335 +0000
+@@ -92,5 +92,10 @@
+ DECLARE_double(local_multihop_ewma_alpha);
+ DECLARE_int64(local_multihop_assumed_rtt_us);
+ DECLARE_bool(local_multihop_trace);
++// v2. per_part splits the start set. early_flip treats repeated hop-1
++// guards as stronger than a stale latency average. Both default on;
++// setting them off is the v1 controller.
++DECLARE_bool(local_multihop_per_part);
++DECLARE_bool(local_multihop_early_flip);
+ 
+ #endif  // GRAPH_GRAPHFLAGS_H_

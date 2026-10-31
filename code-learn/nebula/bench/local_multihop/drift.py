@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--steps", type=int, default=3)
     p.add_argument("--affinity-queries", type=int, default=30)
     p.add_argument("--random-queries", type=int, default=40)
+    p.add_argument("--return-queries", type=int, default=40,
+                   help="affinity queries after the random phase; 0 skips the return")
     p.add_argument("--window", type=int, default=10)
     p.add_argument("--log", default="/tmp/nebula-dist/graph1/logs/nebula-graphd.INFO")
     p.add_argument("--tag", default="drift")
@@ -58,7 +60,10 @@ def log_lines(path, start):
 def parse_choice(line):
     fields = {}
     for part in line.split():
-        if "=" in part and part.startswith(("choice", "walk_us", "ratio", "early", "hop", "rpc", "steps", "space")):
+        if "=" in part and part.startswith((
+            "choice", "walk_us", "ratio", "early", "hop", "rpc", "steps", "space",
+            "multi_parts", "base_parts", "early_parts",
+        )):
             k, v = part.split("=", 1)
             fields[k] = v
     return fields
@@ -83,6 +88,10 @@ def run_phase(session, space, sql, expect, n, log_path):
                 break
             time.sleep(0.05)
         choice = parse_choice(lines[-1]) if lines else {}
+        early = int(choice["early"]) if "early" in choice else None
+        early_parts = int(choice["early_parts"]) if "early_parts" in choice else None
+        if early is None and early_parts is not None:
+            early = 1 if early_parts else 0
         rows.append(
             {
                 "i": i,
@@ -92,7 +101,10 @@ def run_phase(session, space, sql, expect, n, log_path):
                 "choice": choice.get("choice"),
                 "walk_us": int(choice["walk_us"]) if "walk_us" in choice else None,
                 "ratio": float(choice["ratio"]) if "ratio" in choice else None,
-                "early": int(choice["early"]) if "early" in choice else None,
+                "early": early,
+                "early_parts": early_parts,
+                "multi_parts": int(choice["multi_parts"]) if "multi_parts" in choice else None,
+                "base_parts": int(choice["base_parts"]) if "base_parts" in choice else None,
                 "hop": int(choice["hop"]) if "hop" in choice else None,
                 "rpc": int(choice["rpc"]) if "rpc" in choice else None,
                 "log_lines": len(lines),
@@ -115,6 +127,7 @@ def windows(rows, size):
                 "errors": sum(1 for r in chunk if r.get("error")),
                 "multi": sum(1 for c in choices if c == "multi"),
                 "base": sum(1 for c in choices if c == "base"),
+                "mixed": sum(1 for c in choices if c == "mixed"),
                 "missing_choice": sum(1 for c in choices if c is None),
                 "early": sum(1 for r in chunk if r.get("early") == 1),
                 "p50_ms": pct(lats, 50),
@@ -159,9 +172,21 @@ def main():
         report["random"] = run_phase(
             session, args.space, rnd_sql, rnd_expect, args.random_queries, args.log
         )
+        if args.return_queries > 0:
+            delete_edges(session, rnd["edges"])
+            load_graph(session, args, aff)
+            report["return"] = run_phase(
+                session, args.space, aff_sql, aff_expect, args.return_queries, args.log
+            )
         report["affinity_windows"] = windows(report["affinity"], args.window)
         report["random_windows"] = windows(report["random"], args.window)
-        print(json.dumps({"affinity_windows": report["affinity_windows"], "random_windows": report["random_windows"]}))
+        if "return" in report:
+            report["return_windows"] = windows(report["return"], args.window)
+        print(json.dumps({
+            "affinity_windows": report["affinity_windows"],
+            "random_windows": report["random_windows"],
+            "return_windows": report.get("return_windows"),
+        }))
     finally:
         session.release()
         client.close()

@@ -1,6 +1,6 @@
 # 36 — 自适应本地多跳：逐跳守卫和 EWMA
 
-> 静态多跳是 [34](34-local-multihop-impl.md)，它的亲和收益和随机放置回退在 [35](35-local-multihop-bench.md)。实测在 [37](37-adaptive-multihop-bench.md)。
+> 静态多跳是 [34](34-local-multihop-impl.md)，它的亲和收益和随机放置回退在 [35](35-local-multihop-bench.md)。实测在 [37](37-adaptive-multihop-bench.md)。按源分区拆开、并在连续 hop-1 提前停后改走基线，是 [38](38-adaptive-multihop-v2.md)。
 > 补丁 [`patches/v3.8.0-adaptive-local-multihop.patch`](patches/v3.8.0-adaptive-local-multihop.patch) 打在 `v3.8.0-local-multihop.patch` 之上，基线仍是 `fa928930`。
 > 日期：2026-10-31。
 

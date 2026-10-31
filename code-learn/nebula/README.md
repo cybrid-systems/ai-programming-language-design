@@ -51,6 +51,7 @@
 | 35 | [LocalMultiHop 压测](35-local-multihop-bench.md) | 亲和 / 随机 × flag 关 / 开，单机与 3 storaged，P50/P95/P99、QPS、RPC 波次 |
 | 36 | [自适应多跳](36-adaptive-multihop-design-impl.md) | 逐跳本地比例守卫、EWMA 选路、冷启动与 5% 探索；心跳采样只写设计 |
 | 37 | [自适应多跳压测](37-adaptive-multihop-bench.md) | 基线 / 静态多跳 / 自适应，亲和、随机、混合、漂移，近零 RTT 与约 5ms |
+| 38 | [自适应多跳 v2](38-adaptive-multihop-v2.md) | 按源分区选路、hop-1 连续两次就切基线，混合查询里亲和分区仍走多跳 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -68,7 +69,7 @@
 
 28–32 是执行引擎子系列：28 讲 Executor 框架（PlanNode 树 → 异步 DAG、open/execute/close、finish 与生命周期），29 讲 GetNeighbors / Expand / Traverse 三件套，30 讲 Filter / Project / Aggregate / Sort / TopN / Limit / Join，31 讲 Promise/Future 调度、Select/Loop 与内存水位，32 讲最短路 / 全路径 / 子图。13–14 是控制流与数据流总览，这一组补的是 executor 内部实现和关键分支。
 
-33 是设计稿：前提是分区器已经做了社区/子图划分并暴露亲和性元数据；核心是 storaged 内做有界本地 BFS，把远程边界交回 graphd，路径只返回紧凑 `PathPrefix`。34 是按 `fa928930` 收窄后的一阶段实现（没有 PathPrefix，亲和估计是 flag 而不是 meta）。35 是它的单机和多进程实测。36 在 34 的协议上加逐跳守卫和 graphd 的 EWMA，用来在分布未知时保留亲和收益、避开 35 里随机放置的回退。37 是这三路（基线、静态多跳、自适应）的实测。
+33 是设计稿：前提是分区器已经做了社区/子图划分并暴露亲和性元数据；核心是 storaged 内做有界本地 BFS，把远程边界交回 graphd，路径只返回紧凑 `PathPrefix`。34 是按 `fa928930` 收窄后的一阶段实现（没有 PathPrefix，亲和估计是 flag 而不是 meta）。35 是它的单机和多进程实测。36 在 34 的协议上加逐跳守卫和 graphd 的 EWMA，用来在分布未知时保留亲和收益、避开 35 里随机放置的回退。37 是这三路（基线、静态多跳、自适应）的实测。38 把决策拆到源分区，并在连续两次 hop-1 提前停之后改走基线。
 
 ## 主线
 
