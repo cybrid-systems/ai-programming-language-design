@@ -1,0 +1,311 @@
+{
+  "label": "rtt5",
+  "meta": {
+    "users": 20000,
+    "products": 2000,
+    "product_base": 1000001,
+    "alpha": 1.0,
+    "days": 60,
+    "seed": 42,
+    "now": 1761868800,
+    "edges": 379948,
+    "window_30d": [
+      1759276800,
+      1761868800
+    ],
+    "window_7d": [
+      1761264000,
+      1761868800
+    ],
+    "purchases_per_user": "8 + (user % 23), distinct products",
+    "rank": "unix seconds, one edge per user-product",
+    "sales": "1000000 / (1 + permutation), independent of popularity"
+  },
+  "parts": 9,
+  "replica": 1,
+  "host": "10.88.0.31",
+  "measured": true,
+  "accuracy": [],
+  "accuracy_note": "skipped; overlap was measured on the bridge run",
+  "latency": {
+    "exact:30d:c1": {
+      "n": 30,
+      "p50_ms": 47.331,
+      "p99_ms": 68.906,
+      "qps": 10.960440541132986,
+      "wall_s": 2.737116258002061,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "exact:30d:c10": {
+      "n": 10,
+      "p50_ms": 51.756,
+      "p99_ms": 70.621,
+      "qps": 48.792311728961046,
+      "wall_s": 0.20495032200051355,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "exact:30d:c50": {
+      "n": 50,
+      "p50_ms": 89.963,
+      "p99_ms": 183.53,
+      "qps": 61.13790487244487,
+      "wall_s": 0.8178232490026858,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "naive:30d:c1": {
+      "n": 30,
+      "p50_ms": 27.501,
+      "p99_ms": 33.144,
+      "qps": 10.689662847087355,
+      "wall_s": 2.8064495980033826,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "naive:30d:c10": {
+      "n": 10,
+      "p50_ms": 41.108,
+      "p99_ms": 49.243,
+      "qps": 70.6612368313128,
+      "wall_s": 0.14152030799959903,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "naive:30d:c50": {
+      "n": 50,
+      "p50_ms": 40.937,
+      "p99_ms": 53.637,
+      "qps": 120.35474001120531,
+      "wall_s": 0.41543856100179255,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "baseline:30d:c1": {
+      "n": 30,
+      "p50_ms": 160.82,
+      "p99_ms": 323.756,
+      "qps": 0.7144109087759964,
+      "wall_s": 41.99263985400103,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0,
+      "client_rounds": 4,
+      "baseline_rows_example": {
+        "hop1": 5,
+        "inbound": 326,
+        "outbound": 3475,
+        "fetch": 156
+      },
+      "client_rounds_note": "nGQL statements per query, measured. Storage host fanout is not in this number."
+    },
+    "baseline:30d:c10": {
+      "n": 10,
+      "p50_ms": 173.314,
+      "p99_ms": 405.844,
+      "qps": 0.961036133218825,
+      "wall_s": 10.40543602300022,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0,
+      "client_rounds": 4,
+      "baseline_rows_example": {
+        "hop1": 5,
+        "inbound": 326,
+        "outbound": 3475,
+        "fetch": 156
+      },
+      "client_rounds_note": "nGQL statements per query, measured. Storage host fanout is not in this number."
+    },
+    "baseline:30d:c50": {
+      "n": 50,
+      "p50_ms": 209.094,
+      "p99_ms": 492.481,
+      "qps": 0.8132163833988225,
+      "wall_s": 61.484250712001085,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0,
+      "client_rounds": 4,
+      "baseline_rows_example": {
+        "hop1": 5,
+        "inbound": 326,
+        "outbound": 3475,
+        "fetch": 156
+      },
+      "client_rounds_note": "nGQL statements per query, measured. Storage host fanout is not in this number."
+    },
+    "exact:7d:c1": {
+      "n": 30,
+      "p50_ms": 28.896,
+      "p99_ms": 37.825,
+      "qps": 10.818608922592729,
+      "wall_s": 2.7729997650021687,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "exact:7d:c10": {
+      "n": 10,
+      "p50_ms": 37.948,
+      "p99_ms": 51.379,
+      "qps": 70.05580294836638,
+      "wall_s": 0.14274335000300198,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "exact:7d:c50": {
+      "n": 50,
+      "p50_ms": 39.986,
+      "p99_ms": 50.076,
+      "qps": 123.633405785226,
+      "wall_s": 0.4044214400018973,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "naive:7d:c1": {
+      "n": 30,
+      "p50_ms": 24.812,
+      "p99_ms": 29.777,
+      "qps": 11.233647757494367,
+      "wall_s": 2.6705483959995036,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "naive:7d:c10": {
+      "n": 10,
+      "p50_ms": 38.324,
+      "p99_ms": 57.287,
+      "qps": 71.8066519161248,
+      "wall_s": 0.13926286399873788,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "naive:7d:c50": {
+      "n": 50,
+      "p50_ms": 38.842,
+      "p99_ms": 58.469,
+      "qps": 133.27966605440224,
+      "wall_s": 0.3751510000001872,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0
+    },
+    "baseline:7d:c1": {
+      "n": 30,
+      "p50_ms": 42.709,
+      "p99_ms": 86.216,
+      "qps": 6.197784956819838,
+      "wall_s": 4.840438996998273,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0,
+      "client_rounds": 4,
+      "baseline_rows_example": {
+        "hop1": 1,
+        "inbound": 5,
+        "outbound": 16,
+        "fetch": 12
+      },
+      "client_rounds_note": "nGQL statements per query, measured. Storage host fanout is not in this number."
+    },
+    "baseline:7d:c10": {
+      "n": 10,
+      "p50_ms": 44.138,
+      "p99_ms": 95.806,
+      "qps": 13.866057577677255,
+      "wall_s": 0.7211855240020668,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0,
+      "client_rounds": 4,
+      "baseline_rows_example": {
+        "hop1": 1,
+        "inbound": 5,
+        "outbound": 16,
+        "fetch": 12
+      },
+      "client_rounds_note": "nGQL statements per query, measured. Storage host fanout is not in this number."
+    },
+    "baseline:7d:c50": {
+      "n": 50,
+      "p50_ms": 44.635,
+      "p99_ms": 87.614,
+      "qps": 16.205164959435443,
+      "wall_s": 3.0854360400007863,
+      "latency": "ResultSet.latency microseconds, reported in ms",
+      "qps_def": "completed queries / wall clock of this wave",
+      "errors": 0,
+      "client_rounds": 4,
+      "baseline_rows_example": {
+        "hop1": 1,
+        "inbound": 5,
+        "outbound": 16,
+        "fetch": 12
+      },
+      "client_rounds_note": "nGQL statements per query, measured. Storage host fanout is not in this number."
+    }
+  },
+  "plan_summary": {
+    "exact": {
+      "n": 360,
+      "rounds_median": 4,
+      "fallback_n": 0,
+      "hop_rows_median": [
+        5,
+        2083,
+        45,
+        60
+      ],
+      "hop_hosts_median": [
+        1,
+        2,
+        3,
+        3
+      ],
+      "scanned_median": [
+        5,
+        2145,
+        8491,
+        119
+      ],
+      "buyers_median": 2083
+    },
+    "naive": {
+      "n": 360,
+      "rounds_median": 4,
+      "fallback_n": 0,
+      "hop_rows_median": [
+        5,
+        30,
+        15,
+        60
+      ],
+      "hop_hosts_median": [
+        1,
+        2,
+        3,
+        3
+      ],
+      "scanned_median": [
+        5,
+        2145,
+        144,
+        100
+      ],
+      "buyers_median": 15
+    }
+  },
+  "plan_summary_note": "Medians of copurchase_plan lines emitted during the latency waves. hop_rows are storage rows_returned summed across hosts (hop2a is graphd-deduped buyer ids). Baseline has no plan line."
+}

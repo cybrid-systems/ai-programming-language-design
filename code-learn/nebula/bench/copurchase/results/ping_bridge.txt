@@ -1,0 +1,27 @@
+conf meta 10.88.0.11 -> /tmp/nebula-dist/meta1
+conf meta 10.88.0.12 -> /tmp/nebula-dist/meta2
+conf meta 10.88.0.13 -> /tmp/nebula-dist/meta3
+conf storage 10.88.0.21 -> /tmp/nebula-dist/stor1
+conf storage 10.88.0.22 -> /tmp/nebula-dist/stor2
+conf storage 10.88.0.23 -> /tmp/nebula-dist/stor3
+conf graph 10.88.0.31 -> /tmp/nebula-dist/graph1
+netem_delay=0 (egress on every vp-*; ping RTT is about 2x)
+graphd 10.88.0.31:9669 metas=10.88.0.11:9559,10.88.0.12:9559,10.88.0.13:9559 storages=3
+graph -> stor1
+PING 10.88.0.21 (10.88.0.21) 56(84) bytes of data.
+
+--- 10.88.0.21 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 1063ms
+rtt min/avg/max/mdev = 0.018/0.022/0.081/0.013 ms
+stor1 -> stor2
+PING 10.88.0.22 (10.88.0.22) 56(84) bytes of data.
+
+--- 10.88.0.22 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 1061ms
+rtt min/avg/max/mdev = 0.018/0.023/0.094/0.016 ms
+graph -> meta1
+PING 10.88.0.11 (10.88.0.11) 56(84) bytes of data.
+
+--- 10.88.0.11 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 1063ms
+rtt min/avg/max/mdev = 0.014/0.022/0.087/0.014 ms

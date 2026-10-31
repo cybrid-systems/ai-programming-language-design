@@ -11,6 +11,8 @@ TZ="${NEBULA_TZ:-/tmp/nebula-380/resources/date_time_zonespec.csv}"
 ENABLE_LOCAL_MULTIHOP="${ENABLE_LOCAL_MULTIHOP:-false}"
 LOCAL_MULTIHOP_AFFINITY="${LOCAL_MULTIHOP_AFFINITY:-0}"
 STORAGED_ACCEPT="${STORAGED_ACCEPT_LOCAL_MULTIHOP:-true}"
+ENABLE_COPURCHASE="${ENABLE_COPURCHASE:-false}"
+STORAGED_ACCEPT_COPURCHASE="${STORAGED_ACCEPT_COPURCHASE:-true}"
 GRAPH_WORKERS="${GRAPH_WORKERS:-4}"
 ACTION="${1:-start}"
 TMUX_CONF="/exec-daemon/tmux.portal.conf"
@@ -26,10 +28,11 @@ tmux_bin() {
 write_conf() {
   mkdir -p "$ROOT"/{conf,logs,pids,data/meta,data/storage}
   python3 - "$ROOT" "$SRC_CONF" "$TZ" "$ENABLE_LOCAL_MULTIHOP" \
-    "$LOCAL_MULTIHOP_AFFINITY" "$STORAGED_ACCEPT" "$GRAPH_WORKERS" <<'PY'
+    "$LOCAL_MULTIHOP_AFFINITY" "$STORAGED_ACCEPT" "$GRAPH_WORKERS" \
+    "$ENABLE_COPURCHASE" "$STORAGED_ACCEPT_COPURCHASE" <<'PY'
 import sys
 from pathlib import Path
-root, src, tz, enable, affinity, accept, workers = sys.argv[1:]
+root, src, tz, enable, affinity, accept, workers, copurchase, copurchase_accept = sys.argv[1:]
 src, dst = Path(src), Path(root) / "conf"
 dst.mkdir(parents=True, exist_ok=True)
 
@@ -57,7 +60,10 @@ stor = rewrite("nebula-storaged.conf.default", common + [
     ("--data_path=data/storage", f"--data_path={root}/data/storage"),
     ("--rocksdb_block_cache=4", "--rocksdb_block_cache=256"),
 ])
-stor += f"\n--timezone_file={tz}\n--storaged_accept_local_multihop={accept}\n"
+stor += (
+    f"\n--timezone_file={tz}\n--storaged_accept_local_multihop={accept}\n"
+    f"--storaged_accept_copurchase={copurchase_accept}\n"
+)
 (dst / "nebula-storaged.conf").write_text(stor)
 graph = rewrite("nebula-graphd.conf.default", common + [
     ("--pid_file=pids/nebula-graphd.pid", f"--pid_file={root}/pids/nebula-graphd.pid"),
@@ -66,6 +72,7 @@ graph += (
     f"\n--timezone_file={tz}\n"
     f"--enable_local_multihop={enable}\n"
     f"--local_multihop_affinity={affinity}\n"
+    f"--enable_copurchase={copurchase}\n"
     f"--num_worker_threads={workers}\n"
 )
 (dst / "nebula-graphd.conf").write_text(graph)
