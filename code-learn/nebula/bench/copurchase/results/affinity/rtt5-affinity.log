@@ -1,0 +1,11 @@
+warmup {'reason': 'stats', 'waited_s': 0.021, 'mode': 'local', 'ratio': 1.0, 'cov': 1.0, 'stop': 1}
+rtt5-affinity local c=1 p50=6.47 p99=8.192 qps=14.298754555812584 err=0 veth=None
+rtt5-affinity local c=50 p50=9.466 p99=15.697 qps=220.25409331565447 err=0 veth=None
+rtt5-affinity local c=100 p50=12.006 p99=24.434 qps=281.4363803637058 err=0 veth=None
+rtt5-affinity v2 c=1 p50=24.269 p99=26.954 qps=10.88528994751582 err=0 veth=None
+rtt5-affinity v2 c=50 p50=50.148 p99=55.996 qps=341.2173513160882 err=0 veth=None
+rtt5-affinity v2 c=100 p50=79.869 p99=91.84 qps=169.9425492048273 err=0 veth=None
+rtt5-affinity ngql c=1 p50=31.591 p99=38.559 qps=9.433755424615812 err=0 veth=None
+rtt5-affinity ngql c=50 p50=45.345 p99=55.851 qps=72.46321592528814 err=0 veth=None
+rtt5-affinity ngql c=100 p50=38.363 p99=49.448 qps=83.7340462769409 err=1 veth=None
+wrote code-learn/nebula/bench/copurchase/results/affinity/rtt5-affinity.json accuracy 24/24

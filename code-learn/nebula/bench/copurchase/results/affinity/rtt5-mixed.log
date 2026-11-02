@@ -1,0 +1,11 @@
+warmup {'reason': 'ratio', 'waited_s': 0.034, 'mode': 'exact', 'ratio': 0.971042, 'cov': -1.0, 'stop': 0}
+rtt5-mixed local c=1 p50=24.761 p99=28.233 qps=11.350869775979131 err=0 veth=None
+rtt5-mixed local c=50 p50=50.959 p99=60.912 qps=309.4146869209567 err=0 veth=None
+rtt5-mixed local c=100 p50=67.669 p99=84.588 qps=173.61214705734406 err=0 veth=None
+rtt5-mixed v2 c=1 p50=24.476 p99=28.298 qps=11.14532103006317 err=0 veth=None
+rtt5-mixed v2 c=50 p50=62.819 p99=69.815 qps=308.33057284829476 err=0 veth=None
+rtt5-mixed v2 c=100 p50=119.472 p99=132.397 qps=295.5706069633216 err=0 veth=None
+rtt5-mixed ngql c=1 p50=31.693 p99=36.205 qps=8.439030766073053 err=0 veth=None
+rtt5-mixed ngql c=50 p50=44.338 p99=59.662 qps=76.12584062478228 err=0 veth=None
+rtt5-mixed ngql c=100 p50=40.622 p99=56.624 qps=79.45680909812165 err=0 veth=None
+wrote code-learn/nebula/bench/copurchase/results/affinity/rtt5-mixed.json accuracy 24/24

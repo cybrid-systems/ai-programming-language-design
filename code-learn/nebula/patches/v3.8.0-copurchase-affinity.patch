@@ -1,0 +1,1474 @@
+diff --git a/src/clients/meta/MetaClient.cpp b/src/clients/meta/MetaClient.cpp
+index 5a7a368..eefa0aa 100644
+--- a/src/clients/meta/MetaClient.cpp
++++ b/src/clients/meta/MetaClient.cpp
+@@ -2873,7 +2873,9 @@ StatusOr<double> MetaClient::localDstRatioForEdges(GraphSpaceID spaceId,
+   double minRatio = 0;
+   for (int32_t edge : edgeTypes) {
+     const LocalDstRatioSample* entry = find(edge);
+-    if (entry == nullptr && !haveTyped) entry = find(0);
++    // edge 0 is the legacy all-type minimum. A negative type is buyer-host
++    // coverage and must not be replaced by that minimum.
++    if (entry == nullptr && !haveTyped && edge > 0) entry = find(0);
+     if (entry == nullptr) return Status::Error("no local-dst sample");
+     if (perEntry && !algorithm::ratioEntryFresh(entry->tsMs, now, maxAgeMs)) {
+       return Status::Error("stale local-dst sample");
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index a9bfc72..686183e 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -172,7 +172,10 @@ StorageRpcRespFuture<cpp2::CopurchaseResponse> StorageClient::copurchase(
+     std::string salesProp,
+     int64_t budgetUs,
+     int64_t maxEdges,
+-    int32_t maxBuyers) {
++    int32_t maxBuyers,
++    bool coarse,
++    int32_t topUsers,
++    int32_t topSales) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::CopurchaseResponse>>(
+@@ -206,6 +209,9 @@ StorageRpcRespFuture<cpp2::CopurchaseResponse> StorageClient::copurchase(
+     if (budgetUs > 0) req.budget_us_ref() = budgetUs;
+     if (maxEdges > 0) req.max_edges_ref() = maxEdges;
+     if (maxBuyers > 0) req.max_buyers_ref() = maxBuyers;
++    if (coarse) req.coarse_ref() = true;
++    if (topUsers > 0) req.top_users_ref() = topUsers;
++    if (topSales > 0) req.top_sales_ref() = topSales;
+   }
+ 
+   return collectResponse(param.evb,
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index df5cd28..3f42ae6 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -110,7 +110,10 @@ class StorageClient
+       std::string salesProp = "",
+       int64_t budgetUs = 0,
+       int64_t maxEdges = 0,
+-      int32_t maxBuyers = 0);
++      int32_t maxBuyers = 0,
++      bool coarse = false,
++      int32_t topUsers = 0,
++      int32_t topSales = 0);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+diff --git a/src/common/algorithm/Copurchase.h b/src/common/algorithm/Copurchase.h
+index dff0c59..84aace8 100644
+--- a/src/common/algorithm/Copurchase.h
++++ b/src/common/algorithm/Copurchase.h
+@@ -8,7 +8,9 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstring>
+ #include <limits>
++#include <string>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -299,6 +301,121 @@ inline std::vector<SalesScore> mergeSales(const std::vector<std::vector<SalesSco
+   return localTopSales(std::move(rows), k);
+ }
+ 
++// INT64 vid partition. MetaClient::partId copies 8 little-endian bytes into a
++// uint64 and returns vid % numParts + 1. Positive vids are that integer.
++inline int32_t partOfInt64(int64_t vid, int32_t numParts) {
++  if (numParts <= 0) return 0;
++  const uint64_t raw = static_cast<uint64_t>(vid);
++  return static_cast<int32_t>(raw % static_cast<uint64_t>(numParts)) + 1;
++}
++
++// seq >= 0, partIndex in [0, numParts). The vid hashes to part partIndex+1
++// without changing Nebula's hash. Existing data does not move; only new vids
++// chosen this way land on the requested part.
++inline int64_t affinityVid(int64_t seq, int32_t partIndex, int32_t numParts) {
++  return seq * static_cast<int64_t>(numParts) + static_cast<int64_t>(partIndex);
++}
++
++// One community lives on one part of one host. hostParts are the part ids
++// (1-based) that host leads. Communities rotate across those parts.
++inline int32_t communityPart(int32_t community, const std::vector<int32_t>& hostParts) {
++  if (hostParts.empty()) return 0;
++  const auto n = static_cast<int32_t>(hostParts.size());
++  const int32_t idx = community % n;
++  return hostParts[static_cast<size_t>(idx < 0 ? idx + n : idx)];
++}
++
++// True only when every vid's part is present and maps to the same host.
++// A missing part or a second host is not a local chain. The caller passes the
++// live leader map; this function does not guess.
++struct ChainProof {
++  bool complete{false};
++  int32_t host{-1};
++  std::vector<int32_t> parts;
++};
++
++inline ChainProof proveLocalChain(const std::vector<int64_t>& vids,
++                                  int32_t numParts,
++                                  const std::unordered_map<int32_t, int32_t>& partToHost) {
++  ChainProof proof;
++  int32_t host = -1;
++  for (const auto vid : vids) {
++    const int32_t part = partOfInt64(vid, numParts);
++    proof.parts.push_back(part);
++    auto it = partToHost.find(part);
++    if (it == partToHost.end()) {
++      proof.complete = false;
++      proof.host = host;
++      return proof;
++    }
++    if (host < 0) {
++      host = it->second;
++    } else if (host != it->second) {
++      proof.complete = false;
++      proof.host = host;
++      return proof;
++    }
++  }
++  std::sort(proof.parts.begin(), proof.parts.end());
++  proof.parts.erase(std::unique(proof.parts.begin(), proof.parts.end()), proof.parts.end());
++  proof.host = host;
++  proof.complete = host >= 0 && !vids.empty();
++  return proof;
++}
++
++// Per-host coarse prune. `missing` is the number of focus products whose
++// canonical in-edges are not on this host. lower is the focus products this
++// host actually saw. upper = lower + missing.
++//
++// The k-th highest lower on this host is <= the global k-th exact coCount:
++// every lower is <= that buyer's true coCount, and the k-th of a subset cannot
++// exceed the k-th of the full set. A buyer with upper < threshold therefore
++// has true coCount < threshold <= global k-th, so dropping them cannot remove
++// a member of the true top k. Buyers at the threshold stay, ties included.
++//
++// The union of the kept sets, over every host that scanned its own products,
++// still contains the true top k. A buyer whose true coCount reaches the global
++// k-th has upper >= that coCount on every host that sees them, so each such
++// host keeps them and ships every product it saw. Graphd must not treat a
++// missing host as missing=0.
++inline std::vector<int64_t> coarseKeep(const std::vector<CoBuyer>& buyers, int k, int32_t* pruned) {
++  return pruneCandidates(buyers, k, pruned);
++}
++
++// Inverted index stored on the source part, in the same raft batch as the
++// out-edge. Key order is edge type, destination (product), rank, source.
++// The prefix of (edge type, product) lists buyers who live on THIS part only.
++// It is not a copy of the canonical in-edge, which lives on the product part.
++inline std::string mirrorSuffix(int32_t edgeType, int64_t dstVid, int64_t rank, int64_t srcVid) {
++  auto append32 = [](std::string* out, uint32_t value) {
++    char bytes[4];
++    for (int i = 3; i >= 0; --i) {
++      bytes[i] = static_cast<char>(value & 0xff);
++      value >>= 8;
++    }
++    out->append(bytes, 4);
++  };
++  auto append64 = [](std::string* out, uint64_t value) {
++    char bytes[8];
++    for (int i = 7; i >= 0; --i) {
++      bytes[i] = static_cast<char>(value & 0xff);
++      value >>= 8;
++    }
++    out->append(bytes, 8);
++  };
++  std::string name = "cpv1";
++  append32(&name, static_cast<uint32_t>(edgeType));
++  append64(&name, static_cast<uint64_t>(dstVid));
++  append64(&name, static_cast<uint64_t>(rank));
++  append64(&name, static_cast<uint64_t>(srcVid));
++  return name;
++}
++
++inline bool mirrorSameProduct(const std::string& a, const std::string& b) {
++  const size_t prefix = 4 + 4 + 8;
++  return a.size() >= prefix && b.size() >= prefix && a.compare(0, prefix, b, 0, prefix) == 0;
++}
++
+ }  // namespace algorithm
+ }  // namespace nebula
+ 
+diff --git a/src/common/algorithm/test/CopurchaseTest.cpp b/src/common/algorithm/test/CopurchaseTest.cpp
+index 2091117..d24b9e5 100644
+--- a/src/common/algorithm/test/CopurchaseTest.cpp
++++ b/src/common/algorithm/test/CopurchaseTest.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <gtest/gtest.h>
+ 
++#include <random>
++#include <unordered_map>
+ #include <unordered_set>
+ 
+ #include "common/algorithm/Copurchase.h"
+@@ -187,5 +189,157 @@ TEST(Copurchase, SalesLocalTopContainsGlobal) {
+   EXPECT_EQ(100, merged[0].pid);
+ }
+ 
++TEST(Copurchase, AffinityVidMatchesHashPart) {
++  for (int parts : {1, 3, 9, 16}) {
++    for (int partIndex = 0; partIndex < parts; ++partIndex) {
++      for (int64_t seq = 0; seq < 50; ++seq) {
++        const int64_t vid = affinityVid(seq, partIndex, parts);
++        EXPECT_GE(vid, 0);
++        EXPECT_EQ(partIndex + 1, partOfInt64(vid, parts)) << vid;
++      }
++    }
++  }
++}
++
++TEST(Copurchase, MirrorSuffixGroupsOneProduct) {
++  const auto a = mirrorSuffix(12, 100, 10, 1);
++  const auto b = mirrorSuffix(12, 100, 20, 2);
++  const auto c = mirrorSuffix(12, 101, 10, 1);
++  EXPECT_TRUE(mirrorSameProduct(a, b));
++  EXPECT_FALSE(mirrorSameProduct(a, c));
++  EXPECT_LT(a, b);
++}
++
++// Eight seeds. Affinity placement puts one community on one part of one host,
++// so the vids the chain touches prove a single host. A cross edge puts a
++// product on another host and the proof fails. Split products still keep the
++// true top users under coarseKeep.
++TEST(Copurchase, AffinityProofAndCoarseEightSeeds) {
++  constexpr int kParts = 9;
++  constexpr int kHosts = 3;
++  std::unordered_map<int32_t, int32_t> partHost;
++  std::vector<std::vector<int32_t>> hostParts(kHosts);
++  for (int part = 1; part <= kParts; ++part) {
++    const int host = (part - 1) % kHosts;
++    partHost[part] = host;
++    hostParts[host].push_back(part);
++  }
++  for (int seed = 1; seed <= 8; ++seed) {
++    std::mt19937 rng(static_cast<uint32_t>(seed) * 10007u);
++    std::uniform_int_distribution<int> hostPick(0, kHosts - 1);
++    std::uniform_int_distribution<int> cross(0, 9);
++    struct Edge {
++      int64_t user;
++      int64_t product;
++      int64_t ts;
++    };
++    std::vector<Edge> edges;
++    std::vector<int64_t> users;
++    std::vector<int64_t> products;
++    int64_t userSeq = 1;
++    int64_t productSeq = 1;
++    for (int host = 0; host < kHosts; ++host) {
++      const int32_t part = hostParts[host][0];
++      const int partIndex = part - 1;
++      for (int i = 0; i < 40; ++i) {
++        users.push_back(affinityVid(userSeq++, partIndex, kParts));
++      }
++      for (int i = 0; i < 6; ++i) {
++        products.push_back(affinityVid(productSeq++, partIndex, kParts));
++      }
++    }
++    std::unordered_map<int64_t, int64_t> sales;
++    for (size_t i = 0; i < products.size(); ++i) sales[products[i]] = 1000 - static_cast<int64_t>(i);
++    for (size_t u = 0; u < users.size(); ++u) {
++      const int home = partHost[partOfInt64(users[u], kParts)];
++      for (int e = 0; e < 4; ++e) {
++        int64_t product = products[(home * 6 + (u + e) % 6) % products.size()];
++        if (seed % 2 == 0 && cross(rng) == 0) {
++          product = products[static_cast<size_t>(hostPick(rng)) * 6 % products.size()];
++        }
++        edges.push_back(Edge{users[u], product, 100 + static_cast<int64_t>((u + e) % 50)});
++      }
++    }
++    const int64_t startUser = users[static_cast<size_t>(seed) % users.size()];
++    std::unordered_map<int64_t, int32_t> count;
++    std::unordered_map<int64_t, int64_t> latest;
++    for (const auto& edge : edges) {
++      if (edge.user != startUser || edge.ts < 100 || edge.ts > 200) continue;
++      count[edge.product]++;
++      if (edge.ts > latest[edge.product]) latest[edge.product] = edge.ts;
++    }
++    std::vector<ProductScore> focusRows;
++    for (const auto& item : count) {
++      focusRows.push_back(ProductScore{item.first, item.second, latest[item.first]});
++    }
++    keepTop(focusRows, 5, betterProduct);
++    std::vector<int64_t> focus;
++    for (const auto& row : focusRows) focus.push_back(row.pid);
++    std::unordered_set<int64_t> focusSet(focus.begin(), focus.end());
++    std::unordered_map<int64_t, std::vector<EdgeFact>> out;
++    for (const auto& edge : edges) {
++      if (edge.ts < 100 || edge.ts > 200) continue;
++      out[edge.user].push_back(EdgeFact{edge.product, edge.ts});
++    }
++    std::vector<UserScore> scored;
++    for (const auto& item : out) {
++      if (item.first == startUser) continue;
++      auto row = scoreUser(item.first, item.second, focusSet, 100, 200);
++      if (row.coCount > 0) scored.push_back(std::move(row));
++    }
++    auto truth = localTopUsers(scored, 15);
++    std::vector<int64_t> touched = {startUser};
++    touched.insert(touched.end(), focus.begin(), focus.end());
++    for (const auto& row : truth) {
++      touched.push_back(row.user);
++      touched.insert(touched.end(), row.productIds.begin(), row.productIds.end());
++    }
++    auto proof = proveLocalChain(touched, kParts, partHost);
++    bool crossEdge = false;
++    for (auto pid : focus) {
++      if (partHost[partOfInt64(pid, kParts)] != partHost[partOfInt64(startUser, kParts)]) {
++        crossEdge = true;
++      }
++    }
++    for (const auto& row : truth) {
++      if (partHost[partOfInt64(row.user, kParts)] != partHost[partOfInt64(startUser, kParts)]) {
++        crossEdge = true;
++      }
++      for (auto pid : row.productIds) {
++        if (partHost[partOfInt64(pid, kParts)] != partHost[partOfInt64(startUser, kParts)]) {
++          crossEdge = true;
++        }
++      }
++    }
++    if (!truth.empty()) {
++      EXPECT_EQ(!crossEdge, proof.complete) << "seed " << seed;
++    }
++
++    std::unordered_map<int32_t, int32_t> focusOnHost;
++    for (auto pid : focus) focusOnHost[partHost[partOfInt64(pid, kParts)]]++;
++    std::unordered_map<int32_t, std::vector<CoBuyer>> byHost;
++    for (const auto& row : scored) {
++      std::unordered_map<int32_t, int32_t> local;
++      for (auto pid : row.productIds) {
++        if (focusSet.count(pid) == 0) continue;
++        local[partHost[partOfInt64(pid, kParts)]]++;
++      }
++      for (const auto& item : local) {
++        const int32_t onHost = focusOnHost[item.first];
++        const int32_t missing = static_cast<int32_t>(focus.size()) - onHost;
++        byHost[item.first].push_back(CoBuyer{row.user, item.second, item.second + missing});
++      }
++    }
++    std::unordered_set<int64_t> kept;
++    for (auto& item : byHost) {
++      auto ids = coarseKeep(item.second, 15, nullptr);
++      kept.insert(ids.begin(), ids.end());
++    }
++    for (const auto& row : truth) {
++      EXPECT_TRUE(kept.count(row.user) != 0) << "seed " << seed << " user " << row.user;
++    }
++  }
++}
++
+ }  // namespace algorithm
+ }  // namespace nebula
+diff --git a/src/graph/executor/query/CopurchaseDriver.cpp b/src/graph/executor/query/CopurchaseDriver.cpp
+index 257357d..083ef7f 100644
+--- a/src/graph/executor/query/CopurchaseDriver.cpp
++++ b/src/graph/executor/query/CopurchaseDriver.cpp
+@@ -8,6 +8,7 @@
+ #include <cctype>
+ #include <chrono>
+ #include <sstream>
++#include <tuple>
+ #include <unordered_set>
+ 
+ #include <folly/executors/InlineExecutor.h>
+@@ -34,6 +35,7 @@ struct Parsed {
+   int64_t windowEnd{0};
+   bool naive{false};
+   bool noprune{false};
++  bool noaffinity{false};
+ };
+ 
+ struct HopStat {
+@@ -67,6 +69,13 @@ struct State {
+   int64_t sent{0};
+   int64_t startedUs{0};
+   std::string failure;
++  bool localHit{false};
++  int32_t localStop{0};
++  double outRatio{-1};
++  double buyerCov{-1};
++  std::string affinityReason{"-"};
++  int rpcN{0};
++  int64_t rpcPayload{0};
+ };
+ 
+ bool parseQuery(const std::string& text, Parsed* out) {
+@@ -89,6 +98,8 @@ bool parseQuery(const std::string& text, Parsed* out) {
+       out->naive = true;
+     } else if (tail == "NOPRUNE" && !out->noprune) {
+       out->noprune = true;
++    } else if (tail == "NOAFFINITY" && !out->noaffinity) {
++      out->noaffinity = true;
+     } else {
+       return false;
+     }
+@@ -145,6 +156,7 @@ struct Inspect {
+   bool limit{false};
+   bool partials{true};
+   HopStat stat;
++  int64_t payload{0};
+ };
+ 
+ Inspect inspect(const storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse>& rpc) {
+@@ -164,11 +176,20 @@ Inspect inspect(const storage::StorageRpcResponse<storage::cpp2::CopurchaseRespo
+     if (resp.rows_returned_ref().has_value()) {
+       out.stat.returned += resp.rows_returned_ref().value();
+     }
++    if (resp.payload_bytes_ref().has_value()) out.payload += resp.payload_bytes_ref().value();
+     if (!resp.get_result().get_failed_parts().empty()) out.ok = false;
+   }
+   return out;
+ }
+ 
++Inspect take(const std::shared_ptr<State>& state,
++             const storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse>& rpc) {
++  auto seen = inspect(rpc);
++  state->rpcN += seen.stat.hosts;
++  state->rpcPayload += seen.payload;
++  return seen;
++}
++
+ void logPlan(const State& state) {
+   std::ostringstream users;
+   for (size_t i = 0; i < state.users.size(); ++i) {
+@@ -195,7 +216,8 @@ void logPlan(const State& state) {
+   if (elapsed >= FLAGS_copurchase_slow_us) {
+     LOG(WARNING) << "copurchase_slow us=" << elapsed << " failure=" << state.failure;
+   }
+-  LOG(INFO) << "copurchase_plan mode=" << (state.query.naive ? "naive" : "exact")
++  const char* mode = state.query.naive ? "naive" : (state.localHit ? "local" : "exact");
++  LOG(INFO) << "copurchase_plan mode=" << mode
+             << " fallback=" << (state.fallback ? 1 : 0) << " prune=" << (prune ? 1 : 0)
+             << " pruned=" << state.pruned << " sent=" << state.sent << " rounds=" << state.rounds
+             << " buyers=" << state.buyers << " failure=" << (state.failure.empty() ? "-" : state.failure)
+@@ -205,7 +227,14 @@ void logPlan(const State& state) {
+             << state.hops[2].hosts << "," << state.hops[3].hosts
+             << " scanned=" << state.hops[0].scanned << "," << state.hops[1].scanned << ","
+             << state.hops[2].scanned << "," << state.hops[3].scanned << " users=" << users.str()
+-            << " products=" << products.str();
++            << " products=" << products.str()
++            << " affinity=" << (state.localHit ? 1 : 0) << " stop=" << state.localStop
++            << " reason=" << state.affinityReason << " ratio=" << state.outRatio
++            << " cov=" << state.buyerCov << " rpc=" << state.rpcN
++            << " payload=" << state.rpcPayload;
++  if (state.localHit) stats::StatsManager::addValue(kNumCopurchaseLocal);
++  stats::StatsManager::addValue(kCopurchaseRpc, state.rpcN);
++  stats::StatsManager::addValue(kCopurchasePayload, state.rpcPayload);
+ }
+ 
+ folly::Future<storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse>> callPhase(
+@@ -214,7 +243,10 @@ folly::Future<storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse>> ca
+     const std::vector<int64_t>& vids,
+     const std::vector<int64_t>& focus,
+     int32_t topK,
+-    bool withSales) {
++    bool withSales,
++    bool coarse = false,
++    int32_t topUsers = 0,
++    int32_t topSales = 0) {
+   auto* client = state->qctx->getStorageClient();
+   return client
+       ->copurchase(paramOf(*state),
+@@ -230,7 +262,10 @@ folly::Future<storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse>> ca
+                    withSales ? FLAGS_copurchase_sales_prop : "",
+                    FLAGS_copurchase_budget_us,
+                    FLAGS_copurchase_max_edges,
+-                   FLAGS_copurchase_max_buyers)
++                   FLAGS_copurchase_max_buyers,
++                   coarse,
++                   topUsers,
++                   topSales)
+       .via(state->runner);
+ }
+ 
+@@ -338,8 +373,11 @@ folly::Future<StatusOr<DataSet>> fallback(const std::shared_ptr<State>& state) {
+   state->focus.clear();
+   for (auto& hop : state->hops) hop = HopStat();
+   return fetchEdges(state, {state->query.user}, false, &state->hops[0])
+-      .thenValue([state](std::vector<Purchase> edges) {
++      .thenValue([state](std::vector<Purchase> edges) -> folly::Future<StatusOr<DataSet>> {
+         state->rounds++;
++        // No storaged answered. An empty edge list here is a failed read, not
++        // a user with no purchases. Do not publish an empty ranking.
++        if (state->hops[0].hosts <= 0) return fail(state, "rpc");
+         std::vector<algorithm::EdgeFact> facts;
+         facts.reserve(edges.size());
+         for (const auto& edge : edges) {
+@@ -498,7 +536,7 @@ folly::Future<StatusOr<DataSet>> finishWithSales(const std::shared_ptr<State>& s
+                    true)
+       .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> rpc)
+                      -> folly::Future<StatusOr<DataSet>> {
+-        auto seen = inspect(rpc);
++        auto seen = take(state, rpc);
+         state->hops[3] = seen.stat;
+         state->rounds++;
+         if (seen.limit) return fail(state, "limit");
+@@ -543,7 +581,7 @@ folly::Future<StatusOr<DataSet>> afterBuyers(const std::shared_ptr<State>& state
+                      false)
+         .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> rpc)
+                        -> folly::Future<StatusOr<DataSet>> {
+-          auto seen = inspect(rpc);
++          auto seen = take(state, rpc);
+           state->hops[2] = seen.stat;
+           state->rounds++;
+           if (seen.limit) return fail(state, "limit");
+@@ -587,7 +625,7 @@ folly::Future<StatusOr<DataSet>> afterBuyers(const std::shared_ptr<State>& state
+                            false)
+               .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> rpc)
+                              -> folly::Future<StatusOr<DataSet>> {
+-                auto seen = inspect(rpc);
++                auto seen = take(state, rpc);
+                 state->hops[2] = seen.stat;
+                 state->rounds++;
+                 if (seen.limit) return fail(state, "limit");
+@@ -612,15 +650,18 @@ folly::Future<StatusOr<DataSet>> afterBuyers(const std::shared_ptr<State>& state
+         });
+   }
+ 
++  const bool coarse = !state->query.naive && !state->query.noprune && !state->query.noaffinity &&
++                      (FLAGS_copurchase_coarse || FLAGS_copurchase_affinity);
+   return callPhase(state,
+                    storage::cpp2::CopurchasePhase::HOP2A_BUYERS,
+                    state->focus,
+                    state->focus,
+-                   0,
+-                   false)
++                   coarse ? FLAGS_copurchase_top_users : 0,
++                   false,
++                   coarse)
+       .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> rpc)
+                      -> folly::Future<StatusOr<DataSet>> {
+-        auto seen = inspect(rpc);
++        auto seen = take(state, rpc);
+         state->hops[1] = seen.stat;
+         state->rounds++;
+         if (seen.limit) return fail(state, "limit");
+@@ -670,7 +711,7 @@ folly::Future<StatusOr<DataSet>> afterBuyers(const std::shared_ptr<State>& state
+                          false)
+             .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> fused)
+                            -> folly::Future<StatusOr<DataSet>> {
+-              auto fusedSeen = inspect(fused);
++              auto fusedSeen = take(state, fused);
+               state->hops[2] = fusedSeen.stat;
+               state->rounds++;
+               if (fusedSeen.limit) return fail(state, "limit");
+@@ -711,7 +752,7 @@ folly::Future<StatusOr<DataSet>> pushdown(const std::shared_ptr<State>& state) {
+                    false)
+       .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> rpc)
+                      -> folly::Future<StatusOr<DataSet>> {
+-        auto seen = inspect(rpc);
++        auto seen = take(state, rpc);
+         state->hops[0] = seen.stat;
+         state->rounds++;
+         if (seen.limit) return fail(state, "limit");
+@@ -743,6 +784,271 @@ folly::Future<StatusOr<DataSet>> pushdown(const std::shared_ptr<State>& state) {
+       });
+ }
+ 
++bool guardHolds(const std::shared_ptr<State>& state,
++                const storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse>& rpc) {
++  if (rpc.responses().size() != 1 || rpc.hostLatency().size() != 1) return false;
++  const auto host = std::get<0>(rpc.hostLatency().front());
++  const auto& resp = rpc.responses().front();
++  if (!resp.touched_parts_ref().has_value() || resp.touched_parts_ref().value().empty()) return false;
++  auto* client = state->qctx->getStorageClient();
++  for (auto part : resp.touched_parts_ref().value()) {
++    auto leader = client->getLeader(state->space, static_cast<PartitionID>(part));
++    if (!leader.ok() || !(leader.value() == host)) return false;
++  }
++  return true;
++}
++
++std::string vidBytes(int64_t raw) {
++  return std::string(reinterpret_cast<const char*>(&raw), sizeof(raw));
++}
++
++bool localityAllows(const std::shared_ptr<State>& state) {
++  if (state->query.naive || state->query.noaffinity || !FLAGS_copurchase_affinity) {
++    state->affinityReason = "off";
++    return false;
++  }
++  if (FLAGS_copurchase_affinity_force) {
++    state->affinityReason = "force";
++    return true;
++  }
++  auto* meta = state->qctx->getMetaClient();
++  auto parts = meta->partsNum(state->space);
++  if (!parts.ok() || parts.value() <= 0) {
++    state->affinityReason = "parts";
++    return false;
++  }
++  const int32_t numParts = parts.value();
++  const auto userPart = meta->partId(numParts, vidBytes(state->query.user));
++  const int64_t stale = FLAGS_local_multihop_prior_stale_ms;
++  const bool perEntry = FLAGS_local_multihop_prior_per_entry;
++  auto ratio = meta->localDstRatioForEdges(
++      state->space, userPart, std::vector<int32_t>{state->edgeType}, stale, perEntry);
++  if (!ratio.ok()) {
++    state->affinityReason = "no_ratio";
++    return false;
++  }
++  state->outRatio = ratio.value();
++  if (state->outRatio + 1e-12 < FLAGS_copurchase_affinity_min_ratio) {
++    state->affinityReason = "ratio";
++    return false;
++  }
++  auto* storage = state->qctx->getStorageClient();
++  auto home = storage->getLeader(state->space, userPart);
++  if (!home.ok()) {
++    state->affinityReason = "leader";
++    return false;
++  }
++  bool anyCov = false;
++  double minCov = 1.0;
++  for (PartitionID part = 1; part <= static_cast<PartitionID>(numParts); ++part) {
++    auto leader = storage->getLeader(state->space, part);
++    if (!leader.ok() || !(leader.value() == home.value())) continue;
++    auto cov = meta->localDstRatioForEdges(
++        state->space, part, std::vector<int32_t>{-state->edgeType}, stale, perEntry);
++    if (!cov.ok()) continue;
++    anyCov = true;
++    if (cov.value() < minCov) minCov = cov.value();
++  }
++  if (!anyCov) {
++    state->affinityReason = "no_cov";
++    return false;
++  }
++  state->buyerCov = minCov;
++  if (minCov + 1e-12 < FLAGS_copurchase_affinity_min_ratio) {
++    state->affinityReason = "cov";
++    return false;
++  }
++  state->affinityReason = "stats";
++  return true;
++}
++
++algorithm::UserScore userFromRow(const storage::cpp2::CopurchaseUserRow& row) {
++  algorithm::UserScore score;
++  score.user = row.get_user();
++  score.coCount = row.get_co_count();
++  score.purchaseCount = row.get_purchase_count();
++  score.latestTs = row.get_latest_ts();
++  score.productIds = row.get_product_ids();
++  return score;
++}
++
++folly::Future<StatusOr<DataSet>> maybeAffinity(const std::shared_ptr<State>& state) {
++  if (!localityAllows(state)) return pushdown(state);
++  return callPhase(state,
++                   storage::cpp2::CopurchasePhase::LOCAL_CHAIN,
++                   {state->query.user},
++                   {},
++                   FLAGS_copurchase_top_products,
++                   true,
++                   false,
++                   FLAGS_copurchase_top_users,
++                   FLAGS_copurchase_top_sales)
++      .thenValue([state](storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> rpc)
++                     -> folly::Future<StatusOr<DataSet>> {
++        auto seen = take(state, rpc);
++        state->hops[0] = seen.stat;
++        state->rounds = 1;
++        auto restart = [&]() {
++          state->localHit = false;
++          state->rounds = 0;
++          state->focus.clear();
++          state->users.clear();
++          state->sales.clear();
++          for (auto& hop : state->hops) hop = HopStat();
++          return pushdown(state);
++        };
++        if (seen.limit) return fail(state, "limit");
++        if (!seen.applied || !seen.ok || !guardHolds(state, rpc)) {
++          state->affinityReason = !seen.applied ? "not_applied" : "guard";
++          state->localStop = 0;
++          return restart();
++        }
++        const auto& resp = rpc.responses().front();
++        const int32_t stop = resp.local_stop_ref().has_value() ? resp.local_stop_ref().value() : 0;
++        state->localStop = stop;
++        const bool complete =
++            stop == 1 && resp.local_complete_ref().has_value() && resp.local_complete_ref().value();
++        if (complete) {
++          state->localHit = true;
++          if (resp.users_ref().has_value()) {
++            for (const auto& row : resp.users_ref().value()) {
++              state->users.push_back(userFromRow(row));
++            }
++          }
++          state->buyers = static_cast<int64_t>(state->users.size());
++          state->sent = state->buyers;
++          if (resp.ids_ref().has_value()) {
++            const auto& ids = resp.ids_ref().value();
++            const auto& sales =
++                resp.sales_ref().has_value() ? resp.sales_ref().value() : std::vector<int64_t>{};
++            for (size_t i = 0; i < ids.size(); ++i) {
++              algorithm::SalesScore score;
++              score.pid = ids[i];
++              score.sales = i < sales.size() ? sales[i] : 0;
++              state->sales.push_back(score);
++            }
++          }
++          state->hops[1].returned = state->buyers;
++          state->hops[2].returned = state->buyers;
++          state->hops[3].returned = static_cast<int64_t>(state->sales.size());
++          logPlan(*state);
++          return folly::makeFuture<StatusOr<DataSet>>(toDataSet(state->sales));
++        }
++        if (stop == 2 && resp.ids_ref().has_value()) {
++          state->focus = resp.ids_ref().value();
++          state->hops[0].returned = static_cast<int64_t>(state->focus.size());
++          if (state->focus.empty()) {
++            logPlan(*state);
++            return folly::makeFuture<StatusOr<DataSet>>(emptyResult());
++          }
++          return afterBuyers(state);
++        }
++        if (stop == 3 && resp.ids_ref().has_value()) {
++          std::vector<algorithm::UserScore> local;
++          if (resp.users_ref().has_value()) {
++            for (const auto& row : resp.users_ref().value()) {
++              if (row.score_exact_ref().has_value() && row.score_exact_ref().value()) {
++                local.push_back(userFromRow(row));
++              }
++            }
++          }
++          state->focus = resp.ids_ref().value();
++          std::vector<int64_t> remote =
++              resp.remote_ids_ref().has_value() ? resp.remote_ids_ref().value() : std::vector<int64_t>{};
++          if (remote.empty()) {
++            state->users = algorithm::localTopUsers(std::move(local), FLAGS_copurchase_top_users);
++            std::unordered_set<int64_t> pids;
++            for (const auto& user : state->users) {
++              pids.insert(user.productIds.begin(), user.productIds.end());
++            }
++            return finishWithSales(state, std::vector<int64_t>(pids.begin(), pids.end()));
++          }
++          return callPhase(state,
++                           storage::cpp2::CopurchasePhase::FUSED_COCOUNT,
++                           remote,
++                           state->focus,
++                           FLAGS_copurchase_top_users,
++                           false)
++              .thenValue([state, local = std::move(local)](
++                             storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> fused)
++                             -> folly::Future<StatusOr<DataSet>> {
++                auto fusedSeen = take(state, fused);
++                state->hops[2] = fusedSeen.stat;
++                state->rounds++;
++                if (fusedSeen.limit) return fail(state, "limit");
++                if (!fusedSeen.applied) return fail(state, "not_applied");
++                if (!fusedSeen.ok) return fail(state, "rpc");
++                std::vector<algorithm::UserScore> remoteScores;
++                for (const auto& one : fused.responses()) {
++                  if (!one.users_ref().has_value()) continue;
++                  for (const auto& row : one.users_ref().value()) {
++                    remoteScores.push_back(userFromRow(row));
++                  }
++                }
++                state->users = algorithm::mergeExact({local, remoteScores}, FLAGS_copurchase_top_users);
++                state->buyers = static_cast<int64_t>(local.size() + remoteScores.size());
++                state->sent = state->buyers;
++                std::unordered_set<int64_t> pids;
++                for (const auto& user : state->users) {
++                  pids.insert(user.productIds.begin(), user.productIds.end());
++                }
++                return finishWithSales(state, std::vector<int64_t>(pids.begin(), pids.end()));
++              });
++        }
++        if (stop == 4 && resp.users_ref().has_value()) {
++          for (const auto& row : resp.users_ref().value()) state->users.push_back(userFromRow(row));
++          std::vector<algorithm::SalesScore> known;
++          if (resp.ids_ref().has_value()) {
++            const auto& ids = resp.ids_ref().value();
++            const auto& sales =
++                resp.sales_ref().has_value() ? resp.sales_ref().value() : std::vector<int64_t>{};
++            for (size_t i = 0; i < ids.size(); ++i) {
++              known.push_back(algorithm::SalesScore{ids[i], i < sales.size() ? sales[i] : 0});
++            }
++          }
++          std::vector<int64_t> remote =
++              resp.remote_ids_ref().has_value() ? resp.remote_ids_ref().value() : std::vector<int64_t>{};
++          if (remote.empty()) {
++            state->sales = algorithm::localTopSales(std::move(known), FLAGS_copurchase_top_sales);
++            logPlan(*state);
++            return folly::makeFuture<StatusOr<DataSet>>(toDataSet(state->sales));
++          }
++          return callPhase(state,
++                           storage::cpp2::CopurchasePhase::HOP4_SALES,
++                           remote,
++                           {},
++                           FLAGS_copurchase_top_sales,
++                           true)
++              .thenValue([state, known = std::move(known)](
++                             storage::StorageRpcResponse<storage::cpp2::CopurchaseResponse> salesRpc)
++                             -> folly::Future<StatusOr<DataSet>> {
++                auto salesSeen = take(state, salesRpc);
++                state->hops[3] = salesSeen.stat;
++                state->rounds++;
++                if (salesSeen.limit) return fail(state, "limit");
++                if (!salesSeen.applied) return fail(state, "not_applied");
++                if (!salesSeen.ok) return fail(state, "rpc");
++                std::vector<algorithm::SalesScore> rows = known;
++                for (const auto& one : salesRpc.responses()) {
++                  if (!one.ids_ref().has_value()) continue;
++                  const auto& ids = one.ids_ref().value();
++                  const auto& amounts =
++                      one.sales_ref().has_value() ? one.sales_ref().value() : std::vector<int64_t>{};
++                  for (size_t i = 0; i < ids.size(); ++i) {
++                    rows.push_back(algorithm::SalesScore{ids[i], i < amounts.size() ? amounts[i] : 0});
++                  }
++                }
++                state->sales = algorithm::localTopSales(std::move(rows), FLAGS_copurchase_top_sales);
++                logPlan(*state);
++                return folly::makeFuture<StatusOr<DataSet>>(toDataSet(state->sales));
++              });
++        }
++        state->affinityReason = "stop";
++        state->localStop = stop;
++        return restart();
++      });
++}
++
+ }  // namespace
+ 
+ bool CopurchaseDriver::match(const std::string& query) {
+@@ -785,7 +1091,7 @@ folly::Future<StatusOr<DataSet>> CopurchaseDriver::run(QueryContext* qctx) {
+   if (state->runner == nullptr) {
+     state->runner = &folly::InlineExecutor::instance();
+   }
+-  auto result = pushdown(state).thenError(
++  auto result = maybeAffinity(state).thenError(
+       folly::tag_t<std::exception>{}, [state](const std::exception& ex) {
+         if (state->fallback || !state->failure.empty()) {
+           return folly::makeFuture<StatusOr<DataSet>>(Status::Error("%s", ex.what()));
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 98e8cf6..d2a54a1 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -230,6 +230,23 @@ DEFINE_string(copurchase_failure_policy,
+ DEFINE_string(copurchase_spaces,
+               "",
+               "Comma-separated space names. Empty allows every space.");
++DEFINE_bool(copurchase_affinity,
++            false,
++            "Try to run the whole co-purchase chain on the user's storaged "
++            "when locality stats say that host leads every part it will touch.");
++DEFINE_bool(copurchase_affinity_force,
++            false,
++            "Try the local chain even when the locality stats are missing. "
++            "The runtime guard still rejects an incomplete chain.");
++DEFINE_double(copurchase_affinity_min_ratio,
++              1.0,
++              "Minimum fresh out-edge ratio and buyer-host coverage required "
++              "before the local chain is attempted. 1 means every counted "
++              "edge's other end is led by the same storaged.");
++DEFINE_bool(copurchase_coarse,
++            false,
++            "On hop 2a, each storaged drops buyers whose upper coCount cannot "
++            "reach its local top. The union still contains the global top.");
+ 
+ DEFINE_bool(enable_async_gc, false, "If enable async gc.");
+ DEFINE_uint32(
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index d6b7fd8..9ef6e84 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -131,5 +131,12 @@ DECLARE_int64(copurchase_timeout_ms);
+ DECLARE_int64(copurchase_slow_us);
+ DECLARE_string(copurchase_failure_policy);
+ DECLARE_string(copurchase_spaces);
++// Affinity. Off keeps the v2 multi-phase path. On tries one local chain when
++// the out-edge ratio and the buyer-host coverage are both fresh and high
++// enough, and turns on per-host coarse upper-bound pruning otherwise.
++DECLARE_bool(copurchase_affinity);
++DECLARE_bool(copurchase_affinity_force);
++DECLARE_double(copurchase_affinity_min_ratio);
++DECLARE_bool(copurchase_coarse);
+ 
+ #endif  // GRAPH_GRAPHFLAGS_H_
+diff --git a/src/graph/stats/GraphStats.cpp b/src/graph/stats/GraphStats.cpp
+index bff5efc..30b61c1 100644
+--- a/src/graph/stats/GraphStats.cpp
++++ b/src/graph/stats/GraphStats.cpp
+@@ -42,6 +42,9 @@ stats::CounterId kCopurchaseCandidates;
+ stats::CounterId kCopurchaseRows;
+ stats::CounterId kCopurchaseRounds;
+ stats::CounterId kCopurchaseLatencyUs;
++stats::CounterId kNumCopurchaseLocal;
++stats::CounterId kCopurchaseRpc;
++stats::CounterId kCopurchasePayload;
+ 
+ stats::CounterId kNumOpenedSessions;
+ stats::CounterId kNumAuthFailedSessions;
+@@ -86,6 +89,9 @@ void initGraphStats() {
+   kCopurchaseRounds = stats::StatsManager::registerStats("copurchase_rounds", "sum");
+   kCopurchaseLatencyUs = stats::StatsManager::registerHisto(
+       "copurchase_latency_us", 1000, 0, 2000, "avg, p75, p95, p99, p999");
++  kNumCopurchaseLocal = stats::StatsManager::registerStats("num_copurchase_local", "rate, sum");
++  kCopurchaseRpc = stats::StatsManager::registerStats("copurchase_rpc", "sum");
++  kCopurchasePayload = stats::StatsManager::registerStats("copurchase_payload_bytes", "sum");
+ 
+   kNumOpenedSessions = stats::StatsManager::registerStats("num_opened_sessions", "rate, sum");
+   kNumAuthFailedSessions =
+diff --git a/src/graph/stats/GraphStats.h b/src/graph/stats/GraphStats.h
+index fa16e1e..0e3c481 100644
+--- a/src/graph/stats/GraphStats.h
++++ b/src/graph/stats/GraphStats.h
+@@ -43,6 +43,9 @@ extern stats::CounterId kCopurchaseCandidates;
+ extern stats::CounterId kCopurchaseRows;
+ extern stats::CounterId kCopurchaseRounds;
+ extern stats::CounterId kCopurchaseLatencyUs;
++extern stats::CounterId kNumCopurchaseLocal;
++extern stats::CounterId kCopurchaseRpc;
++extern stats::CounterId kCopurchasePayload;
+ 
+ // Server client traffic
+ // extern stats::CounterId kReceivedBytes;
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index b8b024b..c39c90b 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -300,6 +300,9 @@ enum CopurchasePhase {
+     FUSED_COCOUNT = 3,
+     NAIVE_PARTIAL = 4,
+     HOP4_SALES = 5,
++    // One storaged runs hop1, hop2a, prune, hop2b, and hop4. local_complete
++    // is set only when every canonical part it read is still led by itself.
++    LOCAL_CHAIN = 6,
+ }
+ 
+ struct CopurchaseUserRow {
+@@ -308,6 +311,11 @@ struct CopurchaseUserRow {
+     3: i32 purchase_count,
+     4: i64 latest_ts,
+     5: list<i64> product_ids,
++    // upper coCount used by the coarse prune. Unset means "same as co_count".
++    6: optional i32 upper_count,
++    // True when co_count/purchase_count/latest_ts came from the user's own
++    // out-edges, which live entirely on the user's part.
++    7: optional bool score_exact,
+ }
+ 
+ struct CopurchaseRequest {
+@@ -329,6 +337,12 @@ struct CopurchaseRequest {
+     13: optional i64 budget_us,
+     14: optional i64 max_edges,
+     15: optional i32 max_buyers,
++    // HOP2A: drop buyers whose upper coCount cannot reach this host's top_k.
++    // product_ids is the full focus set; parts holds only this host's products.
++    16: optional bool coarse,
++    // LOCAL_CHAIN limits. top_k remains the hop-1 product limit.
++    17: optional i32 top_users,
++    18: optional i32 top_sales,
+ }
+ 
+ struct CopurchaseResponse {
+@@ -348,6 +362,18 @@ struct CopurchaseResponse {
+     10: optional bool limit_hit,
+     // 1 edges, 2 buyers, 3 time
+     11: optional i32 limit_code,
++    // LOCAL_CHAIN. True only together with local_stop = 1.
++    12: optional bool local_complete,
++    13: optional list<i32> touched_parts,
++    // 1 complete, 2 focus products split, 3 buyers split, 4 sales split,
++    // 5 leadership lost while the chain was running.
++    14: optional i32 local_stop,
++    // stop 3: remote candidate users. stop 4: products whose sales were not read.
++    15: optional list<i64> remote_ids,
++    // Bytes of the integer fields in this response. Not a TCP byte count.
++    16: optional i64 payload_bytes,
++    // Buyers observed before a coarse drop.
++    17: optional i64 seen_buyers,
+ }
+ 
+ 
+diff --git a/src/meta/processors/admin/HBProcessor.cpp b/src/meta/processors/admin/HBProcessor.cpp
+index 2ffb1f6..93e6c51 100644
+--- a/src/meta/processors/admin/HBProcessor.cpp
++++ b/src/meta/processors/admin/HBProcessor.cpp
+@@ -218,6 +218,9 @@ void HBProcessor::process(const cpp2::HBReq& req) {
+             entry.ts_ms_ref() = edgeEntry.second.tsMs;
+             entry.version_ref() = edgeEntry.second.version;
+             entries.push_back(std::move(entry));
++            // Field 9 stays the min of positive edge types. Buyer coverage is
++            // published as a negative edge type and must not lower that min.
++            if (edgeEntry.first <= 0) continue;
+             if (!have[spaceEntry.first][partEntry.first]) {
+               mins[spaceEntry.first][partEntry.first] = edgeEntry.second.ratio;
+               have[spaceEntry.first][partEntry.first] = true;
+diff --git a/src/storage/LocalDstRatioSampler.cpp b/src/storage/LocalDstRatioSampler.cpp
+index 0db6126..1763f67 100644
+--- a/src/storage/LocalDstRatioSampler.cpp
++++ b/src/storage/LocalDstRatioSampler.cpp
+@@ -210,11 +210,14 @@ void LocalDstRatioSampler::loop() {
+         }
+         ++visited;
+         auto key = iter->key();
+-        if (!NebulaKeyUtils::isEdge(vidLen, key) ||
+-            NebulaKeyUtils::getEdgeType(vidLen, key) <= 0) {
++        if (!NebulaKeyUtils::isEdge(vidLen, key)) {
+           iter->next();
+           continue;
+         }
++        // Positive types: fraction of out-edges whose destination part this
++        // process leads. Negative types: fraction of in-edges whose buyer
++        // (the key's dst) lives on a part this process leads. Both publish
++        // only after the part prefix is exhausted, so the ratio is a full count.
+         const int32_t edgeType = NebulaKeyUtils::getEdgeType(vidLen, key);
+         auto dst = NebulaKeyUtils::getDstId(vidLen, key);
+         std::string dstId(dst.data(), dst.size());
+diff --git a/src/storage/StorageFlags.cpp b/src/storage/StorageFlags.cpp
+index 3805cb9..67f0129 100644
+--- a/src/storage/StorageFlags.cpp
++++ b/src/storage/StorageFlags.cpp
+@@ -67,3 +67,9 @@ DEFINE_int64(copurchase_budget_us,
+ DEFINE_int32(copurchase_max_buyers,
+              0,
+              "Per copurchase RPC distinct-buyer cap. 0 is unlimited.");
++
++DEFINE_bool(copurchase_mirror_in_edges,
++            false,
++            "With each positive buy edge, write a same-part key ordered by "
++            "product so one partition can list its own buyers. This is not a "
++            "replica of the canonical in-edge and is not used as an answer.");
+diff --git a/src/storage/StorageFlags.h b/src/storage/StorageFlags.h
+index cb5dcb7..8f9021b 100644
+--- a/src/storage/StorageFlags.h
++++ b/src/storage/StorageFlags.h
+@@ -47,4 +47,8 @@ DECLARE_int64(copurchase_max_edges);
+ DECLARE_int64(copurchase_budget_us);
+ DECLARE_int32(copurchase_max_buyers);
+ 
++// Write a same-part inverted index of out-edges, keyed by the product.
++// It lists buyers on that part only and is not read by the exact chain.
++DECLARE_bool(copurchase_mirror_in_edges);
++
+ #endif  // STORAGE_STORAGEFLAGS_H_
+diff --git a/src/storage/mutate/AddEdgesProcessor.cpp b/src/storage/mutate/AddEdgesProcessor.cpp
+index e3a20e9..cb947c2 100644
+--- a/src/storage/mutate/AddEdgesProcessor.cpp
++++ b/src/storage/mutate/AddEdgesProcessor.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ 
+ #include "codec/RowWriterV2.h"
++#include "common/algorithm/Copurchase.h"
+ #include "common/memory/MemoryTracker.h"
+ #include "common/stats/StatsManager.h"
+ #include "common/utils/IndexKeyUtils.h"
+@@ -139,6 +140,18 @@ void AddEdgesProcessor::doProcess(const cpp2::AddEdgesRequest& req) {
+         break;
+       } else {
+         data.emplace_back(std::move(key), std::move(retEnc.value()));
++        if (FLAGS_copurchase_mirror_in_edges && *edgeKey.edge_type_ref() > 0 &&
++            spaceVidLen_ == sizeof(int64_t) &&
++            edgeKey.src_ref()->getStr().size() == sizeof(int64_t) &&
++            edgeKey.dst_ref()->getStr().size() == sizeof(int64_t)) {
++          int64_t src = 0;
++          int64_t dst = 0;
++          memcpy(&src, edgeKey.src_ref()->getStr().data(), sizeof(src));
++          memcpy(&dst, edgeKey.dst_ref()->getStr().data(), sizeof(dst));
++          auto name = algorithm::mirrorSuffix(
++              *edgeKey.edge_type_ref(), dst, *edgeKey.ranking_ref(), src);
++          data.emplace_back(NebulaKeyUtils::kvKey(partId, name), "");
++        }
+       }
+     }
+     if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+@@ -317,6 +330,21 @@ kvstore::MergeableAtomicOpResult AddEdgesProcessor::addEdgesWithIndex(
+     }
+     // step 3, Insert new edge data
+     ret.writeSet.push_back(key);
++    if (FLAGS_copurchase_mirror_in_edges && edgeType > 0 && spaceVidLen_ == sizeof(int64_t)) {
++      int64_t src = 0;
++      int64_t dst = 0;
++      auto srcRaw = NebulaKeyUtils::getSrcId(spaceVidLen_, key);
++      auto dstRaw = NebulaKeyUtils::getDstId(spaceVidLen_, key);
++      if (srcRaw.size() >= sizeof(src) && dstRaw.size() >= sizeof(dst)) {
++        memcpy(&src, srcRaw.data(), sizeof(src));
++        memcpy(&dst, dstRaw.data(), sizeof(dst));
++        auto name = algorithm::mirrorSuffix(
++            edgeType, dst, NebulaKeyUtils::getRank(spaceVidLen_, key), src);
++        auto mirror = NebulaKeyUtils::kvKey(partId, name);
++        ret.writeSet.push_back(mirror);
++        batchHolder->put(std::move(mirror), "");
++      }
++    }
+     // for why use a copy not move here:
+     // previously, we use atomicOp(a kind of raft log, raft send this log in sync)
+     //             this import an implicit constraint
+diff --git a/src/storage/mutate/DeleteEdgesProcessor.cpp b/src/storage/mutate/DeleteEdgesProcessor.cpp
+index 944e25b..0e04580 100644
+--- a/src/storage/mutate/DeleteEdgesProcessor.cpp
++++ b/src/storage/mutate/DeleteEdgesProcessor.cpp
+@@ -7,7 +7,9 @@
+ 
+ #include <algorithm>
+ 
++#include "common/algorithm/Copurchase.h"
+ #include "common/memory/MemoryTracker.h"
++#include "storage/StorageFlags.h"
+ #include "common/stats/StatsManager.h"
+ #include "common/utils/IndexKeyUtils.h"
+ #include "common/utils/NebulaKeyUtils.h"
+@@ -73,6 +75,18 @@ void DeleteEdgesProcessor::process(const cpp2::DeleteEdgesRequest& req) {
+                                             *edgeKey.ranking_ref(),
+                                             edgeKey.dst_ref()->getStr());
+         keys.emplace_back(edge.data(), edge.size());
++        if (FLAGS_copurchase_mirror_in_edges && *edgeKey.edge_type_ref() > 0 &&
++            spaceVidLen_ == sizeof(int64_t) &&
++            edgeKey.src_ref()->getStr().size() == sizeof(int64_t) &&
++            edgeKey.dst_ref()->getStr().size() == sizeof(int64_t)) {
++          int64_t src = 0;
++          int64_t dst = 0;
++          memcpy(&src, edgeKey.src_ref()->getStr().data(), sizeof(src));
++          memcpy(&dst, edgeKey.dst_ref()->getStr().data(), sizeof(dst));
++          auto name = algorithm::mirrorSuffix(
++              *edgeKey.edge_type_ref(), dst, *edgeKey.ranking_ref(), src);
++          keys.emplace_back(NebulaKeyUtils::kvKey(partId, name));
++        }
+       }
+       if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+         handleAsync(spaceId_, partId, code);
+diff --git a/src/storage/query/CopurchaseProcessor.cpp b/src/storage/query/CopurchaseProcessor.cpp
+index c1109f6..aeefb94 100644
+--- a/src/storage/query/CopurchaseProcessor.cpp
++++ b/src/storage/query/CopurchaseProcessor.cpp
+@@ -26,12 +26,16 @@ namespace {
+ 
+ stats::CounterId kCopurchaseEdges;
+ stats::CounterId kCopurchaseLimits;
++stats::CounterId kCopurchaseLocal;
++stats::CounterId kCopurchaseCoarse;
+ 
+ void ensureCopurchaseStats() {
+   static std::once_flag once;
+   std::call_once(once, [] {
+     kCopurchaseEdges = stats::StatsManager::registerStats("copurchase_edges_scanned", "sum");
+     kCopurchaseLimits = stats::StatsManager::registerStats("copurchase_limit_hits", "sum");
++    kCopurchaseLocal = stats::StatsManager::registerStats("copurchase_local_complete", "sum");
++    kCopurchaseCoarse = stats::StatsManager::registerStats("copurchase_coarse_pruned", "sum");
+   });
+ }
+ 
+@@ -128,6 +132,7 @@ void CopurchaseProcessor::process(const cpp2::CopurchaseRequest& req) {
+     resp_.copurchase_applied_ref() = true;
+     stats::StatsManager::addValue(kCopurchaseLimits);
+     stats::StatsManager::addValue(kCopurchaseEdges, scanned);
++    resp_.payload_bytes_ref() = 64 + scanned * 16;
+     onFinished();
+   };
+ 
+@@ -234,6 +239,34 @@ void CopurchaseProcessor::process(const cpp2::CopurchaseRequest& req) {
+         }
+       }
+     }
++    resp_.seen_buyers_ref() = static_cast<int64_t>(buyers.size());
++    const bool coarse = req.coarse_ref().has_value() && req.coarse_ref().value() && topK > 0;
++    if (coarse) {
++      int32_t localProducts = 0;
++      for (const auto& part : req.get_parts()) {
++        localProducts += static_cast<int32_t>(part.second.size());
++      }
++      int32_t focusN = static_cast<int32_t>(req.get_product_ids().size());
++      if (focusN < localProducts) focusN = localProducts;
++      const int32_t missing = focusN - localProducts;
++      std::vector<algorithm::CoBuyer> scored;
++      scored.reserve(buyers.size());
++      for (const auto& item : buyers) {
++        const auto lower = static_cast<int32_t>(item.second.pids.size());
++        scored.push_back(algorithm::CoBuyer{item.first, lower, lower + missing});
++      }
++      int32_t pruned = 0;
++      auto keep = algorithm::coarseKeep(scored, topK, &pruned);
++      std::unordered_set<int64_t> keepSet(keep.begin(), keep.end());
++      for (auto it = buyers.begin(); it != buyers.end();) {
++        if (keepSet.count(it->first) == 0) {
++          it = buyers.erase(it);
++        } else {
++          ++it;
++        }
++      }
++      if (pruned > 0) stats::StatsManager::addValue(kCopurchaseCoarse, pruned);
++    }
+     std::vector<int64_t> ids;
+     std::vector<cpp2::CopurchaseUserRow> rows;
+     ids.reserve(buyers.size());
+@@ -247,7 +280,17 @@ void CopurchaseProcessor::process(const cpp2::CopurchaseRequest& req) {
+       row.latest_ts_ref() = item.second.ts;
+       std::vector<int64_t> pids(item.second.pids.begin(), item.second.pids.end());
+       std::sort(pids.begin(), pids.end());
++      const auto lower = static_cast<int32_t>(pids.size());
+       row.product_ids_ref() = std::move(pids);
++      if (coarse) {
++        int32_t localProducts = 0;
++        for (const auto& part : req.get_parts()) {
++          localProducts += static_cast<int32_t>(part.second.size());
++        }
++        int32_t focusN = static_cast<int32_t>(req.get_product_ids().size());
++        if (focusN < localProducts) focusN = localProducts;
++        row.upper_count_ref() = lower + (focusN - localProducts);
++      }
+       rows.push_back(std::move(row));
+     }
+     std::sort(ids.begin(), ids.end());
+@@ -340,6 +383,236 @@ void CopurchaseProcessor::process(const cpp2::CopurchaseRequest& req) {
+     resp_.rows_returned_ref() = static_cast<int64_t>(ids.size());
+     resp_.ids_ref() = std::move(ids);
+     resp_.sales_ref() = std::move(amounts);
++  } else if (phase == cpp2::CopurchasePhase::LOCAL_CHAIN) {
++    if (store == nullptr || env_->metaClient_ == nullptr) {
++      resp_.local_complete_ref() = false;
++      resp_.local_stop_ref() = 5;
++      resp_.copurchase_applied_ref() = true;
++      resp_.rows_scanned_ref() = scanned;
++      onFinished();
++      return;
++    }
++    auto partsRet = env_->metaClient_->partsNum(spaceId);
++    if (!partsRet.ok() || partsRet.value() <= 0) {
++      resp_.local_complete_ref() = false;
++      resp_.local_stop_ref() = 5;
++      resp_.copurchase_applied_ref() = true;
++      resp_.rows_scanned_ref() = scanned;
++      onFinished();
++      return;
++    }
++    const int32_t numParts = partsRet.value();
++    auto partOf = [&](int64_t vid) -> PartitionID {
++      std::string bytes(reinterpret_cast<const char*>(&vid), sizeof(vid));
++      return env_->metaClient_->partId(numParts, bytes);
++    };
++    auto leads = [&](PartitionID part) { return store->isLeader(spaceId, part); };
++    std::vector<int32_t> touched;
++    auto touch = [&](PartitionID part) {
++      for (auto existing : touched) {
++        if (existing == part) return;
++      }
++      touched.push_back(part);
++    };
++    auto seal = [&](int32_t stop, bool complete) {
++      if (complete) stats::StatsManager::addValue(kCopurchaseLocal);
++      resp_.local_stop_ref() = stop;
++      resp_.local_complete_ref() = complete;
++      resp_.touched_parts_ref() = touched;
++      resp_.rows_scanned_ref() = scanned;
++      resp_.copurchase_applied_ref() = true;
++      int64_t bytes = 64 + req.get_product_ids().size() * 8;
++      for (const auto& part : req.get_parts()) bytes += part.second.size() * 8;
++      if (resp_.ids_ref().has_value()) bytes += resp_.ids_ref()->size() * 8;
++      if (resp_.sales_ref().has_value()) bytes += resp_.sales_ref()->size() * 8;
++      if (resp_.remote_ids_ref().has_value()) bytes += resp_.remote_ids_ref()->size() * 8;
++      if (resp_.touched_parts_ref().has_value()) bytes += resp_.touched_parts_ref()->size() * 4;
++      if (resp_.users_ref().has_value()) {
++        for (const auto& row : resp_.users_ref().value()) {
++          bytes += 32 + static_cast<int64_t>(row.get_product_ids().size()) * 8;
++        }
++      }
++      resp_.payload_bytes_ref() = bytes;
++      stats::StatsManager::addValue(kCopurchaseEdges, scanned);
++      onFinished();
++    };
++    auto putUsers = [&](const std::vector<algorithm::UserScore>& rows) {
++      std::vector<cpp2::CopurchaseUserRow> out;
++      out.reserve(rows.size());
++      for (const auto& user : rows) {
++        cpp2::CopurchaseUserRow row;
++        row.user_ref() = user.user;
++        row.co_count_ref() = user.coCount;
++        row.purchase_count_ref() = user.purchaseCount;
++        row.latest_ts_ref() = user.latestTs;
++        row.product_ids_ref() = user.productIds;
++        row.score_exact_ref() = true;
++        row.upper_count_ref() = user.coCount;
++        out.push_back(std::move(row));
++      }
++      resp_.rows_returned_ref() = static_cast<int64_t>(out.size());
++      resp_.users_ref() = std::move(out);
++    };
++    int64_t user = 0;
++    PartitionID userPart = 0;
++    bool haveUser = false;
++    for (const auto& part : req.get_parts()) {
++      if (!leads(part.first)) {
++        handleLeaderChanged(spaceId, part.first);
++        onFinished();
++        return;
++      }
++      touch(part.first);
++      for (const auto& src : part.second) {
++        user = vidOf(src);
++        userPart = part.first;
++        haveUser = true;
++      }
++    }
++    if (!haveUser || partOf(user) != userPart) {
++      seal(5, false);
++      return;
++    }
++    const int kUsers = req.top_users_ref().has_value() && req.top_users_ref().value() > 0
++                           ? req.top_users_ref().value()
++                           : 15;
++    const int kSales = req.top_sales_ref().has_value() && req.top_sales_ref().value() > 0
++                           ? req.top_sales_ref().value()
++                           : 20;
++    std::vector<algorithm::EdgeFact> userEdges;
++    if (afterScan(scan(userPart, user, edgeType, &userEdges))) return;
++    auto products = algorithm::topProducts(userEdges, topK > 0 ? topK : 5, windowStart, windowEnd);
++    std::vector<int64_t> focusIds;
++    focusIds.reserve(products.size());
++    for (const auto& row : products) focusIds.push_back(row.pid);
++    if (focusIds.empty()) {
++      resp_.ids_ref() = std::vector<int64_t>{};
++      seal(1, true);
++      return;
++    }
++    for (auto pid : focusIds) {
++      if (!leads(partOf(pid))) {
++        resp_.ids_ref() = focusIds;
++        seal(2, false);
++        return;
++      }
++    }
++    for (auto pid : focusIds) touch(partOf(pid));
++    std::unordered_set<int64_t> focusSet(focusIds.begin(), focusIds.end());
++    std::unordered_map<int64_t, std::unordered_set<int64_t>> buyerPids;
++    for (auto pid : focusIds) {
++      std::vector<algorithm::EdgeFact> edges;
++      if (afterScan(scan(partOf(pid), pid, -edgeType, &edges))) return;
++      for (const auto& edge : edges) {
++        if (hasExclude && edge.other == excludeUser) continue;
++        buyerPids[edge.other].insert(pid);
++      }
++    }
++    std::vector<algorithm::CoBuyer> scored;
++    scored.reserve(buyerPids.size());
++    for (const auto& item : buyerPids) {
++      const auto n = static_cast<int32_t>(item.second.size());
++      scored.push_back(algorithm::CoBuyer{item.first, n, n});
++    }
++    auto keep = algorithm::pruneCandidates(scored, kUsers, nullptr);
++    std::vector<int64_t> remoteUsers;
++    std::vector<algorithm::UserScore> localScores;
++    for (auto id : keep) {
++      const auto part = partOf(id);
++      if (!leads(part)) {
++        remoteUsers.push_back(id);
++        continue;
++      }
++      touch(part);
++      std::vector<algorithm::EdgeFact> edges;
++      if (afterScan(scan(part, id, edgeType, &edges))) return;
++      auto score = algorithm::scoreUser(id, edges, focusSet, windowStart, windowEnd);
++      if (score.coCount > 0) localScores.push_back(std::move(score));
++    }
++    if (!remoteUsers.empty()) {
++      auto localTop = algorithm::localTopUsers(localScores, kUsers);
++      putUsers(localTop);
++      resp_.ids_ref() = focusIds;
++      resp_.remote_ids_ref() = std::move(remoteUsers);
++      seal(3, false);
++      return;
++    }
++    auto topUsers = algorithm::localTopUsers(std::move(localScores), kUsers);
++    std::unordered_set<int64_t> salePids;
++    for (const auto& row : topUsers) {
++      salePids.insert(row.productIds.begin(), row.productIds.end());
++    }
++    if (!req.product_tag_id_ref().has_value() || !req.sales_prop_ref().has_value()) {
++      putUsers(topUsers);
++      resp_.remote_ids_ref() = std::vector<int64_t>(salePids.begin(), salePids.end());
++      seal(4, false);
++      return;
++    }
++    std::vector<algorithm::SalesScore> known;
++    std::vector<int64_t> remotePids;
++    const auto tagId = req.product_tag_id_ref().value();
++    const auto& prop = req.sales_prop_ref().value();
++    for (auto pid : salePids) {
++      const auto part = partOf(pid);
++      if (!leads(part)) {
++        remotePids.push_back(pid);
++        continue;
++      }
++      touch(part);
++      auto key = NebulaKeyUtils::tagKey(spaceVidLen_, part, keyOf(pid), tagId);
++      std::string value;
++      auto ret = env_->kvstore_->get(spaceId, part, key, &value);
++      int64_t amount = 0;
++      if (ret == nebula::cpp2::ErrorCode::SUCCEEDED) {
++        scanned++;
++        auto reader = RowReaderWrapper::getTagPropReader(
++            env_->schemaMan_, spaceId, tagId, folly::StringPiece(value));
++        if (reader) {
++          auto field = reader.getValueByName(prop);
++          if (field.isInt()) amount = field.getInt();
++        }
++      } else if (ret != nebula::cpp2::ErrorCode::E_KEY_NOT_FOUND) {
++        pushResultCode(ret, part);
++        onFinished();
++        return;
++      }
++      known.push_back(algorithm::SalesScore{pid, amount});
++    }
++    if (!remotePids.empty()) {
++      putUsers(topUsers);
++      std::vector<int64_t> ids;
++      std::vector<int64_t> amounts;
++      for (const auto& row : known) {
++        ids.push_back(row.pid);
++        amounts.push_back(row.sales);
++      }
++      resp_.ids_ref() = std::move(ids);
++      resp_.sales_ref() = std::move(amounts);
++      resp_.remote_ids_ref() = std::move(remotePids);
++      seal(4, false);
++      return;
++    }
++    for (auto part : touched) {
++      if (!leads(part)) {
++        resp_.users_ref() = std::vector<cpp2::CopurchaseUserRow>{};
++        resp_.ids_ref() = std::vector<int64_t>{};
++        resp_.sales_ref() = std::vector<int64_t>{};
++        seal(5, false);
++        return;
++      }
++    }
++    auto topSales = algorithm::localTopSales(std::move(known), kSales);
++    putUsers(topUsers);
++    std::vector<int64_t> ids;
++    std::vector<int64_t> amounts;
++    for (const auto& row : topSales) {
++      ids.push_back(row.pid);
++      amounts.push_back(row.sales);
++    }
++    resp_.ids_ref() = std::move(ids);
++    resp_.sales_ref() = std::move(amounts);
++    seal(1, true);
++    return;
+   } else {
+     for (const auto& part : req.get_parts()) {
+       pushResultCode(nebula::cpp2::ErrorCode::E_INVALID_PARM, part.first);
+@@ -350,6 +623,18 @@ void CopurchaseProcessor::process(const cpp2::CopurchaseRequest& req) {
+ 
+   resp_.rows_scanned_ref() = scanned;
+   resp_.copurchase_applied_ref() = true;
++  int64_t bytes = 64 + req.get_product_ids().size() * 8;
++  for (const auto& part : req.get_parts()) bytes += part.second.size() * 8;
++  if (resp_.ids_ref().has_value()) bytes += resp_.ids_ref()->size() * 8;
++  if (resp_.sales_ref().has_value()) bytes += resp_.sales_ref()->size() * 8;
++  if (resp_.counts_ref().has_value()) bytes += resp_.counts_ref()->size() * 4;
++  if (resp_.latest_ts_ref().has_value()) bytes += resp_.latest_ts_ref()->size() * 8;
++  if (resp_.users_ref().has_value()) {
++    for (const auto& row : resp_.users_ref().value()) {
++      bytes += 32 + static_cast<int64_t>(row.get_product_ids().size()) * 8;
++    }
++  }
++  resp_.payload_bytes_ref() = bytes;
+   stats::StatsManager::addValue(kCopurchaseEdges, scanned);
+   onFinished();
+ }

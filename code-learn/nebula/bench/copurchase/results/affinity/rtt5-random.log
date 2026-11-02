@@ -1,0 +1,11 @@
+warmup {'reason': 'ratio', 'waited_s': 0.036, 'mode': 'exact', 'ratio': 0.337057, 'cov': -1.0, 'stop': 0}
+rtt5-random local c=1 p50=23.871 p99=29.633 qps=11.480067903727104 err=0 veth=None
+rtt5-random local c=50 p50=75.378 p99=90.49 qps=269.62059394375893 err=0 veth=None
+rtt5-random local c=100 p50=79.107 p99=99.345 qps=160.18800279146956 err=0 veth=None
+rtt5-random v2 c=1 p50=25.498 p99=29.435 qps=11.345258186348325 err=0 veth=None
+rtt5-random v2 c=50 p50=59.656 p99=62.371 qps=318.4886069656749 err=0 veth=None
+rtt5-random v2 c=100 p50=112.643 p99=127.229 qps=286.44079450339075 err=0 veth=None
+rtt5-random ngql c=1 p50=27.605 p99=34.58 qps=8.562540171558043 err=0 veth=None
+rtt5-random ngql c=50 p50=44.04 p99=55.194 qps=64.14933176835441 err=1 veth=None
+rtt5-random ngql c=100 p50=39.255 p99=52.301 qps=62.179237947173604 err=0 veth=None
+wrote code-learn/nebula/bench/copurchase/results/affinity/rtt5-random.json accuracy 24/24

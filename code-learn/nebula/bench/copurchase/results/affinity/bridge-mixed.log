@@ -1,0 +1,11 @@
+warmup {'reason': 'ratio', 'waited_s': 0.016, 'mode': 'exact', 'ratio': 0.971042, 'cov': -1.0, 'stop': 0}
+bridge-mixed local c=1 p50=2.324 p99=3.164 qps=20.424473666411814 err=0 veth=133816
+bridge-mixed local c=50 p50=1.951 p99=4.04 qps=123.95061887657539 err=0 veth=284583
+bridge-mixed local c=100 p50=1.708 p99=3.905 qps=129.83350400715076 err=0 veth=544051
+bridge-mixed v2 c=1 p50=1.999 p99=3.335 qps=20.547754033956608 err=0 veth=160238
+bridge-mixed v2 c=50 p50=1.878 p99=3.423 qps=143.42082809869405 err=0 veth=333497
+bridge-mixed v2 c=100 p50=1.7 p99=3.361 qps=100.8074543015235 err=0 veth=686209
+bridge-mixed ngql c=1 p50=5.712 p99=8.031 qps=15.497350118955538 err=0 veth=444015
+bridge-mixed ngql c=50 p50=5.261 p99=8.619 qps=54.796417314634155 err=0 veth=1063765
+bridge-mixed ngql c=100 p50=5.216 p99=7.096 qps=47.31101333866214 err=0 veth=2248268
+wrote code-learn/nebula/bench/copurchase/results/affinity/bridge-mixed.json accuracy 24/24

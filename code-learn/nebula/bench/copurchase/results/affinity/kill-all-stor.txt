@@ -1,0 +1,5 @@
+connect True
+use True
+ok False
+err copurchase rpc
+rows -1

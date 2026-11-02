@@ -1,0 +1,11 @@
+warmup {'reason': 'stats', 'waited_s': 0.012, 'mode': 'local', 'ratio': 1.0, 'cov': 1.0, 'stop': 1}
+bridge-affinity local c=1 p50=0.989 p99=1.671 qps=20.327810231733178 err=0 veth=31325
+bridge-affinity local c=50 p50=0.74 p99=1.355 qps=114.79998410251514 err=0 veth=48380
+bridge-affinity local c=100 p50=0.661 p99=1.578 qps=116.20705328372757 err=0 veth=129976
+bridge-affinity v2 c=1 p50=2.29 p99=3.608 qps=20.345189340507073 err=0 veth=123997
+bridge-affinity v2 c=50 p50=1.645 p99=3.422 qps=125.66551735410775 err=0 veth=307447
+bridge-affinity v2 c=100 p50=1.653 p99=15.846 qps=118.34716192705675 err=0 veth=602030
+bridge-affinity ngql c=1 p50=6.092 p99=7.416 qps=15.529523229418118 err=0 veth=452775
+bridge-affinity ngql c=50 p50=5.009 p99=7.798 qps=56.08954937965818 err=0 veth=1009293
+bridge-affinity ngql c=100 p50=4.717 p99=7.733 qps=48.27097261890516 err=0 veth=2025285
+wrote code-learn/nebula/bench/copurchase/results/affinity/bridge-affinity.json accuracy 24/24

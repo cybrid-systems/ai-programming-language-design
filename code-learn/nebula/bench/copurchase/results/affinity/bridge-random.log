@@ -1,0 +1,11 @@
+warmup {'reason': 'ratio', 'waited_s': 0.012, 'mode': 'exact', 'ratio': 0.337057, 'cov': -1.0, 'stop': 0}
+bridge-random local c=1 p50=1.788 p99=3.401 qps=20.59001664545572 err=0 veth=207474
+bridge-random local c=50 p50=1.838 p99=3.902 qps=102.67031252766654 err=0 veth=461465
+bridge-random local c=100 p50=2.129 p99=4.366 qps=89.07907151891195 err=0 veth=929491
+bridge-random v2 c=1 p50=1.978 p99=2.862 qps=20.401683669756714 err=0 veth=194706
+bridge-random v2 c=50 p50=2.427 p99=4.433 qps=112.10610686957712 err=0 veth=444425
+bridge-random v2 c=100 p50=2.314 p99=3.994 qps=135.78312154959022 err=0 veth=915207
+bridge-random ngql c=1 p50=5.264 p99=7.258 qps=15.527558312040332 err=0 veth=489631
+bridge-random ngql c=50 p50=5.064 p99=8.887 qps=47.40515569200926 err=0 veth=1279226
+bridge-random ngql c=100 p50=4.903 p99=7.238 qps=50.942877392422965 err=0 veth=2547335
+wrote code-learn/nebula/bench/copurchase/results/affinity/bridge-random.json accuracy 24/24

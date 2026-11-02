@@ -1,0 +1,4 @@
+still_ok after stor1
+still_ok after stor2
+FAILED_CLOSED at stor3
+ok False rows -1 err copurchase rpc

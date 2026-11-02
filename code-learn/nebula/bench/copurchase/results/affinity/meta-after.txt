@@ -1,0 +1,3 @@
+connect attempt after kill -9 of meta1 (pid 8555), new session
+AuthFailedException: Create session failed: LeaderChanged: Leader changed!
+no result rows
