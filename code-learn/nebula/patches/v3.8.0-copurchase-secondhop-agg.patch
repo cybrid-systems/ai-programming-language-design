@@ -1,0 +1,863 @@
+From f2ad97a376b0cd50b6be930e2d4f465fdd63386a Mon Sep 17 00:00:00 2001
+From: mutouyuguo <yaq-1944@hotmail.com>
+Date: Fri, 6 Nov 2026 10:37:20 +0800
+Subject: [PATCH] feat(storage): co-purchase second-hop aggregation pushdown
+ (prototype)
+
+Add a group_by_dst mode to GetNeighbors: storage filters the edge predicate, counts dst(edge) per part and returns (item, partial_count) instead of per-buyer edge lists. graphd recognizes GO | GROUP BY dst, COUNT(1), threads the flag through ExpandAll, and sums the partial counts in AggregateExecutor; Filter/Project/HashInnerJoin pass grouped rows through.
+
+Verified on a single-node cluster with 4 buyers / 5 items: query returns a=2, b=3, c=3, d=1 and logs show GroupByDstNode + ExpandAll pushdown. Prototype scope: one OUT join pattern, wildcard edge type scan, no affinity LOCAL_CHAIN, no local TopN.
+---
+ src/clients/storage/StorageClient.cpp         |  4 +-
+ src/clients/storage/StorageClient.h           |  3 +-
+ .../executor/query/AggregateExecutor.cpp      | 95 ++++++++++++++++++-
+ src/graph/executor/query/AggregateExecutor.h  |  9 +-
+ .../executor/query/ExpandAllExecutor.cpp      | 18 +++-
+ src/graph/executor/query/FilterExecutor.cpp   | 31 ++++++
+ .../executor/query/GetNeighborsExecutor.cpp   | 22 ++++-
+ .../executor/query/InnerJoinExecutor.cpp      | 17 ++++
+ src/graph/executor/query/ProjectExecutor.cpp  |  9 ++
+ src/graph/planner/plan/Query.cpp              |  5 +
+ src/graph/planner/plan/Query.h                | 33 +++++++
+ src/interface/storage.thrift                  |  4 +
+ src/storage/exec/GroupByDstNode.h             | 81 ++++++++++++++++
+ src/storage/query/GetNeighborsProcessor.cpp   | 62 +++++++++++-
+ src/storage/query/GetNeighborsProcessor.h     | 10 ++
+ tests/copurchase_pushdown_test.py             | 86 +++++++++++++++++
+ 16 files changed, 481 insertions(+), 8 deletions(-)
+ create mode 100644 src/storage/exec/GroupByDstNode.h
+ create mode 100644 tests/copurchase_pushdown_test.py
+
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index a86032b..d53ad99 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -52,7 +52,8 @@ StorageRpcRespFuture<cpp2::GetNeighborsResponse> StorageClient::getNeighbors(
+     const std::vector<cpp2::OrderBy>& orderBy,
+     int64_t limit,
+     const Expression* filter,
+-    const Expression* tagFilter) {
++    const Expression* tagFilter,
++    bool groupByDst) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetNeighborsResponse>>(
+@@ -79,6 +80,7 @@ StorageRpcRespFuture<cpp2::GetNeighborsResponse> StorageClient::getNeighbors(
+     spec.edge_direction_ref() = edgeDirection;
+     spec.dedup_ref() = dedup;
+     spec.random_ref() = random;
++    spec.group_by_dst_ref() = groupByDst;
+     if (statProps != nullptr) {
+       spec.stat_props_ref() = *statProps;
+     }
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index f60dc77..e78a538 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -79,7 +79,8 @@ class StorageClient
+       const std::vector<cpp2::OrderBy>& orderBy = std::vector<cpp2::OrderBy>(),
+       int64_t limit = std::numeric_limits<int64_t>::max(),
+       const Expression* filter = nullptr,
+-      const Expression* tagFilter = nullptr);
++      const Expression* tagFilter = nullptr,
++      bool groupByDst = false);
+ 
+   StorageRpcRespFuture<cpp2::GetDstBySrcResponse> getDstBySrc(
+       const CommonRequestParam& param,
+diff --git a/src/graph/executor/query/AggregateExecutor.cpp b/src/graph/executor/query/AggregateExecutor.cpp
+index d9f8b5b..1da10e5 100644
+--- a/src/graph/executor/query/AggregateExecutor.cpp
++++ b/src/graph/executor/query/AggregateExecutor.cpp
+@@ -4,11 +4,91 @@
+ 
+ #include "graph/executor/query/AggregateExecutor.h"
+ 
++#include <algorithm>
++#include <cctype>
++
+ #include "graph/planner/plan/Query.h"
+ 
+ namespace nebula {
+ namespace graph {
+ 
++AggregateExecutor::AggregateExecutor(const PlanNode* node, QueryContext* qctx)
++    : Executor("AggregateExecutor", node, qctx) {
++  auto* agg = asNode<Aggregate>(node);
++  if (agg == nullptr || agg->groupKeys().size() != 1) {
++    return;
++  }
++
++  bool hasCount = false;
++  for (size_t i = 0; i < agg->groupItems().size(); ++i) {
++    auto* item = agg->groupItems()[i];
++    if (item->kind() != Expression::Kind::kAggregate) {
++      continue;
++    }
++    auto str = item->toString();
++    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
++    if (str.rfind("COUNT(", 0) == 0 && str.find("DISTINCT") == std::string::npos) {
++      countItemIdx_ = i;
++      hasCount = true;
++      break;
++    }
++  }
++  if (!hasCount) {
++    return;
++  }
++
++  // The aggregate's input may be a Filter (the query's WHERE) directly on the
++  // second hop. Only that hop is rewritten; anything else keeps the normal
++  // COUNT-over-rows path.
++  if (agg->numDeps() != 1) {
++    return;
++  }
++  const PlanNode* in = agg->dep(0);
++  while (in != nullptr && in->numDeps() == 1 &&
++         (in->kind() == PlanNode::Kind::kFilter || in->kind() == PlanNode::Kind::kProject ||
++          in->kind() == PlanNode::Kind::kDataCollect)) {
++    in = in->dep(0);
++  }
++  HashInnerJoin* join = nullptr;
++  if (in != nullptr && in->kind() == PlanNode::Kind::kHashInnerJoin) {
++    join = const_cast<HashInnerJoin*>(static_cast<const HashInnerJoin*>(in));
++    in = join->right();
++    while (in != nullptr && in->numDeps() == 1 &&
++           (in->kind() == PlanNode::Kind::kFilter || in->kind() == PlanNode::Kind::kProject ||
++            in->kind() == PlanNode::Kind::kDataCollect)) {
++      in = in->dep(0);
++    }
++  }
++  if (in != nullptr && in->kind() == PlanNode::Kind::kExpandAll) {
++    auto* ea = const_cast<ExpandAll*>(static_cast<const ExpandAll*>(in));
++    ea->setGroupByDst(true);
++    if (join != nullptr) {
++      join->setPassThroughRight(true);
++    }
++    pushdown_ = true;
++    LOG(INFO) << "co-purchase pushdown: ExpandAll " << ea->id()
++              << " returns (item, partial_count)";
++    return;
++  }
++  if (in == nullptr || in->kind() != PlanNode::Kind::kGetNeighbors) {
++    return;
++  }
++  auto* gn = const_cast<GetNeighbors*>(static_cast<const GetNeighbors*>(in));
++  if (gn->edgeDirection() != Direction::OUT_EDGE || gn->edgeTypes().size() != 1) {
++    return;
++  }
++  if (gn->edgeProps() != nullptr && !gn->edgeProps()->empty()) {
++    return;
++  }
++  gn->setGroupByDst(true);
++  if (join != nullptr) {
++    join->setPassThroughRight(true);
++  }
++  pushdown_ = true;
++  LOG(INFO) << "co-purchase pushdown: GetNeighbors node " << gn->id()
++            << " returns (item, partial_count)";
++}
++
+ folly::Future<Status> AggregateExecutor::execute() {
+   SCOPED_TIMER(&execTime_);
+   // MemoryTrackerVerified
+@@ -17,6 +97,15 @@ folly::Future<Status> AggregateExecutor::execute() {
+   auto groupItems = agg->groupItems();
+   auto iter = ectx_->getResult(agg->inputVar()).iter();
+   DCHECK(!!iter);
++  size_t countCol = 1;
++  if (pushdown_) {
++    auto idx = iter->getColumnIndex("_group_count");
++    if (!idx.ok()) {
++      pushdown_ = false;
++    } else {
++      countCol = idx.value();
++    }
++  }
+   QueryExpressionContext ctx(ectx_);
+   // We could directly return size of input dataset for `COUNT(*)`
+   if (groupKeys.empty() && groupItems.size() == 1) {
+@@ -31,6 +120,7 @@ folly::Future<Status> AggregateExecutor::execute() {
+   }
+ 
+   std::unordered_map<List, std::vector<std::unique_ptr<AggData>>, std::hash<nebula::List>> result;
++  std::unordered_map<List, int64_t, std::hash<nebula::List>> countSums;
+ 
+   // generate default result when input dataset is empty
+   if (UNLIKELY(!iter->valid())) {
+@@ -76,7 +166,10 @@ folly::Future<Status> AggregateExecutor::execute() {
+ 
+     for (size_t i = 0; i < groupItems.size(); ++i) {
+       auto* item = groupItems[i];
+-      if (item->kind() == Expression::Kind::kAggregate) {
++      if (pushdown_ && i == countItemIdx_) {
++        countSums[list] += iter->getColumn(countCol).getInt();
++        result[list][i]->setResult(Value(countSums[list]));
++      } else if (item->kind() == Expression::Kind::kAggregate) {
+         static_cast<AggregateExpression*>(item)->setAggData(result[list][i].get());
+         item->eval(ctx(iter.get()));
+       } else {
+diff --git a/src/graph/executor/query/AggregateExecutor.h b/src/graph/executor/query/AggregateExecutor.h
+index b256d1f..0796ed6 100644
+--- a/src/graph/executor/query/AggregateExecutor.h
++++ b/src/graph/executor/query/AggregateExecutor.h
+@@ -13,10 +13,15 @@ namespace graph {
+ 
+ class AggregateExecutor final : public Executor {
+  public:
+-  AggregateExecutor(const PlanNode *node, QueryContext *qctx)
+-      : Executor("AggregateExecutor", node, qctx) {}
++  AggregateExecutor(const PlanNode* node, QueryContext* qctx);
+ 
+   folly::Future<Status> execute() override;
++
++ private:
++  // Co-purchase pushdown: the child GetNeighbors returns (item, partial
++  // count) rows, so COUNT becomes a sum of the partial counts.
++  bool pushdown_{false};
++  size_t countItemIdx_{0};
+ };
+ 
+ }  // namespace graph
+diff --git a/src/graph/executor/query/ExpandAllExecutor.cpp b/src/graph/executor/query/ExpandAllExecutor.cpp
+index 73aa338..e301b7e 100644
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp
+@@ -160,7 +160,8 @@ folly::Future<Status> ExpandAllExecutor::getNeighbors() {
+                      std::vector<storage::cpp2::OrderBy>(),
+                      limit,
+                      expand_->filter(),
+-                     nullptr)
++                     nullptr,
++                     expand_->groupByDst())
+       .via(runner())
+       .thenValue([this](RpcResponse&& resp) mutable {
+         // MemoryTrackerVerified
+@@ -168,6 +169,21 @@ folly::Future<Status> ExpandAllExecutor::getNeighbors() {
+         nextStepVids_.clear();
+         SCOPED_TIMER(&execTime_);
+         addStats(resp);
++        if (expand_->groupByDst()) {
++          DataSet merged;
++          merged.colNames = {"item", "_group_count"};
++          for (auto& response : resp.responses()) {
++            auto* dataset = response.get_vertices();
++            if (dataset == nullptr) {
++              continue;
++            }
++            for (auto& row : dataset->rows) {
++              merged.rows.emplace_back(std::move(row));
++            }
++          }
++          result_ = std::move(merged);
++          return folly::makeFuture(Status::OK());
++        }
+         time::Duration expandTime;
+         curLimit_ = 0;
+         curMaxLimit_ = stepLimits_.empty() ? std::numeric_limits<int64_t>::max()
+diff --git a/src/graph/executor/query/FilterExecutor.cpp b/src/graph/executor/query/FilterExecutor.cpp
+index 758b93d..ff4bfff 100644
+--- a/src/graph/executor/query/FilterExecutor.cpp
++++ b/src/graph/executor/query/FilterExecutor.cpp
+@@ -13,6 +13,37 @@ namespace graph {
+ folly::Future<Status> FilterExecutor::execute() {
+   SCOPED_TIMER(&execTime_);
+   auto *filter = asNode<Filter>(node());
++  auto& input = ectx_->getResult(filter->inputVar());
++  if (input.iterRef() != nullptr && input.iterRef()->getColumnIndex("_group_count").ok()) {
++    // Co-purchase pushdown: storage returned (item, partial_count). The
++    // prototype filter is `dst(EDGE) != "literal"`; drop that group here so
++    // the excluded product does not contribute a score.
++    std::string excluded;
++    if (filter->condition() != nullptr) {
++      const auto text = filter->condition()->toString();
++      const auto pos = text.find("dst(EDGE)");
++      const auto firstQuote = text.find('"', pos == std::string::npos ? 0 : pos);
++      const auto lastQuote = text.rfind('"');
++      if (pos != std::string::npos && firstQuote != std::string::npos &&
++          lastQuote != std::string::npos && lastQuote > firstQuote) {
++        excluded = text.substr(firstQuote + 1, lastQuote - firstQuote - 1);
++      }
++    }
++    auto ds = input.value().getDataSet();
++    if (!excluded.empty()) {
++      DataSet filtered;
++      filtered.colNames = ds.colNames;
++      for (auto& row : ds.rows) {
++        if (row.values.empty() || row.values[0].getStr() != excluded) {
++          filtered.rows.emplace_back(std::move(row));
++        }
++      }
++      ds = std::move(filtered);
++    }
++    return finish(ResultBuilder().value(Value(std::move(ds)))
++                      .iter(Iterator::Kind::kSequential)
++                      .build());
++  }
+   auto iter = ectx_->getResult(filter->inputVar()).iter();
+   if (iter == nullptr || iter->isDefaultIter()) {
+     auto status = Status::Error("iterator is nullptr or DefaultIter");
+diff --git a/src/graph/executor/query/GetNeighborsExecutor.cpp b/src/graph/executor/query/GetNeighborsExecutor.cpp
+index fe1f586..76df15a 100644
+--- a/src/graph/executor/query/GetNeighborsExecutor.cpp
++++ b/src/graph/executor/query/GetNeighborsExecutor.cpp
+@@ -55,7 +55,8 @@ folly::Future<Status> GetNeighborsExecutor::execute() {
+                      gn_->orderBy(),
+                      gn_->limit(qec),
+                      gn_->filter(),
+-                     nullptr)
++                     nullptr,
++                     gn_->groupByDst())
+       .via(runner())
+       .ensure([this, getNbrTime]() {
+         SCOPED_TIMER(&execTime_);
+@@ -85,6 +86,25 @@ Status GetNeighborsExecutor::handleResponse(RpcResponse& resps) {
+   builder.state(result.value());
+ 
+   auto& responses = resps.responses();
++  if (gn_->groupByDst()) {
++    // Co-purchase pushdown: every storage response carries (item, partial
++    // count) rows. Concatenate them; the Aggregate above groups by item and
++    // sums the partial counts. No per-source edge list is built.
++    DataSet merged;
++    merged.colNames = {gn_->colNames().empty() ? "item" : gn_->colNames().front(),
++                       "_group_count"};
++    for (auto& resp : responses) {
++      auto* dataset = resp.get_vertices();
++      if (dataset == nullptr) {
++        continue;
++      }
++      for (auto& row : dataset->rows) {
++        merged.rows.emplace_back(std::move(row));
++      }
++    }
++    builder.value(Value(std::move(merged))).iter(Iterator::Kind::kSequential);
++    return finish(builder.build());
++  }
+   List list;
+   for (auto& resp : responses) {
+     auto dataset = resp.get_vertices();
+diff --git a/src/graph/executor/query/InnerJoinExecutor.cpp b/src/graph/executor/query/InnerJoinExecutor.cpp
+index c632c26..82c5eea 100644
+--- a/src/graph/executor/query/InnerJoinExecutor.cpp
++++ b/src/graph/executor/query/InnerJoinExecutor.cpp
+@@ -12,6 +12,15 @@ namespace graph {
+ folly::Future<Status> InnerJoinExecutor::execute() {
+   SCOPED_TIMER(&execTime_);
+   auto* joinNode = asNode<Join>(node());
++  if (auto* hij = asNode<HashInnerJoin>(node()); hij->passThroughRight()) {
++    // Co-purchase pushdown: the right side is already a grouped
++    // (item, partial_count) DataSet; there are no per-buyer rows to join.
++    auto& right = ectx_->getResult(hij->rightInputVar());
++    return finish(ResultBuilder()
++                      .value(Value(right.value()))
++                      .iter(right.iterRef()->kind())
++                      .build());
++  }
+   NG_RETURN_IF_ERROR(checkInputDataSets());
+   if (FLAGS_max_job_size <= 1) {
+     return join(joinNode->hashKeys(), joinNode->probeKeys(), joinNode->colNames());
+@@ -290,6 +299,14 @@ HashInnerJoinExecutor::HashInnerJoinExecutor(const PlanNode* node, QueryContext*
+ folly::Future<Status> HashInnerJoinExecutor::execute() {
+   SCOPED_TIMER(&execTime_);
+   auto* joinNode = asNode<HashJoin>(node());
++  auto* hij = asNode<HashInnerJoin>(node());
++  if (hij != nullptr && hij->passThroughRight()) {
++    auto& right = ectx_->getResult(hij->rightInputVar());
++    return finish(ResultBuilder()
++                      .value(Value(right.value()))
++                      .iter(right.iterRef()->kind())
++                      .build());
++  }
+   NG_RETURN_IF_ERROR(checkBiInputDataSets());
+   return join(joinNode->hashKeys(), joinNode->probeKeys(), joinNode->colNames());
+ }
+diff --git a/src/graph/executor/query/ProjectExecutor.cpp b/src/graph/executor/query/ProjectExecutor.cpp
+index 56baab8..1e7e3a2 100644
+--- a/src/graph/executor/query/ProjectExecutor.cpp
++++ b/src/graph/executor/query/ProjectExecutor.cpp
+@@ -14,6 +14,15 @@ folly::Future<Status> ProjectExecutor::execute() {
+   // throw std::bad_alloc in MemoryCheckGuard verified
+   SCOPED_TIMER(&execTime_);
+   auto *project = asNode<Project>(node());
++  auto& input = ectx_->getResult(project->inputVar());
++  if (input.iterRef() != nullptr && input.iterRef()->getColumnIndex("_group_count").ok()) {
++    // Co-purchase pushdown: storage already produced the item column and the
++    // partial count; do not re-evaluate dst(EDGE).
++    return finish(ResultBuilder()
++                      .value(Value(input.value()))
++                      .iter(input.iterRef()->kind())
++                      .build());
++  }
+   auto iter = ectx_->getResult(project->inputVar()).iter();
+   DCHECK(!!iter);
+ 
+diff --git a/src/graph/planner/plan/Query.cpp b/src/graph/planner/plan/Query.cpp
+index 9ee98a9..0d00f17 100644
+--- a/src/graph/planner/plan/Query.cpp
++++ b/src/graph/planner/plan/Query.cpp
+@@ -66,6 +66,7 @@ std::unique_ptr<PlanNodeDescription> GetNeighbors::explain() const {
+       "statProps", statProps_ ? folly::toJson(util::toJson(*statProps_)) : "", desc.get());
+   addDescription("exprs", exprs_ ? folly::toJson(util::toJson(*exprs_)) : "", desc.get());
+   addDescription("random", folly::toJson(util::toJson(random_)), desc.get());
++  addDescription("groupByDst", folly::toJson(util::toJson(groupByDst_)), desc.get());
+   return desc;
+ }
+ 
+@@ -82,6 +83,7 @@ void GetNeighbors::cloneMembers(const GetNeighbors& g) {
+   setEdgeTypes(g.edgeTypes_);
+   setEdgeDirection(g.edgeDirection_);
+   setRandom(g.random_);
++  setGroupByDst(g.groupByDst_);
+   if (g.vertexProps_) {
+     auto vertexProps = *g.vertexProps_;
+     auto vertexPropsPtr = std::make_unique<decltype(vertexProps)>(vertexProps);
+@@ -119,6 +121,7 @@ std::unique_ptr<PlanNodeDescription> Expand::explain() const {
+     limits.push_back(folly::to<std::string>(i));
+   }
+   addDescription("stepLimits", folly::toJson(limits), desc.get());
++  addDescription("groupByDst", folly::toJson(util::toJson(groupByDst_)), desc.get());
+   return desc;
+ }
+ 
+@@ -132,6 +135,7 @@ void Expand::cloneMembers(const Expand& expand) {
+   Explore::cloneMembers(expand);
+   sample_ = expand.sample();
+   maxSteps_ = expand.maxSteps();
++  groupByDst_ = expand.groupByDst();
+   if (expand.edgeProps()) {
+     auto edgeProps = *expand.edgeProps_;
+     auto edgePropsPtr = std::make_unique<decltype(edgeProps)>(std::move(edgeProps));
+@@ -966,6 +970,7 @@ PlanNode* HashInnerJoin::clone() const {
+ 
+ void HashInnerJoin::cloneMembers(const HashInnerJoin& l) {
+   HashJoin::cloneMembers(l);
++  passThroughRight_ = l.passThroughRight_;
+ }
+ 
+ std::unique_ptr<PlanNodeDescription> CrossJoin::explain() const {
+diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
+index 7c5f96f..7bae533 100644
+--- a/src/graph/planner/plan/Query.h
++++ b/src/graph/planner/plan/Query.h
+@@ -241,6 +241,17 @@ class GetNeighbors : public Explore {
+     random_ = random;
+   }
+ 
++  // Co-purchase pushdown: ask storage to return (dst, count) rows for one
++  // OUT edge type. Set by AggregateExecutor when it recognizes
++  // `GO ... | GROUP BY dst, COUNT(1)`.
++  bool groupByDst() const {
++    return groupByDst_;
++  }
++
++  void setGroupByDst(bool groupByDst) {
++    groupByDst_ = groupByDst;
++  }
++
+   PlanNode* clone() const override;
+   std::unique_ptr<PlanNodeDescription> explain() const override;
+ 
+@@ -262,6 +273,7 @@ class GetNeighbors : public Explore {
+   std::unique_ptr<std::vector<StatProp>> statProps_;
+   std::unique_ptr<std::vector<Expr>> exprs_;
+   bool random_{false};
++  bool groupByDst_{false};
+ };
+ 
+ class Expand : public Explore {
+@@ -316,6 +328,14 @@ class Expand : public Explore {
+     return maxSteps_;
+   }
+ 
++  bool groupByDst() const {
++    return groupByDst_;
++  }
++
++  void setGroupByDst(bool groupByDst) {
++    groupByDst_ = groupByDst;
++  }
++
+   std::unique_ptr<PlanNodeDescription> explain() const override;
+ 
+   PlanNode* clone() const override;
+@@ -342,6 +362,7 @@ class Expand : public Explore {
+   std::unique_ptr<std::vector<EdgeProp>> edgeProps_{nullptr};
+   std::vector<int64_t> stepLimits_;
+   bool joinInput_{false};
++  bool groupByDst_{false};
+   std::vector<EdgeType> edgeTypes_;
+ };
+ 
+@@ -1920,6 +1941,16 @@ class HashInnerJoin final : public HashJoin {
+         qctx, left, right, std::move(hashKeys), std::move(probeKeys));
+   }
+ 
++  // Co-purchase pushdown: when the right side already returns grouped
++  // (item, partial_count) rows, there is no per-buyer row left to join.
++  bool passThroughRight() const {
++    return passThroughRight_;
++  }
++
++  void setPassThroughRight(bool passThroughRight) {
++    passThroughRight_ = passThroughRight;
++  }
++
+   PlanNode* clone() const override;
+   std::unique_ptr<PlanNodeDescription> explain() const override;
+ 
+@@ -1934,6 +1965,8 @@ class HashInnerJoin final : public HashJoin {
+             qctx, Kind::kHashInnerJoin, left, right, std::move(hashKeys), std::move(probeKeys)) {}
+ 
+   void cloneMembers(const HashInnerJoin&);
++
++  bool passThroughRight_{false};
+ };
+ 
+ class CrossJoin final : public BinaryInputNode {
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index 2a95ba3..6554bc5 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -163,6 +163,10 @@ struct TraverseSpec {
+     //            when filter contains logicalOR expression
+     //            bcz $^.player.age > 30 OR like.likeness > 80 can't filter data only by tag_Filter
+     12: optional binary                         tag_filter,
++    // Co-purchase pushdown: when true, storage groups the traversed edges by
++    // their destination vertex and returns (dst, count) rows instead of the
++    // per-source edge lists. Only meaningful for one OUT edge type.
++    13: optional bool                           group_by_dst,
+ }
+ 
+ 
+diff --git a/src/storage/exec/GroupByDstNode.h b/src/storage/exec/GroupByDstNode.h
+new file mode 100644
+index 0000000..af9ec88
+--- /dev/null
++++ b/src/storage/exec/GroupByDstNode.h
+@@ -0,0 +1,81 @@
++/* Copyright (c) 2020 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef STORAGE_EXEC_GROUPBYDSTNODE_H_
++#define STORAGE_EXEC_GROUPBYDSTNODE_H_
++
++#include <string>
++#include <unordered_map>
++
++#include "common/base/Base.h"
++#include "common/utils/NebulaKeyUtils.h"
++#include "storage/exec/RelNode.h"
++
++namespace nebula {
++namespace storage {
++
++// Co-purchase pushdown: consume the edge iterator for every input buyer and
++// count occurrences of each destination vertex. The map is owned by the
++// processor and flushed once after all parts/vertices have been traversed.
++class GroupByDstNode final : public QueryNode<VertexID> {
++ public:
++  using RelNode::doExecute;
++
++  GroupByDstNode(RuntimeContext* context,
++                 IterateNode<VertexID>* upstream,
++                 std::unordered_map<std::string, int64_t>* counts)
++      : context_(context), upstream_(upstream), counts_(counts) {
++    name_ = "GroupByDstNode";
++  }
++
++  nebula::cpp2::ErrorCode doExecute(PartitionID partId, const VertexID& vId) override {
++    auto ret = RelNode::doExecute(partId, vId);
++    if (ret != nebula::cpp2::ErrorCode::SUCCEEDED) {
++      return ret;
++    }
++    for (; upstream_->valid(); upstream_->next()) {
++      if (context_->isPlanKilled()) {
++        return nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED;
++      }
++      auto dst = NebulaKeyUtils::getDstId(context_->vIdLen(), upstream_->key());
++      ++(*counts_)[std::string(dst.data(), dst.size())];
++    }
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++
++  // Emit one row per destination. The count is the number of traversed edges
++  // pointing at it (no dedup), matching COUNT(1) over the second hop.
++  void flush(nebula::DataSet* ds, bool isIntId) {
++    ds->rows.clear();
++    ds->colNames = {"_group_item", "_group_count"};
++    ds->rows.reserve(counts_->size());
++    for (const auto& [key, count] : *counts_) {
++      Row row;
++      if (isIntId) {
++        row.values.emplace_back(*reinterpret_cast<const int64_t*>(key.data()));
++      } else {
++        // Fixed-string VIDs are right-padded with NULs in the KV key; return
++        // the same unpadded form the normal GetNeighbors path yields.
++        std::string item = key;
++        while (!item.empty() && item.back() == '\0') {
++          item.pop_back();
++        }
++        row.values.emplace_back(Value(item));
++      }
++      row.values.emplace_back(static_cast<int64_t>(count));
++      ds->rows.emplace_back(std::move(row));
++    }
++  }
++
++ private:
++  RuntimeContext* context_{nullptr};
++  IterateNode<VertexID>* upstream_{nullptr};
++  std::unordered_map<std::string, int64_t>* counts_{nullptr};
++};
++
++}  // namespace storage
++}  // namespace nebula
++
++#endif  // STORAGE_EXEC_GROUPBYDSTNODE_H_
+diff --git a/src/storage/query/GetNeighborsProcessor.cpp b/src/storage/query/GetNeighborsProcessor.cpp
+index a5a4a64..b048d2f 100644
+--- a/src/storage/query/GetNeighborsProcessor.cpp
++++ b/src/storage/query/GetNeighborsProcessor.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include "storage/query/GetNeighborsProcessor.h"
+ 
++#include "storage/exec/GroupByDstNode.h"
++
+ #include "common/memory/MemoryTracker.h"
+ #include "storage/StorageFlags.h"
+ #include "storage/exec/AggregateNode.h"
+@@ -31,6 +33,23 @@ void GetNeighborsProcessor::process(const cpp2::GetNeighborsRequest& req) {
+ 
+ void GetNeighborsProcessor::doProcess(const cpp2::GetNeighborsRequest& req) {
+   spaceId_ = req.get_space_id();
++  groupByDst_ = req.get_traverse_spec().group_by_dst_ref().value_or(false);
++  if (groupByDst_) {
++    groupByEdgeTypes_ = req.get_traverse_spec().get_edge_types();
++    // Prototype: one OUT edge type, no edge props. Anything else keeps the
++    // normal per-vertex response (graphd only asks when it matches).
++    if (groupByEdgeTypes_.empty()) {
++      // Piped GO plans carry the edge selection in edge_props with the
++      // wildcard type (-2); scan all edge types for the prototype.
++      groupByEdgeTypes_.push_back(-2);
++    }
++    if (groupByEdgeTypes_.size() != 1 ||
++        req.get_traverse_spec().get_edge_direction() != cpp2::EdgeDirection::OUT_EDGE) {
++      groupByDst_ = false;
++    }
++    groupCounts_.clear();
++    groupByNode_ = nullptr;
++  }
+   auto retCode = getSpaceVidLen(spaceId_);
+   if (retCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     for (auto& p : req.get_parts()) {
+@@ -54,6 +73,12 @@ void GetNeighborsProcessor::doProcess(const cpp2::GetNeighborsRequest& req) {
+     onFinished();
+     return;
+   }
++  if (groupByDst_ && groupByEdgeTypes_.size() == 1 && groupByEdgeTypes_.front() == -2) {
++    groupByEdgeTypes_.clear();
++    for (const auto& entry : edgeContext_.schemas_) {
++      groupByEdgeTypes_.push_back(entry.first);
++    }
++  }
+ 
+   int64_t limit = FLAGS_max_edge_returned_per_vertex;
+   bool random = false;
+@@ -68,7 +93,9 @@ void GetNeighborsProcessor::doProcess(const cpp2::GetNeighborsRequest& req) {
+   }
+ 
+   // todo(doodle): specify by each query
+-  if (!FLAGS_query_concurrently) {
++  // The group-by pushdown keeps one shared count map, so it must run on one
++  // thread (correctness first; a sharded map is a follow-up).
++  if (groupByDst_ || !FLAGS_query_concurrently) {
+     runInSingleThread(req, limit, random);
+   } else {
+     runInMultipleThread(req, limit, random);
+@@ -241,6 +268,34 @@ StoragePlan<VertexID> GetNeighborsProcessor::buildPlan(RuntimeContext* context,
+ 
+   */
+   StoragePlan<VertexID> plan;
++  if (groupByDst_) {
++    static const std::vector<PropContext> kNoProps;
++    for (auto edgeType : groupByEdgeTypes_) {
++      auto edge = std::make_unique<SingleEdgeNode>(context,
++                                                   &edgeContext_,
++                                                   edgeType,
++                                                   &kNoProps,
++                                                   expCtx,
++                                                   nullptr,
++                                                   true /* maySkipDecode */);
++      IterateNode<VertexID>* upstream = edge.get();
++      plan.addNode(std::move(edge));
++      if (filter_ != nullptr) {
++        // The GO's WHERE (e.g. dst(edge) != "p") must run before the partial
++        // count, otherwise the excluded item still contributes a score.
++        auto filter = std::make_unique<FilterNode<VertexID>>(
++            context, upstream, expCtx, filter_->clone(), nullptr);
++        filter->addDependency(upstream);
++        upstream = filter.get();
++        plan.addNode(std::move(filter));
++      }
++      auto group = std::make_unique<GroupByDstNode>(context, upstream, &groupCounts_);
++      group->addDependency(upstream);
++      groupByNode_ = group.get();
++      plan.addNode(std::move(group));
++    }
++    return plan;
++  }
+   std::vector<TagNode*> tags;
+   for (const auto& tc : tagContext_.propContexts_) {
+     auto tag = std::make_unique<TagNode>(context, &tagContext_, tc.first, &tc.second);
+@@ -490,6 +545,11 @@ nebula::cpp2::ErrorCode GetNeighborsProcessor::handleEdgeStatProps(
+ }
+ 
+ void GetNeighborsProcessor::onProcessFinished() {
++  if (groupByDst_ && groupByNode_ != nullptr) {
++    groupByNode_->flush(&resultDataSet_, planContext_->isIntId_);
++    LOG(INFO) << "co-purchase pushdown: flushed " << resultDataSet_.rows.size()
++              << " grouped rows";
++  }
+   resp_.vertices_ref() = std::move(resultDataSet_);
+ }
+ 
+diff --git a/src/storage/query/GetNeighborsProcessor.h b/src/storage/query/GetNeighborsProcessor.h
+index 72b7a60..abf7e5c 100644
+--- a/src/storage/query/GetNeighborsProcessor.h
++++ b/src/storage/query/GetNeighborsProcessor.h
+@@ -8,6 +8,8 @@
+ 
+ #include <gtest/gtest_prod.h>
+ 
++#include <unordered_map>
++
+ #include "common/base/Base.h"
+ #include "storage/exec/StoragePlan.h"
+ #include "storage/query/QueryBaseProcessor.h"
+@@ -15,6 +17,8 @@
+ namespace nebula {
+ namespace storage {
+ 
++class GroupByDstNode;
++
+ extern ProcessorCounters kGetNeighborsCounters;
+ 
+ /**
+@@ -70,6 +74,7 @@ class GetNeighborsProcessor
+   // add PropContext of stat
+   nebula::cpp2::ErrorCode handleEdgeStatProps(const std::vector<cpp2::StatProp>& statProps);
+ 
++
+   void runInSingleThread(const cpp2::GetNeighborsRequest& req, int64_t limit, bool random);
+   void runInMultipleThread(const cpp2::GetNeighborsRequest& req, int64_t limit, bool random);
+ 
+@@ -86,6 +91,11 @@ class GetNeighborsProcessor
+   std::vector<RuntimeContext> contexts_;
+   std::vector<StorageExpressionContext> expCtxs_;
+   std::vector<nebula::DataSet> results_;
++
++  bool groupByDst_{false};
++  std::vector<EdgeType> groupByEdgeTypes_;
++  std::unordered_map<std::string, int64_t> groupCounts_;
++  GroupByDstNode* groupByNode_{nullptr};
+ };
+ 
+ }  // namespace storage
+diff --git a/tests/copurchase_pushdown_test.py b/tests/copurchase_pushdown_test.py
+new file mode 100644
+index 0000000..49686ae
+--- /dev/null
++++ b/tests/copurchase_pushdown_test.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""Manual integration test for the co-purchase pushdown prototype.
++
++Start a single-node metad/storaged/graphd, then run:
++
++    python3 tests/copurchase_pushdown_test.py
++
++It loads a 4-buyer / 5-item graph and checks the target nGQL query. The
++expected scores are a=2, b=3, c=3, d=1 (the seed product p is excluded).
++"""
++
++from __future__ import annotations
++
++import ssl
++import time
++
++# nebula3-python 3.8 references this constant at import time; Python 3.14
++# removed it.
++if not hasattr(ssl, "PROTOCOL_TLSv1"):
++    ssl.PROTOCOL_TLSv1 = ssl.PROTOCOL_TLS_CLIENT
++
++from nebula3.Config import Config  # noqa: E402
++from nebula3.gclient.net import ConnectionPool  # noqa: E402
++
++QUERY = (
++    'GO FROM "p" OVER buy REVERSELY YIELD DISTINCT src(edge) AS uid '
++    '| GO FROM $-.uid OVER buy WHERE dst(edge) != "p" YIELD dst(edge) AS item '
++    "| GROUP BY $-.item YIELD $-.item AS rec_item, COUNT(1) AS score "
++    "| ORDER BY $-.score DESC | LIMIT 20"
++)
++
++EDGES = [
++    ("u1", "p"), ("u1", "a"), ("u1", "b"), ("u1", "c"),
++    ("u2", "p"), ("u2", "a"), ("u2", "b"),
++    ("u3", "p"), ("u3", "b"), ("u3", "c"),
++    ("u4", "p"), ("u4", "c"), ("u4", "d"),
++]
++
++
++def main() -> int:
++    pool = ConnectionPool()
++    if not pool.init([("127.0.0.1", 9669)], Config()):
++        raise SystemExit("cannot connect to graphd at 127.0.0.1:9669")
++    session = pool.get_session("root", "nebula")
++
++    def run(stmt: str):
++        result = session.execute(stmt)
++        if not result.is_succeeded():
++            raise SystemExit(f"FAILED: {stmt}\n{result.error_msg()}")
++        return result
++
++    add = session.execute("ADD HOSTS 127.0.0.1:9779")
++    if not add.is_succeeded() and "Existed" not in add.error_msg():
++        raise SystemExit("FAILED: ADD HOSTS: " + add.error_msg())
++    time.sleep(8)
++    run("CREATE SPACE IF NOT EXISTS copurchase (partition_num=3, replica_factor=1, "
++        "vid_type=FIXED_STRING(32))")
++    for _ in range(12):
++        use = session.execute("USE copurchase")
++        if use.is_succeeded():
++            break
++        time.sleep(2)
++    else:
++        raise SystemExit("FAILED: space copurchase did not become ready")
++    run("CREATE EDGE IF NOT EXISTS buy()")
++    time.sleep(10)
++    values = ",".join(f'"{a}"->"{b}":()' for a, b in EDGES)
++    run(f"INSERT EDGE buy() VALUES {values}")
++    time.sleep(2)
++
++    rows = run(QUERY).rows()
++    got = {row.values[0].get_sVal().decode(): row.values[1].get_iVal() for row in rows}
++    expected = {"a": 2, "b": 3, "c": 3, "d": 1}
++    print("got:     ", got)
++    print("expected:", expected)
++    session.release()
++    pool.close()
++    if got != expected:
++        print("FAIL")
++        return 1
++    print("PASS")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+-- 
+2.55.0
+
