@@ -58,7 +58,7 @@
 | 42 | [共同购买下推](42-copurchase-pushdown.md) | 用户的 top5 商品、时间窗里的共同购买 top15、再按销量取 top20；精确路径和按存储切 top15 的误差 |
 | 43 | [共同购买下推 v2](43-copurchase-pushdown-prod.md) | hop2a 的 coCount 上界剪枝、限额和失败策略、混部；15 万用户上 v1/v2/nGQL |
 | 44 | [亲和感知的共同购买](44-copurchase-affinity-local.md) | VID 亲和放置、单机整链的运行时证明、拆开时的上界剪枝；亲和/随机/混合实测 |
-| 45 | [共现推荐第二跳聚合下推](45-copurchase-secondhop-agg.md) | 标准 GO 管道的第二跳 `GROUP BY dst + COUNT` 下推；ExpandAll 路径、原型补丁、单机验证与边界 |
+| 45 | [共现推荐第二跳聚合下推](45-copurchase-secondhop-agg.md) | 两跳 GO 的计划形状（Expand/ExpandAll + HashInnerJoin）、第二跳 `GROUP BY dst + COUNT` 下推、原型补丁与单机验证、已知边界 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
