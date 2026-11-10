@@ -482,3 +482,5 @@ python3 code-learn/nebula/bench/reco/measure_pushdown.py --only q1 --rounds 5 --
 ```
 
 `q2-opt.ngql` 到 `q6-opt.ngql` 同样，每份文件只有 `USE reco` 和那一条语句。
+
+基线也在同一目录，`q1-base.ngql` 到 `q6-base.ngql`，内容与上面各节的「基线」代码块逐字一致（`q4-base.ngql` 是本文修正后的版本）。跑基线时把 `-f` 指到 `-base` 那一份，两侧就构成第 5 节要求的那种受控对比。
