@@ -3,14 +3,14 @@
   "rounds": 7,
   "statements": "opt",
   "loadavg_start": [
-    "8.35",
-    "12.10",
-    "12.00"
+    "3.52",
+    "7.54",
+    "8.22"
   ],
   "queries": {
     "q1": {
       "plan": {
-        "optimize_time_in_us": 97,
+        "optimize_time_in_us": 68,
         "nodes": [
           {
             "id": 8,
@@ -122,56 +122,56 @@
       },
       "samples": [
         {
-          "server_us": 995,
-          "whole_us": 1255,
-          "wall_us": 1268,
+          "server_us": 505,
+          "whole_us": 663,
+          "wall_us": 671,
           "rows": 10
         },
         {
-          "server_us": 2834,
-          "whole_us": 3567,
-          "wall_us": 3580,
+          "server_us": 454,
+          "whole_us": 593,
+          "wall_us": 598,
           "rows": 10
         },
         {
-          "server_us": 2582,
-          "whole_us": 2889,
-          "wall_us": 2904,
+          "server_us": 414,
+          "whole_us": 576,
+          "wall_us": 583,
           "rows": 10
         },
         {
-          "server_us": 4357,
-          "whole_us": 4727,
-          "wall_us": 4741,
+          "server_us": 457,
+          "whole_us": 637,
+          "wall_us": 644,
           "rows": 10
         },
         {
-          "server_us": 849,
-          "whole_us": 1067,
-          "wall_us": 1077,
+          "server_us": 379,
+          "whole_us": 572,
+          "wall_us": 579,
           "rows": 10
         },
         {
-          "server_us": 1513,
-          "whole_us": 1757,
-          "wall_us": 1764,
+          "server_us": 441,
+          "whole_us": 611,
+          "wall_us": 616,
           "rows": 10
         },
         {
-          "server_us": 1013,
-          "whole_us": 2956,
-          "wall_us": 2970,
+          "server_us": 399,
+          "whole_us": 543,
+          "wall_us": 548,
           "rows": 10
         }
       ],
-      "server_us_min": 849,
-      "server_us_p50": 1513,
-      "server_us_max": 4357,
-      "wall_us_p50": 2904
+      "server_us_min": 379,
+      "server_us_p50": 441,
+      "server_us_max": 505,
+      "wall_us_p50": 598
     },
     "q2": {
       "plan": {
-        "optimize_time_in_us": 80,
+        "optimize_time_in_us": 54,
         "nodes": [
           {
             "id": 9,
@@ -310,56 +310,56 @@
       },
       "samples": [
         {
-          "server_us": 2123,
-          "whole_us": 2379,
-          "wall_us": 2391,
+          "server_us": 445,
+          "whole_us": 567,
+          "wall_us": 571,
           "rows": 8
         },
         {
-          "server_us": 2259,
-          "whole_us": 3519,
-          "wall_us": 3534,
+          "server_us": 449,
+          "whole_us": 568,
+          "wall_us": 572,
           "rows": 8
         },
         {
-          "server_us": 658,
-          "whole_us": 2473,
-          "wall_us": 2486,
+          "server_us": 372,
+          "whole_us": 492,
+          "wall_us": 497,
           "rows": 8
         },
         {
-          "server_us": 3869,
-          "whole_us": 4836,
-          "wall_us": 4857,
+          "server_us": 317,
+          "whole_us": 428,
+          "wall_us": 432,
           "rows": 8
         },
         {
-          "server_us": 2085,
-          "whole_us": 2369,
-          "wall_us": 2382,
+          "server_us": 279,
+          "whole_us": 387,
+          "wall_us": 390,
           "rows": 8
         },
         {
-          "server_us": 3092,
-          "whole_us": 3992,
-          "wall_us": 4007,
+          "server_us": 362,
+          "whole_us": 485,
+          "wall_us": 489,
           "rows": 8
         },
         {
-          "server_us": 669,
-          "whole_us": 1799,
-          "wall_us": 1812,
+          "server_us": 388,
+          "whole_us": 506,
+          "wall_us": 509,
           "rows": 8
         }
       ],
-      "server_us_min": 658,
-      "server_us_p50": 2123,
-      "server_us_max": 3869,
-      "wall_us_p50": 2486
+      "server_us_min": 279,
+      "server_us_p50": 372,
+      "server_us_max": 449,
+      "wall_us_p50": 497
     },
     "q3": {
       "plan": {
-        "optimize_time_in_us": 311,
+        "optimize_time_in_us": 207,
         "nodes": [
           {
             "id": 13,
@@ -512,56 +512,56 @@
       },
       "samples": [
         {
-          "server_us": 15693,
-          "whole_us": 21088,
-          "wall_us": 21163,
+          "server_us": 12258,
+          "whole_us": 17141,
+          "wall_us": 17213,
           "rows": 1801
         },
         {
-          "server_us": 16754,
-          "whole_us": 23323,
-          "wall_us": 23427,
+          "server_us": 12078,
+          "whole_us": 16856,
+          "wall_us": 16916,
           "rows": 1801
         },
         {
-          "server_us": 20576,
-          "whole_us": 25922,
-          "wall_us": 26013,
+          "server_us": 12413,
+          "whole_us": 17216,
+          "wall_us": 17288,
           "rows": 1801
         },
         {
-          "server_us": 17627,
-          "whole_us": 23597,
-          "wall_us": 23682,
+          "server_us": 12666,
+          "whole_us": 17442,
+          "wall_us": 17511,
           "rows": 1801
         },
         {
-          "server_us": 16101,
-          "whole_us": 21510,
-          "wall_us": 21598,
+          "server_us": 12129,
+          "whole_us": 17024,
+          "wall_us": 17084,
           "rows": 1801
         },
         {
-          "server_us": 15484,
-          "whole_us": 20812,
-          "wall_us": 20894,
+          "server_us": 12217,
+          "whole_us": 17016,
+          "wall_us": 17084,
           "rows": 1801
         },
         {
-          "server_us": 15562,
-          "whole_us": 21413,
-          "wall_us": 21510,
+          "server_us": 11713,
+          "whole_us": 16719,
+          "wall_us": 16789,
           "rows": 1801
         }
       ],
-      "server_us_min": 15484,
-      "server_us_p50": 16101,
-      "server_us_max": 20576,
-      "wall_us_p50": 21598
+      "server_us_min": 11713,
+      "server_us_p50": 12217,
+      "server_us_max": 12666,
+      "wall_us_p50": 17084
     },
     "q4": {
       "plan": {
-        "optimize_time_in_us": 224,
+        "optimize_time_in_us": 189,
         "nodes": [
           {
             "id": 19,
@@ -764,56 +764,56 @@
       },
       "samples": [
         {
-          "server_us": 119719,
-          "whole_us": 122082,
-          "wall_us": 122124,
+          "server_us": 99170,
+          "whole_us": 100974,
+          "wall_us": 101007,
           "rows": 670
         },
         {
-          "server_us": 121929,
-          "whole_us": 124469,
-          "wall_us": 124512,
+          "server_us": 94626,
+          "whole_us": 96598,
+          "wall_us": 96633,
           "rows": 670
         },
         {
-          "server_us": 127468,
-          "whole_us": 129975,
-          "wall_us": 130024,
+          "server_us": 94852,
+          "whole_us": 96832,
+          "wall_us": 96868,
           "rows": 670
         },
         {
-          "server_us": 122221,
-          "whole_us": 124478,
-          "wall_us": 124528,
+          "server_us": 98165,
+          "whole_us": 100849,
+          "wall_us": 100886,
           "rows": 670
         },
         {
-          "server_us": 126312,
-          "whole_us": 128634,
-          "wall_us": 128678,
+          "server_us": 98367,
+          "whole_us": 100322,
+          "wall_us": 100359,
           "rows": 670
         },
         {
-          "server_us": 127335,
-          "whole_us": 130340,
-          "wall_us": 130391,
+          "server_us": 93657,
+          "whole_us": 95611,
+          "wall_us": 95649,
           "rows": 670
         },
         {
-          "server_us": 128120,
-          "whole_us": 131360,
-          "wall_us": 131410,
+          "server_us": 92018,
+          "whole_us": 93907,
+          "wall_us": 93943,
           "rows": 670
         }
       ],
-      "server_us_min": 119719,
-      "server_us_p50": 126312,
-      "server_us_max": 128120,
-      "wall_us_p50": 128678
+      "server_us_min": 92018,
+      "server_us_p50": 94852,
+      "server_us_max": 99170,
+      "wall_us_p50": 96868
     },
     "q5": {
       "plan": {
-        "optimize_time_in_us": 265,
+        "optimize_time_in_us": 196,
         "nodes": [
           {
             "id": 19,
@@ -1044,56 +1044,56 @@
       },
       "samples": [
         {
-          "server_us": 5676,
-          "whole_us": 6721,
-          "wall_us": 6738,
+          "server_us": 1999,
+          "whole_us": 2213,
+          "wall_us": 2220,
           "rows": 20
         },
         {
-          "server_us": 4712,
-          "whole_us": 5083,
-          "wall_us": 5099,
+          "server_us": 1834,
+          "whole_us": 2037,
+          "wall_us": 2043,
           "rows": 20
         },
         {
-          "server_us": 6755,
-          "whole_us": 7163,
-          "wall_us": 7178,
+          "server_us": 1782,
+          "whole_us": 1974,
+          "wall_us": 1979,
           "rows": 20
         },
         {
-          "server_us": 8911,
-          "whole_us": 9328,
-          "wall_us": 9345,
+          "server_us": 2192,
+          "whole_us": 2373,
+          "wall_us": 2381,
           "rows": 20
         },
         {
-          "server_us": 3527,
-          "whole_us": 3972,
-          "wall_us": 3987,
+          "server_us": 1897,
+          "whole_us": 2093,
+          "wall_us": 2098,
           "rows": 20
         },
         {
-          "server_us": 3403,
-          "whole_us": 3948,
-          "wall_us": 3963,
+          "server_us": 1690,
+          "whole_us": 1876,
+          "wall_us": 1882,
           "rows": 20
         },
         {
-          "server_us": 8918,
-          "whole_us": 9562,
-          "wall_us": 9578,
+          "server_us": 1574,
+          "whole_us": 1747,
+          "wall_us": 1752,
           "rows": 20
         }
       ],
-      "server_us_min": 3403,
-      "server_us_p50": 5676,
-      "server_us_max": 8918,
-      "wall_us_p50": 6738
+      "server_us_min": 1574,
+      "server_us_p50": 1834,
+      "server_us_max": 2192,
+      "wall_us_p50": 2043
     },
     "q6": {
       "plan": {
-        "optimize_time_in_us": 256,
+        "optimize_time_in_us": 226,
         "nodes": [
           {
             "id": 16,
@@ -1280,52 +1280,52 @@
       },
       "samples": [
         {
-          "server_us": 2597,
-          "whole_us": 3280,
-          "wall_us": 3293,
+          "server_us": 929,
+          "whole_us": 1117,
+          "wall_us": 1124,
           "rows": 20
         },
         {
-          "server_us": 5515,
-          "whole_us": 5868,
-          "wall_us": 5882,
+          "server_us": 930,
+          "whole_us": 1132,
+          "wall_us": 1139,
           "rows": 20
         },
         {
-          "server_us": 2322,
-          "whole_us": 2652,
-          "wall_us": 2665,
+          "server_us": 939,
+          "whole_us": 1133,
+          "wall_us": 1138,
           "rows": 20
         },
         {
-          "server_us": 2947,
-          "whole_us": 3955,
-          "wall_us": 3969,
+          "server_us": 853,
+          "whole_us": 1145,
+          "wall_us": 1152,
           "rows": 20
         },
         {
-          "server_us": 1510,
-          "whole_us": 2211,
-          "wall_us": 2224,
+          "server_us": 936,
+          "whole_us": 1165,
+          "wall_us": 1171,
           "rows": 20
         },
         {
-          "server_us": 4967,
-          "whole_us": 5392,
-          "wall_us": 5408,
+          "server_us": 873,
+          "whole_us": 1071,
+          "wall_us": 1076,
           "rows": 20
         },
         {
-          "server_us": 1248,
-          "whole_us": 1621,
-          "wall_us": 1633,
+          "server_us": 1009,
+          "whole_us": 1218,
+          "wall_us": 1229,
           "rows": 20
         }
       ],
-      "server_us_min": 1248,
-      "server_us_p50": 2597,
-      "server_us_max": 5515,
-      "wall_us_p50": 3293
+      "server_us_min": 853,
+      "server_us_p50": 930,
+      "server_us_max": 1009,
+      "wall_us_p50": 1139
     }
   },
   "q4_topk": {
@@ -1427,8 +1427,8 @@
     ]
   },
   "loadavg_end": [
-    "8.56",
-    "12.09",
-    "12.00"
+    "3.52",
+    "7.54",
+    "8.22"
   ]
 }

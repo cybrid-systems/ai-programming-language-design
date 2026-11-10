@@ -1,0 +1,1434 @@
+{
+  "label": "01-rank-bounded",
+  "rounds": 7,
+  "statements": "opt",
+  "loadavg_start": [
+    "7.24",
+    "9.30",
+    "10.69"
+  ],
+  "queries": {
+    "q1": {
+      "plan": {
+        "optimize_time_in_us": 68,
+        "nodes": [
+          {
+            "id": 8,
+            "name": "TopN",
+            "deps": [
+              5
+            ],
+            "fields": {
+              "inputVar": "__Project_5",
+              "factors": "[{\"ts\":\"DESCEND\"}]",
+              "count": "10"
+            }
+          },
+          {
+            "id": 5,
+            "name": "Project",
+            "deps": [
+              9
+            ],
+            "fields": {
+              "inputVar": "__Filter_4",
+              "columns": "[\"$__COL_1 AS pid\",\"$__COL_0 AS ts\"]"
+            }
+          },
+          {
+            "id": 9,
+            "name": "ExpandAll",
+            "deps": [
+              2
+            ],
+            "fields": {
+              "inputVar": "__Expand_2",
+              "dedup": "0",
+              "limit": "9223372036854775807",
+              "filter": "(buy._rank>=1761435000)",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\",\"_rank\"],\"type\":15}]",
+              "edgeColumns": "[\"buy._rank AS __COL_0\",\"buy._dst AS __COL_1\"]"
+            }
+          },
+          {
+            "id": 2,
+            "name": "Expand",
+            "deps": [
+              1
+            ],
+            "fields": {
+              "inputVar": "__VAR_0",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]"
+            }
+          },
+          {
+            "id": 1,
+            "name": "Start",
+            "deps": [],
+            "fields": {}
+          }
+        ]
+      },
+      "spine": [
+        "TopN",
+        "Project",
+        "ExpandAll",
+        "Expand",
+        "Start"
+      ],
+      "fingerprint": {
+        "rows": 10,
+        "unique": 10,
+        "sha256": "58819b84f72b41a1e04a9d1ff3659287fd121d7e5f9f8e94f158055eb419bc20",
+        "sample": [
+          [
+            10000019766,
+            1761436409
+          ],
+          [
+            10000015162,
+            1761436355
+          ],
+          [
+            10000031436,
+            1761436343
+          ],
+          [
+            10000002101,
+            1761436331
+          ],
+          [
+            10000037751,
+            1761436271
+          ]
+        ],
+        "last_col_hist": {
+          "1761436409": 1,
+          "1761436355": 1,
+          "1761436343": 1,
+          "1761436331": 1,
+          "1761436271": 1,
+          "1761436260": 1,
+          "1761436258": 1,
+          "1761436115": 1,
+          "1761435846": 1,
+          "1761435817": 1
+        }
+      },
+      "samples": [
+        {
+          "server_us": 507,
+          "whole_us": 645,
+          "wall_us": 651,
+          "rows": 10
+        },
+        {
+          "server_us": 498,
+          "whole_us": 651,
+          "wall_us": 657,
+          "rows": 10
+        },
+        {
+          "server_us": 361,
+          "whole_us": 500,
+          "wall_us": 506,
+          "rows": 10
+        },
+        {
+          "server_us": 448,
+          "whole_us": 614,
+          "wall_us": 619,
+          "rows": 10
+        },
+        {
+          "server_us": 495,
+          "whole_us": 647,
+          "wall_us": 651,
+          "rows": 10
+        },
+        {
+          "server_us": 405,
+          "whole_us": 567,
+          "wall_us": 573,
+          "rows": 10
+        },
+        {
+          "server_us": 400,
+          "whole_us": 541,
+          "wall_us": 545,
+          "rows": 10
+        }
+      ],
+      "server_us_min": 361,
+      "server_us_p50": 448,
+      "server_us_max": 507,
+      "wall_us_p50": 619
+    },
+    "q2": {
+      "plan": {
+        "optimize_time_in_us": 65,
+        "nodes": [
+          {
+            "id": 9,
+            "name": "Minus",
+            "deps": [
+              4,
+              8
+            ],
+            "fields": {
+              "inputVar": "{\"rightVar\":\"__Project_8\",\"leftVar\":\"__Project_4\"}"
+            }
+          },
+          {
+            "id": 4,
+            "name": "Project",
+            "deps": [
+              3
+            ],
+            "fields": {
+              "inputVar": "__Dedup_3",
+              "columns": "[\"COLUMN[0]\"]"
+            }
+          },
+          {
+            "id": 3,
+            "name": "Dedup",
+            "deps": [
+              2
+            ],
+            "fields": {
+              "inputVar": "__Expand_2"
+            }
+          },
+          {
+            "id": 2,
+            "name": "Expand",
+            "deps": [
+              10
+            ],
+            "fields": {
+              "inputVar": "__VAR_0",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":16}]"
+            }
+          },
+          {
+            "id": 10,
+            "name": "PassThrough",
+            "deps": [
+              0
+            ],
+            "fields": {
+              "inputVar": ""
+            }
+          },
+          {
+            "id": 0,
+            "name": "Start",
+            "deps": [],
+            "fields": {}
+          },
+          {
+            "id": 8,
+            "name": "Project",
+            "deps": [
+              7
+            ],
+            "fields": {
+              "inputVar": "__Dedup_7",
+              "columns": "[\"COLUMN[0]\"]"
+            }
+          },
+          {
+            "id": 7,
+            "name": "Dedup",
+            "deps": [
+              6
+            ],
+            "fields": {
+              "inputVar": "__Expand_6"
+            }
+          },
+          {
+            "id": 6,
+            "name": "Expand",
+            "deps": [
+              10
+            ],
+            "fields": {
+              "inputVar": "__VAR_1",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]"
+            }
+          }
+        ]
+      },
+      "spine": [
+        "Minus",
+        "Project",
+        "Dedup",
+        "Expand",
+        "PassThrough",
+        "Start",
+        "Project",
+        "Dedup",
+        "Expand"
+      ],
+      "fingerprint": {
+        "rows": 8,
+        "unique": 8,
+        "sha256": "7d6a1faae17baef402be4b030792a49c63f56f29a0e156db885ba67f91ea45a6",
+        "sample": [
+          [
+            10000006347
+          ],
+          [
+            10000000434
+          ],
+          [
+            10000043671
+          ],
+          [
+            10000047596
+          ],
+          [
+            10000023151
+          ]
+        ],
+        "last_col_hist": null
+      },
+      "samples": [
+        {
+          "server_us": 466,
+          "whole_us": 572,
+          "wall_us": 575,
+          "rows": 8
+        },
+        {
+          "server_us": 376,
+          "whole_us": 499,
+          "wall_us": 502,
+          "rows": 8
+        },
+        {
+          "server_us": 294,
+          "whole_us": 407,
+          "wall_us": 410,
+          "rows": 8
+        },
+        {
+          "server_us": 333,
+          "whole_us": 430,
+          "wall_us": 433,
+          "rows": 8
+        },
+        {
+          "server_us": 278,
+          "whole_us": 404,
+          "wall_us": 407,
+          "rows": 8
+        },
+        {
+          "server_us": 251,
+          "whole_us": 355,
+          "wall_us": 358,
+          "rows": 8
+        },
+        {
+          "server_us": 273,
+          "whole_us": 373,
+          "wall_us": 377,
+          "rows": 8
+        }
+      ],
+      "server_us_min": 251,
+      "server_us_p50": 294,
+      "server_us_max": 466,
+      "wall_us_p50": 410
+    },
+    "q3": {
+      "plan": {
+        "optimize_time_in_us": 207,
+        "nodes": [
+          {
+            "id": 13,
+            "name": "Limit",
+            "deps": [
+              12
+            ],
+            "fields": {
+              "inputVar": "__Dedup_12",
+              "count": "5000"
+            }
+          },
+          {
+            "id": 12,
+            "name": "Dedup",
+            "deps": [
+              15
+            ],
+            "fields": {
+              "inputVar": "__Project_11"
+            }
+          },
+          {
+            "id": 15,
+            "name": "Project",
+            "deps": [
+              18
+            ],
+            "fields": {
+              "inputVar": "__Filter_9",
+              "columns": "[\"$__COL_1 AS high_potential_user\"]"
+            }
+          },
+          {
+            "id": 18,
+            "name": "HashInnerJoin",
+            "deps": [
+              3,
+              19
+            ],
+            "fields": {
+              "inputVar": "{\"rightVar\":\"__ExpandAll_7\",\"leftVar\":\"__Project_3\"}"
+            }
+          },
+          {
+            "id": 3,
+            "name": "Project",
+            "deps": [
+              14
+            ],
+            "fields": {
+              "inputVar": "__Filter_2",
+              "columns": "[\"id(VERTEX) AS pid\"]"
+            }
+          },
+          {
+            "id": 14,
+            "name": "TagIndexPrefixScan",
+            "deps": [
+              0
+            ],
+            "fields": {
+              "inputVar": "",
+              "dedup": "0",
+              "limit": "9223372036854775807",
+              "filter": ""
+            }
+          },
+          {
+            "id": 0,
+            "name": "Start",
+            "deps": [],
+            "fields": {}
+          },
+          {
+            "id": 19,
+            "name": "ExpandAll",
+            "deps": [
+              6
+            ],
+            "fields": {
+              "inputVar": "__Expand_6",
+              "dedup": "0",
+              "limit": "9223372036854775807",
+              "filter": "(buy._rank>=1753660800)",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\",\"_rank\"],\"type\":-15}]",
+              "edgeColumns": "[\"buy._rank AS __COL_0\",\"buy._dst AS __COL_1\"]"
+            }
+          },
+          {
+            "id": 6,
+            "name": "Expand",
+            "deps": [
+              5
+            ],
+            "fields": {
+              "inputVar": "__Argument_5",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":-15}]"
+            }
+          },
+          {
+            "id": 5,
+            "name": "Argument",
+            "deps": [],
+            "fields": {
+              "inputVar": "__Project_3"
+            }
+          }
+        ]
+      },
+      "spine": [
+        "Limit",
+        "Dedup",
+        "Project",
+        "HashInnerJoin",
+        "Project",
+        "TagIndexPrefixScan",
+        "Start",
+        "ExpandAll",
+        "Expand",
+        "Argument"
+      ],
+      "fingerprint": {
+        "rows": 1801,
+        "unique": 1801,
+        "sha256": "45e59fd185d339542050700fd013ad009249ef0e6de5d0b4110b6ee8995c4dc2",
+        "sample": [
+          [
+            6537
+          ],
+          [
+            3838
+          ],
+          [
+            7937
+          ],
+          [
+            382
+          ],
+          [
+            9908
+          ]
+        ],
+        "last_col_hist": null
+      },
+      "samples": [
+        {
+          "server_us": 11874,
+          "whole_us": 16577,
+          "wall_us": 16633,
+          "rows": 1801
+        },
+        {
+          "server_us": 11618,
+          "whole_us": 16159,
+          "wall_us": 16212,
+          "rows": 1801
+        },
+        {
+          "server_us": 11866,
+          "whole_us": 16418,
+          "wall_us": 16471,
+          "rows": 1801
+        },
+        {
+          "server_us": 11133,
+          "whole_us": 15797,
+          "wall_us": 15851,
+          "rows": 1801
+        },
+        {
+          "server_us": 11260,
+          "whole_us": 15983,
+          "wall_us": 16035,
+          "rows": 1801
+        },
+        {
+          "server_us": 12150,
+          "whole_us": 16815,
+          "wall_us": 16874,
+          "rows": 1801
+        },
+        {
+          "server_us": 11879,
+          "whole_us": 16528,
+          "wall_us": 16587,
+          "rows": 1801
+        }
+      ],
+      "server_us_min": 11133,
+      "server_us_p50": 11866,
+      "server_us_max": 12150,
+      "wall_us_p50": 16471
+    },
+    "q4": {
+      "plan": {
+        "optimize_time_in_us": 171,
+        "nodes": [
+          {
+            "id": 19,
+            "name": "Project",
+            "deps": [
+              18
+            ],
+            "fields": {
+              "inputVar": "__Limit_18",
+              "columns": "[\"COLUMN[0]\"]"
+            }
+          },
+          {
+            "id": 18,
+            "name": "Limit",
+            "deps": [
+              14
+            ],
+            "fields": {
+              "inputVar": "__Dedup_14",
+              "count": "100000"
+            }
+          },
+          {
+            "id": 14,
+            "name": "Dedup",
+            "deps": [
+              13
+            ],
+            "fields": {
+              "inputVar": "__Expand_13"
+            }
+          },
+          {
+            "id": 13,
+            "name": "Expand",
+            "deps": [
+              17
+            ],
+            "fields": {
+              "inputVar": "__Limit_11",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":-15}]"
+            }
+          },
+          {
+            "id": 17,
+            "name": "TopN",
+            "deps": [
+              9
+            ],
+            "fields": {
+              "inputVar": "__Aggregate_9",
+              "factors": "[{\"co_buy\":\"DESCEND\"}]",
+              "count": "100"
+            }
+          },
+          {
+            "id": 9,
+            "name": "Aggregate",
+            "deps": [
+              8
+            ],
+            "fields": {
+              "inputVar": "__Sort_8",
+              "groupKeys": "[\"$-.pid\"]"
+            }
+          },
+          {
+            "id": 8,
+            "name": "Sort",
+            "deps": [
+              7
+            ],
+            "fields": {
+              "inputVar": "__Project_7",
+              "factors": "[{\"pid\":\"ASCEND\"}]"
+            }
+          },
+          {
+            "id": 7,
+            "name": "Project",
+            "deps": [
+              6
+            ],
+            "fields": {
+              "inputVar": "__HashInnerJoin_6",
+              "columns": "[\"$__COL_0 AS pid\"]"
+            }
+          },
+          {
+            "id": 6,
+            "name": "HashInnerJoin",
+            "deps": [
+              1,
+              5
+            ],
+            "fields": {
+              "inputVar": "{\"rightVar\":\"__ExpandAll_5\",\"leftVar\":\"__Unwind_1\"}"
+            }
+          },
+          {
+            "id": 1,
+            "name": "Unwind",
+            "deps": [
+              0
+            ],
+            "fields": {
+              "inputVar": ""
+            }
+          },
+          {
+            "id": 0,
+            "name": "Start",
+            "deps": [],
+            "fields": {}
+          },
+          {
+            "id": 5,
+            "name": "ExpandAll",
+            "deps": [
+              4
+            ],
+            "fields": {
+              "inputVar": "__Expand_4",
+              "dedup": "0",
+              "limit": "9223372036854775807",
+              "filter": "",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]",
+              "edgeColumns": "[\"buy._dst AS __COL_0\"]"
+            }
+          },
+          {
+            "id": 4,
+            "name": "Expand",
+            "deps": [
+              3
+            ],
+            "fields": {
+              "inputVar": "__Argument_3",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]"
+            }
+          },
+          {
+            "id": 3,
+            "name": "Argument",
+            "deps": [],
+            "fields": {
+              "inputVar": "__Unwind_1"
+            }
+          }
+        ]
+      },
+      "spine": [
+        "Project",
+        "Limit",
+        "Dedup",
+        "Expand",
+        "TopN",
+        "Aggregate",
+        "Sort",
+        "Project",
+        "HashInnerJoin",
+        "Unwind",
+        "Start",
+        "ExpandAll",
+        "Expand",
+        "Argument"
+      ],
+      "fingerprint": {
+        "rows": 670,
+        "unique": 670,
+        "sha256": "51e9d5295d9e5e77ee005c37a60d9f3e73c9ec972fcbe833399325367e1442b5",
+        "sample": [
+          [
+            4309
+          ],
+          [
+            8785
+          ],
+          [
+            4952
+          ],
+          [
+            2380
+          ],
+          [
+            8952
+          ]
+        ],
+        "last_col_hist": null
+      },
+      "samples": [
+        {
+          "server_us": 100166,
+          "whole_us": 102108,
+          "wall_us": 102141,
+          "rows": 670
+        },
+        {
+          "server_us": 98645,
+          "whole_us": 100559,
+          "wall_us": 100592,
+          "rows": 670
+        },
+        {
+          "server_us": 99049,
+          "whole_us": 100966,
+          "wall_us": 101000,
+          "rows": 670
+        },
+        {
+          "server_us": 93578,
+          "whole_us": 95461,
+          "wall_us": 95494,
+          "rows": 670
+        },
+        {
+          "server_us": 91927,
+          "whole_us": 93814,
+          "wall_us": 93848,
+          "rows": 670
+        },
+        {
+          "server_us": 91546,
+          "whole_us": 93440,
+          "wall_us": 93475,
+          "rows": 670
+        },
+        {
+          "server_us": 93133,
+          "whole_us": 95618,
+          "wall_us": 95650,
+          "rows": 670
+        }
+      ],
+      "server_us_min": 91546,
+      "server_us_p50": 93578,
+      "server_us_max": 100166,
+      "wall_us_p50": 95650
+    },
+    "q5": {
+      "plan": {
+        "optimize_time_in_us": 220,
+        "nodes": [
+          {
+            "id": 19,
+            "name": "TopN",
+            "deps": [
+              16
+            ],
+            "fields": {
+              "inputVar": "__Aggregate_16",
+              "factors": "[{\"score\":\"DESCEND\"}]",
+              "count": "20"
+            }
+          },
+          {
+            "id": 16,
+            "name": "Aggregate",
+            "deps": [
+              15
+            ],
+            "fields": {
+              "inputVar": "__Sort_15",
+              "groupKeys": "[\"$-.y\"]"
+            }
+          },
+          {
+            "id": 15,
+            "name": "Sort",
+            "deps": [
+              14
+            ],
+            "fields": {
+              "inputVar": "__Project_14",
+              "factors": "[{\"y\":\"ASCEND\"}]"
+            }
+          },
+          {
+            "id": 14,
+            "name": "Project",
+            "deps": [
+              13
+            ],
+            "fields": {
+              "inputVar": "__HashInnerJoin_13",
+              "columns": "[\"$__COL_2 AS y\"]"
+            }
+          },
+          {
+            "id": 13,
+            "name": "HashInnerJoin",
+            "deps": [
+              8,
+              12
+            ],
+            "fields": {
+              "inputVar": "{\"rightVar\":\"__ExpandAll_12\",\"leftVar\":\"__Project_8\"}"
+            }
+          },
+          {
+            "id": 8,
+            "name": "Project",
+            "deps": [
+              7
+            ],
+            "fields": {
+              "inputVar": "__Dedup_7",
+              "columns": "[\"COLUMN[0]\"]"
+            }
+          },
+          {
+            "id": 7,
+            "name": "Dedup",
+            "deps": [
+              6
+            ],
+            "fields": {
+              "inputVar": "__Expand_6"
+            }
+          },
+          {
+            "id": 6,
+            "name": "Expand",
+            "deps": [
+              4
+            ],
+            "fields": {
+              "inputVar": "__Project_4",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":-15}]"
+            }
+          },
+          {
+            "id": 4,
+            "name": "Project",
+            "deps": [
+              3
+            ],
+            "fields": {
+              "inputVar": "__Dedup_3",
+              "columns": "[\"COLUMN[0]\"]"
+            }
+          },
+          {
+            "id": 3,
+            "name": "Dedup",
+            "deps": [
+              2
+            ],
+            "fields": {
+              "inputVar": "__Expand_2"
+            }
+          },
+          {
+            "id": 2,
+            "name": "Expand",
+            "deps": [
+              0
+            ],
+            "fields": {
+              "inputVar": "__VAR_0",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]"
+            }
+          },
+          {
+            "id": 0,
+            "name": "Start",
+            "deps": [],
+            "fields": {}
+          },
+          {
+            "id": 12,
+            "name": "ExpandAll",
+            "deps": [
+              11
+            ],
+            "fields": {
+              "inputVar": "__Expand_11",
+              "dedup": "0",
+              "limit": "9223372036854775807",
+              "filter": "",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]",
+              "edgeColumns": "[\"buy._dst AS __COL_2\"]"
+            }
+          },
+          {
+            "id": 11,
+            "name": "Expand",
+            "deps": [
+              10
+            ],
+            "fields": {
+              "inputVar": "__Argument_10",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]"
+            }
+          },
+          {
+            "id": 10,
+            "name": "Argument",
+            "deps": [],
+            "fields": {
+              "inputVar": "__Project_8"
+            }
+          }
+        ]
+      },
+      "spine": [
+        "TopN",
+        "Aggregate",
+        "Sort",
+        "Project",
+        "HashInnerJoin",
+        "Project",
+        "Dedup",
+        "Expand",
+        "Project",
+        "Dedup",
+        "Expand",
+        "Start",
+        "ExpandAll",
+        "Expand",
+        "Argument"
+      ],
+      "fingerprint": {
+        "rows": 20,
+        "unique": 20,
+        "sha256": "5c0ebd20c7c71f420899f1af3ba0fb3f85a40ebcb7dcfdecadb728b4d346a5c3",
+        "sample": [
+          [
+            10000027663,
+            8
+          ],
+          [
+            10000017204,
+            6
+          ],
+          [
+            10000041658,
+            5
+          ],
+          [
+            10000019766,
+            4
+          ],
+          [
+            10000034846,
+            4
+          ]
+        ],
+        "last_col_hist": {
+          "8": 1,
+          "6": 1,
+          "5": 1,
+          "4": 4,
+          "3": 5,
+          "2": 8
+        }
+      },
+      "samples": [
+        {
+          "server_us": 1689,
+          "whole_us": 1887,
+          "wall_us": 1893,
+          "rows": 20
+        },
+        {
+          "server_us": 1697,
+          "whole_us": 1866,
+          "wall_us": 1871,
+          "rows": 20
+        },
+        {
+          "server_us": 1638,
+          "whole_us": 1811,
+          "wall_us": 1815,
+          "rows": 20
+        },
+        {
+          "server_us": 1698,
+          "whole_us": 1883,
+          "wall_us": 1888,
+          "rows": 20
+        },
+        {
+          "server_us": 1637,
+          "whole_us": 1819,
+          "wall_us": 1825,
+          "rows": 20
+        },
+        {
+          "server_us": 1677,
+          "whole_us": 1856,
+          "wall_us": 1860,
+          "rows": 20
+        },
+        {
+          "server_us": 1586,
+          "whole_us": 1753,
+          "wall_us": 1757,
+          "rows": 20
+        }
+      ],
+      "server_us_min": 1586,
+      "server_us_p50": 1677,
+      "server_us_max": 1698,
+      "wall_us_p50": 1860
+    },
+    "q6": {
+      "plan": {
+        "optimize_time_in_us": 273,
+        "nodes": [
+          {
+            "id": 16,
+            "name": "TopN",
+            "deps": [
+              13
+            ],
+            "fields": {
+              "inputVar": "__Aggregate_13",
+              "factors": "[{\"score\":\"DESCEND\"}]",
+              "count": "20"
+            }
+          },
+          {
+            "id": 13,
+            "name": "Aggregate",
+            "deps": [
+              12
+            ],
+            "fields": {
+              "inputVar": "__Sort_12",
+              "groupKeys": "[\"$-.item\"]"
+            }
+          },
+          {
+            "id": 12,
+            "name": "Sort",
+            "deps": [
+              11
+            ],
+            "fields": {
+              "inputVar": "__Project_11",
+              "factors": "[{\"item\":\"ASCEND\"}]"
+            }
+          },
+          {
+            "id": 11,
+            "name": "Project",
+            "deps": [
+              19
+            ],
+            "fields": {
+              "inputVar": "__Filter_10",
+              "columns": "[\"$__COL_1 AS item\"]"
+            }
+          },
+          {
+            "id": 19,
+            "name": "HashInnerJoin",
+            "deps": [
+              4,
+              20
+            ],
+            "fields": {
+              "inputVar": "{\"rightVar\":\"__ExpandAll_8\",\"leftVar\":\"__Project_4\"}"
+            }
+          },
+          {
+            "id": 4,
+            "name": "Project",
+            "deps": [
+              3
+            ],
+            "fields": {
+              "inputVar": "__Dedup_3",
+              "columns": "[\"COLUMN[0]\"]"
+            }
+          },
+          {
+            "id": 3,
+            "name": "Dedup",
+            "deps": [
+              2
+            ],
+            "fields": {
+              "inputVar": "__Expand_2"
+            }
+          },
+          {
+            "id": 2,
+            "name": "Expand",
+            "deps": [
+              0
+            ],
+            "fields": {
+              "inputVar": "__VAR_0",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "false",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":-15}]"
+            }
+          },
+          {
+            "id": 0,
+            "name": "Start",
+            "deps": [],
+            "fields": {}
+          },
+          {
+            "id": 20,
+            "name": "ExpandAll",
+            "deps": [
+              7
+            ],
+            "fields": {
+              "inputVar": "__Expand_7",
+              "dedup": "0",
+              "limit": "9223372036854775807",
+              "filter": "(buy._dst!=10000031733)",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]",
+              "edgeColumns": "[\"buy._dst AS __COL_1\"]"
+            }
+          },
+          {
+            "id": 7,
+            "name": "Expand",
+            "deps": [
+              6
+            ],
+            "fields": {
+              "inputVar": "__Argument_6",
+              "dedup": "0",
+              "limit": "",
+              "filter": "",
+              "joinInput": "true",
+              "edgeProps": "[{\"props\":[\"_dst\"],\"type\":15}]"
+            }
+          },
+          {
+            "id": 6,
+            "name": "Argument",
+            "deps": [],
+            "fields": {
+              "inputVar": "__Project_4"
+            }
+          }
+        ]
+      },
+      "spine": [
+        "TopN",
+        "Aggregate",
+        "Sort",
+        "Project",
+        "HashInnerJoin",
+        "Project",
+        "Dedup",
+        "Expand",
+        "Start",
+        "ExpandAll",
+        "Expand",
+        "Argument"
+      ],
+      "fingerprint": {
+        "rows": 20,
+        "unique": 20,
+        "sha256": "d4500be032c76abe085765c447d86dfd0a6d3f39858d58bdac7f66f8567dc6e3",
+        "sample": [
+          [
+            10000042680,
+            1
+          ],
+          [
+            10000043449,
+            1
+          ],
+          [
+            10000046407,
+            1
+          ],
+          [
+            10000020598,
+            1
+          ],
+          [
+            10000012410,
+            1
+          ]
+        ],
+        "last_col_hist": {
+          "1": 20
+        }
+      },
+      "samples": [
+        {
+          "server_us": 842,
+          "whole_us": 1004,
+          "wall_us": 1007,
+          "rows": 20
+        },
+        {
+          "server_us": 1013,
+          "whole_us": 1182,
+          "wall_us": 1186,
+          "rows": 20
+        },
+        {
+          "server_us": 878,
+          "whole_us": 1040,
+          "wall_us": 1045,
+          "rows": 20
+        },
+        {
+          "server_us": 830,
+          "whole_us": 1004,
+          "wall_us": 1009,
+          "rows": 20
+        },
+        {
+          "server_us": 932,
+          "whole_us": 1098,
+          "wall_us": 1102,
+          "rows": 20
+        },
+        {
+          "server_us": 763,
+          "whole_us": 934,
+          "wall_us": 938,
+          "rows": 20
+        },
+        {
+          "server_us": 819,
+          "whole_us": 1017,
+          "wall_us": 1024,
+          "rows": 20
+        }
+      ],
+      "server_us_min": 763,
+      "server_us_p50": 842,
+      "server_us_max": 1013,
+      "wall_us_p50": 1024
+    }
+  },
+  "q4_topk": {
+    "rows": 100,
+    "co_buy_hist": {
+      "9": 2,
+      "8": 19,
+      "7": 66,
+      "6": 13
+    },
+    "pids_co_buy_ge_7": [
+      10000000192,
+      10000000271,
+      10000000980,
+      10000001115,
+      10000001487,
+      10000002614,
+      10000002717,
+      10000003063,
+      10000003261,
+      10000003374,
+      10000003844,
+      10000004144,
+      10000004945,
+      10000005002,
+      10000006536,
+      10000008959,
+      10000009099,
+      10000010324,
+      10000010505,
+      10000011080,
+      10000011297,
+      10000011762,
+      10000013960,
+      10000014297,
+      10000015457,
+      10000015632,
+      10000015761,
+      10000016017,
+      10000017278,
+      10000017531,
+      10000019434,
+      10000019456,
+      10000019944,
+      10000020491,
+      10000020774,
+      10000021148,
+      10000021387,
+      10000021730,
+      10000021956,
+      10000022038,
+      10000022506,
+      10000022822,
+      10000023734,
+      10000023981,
+      10000024080,
+      10000024286,
+      10000024566,
+      10000026349,
+      10000027663,
+      10000027677,
+      10000029739,
+      10000030038,
+      10000031165,
+      10000031396,
+      10000031733,
+      10000031878,
+      10000031995,
+      10000032462,
+      10000033187,
+      10000034036,
+      10000034244,
+      10000034617,
+      10000034874,
+      10000035638,
+      10000036184,
+      10000036276,
+      10000036496,
+      10000036799,
+      10000037414,
+      10000037680,
+      10000037763,
+      10000038218,
+      10000038686,
+      10000039396,
+      10000039451,
+      10000039893,
+      10000040835,
+      10000042124,
+      10000044432,
+      10000044484,
+      10000046387,
+      10000046615,
+      10000047644,
+      10000047695,
+      10000047772,
+      10000049297,
+      10000049903
+    ]
+  },
+  "loadavg_end": [
+    "7.24",
+    "9.30",
+    "10.69"
+  ]
+}

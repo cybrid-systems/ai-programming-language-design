@@ -61,6 +61,7 @@
 | 45 | [共现推荐第二跳聚合下推](45-copurchase-secondhop-agg.md) | 两跳 GO 的计划形状（Expand/ExpandAll + HashInnerJoin）、第二跳 `GROUP BY dst + COUNT` 下推、原型补丁与单机验证、已知边界 |
 | 46 | [operator-opt 分支实测与下推前提校正](46-operator-opt-review.md) | 11 个 commit 的落点、与补丁设计 A–F 的对应、EXPLAIN 实测：`edge._dst` 走简单计划、REVERSELY 下 `_dst` 等价于 `src(edge)`、`LIMIT [N]` 是逐步截断；分支单独编译的 A/B：按现状编译不过、补丁 A 确实存在、但并列切分使结果不等价 |
 | 47 | [reco 六场景 nGQL 下推](47-reco-ngql-pushdown.md) | Q1–Q6 各一条可单独替换的语句：下推前/后的 EXPLAIN，以及 loopback 上的 server latency |
+| 48 | [reco 正交算子补丁](48-reco-operator-patches.md) | 在 47 的 opt 语句上，把 `operator-opt` 拆成可单独 apply 的补丁；gcc-11 `fa92893` 上每个补丁的计划、SHA 和 server p50。Q3 组合在补上 rank 窗口后结果回到 1801 行，时延更慢 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -83,6 +84,8 @@
 46 不是新的一组设计稿，是对 `operator-opt` 分支（gitcode `guoshaohong1/nebula`，上游 `v3.8.0` 之上 11 个提交）的落点盘点，加上三条用 EXPLAIN 实测的下推前提校正：`edge._dst` 走简单计划（`getDstBySrc`）；REVERSELY 下 `_dst` 与 `src(edge)` 语义等价（不是商品自己）；`LIMIT [N]` 是逐步截断而非 per-vertex limit，且会让简单计划失效。这三条直接收窄了 42–45 里「哪些算子留在 graphd」的判断边界。第 7 节把分支单独编译后与基线 A/B，得到两个此前不知道的事实：分支按现状编译不过（`-Werror=reorder`），而补丁 A 确实存在、但同样的语句在两个二进制上会因并列切分给出不同的行集合——这同时限定了 47 用的「多重集 SHA 相同」判据的适用范围。
 
 47 是 reco 空间上 Q1–Q6 的语句级下推记录。每条 opt 单独替换 [dev.md](dev.md) 里的同名基线，用的是 `fa92893` 已有的 Filter、列裁剪和简单计划。计划原文和 5 次时延在 [47](47-reco-ngql-pushdown.md)，原始 JSON 在 `bench/reco/pushdown/results.json`。
+
+48 接在 47 的 opt 语句之后，把 `operator-opt` 拆成 `patches/reco-q/` 里可单独 apply 的补丁，在 gcc-11 重编的 `fa92893` 上逐个换二进制。比较点是优化后的 nGQL，不是 47 里的 graphd 基线语句。计划和 7 次时延在 [48](48-reco-operator-patches.md)，原始 JSON 在 `bench/reco/patch-measure/`。
 
 ## 主线
 

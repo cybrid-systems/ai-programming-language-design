@@ -1,0 +1,306 @@
+diff --git a/src/storage/query/GetNeighborsProcessor.cpp b/src/storage/query/GetNeighborsProcessor.cpp
+--- a/src/storage/query/GetNeighborsProcessor.cpp
++++ b/src/storage/query/GetNeighborsProcessor.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "storage/query/GetNeighborsProcessor.h"
+ 
++#include <limits>
+ #include <optional>
+ #include <utility>
+ 
+@@ -82,16 +83,19 @@
+       const Expression* left = rel->left();
+       const Expression* right = rel->right();
+       bool swapped = false;
+-      if (left->kind() == Expression::Kind::kConstant &&
+-          right->kind() == Expression::Kind::kEdgeProperty) {
++      // `edge._rank` is an EdgeRankExpression (kEdgeRank), not an
++      // EdgePropertyExpression. Both carry prop "_rank".
++      const auto rankKind = [](Expression::Kind kind) {
++        return kind == Expression::Kind::kEdgeRank || kind == Expression::Kind::kEdgeProperty;
++      };
++      if (left->kind() == Expression::Kind::kConstant && rankKind(right->kind())) {
+         std::swap(left, right);
+         swapped = true;
+       }
+-      if (left->kind() != Expression::Kind::kEdgeProperty ||
+-          right->kind() != Expression::Kind::kConstant) {
++      if (!rankKind(left->kind()) || right->kind() != Expression::Kind::kConstant) {
+         return false;
+       }
+-      const auto* prop = static_cast<const EdgePropertyExpression*>(left);
++      const auto* prop = static_cast<const PropertyExpression*>(left);
+       if (prop->prop() != "_rank" || prop->sym() != edgeName) {
+         return false;
+       }
+@@ -110,19 +114,38 @@
+           default: break;
+         }
+       }
+-      // GT/LT use the endpoint itself: the residual filter still runs,
+-      // so the range only needs to be a superset (also avoids overflow).
++      // Bounds are exact. GetDstBySrc does not evaluate a residual filter,
++      // and GetNeighbors' residual filter still accepts this tighter range.
++      // An empty interval is lo > hi; SingleEdgeNode returns no edges.
+       switch (kind) {
+         case Expression::Kind::kRelGE:
+-        case Expression::Kind::kRelGT:
+           out.hasLo = true;
+           out.lo = v;
+           return true;
++        case Expression::Kind::kRelGT:
++          if (v == std::numeric_limits<EdgeRanking>::max()) {
++            out.hasLo = out.hasHi = true;
++            out.lo = 0;
++            out.hi = -1;
++            return true;
++          }
++          out.hasLo = true;
++          out.lo = v + 1;
++          return true;
+         case Expression::Kind::kRelLE:
+-        case Expression::Kind::kRelLT:
+           out.hasHi = true;
+           out.hi = v;
+           return true;
++        case Expression::Kind::kRelLT:
++          if (v == std::numeric_limits<EdgeRanking>::min()) {
++            out.hasLo = out.hasHi = true;
++            out.lo = 0;
++            out.hi = -1;
++            return true;
++          }
++          out.hasHi = true;
++          out.hi = v - 1;
++          return true;
+         case Expression::Kind::kRelEQ:
+           out.hasLo = out.hasHi = true;
+           out.lo = out.hi = v;
+diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -7,6 +7,7 @@
+ #define STORAGE_QUERY_GETDSTBYSRCPROCESSOR_H_
+ 
+ #include <deque>
++#include <optional>
+ 
+ #include "common/base/Base.h"
+ #include "storage/BaseProcessor.h"
+@@ -69,6 +70,12 @@
+ 
+   time::Duration totalDuration_;
+   time::Duration dedupDuration_;
++
++  // Exact rank window for filter_. GetDstBySrc does not run exp_, so the
++  // iterator itself has to seek this range. Unset when there is no filter.
++  bool hasRankRange_{false};
++  std::optional<EdgeRanking> rankLo_;
++  std::optional<EdgeRanking> rankHi_;
+ };
+ 
+ }  // namespace storage
+diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -5,6 +5,9 @@
+ 
+ #include "storage/query/GetDstBySrcProcessor.h"
+ 
++#include <limits>
++#include <utility>
++
+ #include <robin_hood.h>
+ 
+ #include "common/expression/ConstantExpression.h"
+@@ -75,6 +78,157 @@
+   return isRankComparison(expr, edgeName);
+ }
+ 
++struct RankBounds {
++  bool hasLo{false};
++  bool hasHi{false};
++  EdgeRanking lo{0};
++  EdgeRanking hi{0};
++};
++
++void intersectRankBounds(RankBounds& dst, const RankBounds& src) {
++  if (src.hasLo) {
++    if (!dst.hasLo || src.lo > dst.lo) {
++      dst.lo = src.lo;
++      dst.hasLo = true;
++    }
++  }
++  if (src.hasHi) {
++    if (!dst.hasHi || src.hi < dst.hi) {
++      dst.hi = src.hi;
++      dst.hasHi = true;
++    }
++  }
++}
++
++// Exact rank window. `edge._rank` parses as kEdgeRank, not kEdgeProperty.
++// GetDstBySrc never evaluates EdgeNode::exp_, so a superset bound would
++// change results. An empty window is encoded as lo > hi.
++bool extractRankBounds(const Expression* expr, const std::string& edgeName, RankBounds& out) {
++  if (expr == nullptr) {
++    return false;
++  }
++  switch (expr->kind()) {
++    case Expression::Kind::kLogicalAnd: {
++      const auto* logic = static_cast<const LogicalExpression*>(expr);
++      bool any = false;
++      for (auto* operand : logic->operands()) {
++        RankBounds sub;
++        if (extractRankBounds(operand, edgeName, sub)) {
++          intersectRankBounds(out, sub);
++          any = true;
++        }
++      }
++      return any;
++    }
++    case Expression::Kind::kLogicalOr:
++      return false;
++    case Expression::Kind::kRelEQ:
++    case Expression::Kind::kRelLT:
++    case Expression::Kind::kRelLE:
++    case Expression::Kind::kRelGT:
++    case Expression::Kind::kRelGE: {
++      const auto* rel = static_cast<const RelationalExpression*>(expr);
++      const Expression* left = rel->left();
++      const Expression* right = rel->right();
++      bool swapped = false;
++      const auto rankKind = [](Expression::Kind kind) {
++        return kind == Expression::Kind::kEdgeRank || kind == Expression::Kind::kEdgeProperty;
++      };
++      if (left->kind() == Expression::Kind::kConstant && rankKind(right->kind())) {
++        std::swap(left, right);
++        swapped = true;
++      }
++      if (!rankKind(left->kind()) || right->kind() != Expression::Kind::kConstant) {
++        return false;
++      }
++      const auto* prop = static_cast<const PropertyExpression*>(left);
++      if (prop->prop() != "_rank" || prop->sym() != edgeName) {
++        return false;
++      }
++      const auto* constant = static_cast<const ConstantExpression*>(right);
++      if (!constant->value().isInt()) {
++        return false;
++      }
++      const EdgeRanking v = constant->value().getInt();
++      auto kind = expr->kind();
++      if (swapped) {
++        switch (kind) {
++          case Expression::Kind::kRelLT:
++            kind = Expression::Kind::kRelGT;
++            break;
++          case Expression::Kind::kRelLE:
++            kind = Expression::Kind::kRelGE;
++            break;
++          case Expression::Kind::kRelGT:
++            kind = Expression::Kind::kRelLT;
++            break;
++          case Expression::Kind::kRelGE:
++            kind = Expression::Kind::kRelLE;
++            break;
++          default:
++            break;
++        }
++      }
++      switch (kind) {
++        case Expression::Kind::kRelGE:
++          out.hasLo = true;
++          out.lo = v;
++          return true;
++        case Expression::Kind::kRelGT:
++          if (v == std::numeric_limits<EdgeRanking>::max()) {
++            out.hasLo = out.hasHi = true;
++            out.lo = 0;
++            out.hi = -1;
++            return true;
++          }
++          out.hasLo = true;
++          out.lo = v + 1;
++          return true;
++        case Expression::Kind::kRelLE:
++          out.hasHi = true;
++          out.hi = v;
++          return true;
++        case Expression::Kind::kRelLT:
++          if (v == std::numeric_limits<EdgeRanking>::min()) {
++            out.hasLo = out.hasHi = true;
++            out.lo = 0;
++            out.hi = -1;
++            return true;
++          }
++          out.hasHi = true;
++          out.hi = v - 1;
++          return true;
++        case Expression::Kind::kRelEQ:
++          out.hasLo = out.hasHi = true;
++          out.lo = out.hi = v;
++          return true;
++        default:
++          return false;
++      }
++    }
++    default:
++      return false;
++  }
++}
++
++std::optional<RankRange> extractRankRange(const Expression* filter, const std::string& edgeName) {
++  RankBounds bounds;
++  if (!extractRankBounds(filter, edgeName, bounds)) {
++    return std::nullopt;
++  }
++  if (!bounds.hasLo && !bounds.hasHi) {
++    return std::nullopt;
++  }
++  RankRange range;
++  if (bounds.hasLo) {
++    range.lo = bounds.lo;
++  }
++  if (bounds.hasHi) {
++    range.hi = bounds.hi;
++  }
++  return range;
++}
++
+ }  // namespace
+ 
+ ProcessorCounters kGetDstBySrcCounters;
+@@ -316,8 +470,15 @@
+   for (const auto& ec : edgeContext_.propContexts_) {
+     // Since we only return dst in this processor, some steps would be skipped when iterating
+     // key-values if possible, for example, decoding value
++    std::optional<RankRange> range;
++    if (hasRankRange_) {
++      RankRange bounds;
++      bounds.lo = rankLo_;
++      bounds.hi = rankHi_;
++      range = std::move(bounds);
++    }
+     auto edge = std::make_unique<SingleEdgeNode>(
+-        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true);
++        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true, std::move(range));
+     edges.emplace_back(edge.get());
+     plan.addNode(std::move(edge));
+   }
+@@ -356,6 +517,14 @@
+     if (!isRankOnlyFilter(filter_, edgeName)) {
+       return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
+     }
++    // Refuse to scan every rank when the predicate cannot become a seek.
++    auto range = extractRankRange(filter_, edgeName);
++    if (!range) {
++      return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++    }
++    hasRankRange_ = true;
++    rankLo_ = range->lo;
++    rankHi_ = range->hi;
+   }
+   return nebula::cpp2::ErrorCode::SUCCEEDED;
+ }

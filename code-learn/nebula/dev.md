@@ -130,3 +130,5 @@ GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid | GO FROM 
 ```
 
 六条 opt 各自替换上面的同名基线，彼此没有依赖。下推前计划、下推后计划和 loopback 时延在 [47-reco-ngql-pushdown.md](47-reco-ngql-pushdown.md)。可单独执行的文件在 `bench/reco/pushdown/q1-opt.ngql` 到 `q6-opt.ngql`，重跑脚本是 `bench/reco/measure_pushdown.py`。
+
+在这六条 opt 上再往下拆的算子补丁、每份补丁的 EXPLAIN 和与 opt 的时延对照在 [48-reco-operator-patches.md](48-reco-operator-patches.md)。补丁在 `patches/reco-q/`，测量 JSON 在 `bench/reco/patch-measure/`，换二进制用 `bench/reco/swap_bins.sh`，重跑脚本是 `bench/reco/measure_patches.py`。
