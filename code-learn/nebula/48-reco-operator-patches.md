@@ -1,5 +1,7 @@
 # 48 — reco Q1–Q6：每个补丁打在哪条查询上，收益是什么
 
+按场景、根因和补丁 A–F 重排的版本是 [49](49-reco-patch-map.md)。本文保留测量表。
+
 比较对象是 [47](47-reco-ngql-pushdown.md) 里六条已经改写过的 opt 语句。基线是 gcc-11 重编的上游 `fa92893`（标签 `00-baseline`），同一份 `reco` 数据。文档 47 的微秒来自另一份二进制，不放进本表。两边的结果多重集 SHA 相同。
 
 补丁在 `patches/reco-q/`。原始 JSON 在 [bench/reco/patch-measure/](bench/reco/patch-measure/)。测量日期 2026-11-10。时延是 server `latency()` 的 p50，单位微秒，1 次预热加 7 次。
