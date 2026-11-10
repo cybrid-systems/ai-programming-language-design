@@ -74,9 +74,17 @@ QUERIES = {
         ),
     },
     "q4": {
+        # Base and opt must differ only in the dst rewrite. The base used to
+        # project an extra $$.product.type column that the opt side lacked, and
+        # the opt side carried an extra `| ORDER BY $-.pid`. That made the pair
+        # a comparison of two different queries, so a multiset mismatch said
+        # nothing about the rewrite itself.
+        # `| ORDER BY $-.pid` before GROUP BY is required on both sides:
+        # without it this shape returns 0 rows on the reco dataset.
         "base": (
             "UNWIND range(1, 10000) AS uid "
-            "| GO FROM $-.uid OVER buy YIELD dst(edge) AS pid, $$.product.type AS t "
+            "| GO FROM $-.uid OVER buy YIELD dst(edge) AS pid "
+            "| ORDER BY $-.pid "
             "| GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy "
             "| ORDER BY $-.co_buy DESC | LIMIT 100 "
             "| GO FROM $-.pid OVER buy REVERSELY "

@@ -4,7 +4,7 @@
     "q1": {
       "base": {
         "plan": {
-          "optimize_time_in_us": 304,
+          "optimize_time_in_us": 320,
           "nodes": [
             {
               "id": 9,
@@ -118,43 +118,43 @@
         },
         "samples": [
           {
-            "server_us": 610,
-            "whole_us": 768,
-            "wall_us": 777,
+            "server_us": 623,
+            "whole_us": 764,
+            "wall_us": 770,
             "rows": 10
           },
           {
-            "server_us": 544,
-            "whole_us": 671,
-            "wall_us": 676,
+            "server_us": 493,
+            "whole_us": 643,
+            "wall_us": 649,
             "rows": 10
           },
           {
-            "server_us": 580,
-            "whole_us": 700,
-            "wall_us": 704,
+            "server_us": 479,
+            "whole_us": 612,
+            "wall_us": 617,
             "rows": 10
           },
           {
-            "server_us": 621,
-            "whole_us": 772,
-            "wall_us": 775,
+            "server_us": 643,
+            "whole_us": 777,
+            "wall_us": 781,
             "rows": 10
           },
           {
-            "server_us": 510,
-            "whole_us": 654,
-            "wall_us": 660,
+            "server_us": 454,
+            "whole_us": 584,
+            "wall_us": 587,
             "rows": 10
           }
         ],
-        "server_us_min": 510,
-        "server_us_p50": 580,
-        "server_us_max": 621
+        "server_us_min": 454,
+        "server_us_p50": 493,
+        "server_us_max": 643
       },
       "opt": {
         "plan": {
-          "optimize_time_in_us": 90,
+          "optimize_time_in_us": 150,
           "nodes": [
             {
               "id": 8,
@@ -247,39 +247,39 @@
         },
         "samples": [
           {
-            "server_us": 280,
-            "whole_us": 403,
-            "wall_us": 406,
+            "server_us": 369,
+            "whole_us": 530,
+            "wall_us": 534,
             "rows": 10
           },
           {
-            "server_us": 282,
-            "whole_us": 403,
-            "wall_us": 407,
+            "server_us": 315,
+            "whole_us": 457,
+            "wall_us": 461,
             "rows": 10
           },
           {
-            "server_us": 288,
-            "whole_us": 421,
-            "wall_us": 426,
+            "server_us": 293,
+            "whole_us": 437,
+            "wall_us": 440,
             "rows": 10
           },
           {
-            "server_us": 319,
-            "whole_us": 433,
-            "wall_us": 436,
+            "server_us": 316,
+            "whole_us": 458,
+            "wall_us": 462,
             "rows": 10
           },
           {
-            "server_us": 255,
-            "whole_us": 365,
-            "wall_us": 368,
+            "server_us": 309,
+            "whole_us": 420,
+            "wall_us": 424,
             "rows": 10
           }
         ],
-        "server_us_min": 255,
-        "server_us_p50": 282,
-        "server_us_max": 319
+        "server_us_min": 293,
+        "server_us_p50": 315,
+        "server_us_max": 369
       },
       "same_row_count": true,
       "same_multiset": true
@@ -287,7 +287,7 @@
     "q2": {
       "base": {
         "plan": {
-          "optimize_time_in_us": 86,
+          "optimize_time_in_us": 58,
           "nodes": [
             {
               "id": 11,
@@ -442,43 +442,43 @@
         },
         "samples": [
           {
-            "server_us": 325,
-            "whole_us": 415,
-            "wall_us": 418,
+            "server_us": 349,
+            "whole_us": 465,
+            "wall_us": 470,
             "rows": 8
           },
           {
-            "server_us": 291,
-            "whole_us": 399,
-            "wall_us": 403,
+            "server_us": 332,
+            "whole_us": 439,
+            "wall_us": 442,
             "rows": 8
           },
           {
-            "server_us": 366,
-            "whole_us": 480,
-            "wall_us": 484,
+            "server_us": 352,
+            "whole_us": 447,
+            "wall_us": 451,
             "rows": 8
           },
           {
-            "server_us": 324,
-            "whole_us": 420,
-            "wall_us": 423,
+            "server_us": 639,
+            "whole_us": 743,
+            "wall_us": 746,
             "rows": 8
           },
           {
-            "server_us": 288,
-            "whole_us": 388,
-            "wall_us": 392,
+            "server_us": 343,
+            "whole_us": 460,
+            "wall_us": 463,
             "rows": 8
           }
         ],
-        "server_us_min": 288,
-        "server_us_p50": 324,
-        "server_us_max": 366
+        "server_us_min": 332,
+        "server_us_p50": 349,
+        "server_us_max": 639
       },
       "opt": {
         "plan": {
-          "optimize_time_in_us": 72,
+          "optimize_time_in_us": 50,
           "nodes": [
             {
               "id": 9,
@@ -605,39 +605,39 @@
         },
         "samples": [
           {
-            "server_us": 326,
-            "whole_us": 411,
-            "wall_us": 417,
+            "server_us": 331,
+            "whole_us": 427,
+            "wall_us": 430,
             "rows": 8
           },
           {
-            "server_us": 270,
-            "whole_us": 356,
-            "wall_us": 359,
+            "server_us": 247,
+            "whole_us": 339,
+            "wall_us": 342,
             "rows": 8
           },
           {
-            "server_us": 260,
-            "whole_us": 345,
-            "wall_us": 349,
+            "server_us": 229,
+            "whole_us": 309,
+            "wall_us": 312,
             "rows": 8
           },
           {
-            "server_us": 234,
-            "whole_us": 323,
-            "wall_us": 326,
+            "server_us": 262,
+            "whole_us": 358,
+            "wall_us": 361,
             "rows": 8
           },
           {
-            "server_us": 352,
-            "whole_us": 444,
-            "wall_us": 447,
+            "server_us": 341,
+            "whole_us": 441,
+            "wall_us": 444,
             "rows": 8
           }
         ],
-        "server_us_min": 234,
-        "server_us_p50": 270,
-        "server_us_max": 352
+        "server_us_min": 229,
+        "server_us_p50": 262,
+        "server_us_max": 341
       },
       "same_row_count": true,
       "same_multiset": true
@@ -645,7 +645,7 @@
     "q3": {
       "base": {
         "plan": {
-          "optimize_time_in_us": 657,
+          "optimize_time_in_us": 731,
           "nodes": [
             {
               "id": 14,
@@ -806,43 +806,43 @@
         },
         "samples": [
           {
-            "server_us": 13199,
-            "whole_us": 18011,
-            "wall_us": 18074,
+            "server_us": 12755,
+            "whole_us": 17463,
+            "wall_us": 17520,
             "rows": 1801
           },
           {
-            "server_us": 12587,
-            "whole_us": 17290,
-            "wall_us": 17347,
+            "server_us": 14585,
+            "whole_us": 19231,
+            "wall_us": 19284,
             "rows": 1801
           },
           {
-            "server_us": 13426,
-            "whole_us": 18156,
-            "wall_us": 18220,
+            "server_us": 13610,
+            "whole_us": 18339,
+            "wall_us": 18394,
             "rows": 1801
           },
           {
-            "server_us": 12791,
-            "whole_us": 17832,
-            "wall_us": 17889,
+            "server_us": 12341,
+            "whole_us": 16960,
+            "wall_us": 17013,
             "rows": 1801
           },
           {
-            "server_us": 13298,
-            "whole_us": 18020,
-            "wall_us": 18083,
+            "server_us": 13180,
+            "whole_us": 17941,
+            "wall_us": 17995,
             "rows": 1801
           }
         ],
-        "server_us_min": 12587,
-        "server_us_p50": 13199,
-        "server_us_max": 13426
+        "server_us_min": 12341,
+        "server_us_p50": 13180,
+        "server_us_max": 14585
       },
       "opt": {
         "plan": {
-          "optimize_time_in_us": 266,
+          "optimize_time_in_us": 206,
           "nodes": [
             {
               "id": 13,
@@ -982,39 +982,39 @@
         },
         "samples": [
           {
-            "server_us": 9621,
-            "whole_us": 14362,
-            "wall_us": 14429,
+            "server_us": 9151,
+            "whole_us": 13806,
+            "wall_us": 13863,
             "rows": 1801
           },
           {
-            "server_us": 9645,
-            "whole_us": 14333,
-            "wall_us": 14390,
+            "server_us": 9267,
+            "whole_us": 13890,
+            "wall_us": 13948,
             "rows": 1801
           },
           {
-            "server_us": 9357,
-            "whole_us": 14266,
-            "wall_us": 14323,
+            "server_us": 8882,
+            "whole_us": 13458,
+            "wall_us": 13511,
             "rows": 1801
           },
           {
-            "server_us": 9434,
-            "whole_us": 14096,
-            "wall_us": 14157,
+            "server_us": 8942,
+            "whole_us": 13698,
+            "wall_us": 13753,
             "rows": 1801
           },
           {
-            "server_us": 9440,
-            "whole_us": 14152,
-            "wall_us": 14217,
+            "server_us": 9102,
+            "whole_us": 13732,
+            "wall_us": 13787,
             "rows": 1801
           }
         ],
-        "server_us_min": 9357,
-        "server_us_p50": 9440,
-        "server_us_max": 9645
+        "server_us_min": 8882,
+        "server_us_p50": 9102,
+        "server_us_max": 9267
       },
       "same_row_count": true,
       "same_multiset": true
@@ -1022,94 +1022,105 @@
     "q4": {
       "base": {
         "plan": {
-          "optimize_time_in_us": 293,
+          "optimize_time_in_us": 249,
           "nodes": [
             {
-              "id": 22,
+              "id": 19,
               "name": "Limit",
               "deps": [
-                21
+                18
               ],
               "fields": {
-                "inputVar": "__Dedup_21",
+                "inputVar": "__Dedup_18",
                 "count": "100000"
               }
             },
             {
-              "id": 21,
+              "id": 18,
               "name": "Dedup",
               "deps": [
-                20
+                17
               ],
               "fields": {
-                "inputVar": "__Project_20"
+                "inputVar": "__Project_17"
               }
             },
             {
-              "id": 20,
+              "id": 17,
               "name": "Project",
               "deps": [
-                19
+                16
               ],
               "fields": {
-                "inputVar": "__HashInnerJoin_19",
+                "inputVar": "__HashInnerJoin_16",
                 "columns": "[\"src(EDGE) AS ext_user\"]"
               }
             },
             {
-              "id": 19,
+              "id": 16,
               "name": "HashInnerJoin",
               "deps": [
-                23,
-                18
+                20,
+                15
               ],
               "fields": {
-                "inputVar": "{\"rightVar\":\"__ExpandAll_18\",\"leftVar\":\"__Limit_14\"}"
+                "inputVar": "{\"rightVar\":\"__ExpandAll_15\",\"leftVar\":\"__Limit_11\"}"
               }
             },
             {
-              "id": 23,
+              "id": 20,
               "name": "TopN",
               "deps": [
-                12
+                9
               ],
               "fields": {
-                "inputVar": "__Aggregate_12",
+                "inputVar": "__Aggregate_9",
                 "factors": "[{\"co_buy\":\"DESCEND\"}]",
                 "count": "100"
               }
             },
             {
-              "id": 12,
+              "id": 9,
               "name": "Aggregate",
               "deps": [
-                11
+                8
               ],
               "fields": {
-                "inputVar": "__Project_11",
+                "inputVar": "__Sort_8",
                 "groupKeys": "[\"$-.pid\"]"
               }
             },
             {
-              "id": 11,
-              "name": "Project",
+              "id": 8,
+              "name": "Sort",
               "deps": [
-                10
+                7
               ],
               "fields": {
-                "inputVar": "__HashInnerJoin_10",
-                "columns": "[\"dst(EDGE) AS pid\",\"$__COL_0 AS t\"]"
+                "inputVar": "__Project_7",
+                "factors": "[{\"pid\":\"ASCEND\"}]"
               }
             },
             {
-              "id": 10,
+              "id": 7,
+              "name": "Project",
+              "deps": [
+                6
+              ],
+              "fields": {
+                "inputVar": "__HashInnerJoin_6",
+                "columns": "[\"dst(EDGE) AS pid\"]"
+              }
+            },
+            {
+              "id": 6,
               "name": "HashInnerJoin",
               "deps": [
                 1,
-                9
+                5
               ],
               "fields": {
-                "inputVar": "{\"rightVar\":\"__HashLeftJoin_9\",\"leftVar\":\"__Unwind_1\"}"
+                "inputVar": "{\"rightVar\":\"__ExpandAll_5\",\"leftVar\":\"__Unwind_1\"}"
               }
             },
             {
@@ -1129,17 +1140,6 @@
               "fields": {}
             },
             {
-              "id": 9,
-              "name": "HashLeftJoin",
-              "deps": [
-                5,
-                8
-              ],
-              "fields": {
-                "inputVar": "{\"rightVar\":\"__Project_8\",\"leftVar\":\"__ExpandAll_5\"}"
-              }
-            },
-            {
               "id": 5,
               "name": "ExpandAll",
               "deps": [
@@ -1152,7 +1152,7 @@
                 "filter": "",
                 "joinInput": "true",
                 "edgeProps": "[{\"props\":[\"_dst\",\"_rank\",\"_src\",\"_type\",\"ad_slot_id\",\"order_id\",\"quantity\",\"timestamp\"],\"type\":15}]",
-                "edgeColumns": "[\"EDGE AS EDGE\",\"*._dst AS _expandall_dst\"]"
+                "edgeColumns": "[\"EDGE AS EDGE\"]"
               }
             },
             {
@@ -1179,45 +1179,13 @@
               }
             },
             {
-              "id": 8,
-              "name": "Project",
-              "deps": [
-                7
-              ],
-              "fields": {
-                "inputVar": "__GetVertices_7",
-                "columns": "[\"$$.product.type AS __COL_0\",\"COLUMN[0] AS _getVertex_vid\"]"
-              }
-            },
-            {
-              "id": 7,
-              "name": "GetVertices",
-              "deps": [
-                6
-              ],
-              "fields": {
-                "inputVar": "__Argument_6",
-                "dedup": "1",
-                "limit": "-1",
-                "filter": ""
-              }
-            },
-            {
-              "id": 6,
-              "name": "Argument",
-              "deps": [],
-              "fields": {
-                "inputVar": "__ExpandAll_5"
-              }
-            },
-            {
-              "id": 18,
+              "id": 15,
               "name": "ExpandAll",
               "deps": [
-                17
+                14
               ],
               "fields": {
-                "inputVar": "__Expand_17",
+                "inputVar": "__Expand_14",
                 "dedup": "0",
                 "limit": "9223372036854775807",
                 "filter": "",
@@ -1227,13 +1195,13 @@
               }
             },
             {
-              "id": 17,
+              "id": 14,
               "name": "Expand",
               "deps": [
-                16
+                13
               ],
               "fields": {
-                "inputVar": "__Argument_16",
+                "inputVar": "__Argument_13",
                 "dedup": "0",
                 "limit": "",
                 "filter": "",
@@ -1242,19 +1210,19 @@
               }
             },
             {
-              "id": 16,
+              "id": 13,
               "name": "Argument",
               "deps": [],
               "fields": {
-                "inputVar": "__Limit_14"
+                "inputVar": "__Limit_11"
               }
             }
           ]
         },
         "fingerprint": {
-          "rows": 669,
-          "unique": 669,
-          "sha256": "ee84408f614fe76dc665485820f0c083e740ab98dc8079eb3de3c3d8c2aaa48e",
+          "rows": 670,
+          "unique": 670,
+          "sha256": "51e9d5295d9e5e77ee005c37a60d9f3e73c9ec972fcbe833399325367e1442b5",
           "sample": [
             [
               8294
@@ -1275,43 +1243,43 @@
         },
         "samples": [
           {
-            "server_us": 212083,
-            "whole_us": 214057,
-            "wall_us": 214095,
-            "rows": 669
+            "server_us": 146296,
+            "whole_us": 148253,
+            "wall_us": 148287,
+            "rows": 670
           },
           {
-            "server_us": 205686,
-            "whole_us": 207800,
-            "wall_us": 207843,
-            "rows": 669
+            "server_us": 151904,
+            "whole_us": 154143,
+            "wall_us": 154179,
+            "rows": 670
           },
           {
-            "server_us": 194454,
-            "whole_us": 196382,
-            "wall_us": 196425,
-            "rows": 669
+            "server_us": 137454,
+            "whole_us": 139367,
+            "wall_us": 139401,
+            "rows": 670
           },
           {
-            "server_us": 206696,
-            "whole_us": 208652,
-            "wall_us": 208691,
-            "rows": 669
+            "server_us": 135568,
+            "whole_us": 137441,
+            "wall_us": 137476,
+            "rows": 670
           },
           {
-            "server_us": 190087,
-            "whole_us": 192069,
-            "wall_us": 192106,
-            "rows": 669
+            "server_us": 139191,
+            "whole_us": 141068,
+            "wall_us": 141099,
+            "rows": 670
           }
         ],
-        "server_us_min": 190087,
-        "server_us_p50": 205686,
-        "server_us_max": 212083
+        "server_us_min": 135568,
+        "server_us_p50": 139191,
+        "server_us_max": 151904
       },
       "opt": {
         "plan": {
-          "optimize_time_in_us": 234,
+          "optimize_time_in_us": 229,
           "nodes": [
             {
               "id": 19,
@@ -1497,47 +1465,47 @@
         },
         "samples": [
           {
-            "server_us": 75186,
-            "whole_us": 77157,
-            "wall_us": 77192,
+            "server_us": 74859,
+            "whole_us": 76807,
+            "wall_us": 76841,
             "rows": 670
           },
           {
-            "server_us": 73097,
-            "whole_us": 75139,
-            "wall_us": 75175,
+            "server_us": 74960,
+            "whole_us": 76856,
+            "wall_us": 76892,
             "rows": 670
           },
           {
-            "server_us": 73392,
-            "whole_us": 75319,
-            "wall_us": 75354,
+            "server_us": 73014,
+            "whole_us": 74886,
+            "wall_us": 74923,
             "rows": 670
           },
           {
-            "server_us": 73232,
-            "whole_us": 75132,
-            "wall_us": 75167,
+            "server_us": 74069,
+            "whole_us": 75995,
+            "wall_us": 76032,
             "rows": 670
           },
           {
-            "server_us": 74028,
-            "whole_us": 75973,
-            "wall_us": 76009,
+            "server_us": 76856,
+            "whole_us": 78770,
+            "wall_us": 78804,
             "rows": 670
           }
         ],
-        "server_us_min": 73097,
-        "server_us_p50": 73392,
-        "server_us_max": 75186
+        "server_us_min": 73014,
+        "server_us_p50": 74859,
+        "server_us_max": 76856
       },
-      "same_row_count": false,
-      "same_multiset": false
+      "same_row_count": true,
+      "same_multiset": true
     },
     "q5": {
       "base": {
         "plan": {
-          "optimize_time_in_us": 235,
+          "optimize_time_in_us": 288,
           "nodes": [
             {
               "id": 23,
@@ -1794,43 +1762,43 @@
         },
         "samples": [
           {
-            "server_us": 2505,
-            "whole_us": 2698,
-            "wall_us": 2704,
+            "server_us": 2362,
+            "whole_us": 2582,
+            "wall_us": 2589,
             "rows": 20
           },
           {
-            "server_us": 2563,
-            "whole_us": 2734,
-            "wall_us": 2740,
+            "server_us": 2506,
+            "whole_us": 2704,
+            "wall_us": 2710,
             "rows": 20
           },
           {
-            "server_us": 2315,
-            "whole_us": 2474,
-            "wall_us": 2478,
+            "server_us": 2402,
+            "whole_us": 2582,
+            "wall_us": 2587,
             "rows": 20
           },
           {
-            "server_us": 2414,
-            "whole_us": 2591,
-            "wall_us": 2596,
+            "server_us": 2640,
+            "whole_us": 2932,
+            "wall_us": 2940,
             "rows": 20
           },
           {
-            "server_us": 2309,
-            "whole_us": 2482,
-            "wall_us": 2486,
+            "server_us": 2371,
+            "whole_us": 2604,
+            "wall_us": 2611,
             "rows": 20
           }
         ],
-        "server_us_min": 2309,
-        "server_us_p50": 2414,
-        "server_us_max": 2563
+        "server_us_min": 2362,
+        "server_us_p50": 2402,
+        "server_us_max": 2640
       },
       "opt": {
         "plan": {
-          "optimize_time_in_us": 177,
+          "optimize_time_in_us": 213,
           "nodes": [
             {
               "id": 19,
@@ -2036,39 +2004,39 @@
         },
         "samples": [
           {
-            "server_us": 1722,
-            "whole_us": 1883,
-            "wall_us": 1889,
+            "server_us": 1565,
+            "whole_us": 1724,
+            "wall_us": 1729,
             "rows": 20
           },
           {
-            "server_us": 1841,
-            "whole_us": 2008,
-            "wall_us": 2014,
+            "server_us": 1711,
+            "whole_us": 1898,
+            "wall_us": 1902,
             "rows": 20
           },
           {
-            "server_us": 1577,
-            "whole_us": 1768,
-            "wall_us": 1773,
+            "server_us": 1565,
+            "whole_us": 1724,
+            "wall_us": 1728,
             "rows": 20
           },
           {
-            "server_us": 2038,
-            "whole_us": 2214,
-            "wall_us": 2219,
+            "server_us": 1720,
+            "whole_us": 1884,
+            "wall_us": 1888,
             "rows": 20
           },
           {
-            "server_us": 1602,
-            "whole_us": 1775,
-            "wall_us": 1780,
+            "server_us": 1528,
+            "whole_us": 1708,
+            "wall_us": 1712,
             "rows": 20
           }
         ],
-        "server_us_min": 1577,
-        "server_us_p50": 1722,
-        "server_us_max": 2038
+        "server_us_min": 1528,
+        "server_us_p50": 1565,
+        "server_us_max": 1720
       },
       "same_row_count": true,
       "same_multiset": true
@@ -2076,7 +2044,7 @@
     "q6": {
       "base": {
         "plan": {
-          "optimize_time_in_us": 511,
+          "optimize_time_in_us": 502,
           "nodes": [
             {
               "id": 18,
@@ -2283,43 +2251,43 @@
         },
         "samples": [
           {
-            "server_us": 1382,
-            "whole_us": 1568,
-            "wall_us": 1577,
+            "server_us": 1311,
+            "whole_us": 1465,
+            "wall_us": 1470,
             "rows": 20
           },
           {
-            "server_us": 1568,
-            "whole_us": 1789,
-            "wall_us": 1794,
+            "server_us": 1322,
+            "whole_us": 1478,
+            "wall_us": 1482,
             "rows": 20
           },
           {
-            "server_us": 1338,
-            "whole_us": 1525,
-            "wall_us": 1530,
+            "server_us": 1316,
+            "whole_us": 1469,
+            "wall_us": 1473,
             "rows": 20
           },
           {
-            "server_us": 1305,
-            "whole_us": 1493,
-            "wall_us": 1498,
+            "server_us": 1401,
+            "whole_us": 1570,
+            "wall_us": 1573,
             "rows": 20
           },
           {
-            "server_us": 1290,
-            "whole_us": 1461,
-            "wall_us": 1465,
+            "server_us": 1270,
+            "whole_us": 1441,
+            "wall_us": 1445,
             "rows": 20
           }
         ],
-        "server_us_min": 1290,
-        "server_us_p50": 1338,
-        "server_us_max": 1568
+        "server_us_min": 1270,
+        "server_us_p50": 1316,
+        "server_us_max": 1401
       },
       "opt": {
         "plan": {
-          "optimize_time_in_us": 219,
+          "optimize_time_in_us": 276,
           "nodes": [
             {
               "id": 16,
@@ -2489,39 +2457,39 @@
         },
         "samples": [
           {
-            "server_us": 971,
-            "whole_us": 1140,
-            "wall_us": 1143,
+            "server_us": 893,
+            "whole_us": 1063,
+            "wall_us": 1066,
             "rows": 20
           },
           {
-            "server_us": 798,
-            "whole_us": 965,
-            "wall_us": 969,
+            "server_us": 807,
+            "whole_us": 977,
+            "wall_us": 981,
             "rows": 20
           },
           {
-            "server_us": 824,
-            "whole_us": 988,
-            "wall_us": 993,
+            "server_us": 896,
+            "whole_us": 1049,
+            "wall_us": 1052,
             "rows": 20
           },
           {
-            "server_us": 963,
-            "whole_us": 1136,
-            "wall_us": 1140,
+            "server_us": 819,
+            "whole_us": 978,
+            "wall_us": 982,
             "rows": 20
           },
           {
-            "server_us": 886,
-            "whole_us": 1044,
-            "wall_us": 1048,
+            "server_us": 948,
+            "whole_us": 1110,
+            "wall_us": 1114,
             "rows": 20
           }
         ],
-        "server_us_min": 798,
-        "server_us_p50": 886,
-        "server_us_max": 971
+        "server_us_min": 807,
+        "server_us_p50": 893,
+        "server_us_max": 948
       },
       "same_row_count": true,
       "same_multiset": true
