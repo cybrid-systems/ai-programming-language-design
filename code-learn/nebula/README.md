@@ -64,6 +64,7 @@
 | 48 | [reco 正交算子补丁](48-reco-operator-patches.md) | 每张补丁打在 Q1–Q6 的哪一跳、收益是什么。结论：这份夹具上没有稳定加速；Q3 收成 GetDstBySrc 必须连 rank 窗口，结果对，慢 28% |
 | 49 | [下推边界与补丁对照](49-reco-patch-map.md) | 用现在能跑的六条 opt，把设计稿 A–F 重新对到实测：B 取消，无过滤的管道去重已经在 3.8，下一张只写局部 COUNT；`LIMIT [N]` 不进这六条 |
 | 50 | [局部 COUNT](50-reco-partial-count.md) | scale 8 的 reco 上把 `GROUP BY dst + COUNT` 推进 `GetDstBySrc`。全量分组 SHA 相同；Q4 p50 621 ms → 193 ms，Q5 213 ms → 82 ms |
+| 51 | [补丁和场景对照](51-reco-patch-index.md) | 01–15 对上 Q1–Q6：哪一跳、结果是加速、并列换序、空操作，还是行集错误。48–50 是测量附录 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 

@@ -131,8 +131,6 @@ GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid | GO FROM 
 
 六条 opt 各自替换上面的同名基线，彼此没有依赖。下推前计划、下推后计划和 loopback 时延在 [47-reco-ngql-pushdown.md](47-reco-ngql-pushdown.md)。可单独执行的文件在 `bench/reco/pushdown/q1-opt.ngql` 到 `q6-opt.ngql`，重跑脚本是 `bench/reco/measure_pushdown.py`。
 
-在这六条 opt 上再往下拆的算子补丁、每份补丁的 EXPLAIN 和与 opt 的时延对照在 [48-reco-operator-patches.md](48-reco-operator-patches.md)。补丁在 `patches/reco-q/`，测量 JSON 在 `bench/reco/patch-measure/`，换二进制用 `bench/reco/swap_bins.sh`，重跑脚本是 `bench/reco/measure_patches.py`。
+补丁和六条场景的对照在 [51-reco-patch-index.md](51-reco-patch-index.md)。[48](48-reco-operator-patches.md) 是小夹具 01–11 的时延，[49](49-reco-patch-map.md) 是当时的边界说明，[50](50-reco-partial-count.md) 是局部 COUNT 的开关对比。编号和结论以 51 为准。补丁在 `patches/reco-q/`，测量 JSON 在 `bench/reco/patch-measure/`，换二进制用 `bench/reco/swap_bins.sh`，重跑脚本是 `bench/reco/measure_patches.py`。语句以本节的 opt 为准。
 
-这六条还剩什么不能下推、设计稿 A–F 里哪张还要写，在 [49-reco-patch-map.md](49-reco-patch-map.md)。语句以本节的 opt 为准。
-
-局部 `COUNT` 的开关对比在 [50-reco-partial-count.md](50-reco-partial-count.md)。生成器的 `--edge-scale` 默认 1；50 的测量用的是 8，清单在 `bench/reco/out-scale8/`。
+生成器的 `--edge-scale` 默认 1。50 和 51 里 scale 8 的数字用的是 `bench/reco/out-scale8/`。那一组微秒和 48 的 80082 条 `buy` 不是同一张表。

@@ -1,0 +1,1547 @@
+--- a/conf/nebula-graphd.conf.production
++++ b/conf/nebula-graphd.conf.production
+@@ -9,6 +9,9 @@
+ # storaged is upgraded to read GetDstBySrcRequest.filter.
+ # --enable_dst_only_edge_filter=false
+ # --enable_partial_edge_agg=false
++# --enable_minus_fusion=false
++# --enable_traverse_rank_topn=false
++# --enable_dedup_limit_stop=false
+ # Heartbeat interval of communication between meta client and graphd service
+ --heartbeat_interval_secs=10
+ # Whether to use the configuration obtained from the configuration file
+--- a/conf/nebula-standalone.conf.default
++++ b/conf/nebula-standalone.conf.default
+@@ -9,6 +9,9 @@
+ # storaged is upgraded to read GetDstBySrcRequest.filter.
+ # --enable_dst_only_edge_filter=false
+ # --enable_partial_edge_agg=false
++# --enable_minus_fusion=false
++# --enable_traverse_rank_topn=false
++# --enable_dedup_limit_stop=false
+ # The default charset when a space is created
+ --default_charset=utf8
+ # The defaule collate when a space is created
+--- a/conf/nebula-graphd.conf.default
++++ b/conf/nebula-graphd.conf.default
+@@ -12,6 +12,12 @@
+ # Leave false until storaged understands GetDstBySrcRequest.aggs. An old
+ # storaged still returns a correct answer: graphd recomputes via GetNeighbors.
+ # --enable_partial_edge_agg=false
++# Q2 MINUS of two DISTINCT dst scans, one getDstBySrc. Default false.
++# --enable_minus_fusion=false
++# Q1 ORDER BY rank DESC LIMIT K inside GetNeighbors. graphd TopN stays.
++# --enable_traverse_rank_topn=false
++# Record LIMIT above Dedup. Does not truncate the scan. Default false.
++# --enable_dedup_limit_stop=false
+ # The default charset when a space is created
+ --default_charset=utf8
+ # The default collate when a space is created
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -79,14 +79,16 @@
+       const std::vector<cpp2::OrderBy>& orderBy = std::vector<cpp2::OrderBy>(),
+       int64_t limit = std::numeric_limits<int64_t>::max(),
+       const Expression* filter = nullptr,
+-      const Expression* tagFilter = nullptr);
++      const Expression* tagFilter = nullptr,
++      int64_t rankTopN = 0);
+ 
+   StorageRpcRespFuture<cpp2::GetDstBySrcResponse> getDstBySrc(
+       const CommonRequestParam& param,
+       const std::vector<Value>& vertices,
+       const std::vector<EdgeType>& edgeTypes,
+       const Expression* filter = nullptr,
+-      const std::vector<cpp2::PartialEdgeAgg>* aggs = nullptr);
++      const std::vector<cpp2::PartialEdgeAgg>* aggs = nullptr,
++      const std::vector<EdgeType>* minusEdgeTypes = nullptr);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -52,7 +52,8 @@
+     const std::vector<cpp2::OrderBy>& orderBy,
+     int64_t limit,
+     const Expression* filter,
+-    const Expression* tagFilter) {
++    const Expression* tagFilter,
++    int64_t rankTopN) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetNeighborsResponse>>(
+@@ -101,6 +102,9 @@
+     if (tagFilter != nullptr) {
+       spec.tag_filter_ref() = tagFilter->encode();
+     }
++    if (rankTopN > 0) {
++      spec.rank_topn_ref() = rankTopN;
++    }
+     req.traverse_spec_ref() = std::move(spec);
+   }
+ 
+@@ -116,7 +120,8 @@
+     const std::vector<Value>& vertices,
+     const std::vector<EdgeType>& edgeTypes,
+     const Expression* filter,
+-    const std::vector<cpp2::PartialEdgeAgg>* aggs) {
++    const std::vector<cpp2::PartialEdgeAgg>* aggs,
++    const std::vector<EdgeType>* minusEdgeTypes) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -145,6 +150,9 @@
+     if (aggs != nullptr && !aggs->empty()) {
+       req.aggs_ref() = *aggs;
+     }
++    if (minusEdgeTypes != nullptr && !minusEdgeTypes->empty()) {
++      req.minus_edge_types_ref() = *minusEdgeTypes;
++    }
+   }
+ 
+   return collectResponse(param.evb,
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -163,6 +163,11 @@
+     //            when filter contains logicalOR expression
+     //            bcz $^.player.age > 30 OR like.likeness > 80 can't filter data only by tag_Filter
+     12: optional binary                         tag_filter,
++    // Per source vertex, keep edges whose rank is at least the Kth highest
++    // after the filter. Does not use field 10: an older storaged treats field
++    // 10 as "first N in scan order", which is the oldest rank. graphd still
++    // runs TopN, so a missing ack is the full scan.
++    13: optional i64                            rank_topn,
+ }
+ 
+ 
+@@ -235,6 +240,8 @@
+     //   "_expr:<alias1>:<alias2>:..."
+     //
+     2: optional common.DataSet vertices,
++    // True only when this storaged applied TraverseSpec.rank_topn.
++    3: optional bool                            rank_topn_applied,
+ }
+ /*
+  * End of GetNeighbors section
+@@ -271,6 +278,12 @@
+     // (_dst, then one column per agg). An older storaged ignores this field and
+     // returns raw dst vids. graphd must check GetDstBySrcResponse.partial_agg.
+     6: optional list<PartialEdgeAgg>           aggs,
++    // Destination edge types to subtract from edge_types, for the same source
++    // vertices. One source's edges live in that source's partition, so the
++    // difference is computed per partition. An older storaged ignores this
++    // field and returns only edge_types. graphd must check minus_applied and
++    // fall back to two scans. Do not set this together with aggs.
++    7: optional list<common.EdgeType>          minus_edge_types,
+ }
+ 
+ struct GetDstBySrcResponse {
+@@ -281,6 +294,9 @@
+     // True only when this storaged applied field 6. Unset on older binaries.
+     // graphd must not read dst vids as partial sums when this is false.
+     3: optional bool                            partial_agg = false,
++    // True only when this storaged subtracted field 7. Unset on older binaries,
++    // which would otherwise return the left edge set as if it were the difference.
++    4: optional bool                            minus_applied,
+ }
+ 
+ 
+--- a/src/graph/optimizer/CMakeLists.txt
++++ b/src/graph/optimizer/CMakeLists.txt
+@@ -32,6 +32,9 @@
+     rule/PushEFilterDownRule.cpp
+     rule/PushFilterDownAggregateRule.cpp
+     rule/PushPartialEdgeAggRule.cpp
++    rule/PushMinusDownGetDstRule.cpp
++    rule/PushRankTopNDownExpandAllRule.cpp
++    rule/PushDedupLimitStopRule.cpp
+     rule/PushFilterDownProjectRule.cpp
+     rule/PushFilterDownExpandAllRule.cpp
+     rule/PushFilterDownAllPathsRule.cpp
+--- a/src/graph/planner/plan/Query.cpp
++++ b/src/graph/planner/plan/Query.cpp
+@@ -127,6 +127,9 @@
+     }
+     addDescription("partialAgg", folly::toJson(aggs), desc.get());
+   }
++  if (!minusEdgeTypes_.empty()) {
++    addDescription("minusEdgeTypes", folly::toJson(util::toJson(minusEdgeTypes_)), desc.get());
++  }
+   return desc;
+ }
+ 
+@@ -153,6 +156,7 @@
+   for (const auto& agg : expand.partialAggs()) {
+     partialAggs_.push_back(PartialAggExpr{agg.op, agg.expr != nullptr ? agg.expr->clone() : nullptr});
+   }
++  minusEdgeTypes_ = expand.minusEdgeTypes();
+ }
+ 
+ std::unique_ptr<PlanNodeDescription> ExpandAll::explain() const {
+@@ -176,6 +180,9 @@
+     }
+     addDescription("edgeColumns", folly::toJson(edgeColumns), desc.get());
+   }
++  if (rankTopN_ > 0) {
++    addDescription("rankTopN", folly::to<std::string>(rankTopN_), desc.get());
++  }
+   return desc;
+ }
+ 
+@@ -188,6 +195,7 @@
+ void ExpandAll::cloneMembers(const ExpandAll& expandAll) {
+   Expand::cloneMembers(expandAll);
+   minSteps_ = expandAll.minSteps();
++  rankTopN_ = expandAll.rankTopN();
+   if (expandAll.vertexProps()) {
+     auto vertexProps = *expandAll.vertexProps_;
+     auto vertexPropsPtr = std::make_unique<decltype(vertexProps)>(vertexProps);
+@@ -678,6 +686,15 @@
+ 
+ void Dedup::cloneMembers(const Dedup& l) {
+   SingleInputNode::cloneMembers(l);
++  stopAfter_ = l.stopAfter();
++}
++
++std::unique_ptr<PlanNodeDescription> Dedup::explain() const {
++  auto desc = SingleInputNode::explain();
++  if (stopAfter_ >= 0) {
++    addDescription("stopAfter", folly::to<std::string>(stopAfter_), desc.get());
++  }
++  return desc;
+ }
+ 
+ std::unique_ptr<PlanNodeDescription> DataCollect::explain() const {
+--- a/src/graph/planner/plan/Query.h
++++ b/src/graph/planner/plan/Query.h
+@@ -327,6 +327,15 @@
+     partialAggs_ = std::move(aggs);
+   }
+ 
++  // Edge types subtracted from edgeTypes() inside one getDstBySrc.
++  const std::vector<EdgeType>& minusEdgeTypes() const {
++    return minusEdgeTypes_;
++  }
++
++  void setMinusEdgeTypes(std::vector<EdgeType> types) {
++    minusEdgeTypes_ = std::move(types);
++  }
++
+   std::unique_ptr<PlanNodeDescription> explain() const override;
+ 
+   PlanNode* clone() const override;
+@@ -355,6 +364,7 @@
+   bool joinInput_{false};
+   std::vector<EdgeType> edgeTypes_;
+   std::vector<PartialAggExpr> partialAggs_;
++  std::vector<EdgeType> minusEdgeTypes_;
+ };
+ 
+ class ExpandAll : public Expand {
+@@ -398,6 +408,15 @@
+     return edgeColumns_;
+   }
+ 
++  // 0 means unset. Per-vertex rank top-K applied by GetNeighbors. graphd TopN stays.
++  int64_t rankTopN() const {
++    return rankTopN_;
++  }
++
++  void setRankTopN(int64_t rankTopN) {
++    rankTopN_ = rankTopN;
++  }
++
+   void setVertexProps(std::unique_ptr<std::vector<VertexProp>> vertexProps) {
+     vertexProps_ = std::move(vertexProps);
+   }
+@@ -445,6 +464,7 @@
+   std::unique_ptr<std::vector<VertexProp>> vertexProps_{nullptr};
+   YieldColumns* vertexColumns_{nullptr};
+   YieldColumns* edgeColumns_{nullptr};
++  int64_t rankTopN_{0};
+ };
+ 
+ // Get property with given vertex keys.
+@@ -1422,13 +1442,27 @@
+     return qctx->objPool()->makeAndAdd<Dedup>(qctx, input);
+   }
+ 
++  // Distinct rows to keep before a following Limit. Negative means unset.
++  // The executor records the cap and still visits every input row.
++  int64_t stopAfter() const {
++    return stopAfter_;
++  }
++
++  void setStopAfter(int64_t stopAfter) {
++    stopAfter_ = stopAfter;
++  }
++
+   PlanNode* clone() const override;
+ 
++  std::unique_ptr<PlanNodeDescription> explain() const override;
++
+  private:
+   friend ObjectPool;
+   Dedup(QueryContext* qctx, PlanNode* input);
+ 
+   void cloneMembers(const Dedup&);
++
++  int64_t stopAfter_{-1};
+ };
+ 
+ // Collect the variable results.
+--- a/src/graph/executor/query/ExpandExecutor.h
++++ b/src/graph/executor/query/ExpandExecutor.h
+@@ -50,6 +50,13 @@
+   // from GetNeighbors so a mixed cluster does not treat dst vids as sums.
+   folly::Future<Status> fallbackPartialAgg();
+ 
++  // One getDstBySrc that subtracts minusEdgeTypes. One step only.
++  folly::Future<Status> minusDst();
++
++  // Old storaged ignored minus_edge_types and returned the left set. Run both
++  // scans and subtract here so that response is not treated as the difference.
++  folly::Future<Status> fallbackMinus(std::vector<Value> vids);
++
+   void getNeighborsFromCache(std::unordered_map<Value, std::unordered_set<Value>>& dst2VidMap,
+                              std::unordered_set<Value>& visitedVids,
+                              std::vector<int64_t>& samples);
+--- a/src/graph/executor/query/DedupExecutor.cpp
++++ b/src/graph/executor/query/DedupExecutor.cpp
+@@ -35,6 +35,13 @@
+     }
+   }
+   iter->reset();
++  if (dedup->stopAfter() >= 0) {
++    // unstableErase pulls a later row into the current slot, so the prefix
++    // Limit will keep is not known until every input row is visited. Record
++    // whether the cap would have bound and leave the rows alone.
++    addState("dedup_limit_binds",
++             unique.size() > static_cast<size_t>(dedup->stopAfter()) ? 1 : 0);
++  }
+   return finish(std::move(result));
+ }
+ 
+--- a/src/graph/executor/query/ExpandAllExecutor.cpp
++++ b/src/graph/executor/query/ExpandAllExecutor.cpp
+@@ -145,6 +145,10 @@
+   auto stepLimit =
+       stepLimits_.empty() ? std::numeric_limits<int64_t>::max() : stepLimits_[currentStep_ - 2];
+   auto limit = std::min(stepLimit, expand_->limit(qec));
++  int64_t rankTopN = 0;
++  if (expand_->minSteps() == expand_->maxSteps() && expand_->rankTopN() > 0) {
++    rankTopN = expand_->rankTopN();
++  }
+   return storageClient
+       ->getNeighbors(param,
+                      {nebula::kVid},
+@@ -160,13 +164,25 @@
+                      std::vector<storage::cpp2::OrderBy>(),
+                      limit,
+                      expand_->filter(),
+-                     nullptr)
++                     nullptr,
++                     rankTopN)
+       .via(runner())
+-      .thenValue([this](RpcResponse&& resp) mutable {
++      .thenValue([this, rankTopN](RpcResponse&& resp) mutable {
+         // MemoryTrackerVerified
+         memory::MemoryCheckGuard guard;
+         nextStepVids_.clear();
+         SCOPED_TIMER(&execTime_);
++        if (rankTopN > 0) {
++          int64_t applied = resp.responses().empty() ? 0 : 1;
++          for (const auto& one : resp.responses()) {
++            const bool* bit = one.get_rank_topn_applied();
++            if (bit == nullptr || !*bit) {
++              applied = 0;
++              break;
++            }
++          }
++          addState("rank_topn_applied", applied);
++        }
+         addStats(resp);
+         time::Duration expandTime;
+         curLimit_ = 0;
+--- a/src/graph/executor/query/ExpandExecutor.cpp
++++ b/src/graph/executor/query/ExpandExecutor.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include "graph/executor/query/ExpandExecutor.h"
+ 
++#include <robin_hood.h>
++
+ #include <unordered_map>
+ 
+ #include "common/algorithm/ReservoirSampling.h"
+@@ -75,6 +77,9 @@
+   if (!expand_->partialAggs().empty()) {
+     return partialAgg();
+   }
++  if (!expand_->minusEdgeTypes().empty()) {
++    return minusDst();
++  }
+   currentStep_++;
+   time::Duration getDstTime;
+   StorageClient* storageClient = qctx_->getStorageClient();
+@@ -562,5 +567,145 @@
+       });
+ }
+ 
++folly::Future<Status> ExpandExecutor::minusDst() {
++  if (expand_->maxSteps() != 1) {
++    return Status::Error("minus fusion is only implemented for one step");
++  }
++  currentStep_++;
++  time::Duration getDstTime;
++  StorageClient* storageClient = qctx_->getStorageClient();
++  StorageClient::CommonRequestParam param(expand_->space(),
++                                          qctx_->rctx()->session()->id(),
++                                          qctx_->plan()->id(),
++                                          qctx_->plan()->isProfileEnabled());
++  std::vector<Value> vids(nextStepVids_.size());
++  std::move(nextStepVids_.begin(), nextStepVids_.end(), vids.begin());
++  // clusterIdsToHosts copies vids into the request before returning.
++  auto kept = vids;
++  return storageClient
++      ->getDstBySrc(param,
++                    vids,
++                    expand_->edgeTypes(),
++                    expand_->filter(),
++                    nullptr,
++                    &expand_->minusEdgeTypes())
++      .via(runner())
++      .ensure([this, getDstTime]() {
++        SCOPED_TIMER(&execTime_);
++        addState("total_rpc_time", getDstTime);
++      })
++      .thenValue([this, kept = std::move(kept)](StorageRpcResponse<GetDstBySrcResponse>&& resps) {
++        memory::MemoryCheckGuard guard;
++        nextStepVids_.clear();
++        SCOPED_TIMER(&execTime_);
++        auto completeness = handleCompleteness(resps, FLAGS_accept_partial_success);
++        if (!completeness.ok()) {
++          return folly::makeFuture<Status>(completeness.status());
++        }
++        bool applied = !resps.responses().empty();
++        for (const auto& resp : resps.responses()) {
++          // Unset on an older storaged, which returns only the left edge set.
++          const bool* bit = resp.get_minus_applied();
++          if (bit == nullptr || !*bit) {
++            applied = false;
++            break;
++          }
++        }
++        if (!applied) {
++          addState("minus_applied", 0);
++          return fallbackMinus(kept);
++        }
++        addState("minus_applied", 1);
++        DataSet ds;
++        // Storage names the column "_dst". append() drops every row when the
++        // headers differ, so rename before appending, same as GetDstBySrc().
++        for (auto& resp : resps.responses()) {
++          auto* dataset = resp.get_dsts();
++          if (dataset == nullptr) {
++            continue;
++          }
++          dataset->colNames = expand_->colNames();
++          ds.append(std::move(*dataset));
++        }
++        ResultBuilder builder;
++        builder.state(completeness.value());
++        builder.value(Value(std::move(ds))).iter(Iterator::Kind::kSequential);
++        finish(builder.build());
++        return folly::makeFuture<Status>(Status::OK());
++      });
++}
++
++folly::Future<Status> ExpandExecutor::fallbackMinus(std::vector<Value> vids) {
++  StorageClient* storageClient = qctx_->getStorageClient();
++  StorageClient::CommonRequestParam param(expand_->space(),
++                                          qctx_->rctx()->session()->id(),
++                                          qctx_->plan()->id(),
++                                          qctx_->plan()->isProfileEnabled());
++  // StorageRpcResponse has a const member, so it cannot be move-assigned into
++  // the vector folly::collect builds. Chain the two scans and keep only rows.
++  return storageClient->getDstBySrc(param, vids, expand_->edgeTypes())
++      .via(runner())
++      .thenValue([this, param, vids](StorageRpcResponse<GetDstBySrcResponse>&& left) {
++        memory::MemoryCheckGuard guard;
++        SCOPED_TIMER(&execTime_);
++        auto leftComplete = handleCompleteness(left, FLAGS_accept_partial_success);
++        if (!leftComplete.ok()) {
++          return folly::makeFuture<Status>(leftComplete.status());
++        }
++        std::vector<Row> leftRows;
++        for (auto& resp : left.responses()) {
++          auto* dataset = resp.get_dsts();
++          if (dataset == nullptr) {
++            continue;
++          }
++          for (auto& row : dataset->rows) {
++            leftRows.emplace_back(std::move(row));
++          }
++        }
++        auto leftState = leftComplete.value();
++        return qctx_->getStorageClient()
++            ->getDstBySrc(param, vids, expand_->minusEdgeTypes())
++            .via(runner())
++            .thenValue([this, leftRows = std::move(leftRows), leftState](
++                           StorageRpcResponse<GetDstBySrcResponse>&& right) mutable {
++              memory::MemoryCheckGuard innerGuard;
++              SCOPED_TIMER(&execTime_);
++              auto rightComplete = handleCompleteness(right, FLAGS_accept_partial_success);
++              if (!rightComplete.ok()) {
++                return folly::makeFuture<Status>(rightComplete.status());
++              }
++              robin_hood::unordered_flat_set<Value, std::hash<Value>> ban;
++              for (auto& resp : right.responses()) {
++                auto* dataset = resp.get_dsts();
++                if (dataset == nullptr) {
++                  continue;
++                }
++                for (auto& row : dataset->rows) {
++                  if (!row.values.empty()) {
++                    ban.emplace(row.values[0]);
++                  }
++                }
++              }
++              DataSet ds;
++              ds.colNames = expand_->colNames();
++              for (auto& row : leftRows) {
++                if (row.values.empty() || ban.find(row.values[0]) != ban.end()) {
++                  continue;
++                }
++                ds.rows.emplace_back(std::move(row));
++              }
++              auto state = leftState;
++              if (rightComplete.value() != Result::State::kSuccess) {
++                state = rightComplete.value();
++              }
++              ResultBuilder builder;
++              builder.state(state);
++              builder.value(Value(std::move(ds))).iter(Iterator::Kind::kSequential);
++              finish(builder.build());
++              return folly::makeFuture<Status>(Status::OK());
++            });
++      });
++}
++
+ }  // namespace graph
+ }  // namespace nebula
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -61,6 +61,12 @@
+ // getDstBySrc, merged by the graphd Aggregate. Default false. A storaged that
+ // does not set partial_agg causes graphd to recompute from GetNeighbors.
+ DECLARE_bool(enable_partial_edge_agg);
++// MINUS of two single-source DISTINCT dst scans, one getDstBySrc. Default false.
++DECLARE_bool(enable_minus_fusion);
++// Per-vertex rank TopN inside GetNeighbors. graphd TopN still runs. Default false.
++DECLARE_bool(enable_traverse_rank_topn);
++// Record a distinct cap on Dedup under Limit. Does not drop rows. Default false.
++DECLARE_bool(enable_dedup_limit_stop);
+ DECLARE_bool(optimize_appendvertice);
+ DECLARE_uint32(num_path_thread);
+ 
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -76,6 +76,24 @@
+             "graphd. If a storaged leaves partial_agg unset, graphd recomputes "
+             "that scan with GetNeighbors. Default false.");
+ 
++DEFINE_bool(enable_minus_fusion,
++            false,
++            "When true, MINUS of two 1-step DISTINCT dst scans from the same "
++            "single source is one getDstBySrc. If minus_applied is unset, "
++            "graphd runs the two scans and subtracts. Default false.");
++
++DEFINE_bool(enable_traverse_rank_topn,
++            false,
++            "When true, ORDER BY edge rank DESC LIMIT K above a 1-step ExpandAll "
++            "keeps at least the per-vertex top K in storaged. graphd TopN stays. "
++            "Default false.");
++
++DEFINE_bool(enable_dedup_limit_stop,
++            false,
++            "When true, LIMIT directly above Dedup records a distinct cap. The "
++            "cap does not drop rows: dedup swaps the tail forward, so the kept "
++            "prefix is only known after the full input. Default false.");
++
+ #ifndef BUILD_STANDALONE
+ DEFINE_uint32(ft_request_retry_times, 3, "Retry times if fulltext request failed");
+ DEFINE_bool(enable_client_white_list, true, "Turn on/off the client white list.");
+--- a/src/storage/exec/GetNeighborsNode.h
++++ b/src/storage/exec/GetNeighborsNode.h
+@@ -6,6 +6,9 @@
+ #ifndef STORAGE_EXEC_GETNEIGHBORSNODE_H_
+ #define STORAGE_EXEC_GETNEIGHBORSNODE_H_
+ 
++#include <algorithm>
++#include <vector>
++
+ #include "common/algorithm/ReservoirSampling.h"
+ #include "common/base/Base.h"
+ #include "storage/StorageFlags.h"
+@@ -28,13 +31,15 @@
+                    IterateNode<VertexID>* upstream,
+                    EdgeContext* edgeContext,
+                    nebula::DataSet* resultDataSet,
+-                   int64_t limit = 0)
++                   int64_t limit = 0,
++                   int64_t rankTopN = 0)
+       : context_(context),
+         hashJoinNode_(hashJoinNode),
+         upstream_(upstream),
+         edgeContext_(edgeContext),
+         resultDataSet_(resultDataSet),
+-        limit_(limit) {
++        limit_(limit),
++        rankTopN_(rankTopN) {
+     name_ = "GetNeighborsNode";
+   }
+ 
+@@ -106,6 +111,9 @@
+     if (edgeContext_->propContexts_.empty()) {
+       return nebula::cpp2::ErrorCode::SUCCEEDED;
+     }
++    if (rankTopN_ > 0) {
++      return iterateRankTopN(row);
++    }
+     int64_t edgeRowCount = 0;
+     nebula::List list;
+     for (; upstream_->valid(); upstream_->next(), ++edgeRowCount) {
+@@ -141,6 +149,60 @@
+     return nebula::cpp2::ErrorCode::SUCCEEDED;
+   }
+ 
++  // Keep every filtered edge whose rank is >= the Kth highest. Ties at the
++  // boundary stay, and graphd TopN picks the final K. Scan order limit is not
++  // applied here: that limit is the oldest N, not the newest N.
++  nebula::cpp2::ErrorCode iterateRankTopN(std::vector<Value>& row) {
++    struct Ranked {
++      int64_t rank{0};
++      size_t columnIdx{0};
++      nebula::List props;
++    };
++    std::vector<Ranked> all;
++    for (; upstream_->valid(); upstream_->next()) {
++      if (context_->isPlanKilled()) {
++        return nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED;
++      }
++      auto key = upstream_->key();
++      if (isDuplicatedSelfReflectiveEdge(key)) {
++        continue;
++      }
++      auto reader = upstream_->reader();
++      auto props = context_->props_;
++      nebula::List list;
++      list.reserve(props->size());
++      if (!QueryUtils::collectEdgeProps(
++               key, context_->vIdLen(), context_->isIntId(), reader, props, list)
++               .ok()) {
++        return nebula::cpp2::ErrorCode::E_EDGE_PROP_NOT_FOUND;
++      }
++      Ranked item;
++      item.rank = NebulaKeyUtils::getRank(context_->vIdLen(), key);
++      item.columnIdx = context_->columnIdx_;
++      item.props = std::move(list);
++      all.emplace_back(std::move(item));
++    }
++    if (static_cast<int64_t>(all.size()) > rankTopN_) {
++      auto kth = all.begin() + static_cast<std::ptrdiff_t>(rankTopN_ - 1);
++      std::nth_element(all.begin(), kth, all.end(), [](const Ranked& a, const Ranked& b) {
++        return a.rank > b.rank;
++      });
++      auto threshold = kth->rank;
++      all.erase(std::remove_if(all.begin(),
++                               all.end(),
++                               [threshold](const Ranked& item) { return item.rank < threshold; }),
++                all.end());
++    }
++    for (auto& item : all) {
++      if (row[item.columnIdx].empty()) {
++        row[item.columnIdx].setList(nebula::List());
++      }
++      auto& cell = row[item.columnIdx].mutableList();
++      cell.values.emplace_back(std::move(item.props));
++    }
++    return nebula::cpp2::ErrorCode::SUCCEEDED;
++  }
++
+   bool isDuplicatedSelfReflectiveEdge(const folly::StringPiece& key) {
+     folly::StringPiece srcID = NebulaKeyUtils::getSrcId(context_->vIdLen(), key);
+     folly::StringPiece dstID = NebulaKeyUtils::getDstId(context_->vIdLen(), key);
+@@ -165,6 +227,7 @@
+   EdgeContext* edgeContext_;
+   nebula::DataSet* resultDataSet_;
+   int64_t limit_;
++  int64_t rankTopN_{0};
+ };
+ 
+ class GetNeighborsSampleNode : public GetNeighborsNode {
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -78,6 +78,19 @@
+ 
+ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req) {
+   memory::MemoryCheckGuard guard;
++  if (minusRequested_) {
++    minusOk_ = true;
++    for (const auto& partEntry : req.get_parts()) {
++      auto code = minusPart(partEntry.first, partEntry.second, &flatResult_);
++      if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++        minusOk_ = false;
++        handleErrorCode(code, spaceId_, partEntry.first);
++      }
++    }
++    onProcessFinished();
++    onFinished();
++    return;
++  }
+   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+   StorageExpressionContext expCtx(this->spaceVidLen_, this->isIntId_);
+   bool needReader = filter_ != nullptr || !aggs_.empty();
+@@ -143,13 +156,18 @@
+         // }
+         // flatResult_.reserve(sum);
+ 
++        if (minusRequested_) {
++          minusOk_ = true;
++        }
+         for (size_t j = 0; j < tries.size(); j++) {
+           if (tries[j].hasException()) {
++            minusOk_ = false;
+             onError();
+             return;
+           }
+           const auto& [code, partId] = tries[j].value();
+           if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++            minusOk_ = false;
+             handleErrorCode(code, spaceId_, partId);
+           } else {
+             for (auto& v : partResults_[j]) {
+@@ -180,6 +198,13 @@
+                         return std::make_pair(nebula::cpp2::ErrorCode::E_STORAGE_MEMORY_EXCEEDED,
+                                               partId);
+                       }
++                      if (minusRequested_) {
++                        auto code = minusPart(partId, input, result);
++                        if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++                          return std::make_pair(code, partId);
++                        }
++                        return std::make_pair(nebula::cpp2::ErrorCode::SUCCEEDED, partId);
++                      }
+                       StorageExpressionContext expCtx(this->spaceVidLen_, this->isIntId_);
+                       bool needReader = filter_ != nullptr || !aggs_.empty();
+                       auto plan =
+@@ -212,7 +237,11 @@
+ 
+ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
+                                                       std::deque<Value>* result,
+-                                                      StorageExpressionContext* expCtx) {
++                                                      StorageExpressionContext* expCtx,
++                                                      EdgeContext* edgeCtx) {
++  if (edgeCtx == nullptr) {
++    edgeCtx = &edgeContext_;
++  }
+   /*
+     The StoragePlan looks like this:
+         +------------------+
+@@ -225,13 +254,13 @@
+   */
+   StoragePlan<VertexID> plan;
+   std::vector<SingleEdgeNode*> edges;
+-  for (const auto& ec : edgeContext_.propContexts_) {
++  for (const auto& ec : edgeCtx->propContexts_) {
+     // Decode the value when a filter needs it. Rank lives in the key, but
+     // StorageExpressionContext::getEdgeProp still requires a reader.
+     // Decode the value when a filter or a partial aggregate reads a property.
+     bool maySkipDecode = filter_ == nullptr && aggs_.empty();
+     auto edge = std::make_unique<SingleEdgeNode>(
+-        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, maySkipDecode);
++        context, edgeCtx, ec.first, &ec.second, nullptr, nullptr, maySkipDecode);
+     edges.emplace_back(edge.get());
+     plan.addNode(std::move(edge));
+   }
+@@ -244,7 +273,7 @@
+     cloned.push_back(PartialAggExpr{agg.op, agg.expr == nullptr ? nullptr : agg.expr->clone()});
+   }
+   auto output = std::make_unique<GetDstBySrcNode>(
+-      context, edges, &edgeContext_, result, limit, filter, expCtx, std::move(cloned));
++      context, edges, edgeCtx, result, limit, filter, expCtx, std::move(cloned));
+   for (auto* edge : edges) {
+     output->addDependency(edge);
+   }
+@@ -263,6 +292,27 @@
+   if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     return code;
+   }
++  if (req.minus_edge_types_ref().has_value()) {
++    const auto* types = req.get_minus_edge_types();
++    if (types != nullptr && !types->empty()) {
++      if (req.aggs_ref().has_value() && req.get_aggs() != nullptr && !req.get_aggs()->empty()) {
++        return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++      }
++      if (req.filter_ref().has_value()) {
++        return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++      }
++      EdgeContext left = std::move(edgeContext_);
++      edgeContext_ = EdgeContext();
++      edgeContext_.schemas_ = left.schemas_;
++      code = fillEdgeTypes(*types);
++      if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++        return code;
++      }
++      minusContext_ = std::move(edgeContext_);
++      edgeContext_ = std::move(left);
++      minusRequested_ = true;
++    }
++  }
+   code = buildEdgeFilter(req);
+   if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     return code;
+@@ -473,10 +523,14 @@
+ 
+ nebula::cpp2::ErrorCode GetDstBySrcProcessor::buildEdgeContext(
+     const cpp2::GetDstBySrcRequest& req) {
++  return fillEdgeTypes(req.get_edge_types());
++}
++
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::fillEdgeTypes(
++    const std::vector<EdgeType>& edgeTypes) {
+   // Offset is not used in this processor, just set to a dummy value
+   static constexpr size_t kDstOffsetInRespDataSet = 0;
+   edgeContext_.offset_ = kDstOffsetInRespDataSet;
+-  const auto& edgeTypes = req.get_edge_types();
+   for (const auto& edgeType : edgeTypes) {
+     auto iter = edgeContext_.schemas_.find(std::abs(edgeType));
+     if (iter == edgeContext_.schemas_.end()) {
+@@ -619,6 +673,9 @@
+     pool.wait();
+   }
+   resultDataSet_.rows = std::move(deduped);
++  if (minusRequested_ && minusOk_) {
++    resp_.minus_applied_ref() = true;
++  }
+   resp_.dsts_ref() = std::move(resultDataSet_);
+ 
+   if (profileDetailFlag_) {
+@@ -627,5 +684,55 @@
+   }
+ }
+ 
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::scanDsts(EdgeContext* edgeCtx,
++                                                      PartitionID partId,
++                                                      const std::vector<Value>& srcIds,
++                                                      std::deque<Value>* out) {
++  // The plan holds this context. Destroy the plan before the context.
++  RuntimeContext context(planContext_.get());
++  auto plan = buildPlan(&context, out, nullptr, edgeCtx);
++  for (const auto& src : srcIds) {
++    const auto& vId = src.getStr();
++    if (!NebulaKeyUtils::isValidVidLen(spaceVidLen_, vId)) {
++      LOG(INFO) << "Space " << spaceId_ << ", vertex length invalid, "
++                << " space vid len: " << spaceVidLen_ << ",  vid is " << vId;
++      return nebula::cpp2::ErrorCode::E_INVALID_VID;
++    }
++    auto ret = plan.go(partId, vId);
++    if (ret != nebula::cpp2::ErrorCode::SUCCEEDED) {
++      return ret;
++    }
++  }
++  return nebula::cpp2::ErrorCode::SUCCEEDED;
++}
++
++nebula::cpp2::ErrorCode GetDstBySrcProcessor::minusPart(PartitionID partId,
++                                                       const std::vector<Value>& srcIds,
++                                                       std::deque<Value>* out) {
++  std::deque<Value> left;
++  std::deque<Value> right;
++  auto code = scanDsts(&edgeContext_, partId, srcIds, &left);
++  if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++    return code;
++  }
++  code = scanDsts(&minusContext_, partId, srcIds, &right);
++  if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
++    return code;
++  }
++  // Set difference, then the caller dedups. A dst present on either side once
++  // is enough: graphd MINUS also compares the already-distinct dst sets.
++  robin_hood::unordered_flat_set<Value, std::hash<Value>> ban;
++  ban.reserve(right.size());
++  for (auto& value : right) {
++    ban.emplace(std::move(value));
++  }
++  for (auto& value : left) {
++    if (ban.find(value) == ban.end()) {
++      out->emplace_back(std::move(value));
++    }
++  }
++  return nebula::cpp2::ErrorCode::SUCCEEDED;
++}
++
+ }  // namespace storage
+ }  // namespace nebula
+--- a/src/storage/query/GetNeighborsProcessor.cpp
++++ b/src/storage/query/GetNeighborsProcessor.cpp
+@@ -66,6 +66,13 @@
+       random = *(*req.traverse_spec_ref()).random_ref();
+     }
+   }
++  rankTopN_ = 0;
++  if (!random && (*req.traverse_spec_ref()).rank_topn_ref().has_value()) {
++    auto n = *(*req.traverse_spec_ref()).rank_topn_ref();
++    if (n > 0) {
++      rankTopN_ = n;
++    }
++  }
+ 
+   // todo(doodle): specify by each query
+   if (!FLAGS_query_concurrently) {
+@@ -302,8 +309,8 @@
+     output = std::make_unique<GetNeighborsSampleNode>(
+         context, join, upstream, &edgeContext_, result, limit);
+   } else {
+-    output =
+-        std::make_unique<GetNeighborsNode>(context, join, upstream, &edgeContext_, result, limit);
++    output = std::make_unique<GetNeighborsNode>(
++        context, join, upstream, &edgeContext_, result, limit, rankTopN_);
+   }
+   output->addDependency(upstream);
+   plan.addNode(std::move(output));
+@@ -490,6 +497,9 @@
+ }
+ 
+ void GetNeighborsProcessor::onProcessFinished() {
++  if (rankTopN_ > 0) {
++    resp_.rank_topn_applied_ref() = true;
++  }
+   resp_.vertices_ref() = std::move(resultDataSet_);
+ }
+ 
+--- a/src/storage/query/GetNeighborsProcessor.h
++++ b/src/storage/query/GetNeighborsProcessor.h
+@@ -86,6 +86,7 @@
+   std::vector<RuntimeContext> contexts_;
+   std::vector<StorageExpressionContext> expCtxs_;
+   std::vector<nebula::DataSet> results_;
++  int64_t rankTopN_{0};
+ };
+ 
+ }  // namespace storage
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -68,7 +68,19 @@
+ 
+   StoragePlan<VertexID> buildPlan(RuntimeContext* context,
+                                   std::deque<Value>* result,
+-                                  StorageExpressionContext* expCtx);
++                                  StorageExpressionContext* expCtx,
++                                  EdgeContext* edgeCtx = nullptr);
++
++  nebula::cpp2::ErrorCode fillEdgeTypes(const std::vector<EdgeType>& edgeTypes);
++
++  nebula::cpp2::ErrorCode scanDsts(EdgeContext* edgeCtx,
++                                   PartitionID partId,
++                                   const std::vector<Value>& srcIds,
++                                   std::deque<Value>* out);
++
++  nebula::cpp2::ErrorCode minusPart(PartitionID partId,
++                                    const std::vector<Value>& srcIds,
++                                    std::deque<Value>* out);
+ 
+  private:
+   std::vector<RuntimeContext> contexts_;
+@@ -84,6 +96,9 @@
+     Expression* expr{nullptr};
+   };
+   std::vector<DecodedAgg> aggs_;
++  EdgeContext minusContext_;
++  bool minusRequested_{false};
++  bool minusOk_{false};
+ 
+   void mergePartialGroups();
+ };
+--- a/src/graph/optimizer/rule/PushMinusDownGetDstRule.cpp
++++ b/src/graph/optimizer/rule/PushMinusDownGetDstRule.cpp
+@@ -0,0 +1,172 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushMinusDownGetDstRule.h"
++
++#include "common/expression/ColumnExpression.h"
++#include "graph/context/ExecutionContext.h"
++#include "graph/context/QueryContext.h"
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/service/GraphFlags.h"
++#include "parser/Clauses.h"
++
++using nebula::graph::Dedup;
++using nebula::graph::Expand;
++using nebula::graph::PlanNode;
++using nebula::graph::Project;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushMinusDownGetDstRule::kInstance =
++    std::unique_ptr<PushMinusDownGetDstRule>(new PushMinusDownGetDstRule());
++
++const Pattern& PushMinusDownGetDstRule::pattern() const {
++  static Pattern pattern = Pattern::create(
++      graph::PlanNode::Kind::kMinus,
++      {Pattern::create(graph::PlanNode::Kind::kProject,
++                       {Pattern::create(graph::PlanNode::Kind::kDedup,
++                                        {Pattern::create(graph::PlanNode::Kind::kExpand)})}),
++       Pattern::create(graph::PlanNode::Kind::kProject,
++                       {Pattern::create(graph::PlanNode::Kind::kDedup,
++                                        {Pattern::create(graph::PlanNode::Kind::kExpand)})})});
++  return pattern;
++}
++
++namespace {
++
++bool columnZero(const Project* project) {
++  if (project == nullptr || project->columns() == nullptr) {
++    return false;
++  }
++  auto cols = project->columns()->columns();
++  if (cols.size() != 1 || cols[0] == nullptr || cols[0]->expr() == nullptr) {
++    return false;
++  }
++  return cols[0]->expr()->kind() == Expression::Kind::kColumn &&
++         cols[0]->expr()->toString() == "COLUMN[0]";
++}
++
++// buildConstantInput writes one vid column into this variable before optimize.
++bool singleVid(graph::QueryContext* qctx, const std::string& var, Value* vid) {
++  if (qctx == nullptr || var.empty() || vid == nullptr) {
++    return false;
++  }
++  const auto& result = qctx->ectx()->getResult(var);
++  auto* iter = result.iterRef();
++  if (iter == nullptr || iter->size() != 1) {
++    return false;
++  }
++  if (!iter->valid()) {
++    iter->reset();
++  }
++  if (!iter->valid()) {
++    return false;
++  }
++  *vid = iter->getColumn(0);
++  return vid->isInt();
++}
++
++bool fusibleExpand(const Expand* expand) {
++  return expand != nullptr && expand->maxSteps() == 1 && !expand->joinInput() &&
++         !expand->sample() && expand->stepLimits().empty() && expand->partialAggs().empty() &&
++         expand->minusEdgeTypes().empty() && expand->filter() == nullptr &&
++         expand->edgeTypes().size() == 1 && expand->edgeTypes()[0] != 0;
++}
++
++}  // namespace
++
++bool PushMinusDownGetDstRule::match(OptContext* ctx, const MatchedResult& matched) const {
++  if (!FLAGS_enable_minus_fusion) {
++    return false;
++  }
++  if (!OptRule::match(ctx, matched)) {
++    return false;
++  }
++  auto* leftProject = static_cast<const Project*>(matched.planNode({0, 0}));
++  auto* rightProject = static_cast<const Project*>(matched.planNode({0, 1}));
++  auto* left = static_cast<const Expand*>(matched.planNode({0, 0, 0, 0}));
++  auto* right = static_cast<const Expand*>(matched.planNode({0, 1, 0, 0}));
++  if (!columnZero(leftProject) || !columnZero(rightProject)) {
++    return false;
++  }
++  if (leftProject->colNames().size() != 1) {
++    return false;
++  }
++  if (!fusibleExpand(left) || !fusibleExpand(right)) {
++    return false;
++  }
++  if (left->space() != right->space()) {
++    return false;
++  }
++  auto leftType = left->edgeTypes()[0];
++  auto rightType = right->edgeTypes()[0];
++  // Same direction. A positive type is outgoing. Different types: subtracting
++  // an edge from itself is not the Q2 expose-minus-buy shape.
++  if (leftType == rightType || (leftType > 0) != (rightType > 0)) {
++    return false;
++  }
++  Value leftVid;
++  Value rightVid;
++  if (!singleVid(ctx->qctx(), left->inputVar(), &leftVid) ||
++      !singleVid(ctx->qctx(), right->inputVar(), &rightVid) || leftVid != rightVid) {
++    return false;
++  }
++  return true;
++}
++
++StatusOr<OptRule::TransformResult> PushMinusDownGetDstRule::transform(
++    OptContext* ctx, const MatchedResult& matched) const {
++  auto* qctx = ctx->qctx();
++  auto* minus = matched.planNode();
++  auto* leftProject = static_cast<const Project*>(matched.planNode({0, 0}));
++  auto* leftExpand = static_cast<const Expand*>(matched.planNode({0, 0, 0, 0}));
++  auto* rightExpand = static_cast<const Expand*>(matched.planNode({0, 1, 0, 0}));
++  const auto* leftExpandGN = matched.result({0, 0, 0, 0}).node;
++
++  auto* expand = static_cast<Expand*>(leftExpand->clone());
++  expand->setMinusEdgeTypes(rightExpand->edgeTypes());
++
++  auto* expandGroup = OptGroup::create(ctx);
++  auto* expandGN = expandGroup->makeGroupNode(expand);
++  for (auto* dep : leftExpandGN->dependencies()) {
++    expandGN->dependsOn(dep);
++  }
++
++  auto* dedup = Dedup::make(qctx, nullptr);
++  dedup->setInputVar(expand->outputVar());
++  dedup->setColNames(expand->colNames());
++  auto* dedupGroup = OptGroup::create(ctx);
++  auto* dedupGN = dedupGroup->makeGroupNode(dedup);
++  dedupGN->dependsOn(expandGroup);
++
++  auto* pool = qctx->objPool();
++  auto* cols = pool->makeAndAdd<YieldColumns>();
++  auto alias = leftProject->colNames().empty() ? std::string() : leftProject->colNames().front();
++  cols->addColumn(new YieldColumn(ColumnExpression::make(pool, 0), alias));
++  auto* project = Project::make(qctx, nullptr, cols);
++  // The Minus group already publishes this variable. Point at it before
++  // writing column names; setOutputVar swaps the variable pointer.
++  project->setOutputVar(minus->outputVar());
++  project->setColNames(leftProject->colNames());
++  project->setInputVar(dedup->outputVar());
++  auto* projectGN = OptGroupNode::create(ctx, project, matched.node->group());
++  projectGN->dependsOn(dedupGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(projectGN);
++  return result;
++}
++
++std::string PushMinusDownGetDstRule::toString() const {
++  return "PushMinusDownGetDstRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+--- a/src/graph/optimizer/rule/PushRankTopNDownExpandAllRule.cpp
++++ b/src/graph/optimizer/rule/PushRankTopNDownExpandAllRule.cpp
+@@ -0,0 +1,153 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushRankTopNDownExpandAllRule.h"
++
++#include "common/expression/PropertyExpression.h"
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/service/GraphFlags.h"
++
++using nebula::graph::ExpandAll;
++using nebula::graph::PlanNode;
++using nebula::graph::Project;
++using nebula::graph::TopN;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushRankTopNDownExpandAllRule::kInstance =
++    std::unique_ptr<PushRankTopNDownExpandAllRule>(new PushRankTopNDownExpandAllRule());
++
++const Pattern& PushRankTopNDownExpandAllRule::pattern() const {
++  static Pattern pattern = Pattern::create(
++      graph::PlanNode::Kind::kTopN,
++      {Pattern::create(graph::PlanNode::Kind::kProject,
++                       {Pattern::create(graph::PlanNode::Kind::kExpandAll)})});
++  return pattern;
++}
++
++namespace {
++
++const Expression* orderedExpr(const TopN* topn, const Project* project, const ExpandAll* expand) {
++  if (topn->factors().size() != 1 || project->columns() == nullptr) {
++    return nullptr;
++  }
++  auto index = topn->factors()[0].first;
++  if (index >= topn->colNames().size()) {
++    return nullptr;
++  }
++  const auto& name = topn->colNames()[index];
++  const Expression* expr = nullptr;
++  for (auto* col : project->columns()->columns()) {
++    if (col == nullptr || col->expr() == nullptr) {
++      continue;
++    }
++    if (col->alias() == name || col->name() == name) {
++      expr = col->expr();
++      break;
++    }
++  }
++  if (expr == nullptr) {
++    return nullptr;
++  }
++  if (expr->kind() != Expression::Kind::kVarProperty &&
++      expr->kind() != Expression::Kind::kInputProperty) {
++    return expr;
++  }
++  if (expand->edgeColumns() == nullptr) {
++    return nullptr;
++  }
++  auto prop = static_cast<const PropertyExpression*>(expr)->prop();
++  for (auto* col : expand->edgeColumns()->columns()) {
++    if (col == nullptr || col->expr() == nullptr) {
++      continue;
++    }
++    if (col->alias() == prop || col->name() == prop) {
++      return col->expr();
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++bool PushRankTopNDownExpandAllRule::match(OptContext* ctx, const MatchedResult& matched) const {
++  if (!FLAGS_enable_traverse_rank_topn) {
++    return false;
++  }
++  if (!OptRule::match(ctx, matched)) {
++    return false;
++  }
++  auto* topn = static_cast<const TopN*>(matched.planNode({0}));
++  auto* project = static_cast<const Project*>(matched.planNode({0, 0}));
++  auto* expand = static_cast<const ExpandAll*>(matched.planNode({0, 0, 0}));
++  if (expand->rankTopN() > 0) {
++    return false;
++  }
++  if (topn->offset() != 0 || topn->count() <= 0) {
++    return false;
++  }
++  if (topn->factors().size() != 1 ||
++      topn->factors()[0].second != OrderFactor::OrderType::DESCEND) {
++    return false;
++  }
++  if (expand->minSteps() != 1 || expand->maxSteps() != 1 || expand->sample() ||
++      expand->joinInput() || !expand->stepLimits().empty()) {
++    return false;
++  }
++  if (expand->vertexColumns() != nullptr && !expand->vertexColumns()->columns().empty()) {
++    return false;
++  }
++  if (expand->vertexProps() != nullptr && !expand->vertexProps()->empty()) {
++    return false;
++  }
++  auto* expr = orderedExpr(topn, project, expand);
++  return expr != nullptr && expr->kind() == Expression::Kind::kEdgeRank;
++}
++
++StatusOr<OptRule::TransformResult> PushRankTopNDownExpandAllRule::transform(
++    OptContext* ctx, const MatchedResult& matched) const {
++  auto* topnGN = matched.node;
++  auto* projectGN = matched.dependencies.front().node;
++  auto* expandGN = matched.dependencies.front().dependencies.front().node;
++  const auto* topn = static_cast<const TopN*>(topnGN->node());
++  const auto* project = static_cast<const Project*>(projectGN->node());
++  const auto* expand = static_cast<const ExpandAll*>(expandGN->node());
++
++  auto* newTopN = static_cast<TopN*>(topn->clone());
++  newTopN->setOutputVar(topn->outputVar());
++  auto* newTopNGN = OptGroupNode::create(ctx, newTopN, topnGN->group());
++
++  auto* newProject = static_cast<Project*>(project->clone());
++  auto* newExpand = static_cast<ExpandAll*>(expand->clone());
++  newExpand->setRankTopN(topn->count());
++  newProject->setInputVar(newExpand->outputVar());
++  newTopN->setInputVar(newProject->outputVar());
++
++  auto* projectGroup = OptGroup::create(ctx);
++  auto* newProjectGN = projectGroup->makeGroupNode(newProject);
++  auto* expandGroup = OptGroup::create(ctx);
++  auto* newExpandGN = expandGroup->makeGroupNode(newExpand);
++  for (auto* dep : expandGN->dependencies()) {
++    newExpandGN->dependsOn(dep);
++  }
++  newProjectGN->dependsOn(expandGroup);
++  newTopNGN->dependsOn(projectGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(newTopNGN);
++  return result;
++}
++
++std::string PushRankTopNDownExpandAllRule::toString() const {
++  return "PushRankTopNDownExpandAllRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+--- a/src/graph/optimizer/rule/PushRankTopNDownExpandAllRule.h
++++ b/src/graph/optimizer/rule/PushRankTopNDownExpandAllRule.h
+@@ -0,0 +1,51 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHRANKTOPNDOWNEXPANDALLRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHRANKTOPNDOWNEXPANDALLRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Annotate a 1-step ExpandAll with the TopN count when the order key is the
++// edge rank, descending.
++//
++//   TopN(ORDER BY rank DESC, LIMIT K)
++//     Project
++//       ExpandAll
++//
++// The TopN node stays. Storaged keeps every filtered edge whose rank is at
++// least the Kth on that vertex, including ties. The global top K is a subset
++// of the per-vertex top K, so graphd TopN still produces the same rows.
++//
++// Does not use TraverseSpec.limit. An older storaged treats that field as the
++// first N edges in scan order, which is the oldest rank. A missing
++// rank_topn_applied ack leaves the full scan for graphd TopN.
++//
++// Requires --enable_traverse_rank_topn.
++class PushRankTopNDownExpandAllRule final : public OptRule {
++ public:
++  const Pattern& pattern() const override;
++
++  bool match(OptContext* ctx, const MatchedResult& matched) const override;
++
++  StatusOr<TransformResult> transform(OptContext* ctx, const MatchedResult& matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushRankTopNDownExpandAllRule() {
++    RuleSet::QueryRules().addRule(this);
++  }
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHRANKTOPNDOWNEXPANDALLRULE_H_
+--- a/src/graph/optimizer/rule/PushDedupLimitStopRule.h
++++ b/src/graph/optimizer/rule/PushDedupLimitStopRule.h
+@@ -0,0 +1,48 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHDEDUPLIMITSTOPRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHDEDUPLIMITSTOPRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Record a Limit that sits directly on Dedup.
++//
++//   Limit(offset = 0, count = N)
++//     Dedup
++//
++// Dedup keeps stopAfter = N and EXPLAIN shows it. The executor still visits
++// every input row. unstableErase swaps a later row into the hole, so the
++// first N surviving rows are not known until the scan finishes, and stopping
++// early would return a different set.
++//
++// The limit is not pushed into GetDstBySrc or GetNeighbors.
++//
++// Requires --enable_dedup_limit_stop.
++class PushDedupLimitStopRule final : public OptRule {
++ public:
++  const Pattern& pattern() const override;
++
++  bool match(OptContext* ctx, const MatchedResult& matched) const override;
++
++  StatusOr<TransformResult> transform(OptContext* ctx, const MatchedResult& matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushDedupLimitStopRule() {
++    RuleSet::QueryRules().addRule(this);
++  }
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHDEDUPLIMITSTOPRULE_H_
+--- a/src/graph/optimizer/rule/PushMinusDownGetDstRule.h
++++ b/src/graph/optimizer/rule/PushMinusDownGetDstRule.h
+@@ -0,0 +1,54 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHMINUSDOWNGETDSTRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHMINUSDOWNGETDSTRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Fuse MINUS of two 1-step DISTINCT dst scans that share one constant source.
++//
++//   Minus
++//     Project(COLUMN[0]) -> Dedup -> Expand(left type)
++//     Project(COLUMN[0]) -> Dedup -> Expand(right type)
++//
++// becomes
++//
++//   Project(COLUMN[0])
++//     Dedup
++//       Expand(left type, minusEdgeTypes = right type)
++//
++// One source's edges live in that source's partition, so the difference is
++// local. Several sources are not the same as a global MINUS: src1 exposes P
++// and src2 buys P must drop P globally, and a per-source union would keep it.
++//
++// Requires --enable_minus_fusion. The scan sets minus_applied. An older
++// storaged ignores the field and returns only the left set, so graphd falls
++// back to two scans.
++class PushMinusDownGetDstRule final : public OptRule {
++ public:
++  const Pattern& pattern() const override;
++
++  bool match(OptContext* ctx, const MatchedResult& matched) const override;
++
++  StatusOr<TransformResult> transform(OptContext* ctx, const MatchedResult& matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushMinusDownGetDstRule() {
++    RuleSet::QueryRules().addRule(this);
++  }
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHMINUSDOWNGETDSTRULE_H_
+--- a/src/graph/optimizer/rule/PushDedupLimitStopRule.cpp
++++ b/src/graph/optimizer/rule/PushDedupLimitStopRule.cpp
+@@ -0,0 +1,85 @@
++/* Copyright (c) 2026 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushDedupLimitStopRule.h"
++
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/service/GraphFlags.h"
++#include "graph/util/ExpressionUtils.h"
++
++using nebula::graph::Dedup;
++using nebula::graph::Limit;
++using nebula::graph::PlanNode;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushDedupLimitStopRule::kInstance =
++    std::unique_ptr<PushDedupLimitStopRule>(new PushDedupLimitStopRule());
++
++const Pattern& PushDedupLimitStopRule::pattern() const {
++  static Pattern pattern = Pattern::create(
++      graph::PlanNode::Kind::kLimit, {Pattern::create(graph::PlanNode::Kind::kDedup)});
++  return pattern;
++}
++
++bool PushDedupLimitStopRule::match(OptContext* ctx, const MatchedResult& matched) const {
++  if (!FLAGS_enable_dedup_limit_stop) {
++    return false;
++  }
++  if (!OptRule::match(ctx, matched)) {
++    return false;
++  }
++  auto* limit = static_cast<const Limit*>(matched.planNode({0}));
++  auto* dedup = static_cast<const Dedup*>(matched.planNode({0, 0}));
++  if (dedup->stopAfter() >= 0) {
++    return false;
++  }
++  if (limit->offset() != 0 || limit->countExpr() == nullptr) {
++    return false;
++  }
++  if (!graph::ExpressionUtils::isEvaluableExpr(limit->countExpr(), ctx->qctx())) {
++    return false;
++  }
++  return limit->count(ctx->qctx()) > 0;
++}
++
++StatusOr<OptRule::TransformResult> PushDedupLimitStopRule::transform(
++    OptContext* ctx, const MatchedResult& matched) const {
++  auto* limitGN = matched.node;
++  auto* dedupGN = matched.dependencies.front().node;
++  const auto* limit = static_cast<const Limit*>(limitGN->node());
++  const auto* dedup = static_cast<const Dedup*>(dedupGN->node());
++
++  auto* newLimit = static_cast<Limit*>(limit->clone());
++  newLimit->setOutputVar(limit->outputVar());
++  auto* newLimitGN = OptGroupNode::create(ctx, newLimit, limitGN->group());
++
++  auto* newDedup = static_cast<Dedup*>(dedup->clone());
++  newDedup->setStopAfter(limit->count(ctx->qctx()));
++  newLimit->setInputVar(newDedup->outputVar());
++
++  auto* dedupGroup = OptGroup::create(ctx);
++  auto* newDedupGN = dedupGroup->makeGroupNode(newDedup);
++  for (auto* dep : dedupGN->dependencies()) {
++    newDedupGN->dependsOn(dep);
++  }
++  newLimitGN->dependsOn(dedupGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(newLimitGN);
++  return result;
++}
++
++std::string PushDedupLimitStopRule::toString() const {
++  return "PushDedupLimitStopRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
