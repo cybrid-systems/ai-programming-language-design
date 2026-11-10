@@ -1,0 +1,2 @@
+USE reco;
+GO FROM 2 OVER buy WHERE buy._rank >= 1761436800 - 1800 YIELD buy._dst AS pid, buy._rank AS ts | ORDER BY $-.ts DESC | LIMIT 10;

@@ -1,0 +1,2 @@
+USE reco;
+GO FROM 2 OVER expose YIELD DISTINCT dst(edge) AS pid MINUS GO FROM 2 OVER buy YIELD DISTINCT dst(edge) AS pid;

@@ -1,0 +1,2 @@
+USE reco;
+GO FROM 2 OVER buy YIELD DISTINCT buy._dst AS x | GO FROM $-.x OVER buy REVERSELY YIELD DISTINCT buy._dst AS u2 | GO FROM $-.u2 OVER buy YIELD buy._dst AS y | ORDER BY $-.y | GROUP BY $-.y YIELD $-.y AS rec_item, COUNT(1) AS score | ORDER BY $-.score DESC | LIMIT 20;

@@ -128,3 +128,5 @@ opt
 ```sql
 GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid | GO FROM $-.uid OVER buy WHERE buy._dst != 10000031733 YIELD buy._dst AS item | ORDER BY $-.item | GROUP BY $-.item YIELD $-.item AS rec_item, COUNT(1) AS score | ORDER BY $-.score DESC | LIMIT 20;
 ```
+
+六条 opt 各自替换上面的同名基线，彼此没有依赖。下推前计划、下推后计划和 loopback 时延在 [47-reco-ngql-pushdown.md](47-reco-ngql-pushdown.md)。可单独执行的文件在 `bench/reco/pushdown/q1-opt.ngql` 到 `q6-opt.ngql`，重跑脚本是 `bench/reco/measure_pushdown.py`。

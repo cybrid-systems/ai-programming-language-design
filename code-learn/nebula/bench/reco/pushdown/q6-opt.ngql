@@ -1,0 +1,2 @@
+USE reco;
+GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid | GO FROM $-.uid OVER buy WHERE buy._dst != 10000031733 YIELD buy._dst AS item | ORDER BY $-.item | GROUP BY $-.item YIELD $-.item AS rec_item, COUNT(1) AS score | ORDER BY $-.score DESC | LIMIT 20;

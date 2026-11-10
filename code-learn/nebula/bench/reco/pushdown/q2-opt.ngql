@@ -1,0 +1,2 @@
+USE reco;
+GO FROM 2 OVER expose YIELD DISTINCT expose._dst AS pid MINUS GO FROM 2 OVER buy YIELD DISTINCT buy._dst AS pid;

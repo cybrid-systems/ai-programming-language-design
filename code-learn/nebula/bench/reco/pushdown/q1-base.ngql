@@ -1,0 +1,2 @@
+USE reco;
+GO FROM 2 OVER buy YIELD dst(edge) AS pid, rank(edge) AS ts | YIELD $-.pid AS pid, $-.ts AS ts WHERE $-.ts >= 1761436800 - 1800 OR $-.pid != $-.pid | ORDER BY $-.ts DESC | LIMIT 10;

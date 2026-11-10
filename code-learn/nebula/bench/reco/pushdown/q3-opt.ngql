@@ -1,0 +1,2 @@
+USE reco;
+LOOKUP ON product WHERE product.type == 1 YIELD id(vertex) AS pid | GO FROM $-.pid OVER buy REVERSELY WHERE buy._rank >= 1761436800 - 7776000 YIELD buy._dst AS uid | YIELD DISTINCT $-.uid AS high_potential_user | LIMIT 5000;

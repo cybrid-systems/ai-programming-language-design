@@ -1,0 +1,2 @@
+USE reco;
+UNWIND range(1, 10000) AS uid | GO FROM $-.uid OVER buy YIELD buy._dst AS pid | ORDER BY $-.pid | GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy | ORDER BY $-.co_buy DESC | LIMIT 100 | GO FROM $-.pid OVER buy REVERSELY YIELD DISTINCT buy._dst AS ext_user | LIMIT 100000;
