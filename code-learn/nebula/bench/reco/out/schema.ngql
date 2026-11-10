@@ -1,0 +1,8 @@
+CREATE SPACE IF NOT EXISTS reco(partition_num=3, replica_factor=1, vid_type=INT64);
+USE reco;
+CREATE TAG IF NOT EXISTS user(name string, age int, gender string, city string)
+CREATE TAG IF NOT EXISTS user_stat(vip_level int, active_score int, last_active int)
+CREATE TAG IF NOT EXISTS product(name string, type int, brand string, price int, status int)
+CREATE TAG IF NOT EXISTS product_stat(sales int)
+CREATE TAG IF NOT EXISTS category_node(name string, type int);
+CREATE TAG INDEX IF NOT EXISTS product_type_idx ON product(type);

@@ -1,0 +1,61 @@
+{
+  "space": "reco",
+  "seed": 42,
+  "now_sec": 1761436800,
+  "window_90d_sec": 7776000,
+  "cutoff_sec": 1753660800,
+  "active_score_min": 60,
+  "active_rule": "active_score >= 60 AND last_active >= now_sec - 7776000",
+  "beauty_type": 1,
+  "beauty_ratio": 0.05,
+  "parts": 3,
+  "vid_type": "INT64",
+  "counts": {
+    "users": 10000,
+    "products": 50000,
+    "categories": 4000,
+    "active_users": 2946,
+    "beauty_products": 2245,
+    "on_shelf_products": 47425
+  },
+  "vid": {
+    "user": [
+      1,
+      10000
+    ],
+    "product_base": 10000000000,
+    "product": [
+      10000000001,
+      10000050000
+    ],
+    "category_base": 100000000000,
+    "category": [
+      100000000000,
+      100000003999
+    ],
+    "beauty_category": 100000000001
+  },
+  "sales": {
+    "min": 0,
+    "p50": 1295,
+    "max": 9999389
+  },
+  "sha256": {
+    "active_users": "8a46157e2e14d82fde894b33b49c4c2ce8e3f52c4b07c8a2f76e068d6ecc860e",
+    "beauty_products": "827400e4089b8bad2a54bd959de44d298fc1c859bbe2cecc0afeb094a4fe39eb"
+  },
+  "samples": {
+    "user": 1,
+    "active_user": 2,
+    "inactive_user": 1,
+    "beauty_product": 10000000012,
+    "other_product": 10000000001,
+    "beauty_category": 100000000001
+  },
+  "notes": [
+    "user and user_stat share a vid; product and product_stat share a vid",
+    "coupons is in the mapping table but not in CREATE TAG user; omitted",
+    "edges (buy, contains, expose, click) are not loaded",
+    "beauty_ratio only biases extra products; it is a test skew, not the production prior"
+  ]
+}
