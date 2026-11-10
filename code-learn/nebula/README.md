@@ -61,7 +61,7 @@
 | 45 | [共现推荐第二跳聚合下推](45-copurchase-secondhop-agg.md) | 两跳 GO 的计划形状（Expand/ExpandAll + HashInnerJoin）、第二跳 `GROUP BY dst + COUNT` 下推、原型补丁与单机验证、已知边界 |
 | 46 | [operator-opt 分支实测与下推前提校正](46-operator-opt-review.md) | 11 个 commit 的落点、与补丁设计 A–F 的对应、EXPLAIN 实测：`edge._dst` 走简单计划、REVERSELY 下 `_dst` 等价于 `src(edge)`、`LIMIT [N]` 是逐步截断；分支单独编译的 A/B：按现状编译不过、补丁 A 确实存在、但并列切分使结果不等价 |
 | 47 | [reco 六场景 nGQL 下推](47-reco-ngql-pushdown.md) | Q1–Q6 各一条可单独替换的语句：下推前/后的 EXPLAIN，以及 loopback 上的 server latency |
-| 48 | [reco 正交算子补丁](48-reco-operator-patches.md) | 在 47 的 opt 语句上，把 `operator-opt` 拆成可单独 apply 的补丁；gcc-11 `fa92893` 上每个补丁的计划、SHA 和 server p50。Q3 组合在补上 rank 窗口后结果回到 1801 行，时延更慢 |
+| 48 | [reco 正交算子补丁](48-reco-operator-patches.md) | 每张补丁打在 Q1–Q6 的哪一跳、收益是什么。结论：这份夹具上没有稳定加速；Q3 收成 GetDstBySrc 必须连 rank 窗口，结果对，慢 28% |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -85,7 +85,7 @@
 
 47 是 reco 空间上 Q1–Q6 的语句级下推记录。每条 opt 单独替换 [dev.md](dev.md) 里的同名基线，用的是 `fa92893` 已有的 Filter、列裁剪和简单计划。计划原文和 5 次时延在 [47](47-reco-ngql-pushdown.md)，原始 JSON 在 `bench/reco/pushdown/results.json`。
 
-48 接在 47 的 opt 语句之后，把 `operator-opt` 拆成 `patches/reco-q/` 里可单独 apply 的补丁，在 gcc-11 重编的 `fa92893` 上逐个换二进制。比较点是优化后的 nGQL，不是 47 里的 graphd 基线语句。计划和 7 次时延在 [48](48-reco-operator-patches.md)，原始 JSON 在 `bench/reco/patch-measure/`。
+48 接在 47 的 opt 语句之后。正文先给结论，再用两张表写清每条查询对应哪些补丁、每张补丁在 Q1–Q6 上的收益。全量 p50 和 apply 顺序在附录。原始 JSON 在 `bench/reco/patch-measure/`。
 
 ## 主线
 
