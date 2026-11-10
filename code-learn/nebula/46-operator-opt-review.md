@@ -4,6 +4,7 @@
 > 对照源码：`v3.8.0` `fa928930ab34f150db522933323aa610e54f7`
 > 分支：`operator-opt` `116b6a453dfd95d312a6ab0574d360d8a243570c`（2026-11-06）
 > 基线：上游 `v3.8.0` `fa928930`，分支在其之上 11 个提交
+> 行号锚点一律按 `v3.8.0` 基线计；`operator-opt` 上同名函数的行号见文末对照
 > 日期：2026-11-10
 > 状态：源码分析 + 本机单机集群实测（基线 `v3.8.0` 二进制）；不是生产实现
 
@@ -61,7 +62,7 @@
 
 ### 3.1 ✅ `edge._dst` 确实走简单计划
 
-`isSimpleCase()`（`src/graph/validator/GoValidator.cpp:297`）要求 YIELD 的每一列都是 `Expression::Kind::kEdgeDst`：
+`isSimpleCase()`（`src/graph/validator/GoValidator.cpp:286`）要求 YIELD 的每一列都是 `Expression::Kind::kEdgeDst`：
 
 ```cpp
 for (auto& col : goCtx_->yieldExpr->columns()) {
@@ -93,7 +94,7 @@ GO FROM "u1" OVER buy YIELD DISTINCT buy._dst AS pid;
   → Start → Expand → Dedup → Project                  ← 简单计划
 ```
 
-`GoPlanner::doSimplePlan()`（`src/graph/planner/ngql/GoPlanner.cpp:148`）产出 `Expand` + `Dedup` + `Project`，列名固定 `_expand_vid`；`ExpandExecutor::execute()`（`src/graph/executor/query/ExpandExecutor.cpp:66`）在没有 `joinInput`、没有 `stepLimits` 时走 `GetDstBySrc()`——也就是存储侧去重。
+`GoPlanner::doSimplePlan()`（`src/graph/planner/ngql/GoPlanner.cpp:145`）产出 `Expand` + `Dedup` + `Project`，列名固定 `_expand_vid`；`ExpandExecutor::execute()`（`src/graph/executor/query/ExpandExecutor.cpp:66`）在没有 `joinInput`、没有 `stepLimits` 时走 `GetDstBySrc()`——也就是存储侧去重。
 
 **结论**：「把 `dst(edge)` 改成 `edge._dst` 以触发存储侧去重」这条改写是有效的，方向正确。
 
@@ -110,7 +111,7 @@ GO FROM "I1" OVER purchased REVERSELY YIELD dst(edge) AS who;
   → I1, I1          ← 才是商品自己
 ```
 
-原因在存储布局：反向边在存储层是**独立的一行**，src/dst 对调、type 取负（`src/graph/util/SchemaUtil.cpp:384` 的 `getEdgeProps()` 对 `reversely` 取 `-edgeType`）。因此反向下 `_dst` 读到的正是**原始 src**。
+原因在存储布局：反向边在存储层是**独立的一行**，src/dst 对调、type 取负（`src/graph/util/SchemaUtil.cpp:383` 的 `getEdgeProps()` 对 `reversely` 取 `-edgeType`）。因此反向下 `_dst` 读到的正是**原始 src**。
 
 这带来一个比原设计更好的结论：REVERSELY 下改写 `src(edge)` → `edge._dst` 是**语义安全**的，而且改写后**还能拿到简单计划**：
 
@@ -132,7 +133,7 @@ GO FROM "p1" OVER buy REVERSELY YIELD DISTINCT src(edge) AS uid;
 
 ### 3.3 ⚠️ `LIMIT [N]` 不是 per-vertex limit，而且和「改动 1」互斥
 
-`LIMIT [N]` 走的是 GO 段的截断子句。`GoValidator::validateTruncate()`（`src/graph/validator/GoValidator.cpp:108`）要求它是一个**长度等于步数的 LIST**：
+`LIMIT [N]` 走的是 GO 段的截断子句。`GoValidator::validateTruncate()`（`src/graph/validator/GoValidator.cpp:99`）要求它是一个**长度等于步数的 LIST**：
 
 ```
 GO FROM "u1" OVER buy YIELD dst(edge) AS pid LIMIT 200;
@@ -199,3 +200,18 @@ nebula-console -addr 127.0.0.1 -port 9669 -u root -p nebula -f probe.ngql
 - `116b6a4` 引入的 `shared_dedup_limit_supported` 能力标记是**混版本护栏**：graphd 在 storaged 不支持时直接报错而不是静默降级。这意味着分支的 graphd 和 storaged 必须同版本，不能滚动升级。
 - 第 3 节的三条结论只覆盖**单跳、无 WHERE、无 LIMIT** 的形态。带 WHERE、带截断、多跳的形态下简单计划是否成立，本文没有逐一枚举。
 - `operator-opt` 分支与本文引用的上游 `v3.8.0` 在 `src/graph/optimizer`、`src/graph/planner` 上有差异时，本文以分支自身的代码为准；未标注差异的地方以 `v3.8.0` 为准。
+
+### 6.1 行号锚点对照
+
+正文里的行号一律按 `v3.8.0` 基线计。分支改动过 `GoValidator.cpp` 和 `GoPlanner.cpp`，同名函数在 `operator-opt` 上的行号不同；三个被引用的函数体在两棵树上逐字相同，所以结论对两棵树都成立，只是行号要换。
+
+| 锚点 | v3.8.0 | operator-opt |
+|---|---|---|
+| `GoValidator::isSimpleCase()` | 286 | 297 |
+| `GoValidator::validateTruncate()` | 99 | 108 |
+| `parser.yy` 的 `DST_ID_PROP` 规则 | 1035 | 1035 |
+| `FunctionManager` 注册 `"dst"` | 2049 | 2049 |
+| `GoPlanner::doSimplePlan()` | 145 | 148 |
+| `ExpandExecutor` 走 `GetDstBySrc()` | 66 | 66 |
+| `SchemaUtil::getEdgeProps()`（`reversely` 重载） | 383 | 383 |
+| `PushStepSampleDownGetNeighborsRule` | 56 | 56 |
