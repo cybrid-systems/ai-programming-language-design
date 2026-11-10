@@ -59,6 +59,7 @@
 | 43 | [共同购买下推 v2](43-copurchase-pushdown-prod.md) | hop2a 的 coCount 上界剪枝、限额和失败策略、混部；15 万用户上 v1/v2/nGQL |
 | 44 | [亲和感知的共同购买](44-copurchase-affinity-local.md) | VID 亲和放置、单机整链的运行时证明、拆开时的上界剪枝；亲和/随机/混合实测 |
 | 45 | [共现推荐第二跳聚合下推](45-copurchase-secondhop-agg.md) | 两跳 GO 的计划形状（Expand/ExpandAll + HashInnerJoin）、第二跳 `GROUP BY dst + COUNT` 下推、原型补丁与单机验证、已知边界 |
+| 46 | [operator-opt 分支实测与下推前提校正](46-operator-opt-review.md) | 11 个 commit 的落点、与补丁设计 A–F 的对应、EXPLAIN 实测：`edge._dst` 走简单计划、REVERSELY 下 `_dst` 等价于 `src(edge)`、`LIMIT [N]` 是逐步截断 |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -77,6 +78,8 @@
 28–32 是执行引擎子系列：28 讲 Executor 框架（PlanNode 树 → 异步 DAG、open/execute/close、finish 与生命周期），29 讲 GetNeighbors / Expand / Traverse 三件套，30 讲 Filter / Project / Aggregate / Sort / TopN / Limit / Join，31 讲 Promise/Future 调度、Select/Loop 与内存水位，32 讲最短路 / 全路径 / 子图。13–14 是控制流与数据流总览，这一组补的是 executor 内部实现和关键分支。
 
 33 是设计稿：前提是分区器已经做了社区/子图划分并暴露亲和性元数据；核心是 storaged 内做有界本地 BFS，把远程边界交回 graphd，路径只返回紧凑 `PathPrefix`。34 是按 `fa928930` 收窄后的一阶段实现（没有 PathPrefix，亲和估计是 flag 而不是 meta）。35 是它的单机和多进程实测。36 在 34 的协议上加逐跳守卫和 graphd 的 EWMA，用来在分布未知时保留亲和收益、避开 35 里随机放置的回退。37 是这三路（基线、静态多跳、自适应）的实测。38 把决策拆到源分区，并在连续两次 hop-1 提前停之后改走基线。39 把同一台 leader 上的多跳分区合成一次 RPC，并用心跳里的抽样比例做冷启动和切回。
+
+46 不是新的一组设计稿，是对 `operator-opt` 分支（gitcode `guoshaohong1/nebula`，上游 `v3.8.0` 之上 11 个提交）的落点盘点，加上三条用 EXPLAIN 实测的下推前提校正：`edge._dst` 走简单计划（`getDstBySrc`）；REVERSELY 下 `_dst` 与 `src(edge)` 语义等价（不是商品自己）；`LIMIT [N]` 是逐步截断而非 per-vertex limit，且会让简单计划失效。这三条直接收窄了 42–45 里「哪些算子留在 graphd」的判断边界。
 
 ## 主线
 
