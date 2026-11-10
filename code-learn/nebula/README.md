@@ -63,6 +63,7 @@
 | 47 | [reco 六场景 nGQL 下推](47-reco-ngql-pushdown.md) | Q1–Q6 各一条可单独替换的语句：下推前/后的 EXPLAIN，以及 loopback 上的 server latency |
 | 48 | [reco 正交算子补丁](48-reco-operator-patches.md) | 每张补丁打在 Q1–Q6 的哪一跳、收益是什么。结论：这份夹具上没有稳定加速；Q3 收成 GetDstBySrc 必须连 rank 窗口，结果对，慢 28% |
 | 49 | [下推边界与补丁对照](49-reco-patch-map.md) | 用现在能跑的六条 opt，把设计稿 A–F 重新对到实测：B 取消，无过滤的管道去重已经在 3.8，下一张只写局部 COUNT；`LIMIT [N]` 不进这六条 |
+| 50 | [局部 COUNT](50-reco-partial-count.md) | scale 8 的 reco 上把 `GROUP BY dst + COUNT` 推进 `GetDstBySrc`。全量分组 SHA 相同；Q4 p50 621 ms → 193 ms，Q5 213 ms → 82 ms |
 
 下推阅读顺序是 01 → 02 → 03 → 04 → 05，然后 10。11 是场景二，12 是它的压测记录。05 的更正表是对早期笔记的集中修订，结论都以前面几篇的源码锚点为准。
 
@@ -89,6 +90,8 @@
 48 接在 47 的 opt 语句之后。正文先给结论，再用两张表写清每条查询对应哪些补丁、每张补丁在 Q1–Q6 上的收益。全量 p50 和 apply 顺序在附录。原始 JSON 在 `bench/reco/patch-measure/`。
 
 49 用同一批语句把设计稿里的补丁 A–F 重排了一遍。`LIMIT [N]` 和「REVERSELY 下 `buy._dst` 是商品自己」这两处按 46 的实测改掉。下一张值得写的是局部 `COUNT`，不是补丁 B。
+
+50 就是这张局部 `COUNT`。夹具把每用户的边乘了 8（用户和商品个数不动）。全量 `(vid, count)` 两边 SHA 相同。Q4、Q5 的 p50 大约降到原来的三分之一。`LIMIT` 切在并列分数上时，最终行的商品集合会换，分组和本身没有换。
 
 ## 主线
 

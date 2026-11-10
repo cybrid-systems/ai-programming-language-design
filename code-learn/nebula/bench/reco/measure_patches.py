@@ -29,6 +29,31 @@ Q4_TOPK = (
     "| ORDER BY $-.co_buy DESC | LIMIT 100"
 )
 
+# Full group maps, before LIMIT. Sorted-row sha is the partial-agg check.
+# ORDER BY the vid stays so the ExpandAll GROUP BY bug does not empty the map.
+GROUP_PROBES = {
+    "q4": (
+        "UNWIND range(1, 10000) AS uid "
+        "| GO FROM $-.uid OVER buy YIELD buy._dst AS pid "
+        "| ORDER BY $-.pid "
+        "| GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy"
+    ),
+    "q5": (
+        "GO FROM 2 OVER buy YIELD DISTINCT buy._dst AS x "
+        "| GO FROM $-.x OVER buy REVERSELY YIELD DISTINCT buy._dst AS u2 "
+        "| GO FROM $-.u2 OVER buy YIELD buy._dst AS y "
+        "| ORDER BY $-.y "
+        "| GROUP BY $-.y YIELD $-.y AS rec_item, COUNT(1) AS score"
+    ),
+    "q6": (
+        "GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid "
+        "| GO FROM $-.uid OVER buy WHERE buy._dst != 10000031733 "
+        "YIELD buy._dst AS item "
+        "| ORDER BY $-.item "
+        "| GROUP BY $-.item YIELD $-.item AS rec_item, COUNT(1) AS score"
+    ),
+}
+
 
 def fingerprint(rows):
     as_tuples = [tuple(row) for row in rows]
@@ -160,6 +185,36 @@ def main():
         except Exception as exc:  # noqa: BLE001
             report["q4_topk"] = {"error": str(exc)}
             print("q4_topk ERROR", exc, flush=True)
+        report["group_probes"] = {}
+        for name, stmt in GROUP_PROBES.items():
+            print("== group", name, flush=True)
+            try:
+                explain = execute(session, "EXPLAIN " + stmt)
+                resp = execute(session, stmt)
+                rows = rows_of(resp)
+                got = {
+                    "spine": [n["name"] for n in plan_of(explain)["nodes"]],
+                    "server_us": resp.latency(),
+                    "fingerprint": fingerprint(rows),
+                }
+                print(
+                    "  rows",
+                    got["fingerprint"]["rows"],
+                    "sha",
+                    got["fingerprint"]["sha256"][:12],
+                    "spine",
+                    " ".join(got["spine"]),
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                got = {"error": str(exc)}
+                print("  ERROR", exc, flush=True)
+                try:
+                    pool.close()
+                except Exception:
+                    pass
+                pool, session = connect()
+            report["group_probes"][name] = got
     finally:
         try:
             pool.close()

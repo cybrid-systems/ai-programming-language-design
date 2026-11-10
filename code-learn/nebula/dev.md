@@ -134,3 +134,5 @@ GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid | GO FROM 
 在这六条 opt 上再往下拆的算子补丁、每份补丁的 EXPLAIN 和与 opt 的时延对照在 [48-reco-operator-patches.md](48-reco-operator-patches.md)。补丁在 `patches/reco-q/`，测量 JSON 在 `bench/reco/patch-measure/`，换二进制用 `bench/reco/swap_bins.sh`，重跑脚本是 `bench/reco/measure_patches.py`。
 
 这六条还剩什么不能下推、设计稿 A–F 里哪张还要写，在 [49-reco-patch-map.md](49-reco-patch-map.md)。语句以本节的 opt 为准。
+
+局部 `COUNT` 的开关对比在 [50-reco-partial-count.md](50-reco-partial-count.md)。生成器的 `--edge-scale` 默认 1；50 的测量用的是 8，清单在 `bench/reco/out-scale8/`。

@@ -6,8 +6,13 @@ Q1 reads rank(edge), then filters, sorts, and limits in graphd.
 
 Per active user: 12 purchases inside (now-1800, now], 8 inside the 90-day
 window but outside those 30 minutes. Per inactive user: 3 purchases older
-than 90 days. Destinations are on-shelf products. User 2 is active, so
-Q1 FROM 2 returns 10 rows. User 1 is inactive, so Q1 FROM 1 returns none.
+than 90 days. --edge-scale multiplies those three counts and defaults to 1,
+which is the documented fixture. Destinations are on-shelf products. User 2
+is active, so Q1 FROM 2 returns 10 rows. User 1 is inactive, so Q1 FROM 1
+returns none. load inserts into the existing buy edge. A different
+--edge-scale replaces edges only when the space is recreated first
+(gen_vertices.py load); DROP EDGE races an async delete and drops the
+early inserts.
 """
 
 import argparse
@@ -52,6 +57,12 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--now", type=int, default=NOW_SEC)
     p.add_argument(
+        "--edge-scale",
+        type=int,
+        default=1,
+        help="multiply per-user buy counts; 1 keeps the documented fixture",
+    )
+    p.add_argument(
         "--manifest",
         default=os.path.join(os.path.dirname(__file__), "out", "vertices_manifest.json"),
     )
@@ -73,10 +84,25 @@ def vertex_args(spec):
     return ns
 
 
-def make_buys(vertices, now, seed):
+def scaled_counts(edge_scale):
+    if edge_scale < 1:
+        raise SystemExit("--edge-scale must be >= 1")
+    recent = RECENT_PER_ACTIVE * edge_scale
+    older_active = OLDER_PER_ACTIVE * edge_scale
+    older_inactive = OLDER_PER_INACTIVE * edge_scale
+    if recent > WINDOW_30M:
+        raise SystemExit(
+            f"--edge-scale {edge_scale} needs {recent} distinct timestamps "
+            f"inside the {WINDOW_30M}s window"
+        )
+    return recent, older_active, older_inactive
+
+
+def make_buys(vertices, now, seed, edge_scale=1):
+    recent_per, older_active, older_inactive = scaled_counts(edge_scale)
     rng = random.Random(seed + 7)
     on_shelf = [p["vid"] for p in vertices["products"] if p["status"] == 1]
-    if len(on_shelf) < RECENT_PER_ACTIVE + OLDER_PER_ACTIVE:
+    if len(on_shelf) < recent_per + older_active:
         raise SystemExit("not enough on-shelf products")
     recent_lo, recent_hi = now - WINDOW_30M + 1, now
     mid_lo, mid_hi = now - WINDOW_90D, now - WINDOW_30M - 1
@@ -84,9 +110,9 @@ def make_buys(vertices, now, seed):
     edges = []
     for user in vertices["users"]:
         if user["active"]:
-            recent_n, older_n, older_span = RECENT_PER_ACTIVE, OLDER_PER_ACTIVE, (mid_lo, mid_hi)
+            recent_n, older_n, older_span = recent_per, older_active, (mid_lo, mid_hi)
         else:
-            recent_n, older_n, older_span = 0, OLDER_PER_INACTIVE, (old_lo, old_hi)
+            recent_n, older_n, older_span = 0, older_inactive, (old_lo, old_hi)
         need = recent_n + older_n
         dsts = rng.sample(on_shelf, need)
         times = []
@@ -107,7 +133,8 @@ def make_buys(vertices, now, seed):
     return edges
 
 
-def validate(edges, vertices, now):
+def validate(edges, vertices, now, edge_scale=1):
+    recent_per, _, _ = scaled_counts(edge_scale)
     seen = set()
     cutoff = now - WINDOW_30M
     active = {u["vid"] for u in vertices["users"] if u["active"]}
@@ -119,9 +146,9 @@ def validate(edges, vertices, now):
         seen.add(key)
         if edge["src"] in active and edge["ts"] >= cutoff:
             recent[edge["src"]] += 1
-    short = [uid for uid, n in recent.items() if n != RECENT_PER_ACTIVE]
+    short = [uid for uid, n in recent.items() if n != recent_per]
     if short:
-        raise SystemExit(f"{len(short)} active users do not have {RECENT_PER_ACTIVE} recent buys")
+        raise SystemExit(f"{len(short)} active users do not have {recent_per} recent buys")
     inactive_recent = [
         e for e in edges if e["src"] not in active and e["ts"] >= cutoff
     ]
@@ -180,12 +207,12 @@ def verify(session, edges, now):
     prop = execute(
         session,
         f"FETCH PROP ON buy 2->{top[0]}@{top[1]} "
-        "YIELD buy.`timestamp` AS timestamp, buy.order_id AS order_id",
+        "YIELD buy.`timestamp` AS ts, buy.order_id AS order_id",
     )
     keys = [key_name(k) for k in prop.keys()]
-    if prop.row_size() < 1 or "timestamp" not in keys:
+    if prop.row_size() < 1 or "ts" not in keys:
         raise RuntimeError(f"missing buy.timestamp columns={keys}")
-    ts_cell = rows_of(prop)[0][keys.index("timestamp")]
+    ts_cell = rows_of(prop)[0][keys.index("ts")]
     if ts_cell != top[1]:
         raise RuntimeError(f"buy.timestamp {ts_cell} != rank {top[1]}")
     print(f"Q1 user 2 returned {len(got)} rows; user 1 returned 0", flush=True)
@@ -193,20 +220,22 @@ def verify(session, edges, now):
         print(f"  pid={pid} ts={ts}", flush=True)
 
 
-def write_manifest(path, edges, now, seed):
+def write_manifest(path, edges, now, seed, edge_scale):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    recent_per, older_active, older_inactive = scaled_counts(edge_scale)
     top = q1_oracle(edges, 2, now)
     info = {
         "space": "reco",
         "seed": seed,
         "now_sec": now,
+        "edge_scale": edge_scale,
         "window_30m_sec": WINDOW_30M,
         "rank_is_timestamp": True,
         "counts": {
             "edges": len(edges),
-            "recent_per_active_user": RECENT_PER_ACTIVE,
-            "older_90d_per_active_user": OLDER_PER_ACTIVE,
-            "older_per_inactive_user": OLDER_PER_INACTIVE,
+            "recent_per_active_user": recent_per,
+            "older_90d_per_active_user": older_active,
+            "older_per_inactive_user": older_inactive,
         },
         "q1_user_2": [{"pid": e["dst"], "ts": e["ts"]} for e in top],
     }
@@ -245,11 +274,15 @@ def main():
             f"(active {active} vs {spec['counts']['active_users']}, "
             f"on_shelf {on_shelf} vs {spec['counts']['on_shelf_products']})"
         )
-    edges = make_buys(vertices, args.now, args.seed)
-    validate(edges, vertices, args.now)
+    edges = make_buys(vertices, args.now, args.seed, args.edge_scale)
+    validate(edges, vertices, args.now, args.edge_scale)
     out = os.path.join(args.out, "buy_manifest.json")
-    write_manifest(out, edges, args.now, args.seed)
-    print(f"buy edges={len(edges)} recent_per_active={RECENT_PER_ACTIVE}", flush=True)
+    write_manifest(out, edges, args.now, args.seed, args.edge_scale)
+    recent_per, _, _ = scaled_counts(args.edge_scale)
+    print(
+        f"buy edges={len(edges)} edge_scale={args.edge_scale} recent_per_active={recent_per}",
+        flush=True,
+    )
     if args.phase == "check":
         print(f"wrote {out}", flush=True)
         return

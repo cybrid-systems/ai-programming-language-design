@@ -464,7 +464,7 @@ new file mode 100644
 index 000000000..0db52a8b3
 --- /dev/null
 +++ b/src/graph/optimizer/rule/PushPartialEdgeAggRule.cpp
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,429 @@
 +/* Copyright (c) 2026 vesoft inc. All rights reserved.
 + *
 + * This source code is licensed under Apache 2.0 License.
@@ -625,6 +625,16 @@ index 000000000..0db52a8b3
 +        return false;
 +      }
 +      scan->extraFilter = filter->condition();
++      if (node->dependencies().size() != 1) {
++        return false;
++      }
++      node = soleNode(node->dependencies()[0]);
++      continue;
++    }
++    // Sort does not rename columns. ORDER BY the vid before GROUP BY inserts
++    // one here; skipping it still unfolds the projects below. The rewrite
++    // drops the Sort.
++    if (kind == PlanNode::Kind::kSort) {
 +      if (node->dependencies().size() != 1) {
 +        return false;
 +      }
@@ -906,7 +916,7 @@ index 000000000..e3108f47d
 +// Partial-aggregate a 1-step edge scan that groups by the edge destination.
 +//
 +//   Aggregate(group by edge._dst, SUM/COUNT/MIN/MAX of edge exprs)
-+//     Project* / Filter*
++//     Project* / Filter* / Sort*
 +//       ExpandAll(1, 1)                  or HashInnerJoin(vids, ExpandAll)
 +//
 +// becomes

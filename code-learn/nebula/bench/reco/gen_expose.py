@@ -4,7 +4,10 @@
 Each user is exposed to every product they bought, plus products they did
 not buy. Two of the unbought products are exposed twice (different ranks)
 so YIELD DISTINCT has duplicates to collapse. Q2's result is the unbought
-set. Rank stores exposed_at.
+set. Rank stores exposed_at. --edge-scale must match the buy load: it
+multiplies the extra products and is passed through to make_buys. Default
+1 is the documented fixture. load inserts into the existing expose edge.
+Change scale only after gen_vertices.py recreates the space.
 """
 
 import argparse
@@ -47,6 +50,12 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--now", type=int, default=NOW_SEC)
     p.add_argument(
+        "--edge-scale",
+        type=int,
+        default=1,
+        help="multiply extra exposes and the buy set they cover; 1 is the documented fixture",
+    )
+    p.add_argument(
         "--manifest",
         default=os.path.join(os.path.dirname(__file__), "out", "vertices_manifest.json"),
     )
@@ -67,7 +76,9 @@ def vertex_args(spec):
     )
 
 
-def make_exposes(vertices, buys, now, seed):
+def make_exposes(vertices, buys, now, seed, edge_scale=1):
+    if edge_scale < 1:
+        raise SystemExit("--edge-scale must be >= 1")
     rng = random.Random(seed + 19)
     on_shelf = [p["vid"] for p in vertices["products"] if p["status"] == 1]
     bought = defaultdict(list)
@@ -80,7 +91,10 @@ def make_exposes(vertices, buys, now, seed):
         uid = user["vid"]
         owned_edges = bought[uid]
         owned = {edge["dst"] for edge in owned_edges}
-        extra_n = EXTRA_ACTIVE if user["active"] else EXTRA_INACTIVE
+        extra_base = EXTRA_ACTIVE if user["active"] else EXTRA_INACTIVE
+        extra_n = extra_base * edge_scale
+        if len(on_shelf) <= len(owned) + extra_n:
+            raise SystemExit(f"user {uid} has no room for {extra_n} extra exposes")
         extras = []
         seen = set(owned)
         while len(extras) < extra_n:
@@ -167,12 +181,13 @@ def verify(session, expected):
             print(f"  pid={pid}", flush=True)
 
 
-def write_manifest(path, edges, expected, seed, now):
+def write_manifest(path, edges, expected, seed, now, edge_scale):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     info = {
         "space": "reco",
         "seed": seed,
         "now_sec": now,
+        "edge_scale": edge_scale,
         "rank_is_exposed_at": True,
         "counts": {"edges": len(edges)},
         "q2_user_2": sorted(expected[2]),
@@ -208,13 +223,14 @@ def main():
     active = sum(1 for u in vertices["users"] if u["active"])
     if active != spec["counts"]["active_users"]:
         raise SystemExit("regenerated users do not match the loaded space")
-    buys = make_buys(vertices, args.now, args.seed)
-    edges, expected = make_exposes(vertices, buys, args.now, args.seed)
+    buys = make_buys(vertices, args.now, args.seed, args.edge_scale)
+    edges, expected = make_exposes(vertices, buys, args.now, args.seed, args.edge_scale)
     validate(edges, expected, buys)
     out = os.path.join(args.out, "expose_manifest.json")
-    write_manifest(out, edges, expected, args.seed, args.now)
+    write_manifest(out, edges, expected, args.seed, args.now, args.edge_scale)
     print(
-        f"expose edges={len(edges)} q2_user_2={len(expected[2])} q2_user_1={len(expected[1])}",
+        f"expose edges={len(edges)} edge_scale={args.edge_scale} "
+        f"q2_user_2={len(expected[2])} q2_user_1={len(expected[1])}",
         flush=True,
     )
     if args.phase == "check":
