@@ -6,7 +6,7 @@
 > 基线：上游 `v3.8.0` `fa928930`，分支在其之上 11 个提交
 > 行号锚点一律按 `v3.8.0` 基线计；`operator-opt` 上同名函数的行号见文末对照
 > 日期：2026-11-10
-> 状态：源码分析 + 本机单机集群实测（基线 `v3.8.0` 二进制）；不是生产实现
+> 状态：源码分析 + 本机单机集群实测（基线 `v3.8.0` 二进制）；分支 `operator-opt` 已单独编译并与基线 A/B 对照，见第 7 节；不是生产实现
 
 ---
 
@@ -18,6 +18,10 @@
    - ✅ `edge._dst` 走简单计划（`getDstBySrc`）：「改动 1」的方向是对的，EXPLAIN 证实。
    - ❌ REVERSELY 下 `edge._dst` 与 `src(edge)` **语义等价**，文档「改写会返回商品 B 的 VID、结果完全错误」的警告不成立。于是 Q6 第一跳的去重下推**不需要补丁**，改写即可拿到。
    - ⚠️ `LIMIT [N]` 是 GO 段的**逐步截断**，不是 per-vertex limit；而且它会让简单计划失效，与「改动 1」互斥。
+4. 把分支单独编译后与基线 A/B（第 7 节），有两个本文原先不知道的事实：
+   - **分支按现状编译不过**：`116b6a4` 给 `GetDstBySrcNode` 加了 `sharedDedupLimit_` 成员但没同步初始化列表顺序，项目的 `-Werror` 把 `-Wreorder` 变成致命错误。两行可修。
+   - **补丁 A 确实存在**，但走的不是本文推测的路径：实测 Q3 opt 把 `HashInnerJoin + ExpandAll` 收成一次 `Expand`，Q5 / Q6 opt 把 `Project` 压到 join 之下。
+   - **但结果在并列切分上不等价**：同样的语句、同样的数据，两个二进制返回的行集合不同。机制是聚合的分组输出顺序变了（上游 `unordered_map<List, ...>` vs 分支单键快路径 `unordered_map<Value, ...>`），遇到并列键时 `TopN` 切出的不是同一批。这直接限定了「多重集 SHA 相同」这个判据的适用范围。
 
 ---
 
@@ -196,7 +200,8 @@ nebula-console -addr 127.0.0.1 -port 9669 -u root -p nebula -f probe.ngql
 
 ## 6. 已知边界
 
-- 本文只在本机单集群（上游 `v3.8.0` 二进制）上验证了**计划形状和结果正确性**，没有测分支 `operator-opt` 自身的二进制；分支的行为需要另行编译验证。
+- 第 3 节的三条前提在本机单集群（上游 `v3.8.0` 二进制）上验证了**计划形状和结果正确性**。分支 `operator-opt` 自身在第 7 节单独编译后做了 A/B：计划形状有 3 条不同（补丁 A 确实存在），但**结果在并列切分上不等价**——详见 7.5。
+- 第 7 节的 A/B 只覆盖 [47](47-reco-ngql-pushdown.md) 的 12 条语句，没有覆盖更大数据量或更多形态。
 - `116b6a4` 引入的 `shared_dedup_limit_supported` 能力标记是**混版本护栏**：graphd 在 storaged 不支持时直接报错而不是静默降级。这意味着分支的 graphd 和 storaged 必须同版本，不能滚动升级。
 - 第 3 节的三条结论只覆盖**单跳、无 WHERE、无 LIMIT** 的形态。带 WHERE、带截断、多跳的形态下简单计划是否成立，本文没有逐一枚举。
 - `operator-opt` 分支与本文引用的上游 `v3.8.0` 在 `src/graph/optimizer`、`src/graph/planner` 上有差异时，本文以分支自身的代码为准；未标注差异的地方以 `v3.8.0` 为准。
@@ -215,3 +220,87 @@ nebula-console -addr 127.0.0.1 -port 9669 -u root -p nebula -f probe.ngql
 | `ExpandExecutor` 走 `GetDstBySrc()` | 66 | 66 |
 | `SchemaUtil::getEdgeProps()`（`reversely` 重载） | 383 | 383 |
 | `PushStepSampleDownGetNeighborsRule` | 56 | 56 |
+
+## 7. 分支实测：编译与 A/B
+
+### 7.1 分支按现状编译不过
+
+`operator-opt` HEAD `116b6a4` 直接编译失败：
+
+```text
+src/storage/exec/GetDstBySrcNode.h:141:11: error: 'nebula::storage::GetDstBySrcNode::scanLimit_' will be initialized after [-Werror=reorder]
+src/storage/exec/GetDstBySrcNode.h:139:8:  error: 'bool nebula::storage::GetDstBySrcNode::sharedDedupLimit_' [-Werror=reorder]
+```
+
+`116b6a4` 给 `GetDstBySrcNode` 加了 `sharedDedupLimit_` 成员，声明放在 `dedup_` 之后、`limit_` 之前，但构造函数的初始化列表仍按旧顺序写（`dedup_`、`limit_`、`scanLimit_`、`sharedDedupLimit_`）。项目开 `-Werror`，`-Wreorder` 直接致命。把初始化列表改成与声明同序即可，两行，不改语义：
+
+```cpp
+      : context_(context),
+        edgeNodes_(edgeNodes),
+        edgeContext_(edgeContext),
+        result_(result),
+        dedup_(dedup),
+        sharedDedupLimit_(sharedDedupLimit),
+        limit_(limit),
+        scanLimit_(scanLimit) {
+```
+
+### 7.2 编译配方
+
+第三方的头文件和库在共享前缀下，但 cmake 认的是 `NEBULA_THIRDPARTY_ROOT`，不是 `CMAKE_PREFIX_PATH`：
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/home/dev/gcc11/usr/bin/gcc-11 \
+  -DCMAKE_CXX_COMPILER=/home/dev/gcc11/usr/bin/g++-11 \
+  -DNEBULA_THIRDPARTY_ROOT=/home/dev/nebula-third-party \
+  -DENABLE_TESTS=OFF
+ninja -C build -j 10 nebula-graphd nebula-storaged nebula-metad
+```
+
+两个坑：只给 `CMAKE_PREFIX_PATH` 时链接行变成 `-L /lib -L /lib64`，报一串 `cannot find -lfolly` / `-lfmt` / `-lwangle`；daemon 还要在自己的工作目录下找到 `share/resources/date_time_zonespec.csv`，否则启动即退（`GraphDaemon.cpp:118 Invalid timezone file`）。
+
+### 7.3 A/B：同一个 metad + storaged + 数据，只换 graphd
+
+用上游 `v3.8.0` 的 graphd（9669）和 `operator-opt` 的 graphd（9670）连同一个 metad/storaged、同一份 reco 数据，跑 [47](47-reco-ngql-pushdown.md) 的 12 条语句。
+
+计划主干 9 条相同，3 条不同：
+
+| 场景 | 上游 | operator-opt |
+|---|---|---|
+| Q3 opt | `Limit → Dedup → Project → HashInnerJoin → TagIndexPrefixScan → Start → ExpandAll → Expand → Argument` | `Limit → Dedup → Expand → Project → TagIndexPrefixScan → Start` |
+| Q5 / Q6 opt | `… Sort → Project → HashInnerJoin → Dedup → Expand …` | `… Sort → HashInnerJoin → Project → Dedup → Expand …` |
+
+Q3 opt 把 `HashInnerJoin + ExpandAll` 收成一次 `Expand`，正是第 2 节那张表里补丁 A 的那条新规则（`PushDistinctLimitDownJoinExpandRule`）；Q5 / Q6 opt 是 `PushProjectDownHashInnerJoinRule` 把投影压到 join 之下。补丁 A 确实存在，只是路径与本文原先的推测不同。
+
+### 7.4 混版本护栏按设计生效
+
+`operator-opt` 的 graphd 配上游的 storaged，带新下推的语句直接报错，不静默降级：
+
+```text
+[ERROR (-1005)]: storaged does not support shared dedup/filter semantics; graphd and storaged versions must match
+```
+
+与第 6 节的判断一致：graphd 与 storaged 必须同版本。
+
+### 7.5 但结果不是逐行一致：并列切分变了
+
+结果层面，同一份数据、同一条语句，两个 graphd 给出的**行集合不同**：
+
+| 场景 | 上游 | operator-opt | 分数多重集 | 差异 |
+|---|---|---|---|---|
+| Q1 / Q2 / Q3 base | 10 / 8 / 1801 | 同 | 同 | 无 |
+| Q4 base | 670 行 | 671 行 | 第一跳 `co_buy` 多重集相同 | 集合不同 |
+| Q5 / Q6 base | 20 / 20 | 20 / 20 | **相同** | 成员不同 |
+
+控制实验：同一条 Q4 base 语句在上游连开 3 个独立会话，行数和 sha 完全一致，所以差异不是运行期抖动。
+
+机制是聚合的**分组输出顺序**变了。上游用 `unordered_map<List, vector<AggData>>`（`AggregateExecutor.cpp:33`），operator-opt 的单键快路径用 `unordered_map<Value, FastGroup>`（`AggregateExecutor.cpp:117`）。哈希键类型不同 → 桶序不同 → `Aggregate` 吐出的分组顺序不同 → 遇到**并列键**时 `TopN` 切出的就不是同一批。
+
+Q4 最直观：第一跳 `co_buy` 分布是 9 → 2 个、8 → 19 个、7 → 66 个、6 → **280** 个，`LIMIT 100` 要在 280 个并列的里面取 100 个，取哪 100 个取决于分组顺序，于是下游 `ext_user` 集合不同（670 vs 671）。
+
+**所以：这些改写在聚合值上等价，在并列切分上不等价。** [47](47-reco-ngql-pushdown.md) 用的「排序后多重集 SHA 相同」这个判据，只有在没有并列键时才等价于「结果相同」；一旦有并列键，它只能证明聚合值一致，不能证明返回的行集合一致。
+
+这一条对 [47](47-reco-ngql-pushdown.md) 本身也成立：Q4 / Q5 / Q6 的 base 与 opt 之所以能对上，是因为那一对是在同一个二进制上比的，聚合输出顺序相同。
+
