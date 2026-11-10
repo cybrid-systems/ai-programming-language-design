@@ -132,7 +132,7 @@ GO FROM "p1" OVER buy REVERSELY YIELD DISTINCT src(edge) AS uid;
 
 ### 3.3 ⚠️ `LIMIT [N]` 不是 per-vertex limit，而且和「改动 1」互斥
 
-`LIMIT [N]` 走的是 GO 段的截断子句。`GoValidator::validateTruncate()`（`src/graph/validator/GoValidator.cpp:107`）要求它是一个**长度等于步数的 LIST**：
+`LIMIT [N]` 走的是 GO 段的截断子句。`GoValidator::validateTruncate()`（`src/graph/validator/GoValidator.cpp:108`）要求它是一个**长度等于步数的 LIST**：
 
 ```
 GO FROM "u1" OVER buy YIELD dst(edge) AS pid LIMIT 200;
