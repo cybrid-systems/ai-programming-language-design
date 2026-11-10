@@ -537,7 +537,7 @@ index 9ee98a9..a61106d 100644
  }
  
 diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
-index 7c5f96f..d16ff10 100644
+index 7c5f96f..326982a 100644
 --- a/src/graph/planner/plan/Query.h
 +++ b/src/graph/planner/plan/Query.h
 @@ -312,6 +312,14 @@ class Expand : public Explore {
@@ -563,6 +563,44 @@ index 7c5f96f..d16ff10 100644
    std::vector<EdgeType> edgeTypes_;
  };
  
+@@ -1842,9 +1851,28 @@ class AppendVertices final : public GetVertices {
+   bool trackPrevPath_{true};
+ };
+ 
++// A projected output column of a HashJoin.  `source` names a column in the
++// join's natural left+right output, `alias` is the name exposed downstream.
++struct JoinOutputColumn {
++  std::string source;
++  std::string alias;
++};
++
+ // Binary Join that joins two results from two inputs.
+ class HashJoin : public BinaryInputNode {
+  public:
++  const std::vector<JoinOutputColumn>& outputColumns() const {
++    return outputColumns_;
++  }
++
++  void setOutputColumns(std::vector<JoinOutputColumn> outputColumns) {
++    outputColumns_ = std::move(outputColumns);
++  }
++
++  bool hasOutputColumns() const {
++    return !outputColumns_.empty();
++  }
++
+   const std::vector<Expression*>& hashKeys() const {
+     return hashKeys_;
+   }
+@@ -1878,6 +1906,8 @@ class HashJoin : public BinaryInputNode {
+  protected:
+   std::vector<Expression*> hashKeys_;
+   std::vector<Expression*> probeKeys_;
++  // If non-empty, only these columns are materialized by the join executor.
++  std::vector<JoinOutputColumn> outputColumns_;
+ };
+ 
+ // Left join
 diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
 index 49b9b33..81797fb 100644
 --- a/src/interface/storage.thrift
@@ -699,7 +737,7 @@ index c7b5f5d..490fc47 100644
  
  }  // namespace storage
 diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
-index 19d13f6..f0004a0 100644
+index 19d13f6..5b58a02 100644
 --- a/src/storage/query/GetDstBySrcProcessor.cpp
 +++ b/src/storage/query/GetDstBySrcProcessor.cpp
 @@ -7,6 +7,10 @@
@@ -713,41 +751,11 @@ index 19d13f6..f0004a0 100644
  #include "common/memory/MemoryTracker.h"
  #include "common/thread/GenericThreadPool.h"
  #include "storage/StorageFlags.h"
-@@ -19,6 +23,207 @@ DEFINE_uint64(max_dedup_threads, 6, "max dedup threads");
+@@ -19,6 +23,60 @@ DEFINE_uint64(max_dedup_threads, 6, "max dedup threads");
  namespace nebula {
  namespace storage {
  
 +namespace {
-+
-+struct RankBounds {
-+  bool hasLo{false};
-+  bool hasHi{false};
-+  bool impossible{false};
-+  EdgeRanking lo{0};
-+  EdgeRanking hi{0};
-+};
-+
-+void intersectRankBounds(RankBounds& dst, const RankBounds& src) {
-+  if (dst.impossible || src.impossible) {
-+    dst.impossible = true;
-+    return;
-+  }
-+  if (src.hasLo) {
-+    if (!dst.hasLo || src.lo > dst.lo) {
-+      dst.lo = src.lo;
-+      dst.hasLo = true;
-+    }
-+  }
-+  if (src.hasHi) {
-+    if (!dst.hasHi || src.hi < dst.hi) {
-+      dst.hi = src.hi;
-+      dst.hasHi = true;
-+    }
-+  }
-+  if (dst.hasLo && dst.hasHi && dst.lo > dst.hi) {
-+    dst.impossible = true;
-+  }
-+}
 +
 +bool isRankProperty(const Expression* expr, const std::string& edgeName) {
 +  if (expr == nullptr ||
@@ -799,129 +807,12 @@ index 19d13f6..f0004a0 100644
 +  return isRankComparison(expr, edgeName);
 +}
 +
-+bool extractRankBounds(const Expression* expr,
-+                       const std::string& edgeName,
-+                       RankBounds& out) {
-+  if (expr == nullptr) {
-+    return false;
-+  }
-+  switch (expr->kind()) {
-+    case Expression::Kind::kLogicalAnd: {
-+      const auto* logic = static_cast<const LogicalExpression*>(expr);
-+      bool any = false;
-+      for (const auto* operand : logic->operands()) {
-+        RankBounds sub;
-+        if (extractRankBounds(operand, edgeName, sub)) {
-+          intersectRankBounds(out, sub);
-+          any = true;
-+        }
-+      }
-+      return any;
-+    }
-+    case Expression::Kind::kRelEQ:
-+    case Expression::Kind::kRelLT:
-+    case Expression::Kind::kRelLE:
-+    case Expression::Kind::kRelGT:
-+    case Expression::Kind::kRelGE: {
-+      const auto* rel = static_cast<const RelationalExpression*>(expr);
-+      const Expression* left = rel->left();
-+      const Expression* right = rel->right();
-+      bool swapped = false;
-+      if (left->kind() == Expression::Kind::kConstant && isRankProperty(right, edgeName)) {
-+        std::swap(left, right);
-+        swapped = true;
-+      }
-+      if (!isRankProperty(left, edgeName) || right->kind() != Expression::Kind::kConstant) {
-+        return false;
-+      }
-+      const auto* constant = static_cast<const ConstantExpression*>(right);
-+      if (!constant->value().isInt()) {
-+        return false;
-+      }
-+      const EdgeRanking v = constant->value().getInt();
-+      auto kind = expr->kind();
-+      if (swapped) {
-+        switch (kind) {
-+          case Expression::Kind::kRelLT: kind = Expression::Kind::kRelGT; break;
-+          case Expression::Kind::kRelLE: kind = Expression::Kind::kRelGE; break;
-+          case Expression::Kind::kRelGT: kind = Expression::Kind::kRelLT; break;
-+          case Expression::Kind::kRelGE: kind = Expression::Kind::kRelLE; break;
-+          default: break;
-+        }
-+      }
-+      switch (kind) {
-+        case Expression::Kind::kRelGE:
-+          out.hasLo = true;
-+          out.lo = v;
-+          return true;
-+        case Expression::Kind::kRelGT:
-+          // RankRange is inclusive.  A strict lower bound v must become v+1;
-+          // v == INT64_MAX therefore describes an empty range.
-+          if (v == std::numeric_limits<EdgeRanking>::max()) {
-+            out.impossible = true;
-+            return true;
-+          }
-+          out.hasLo = true;
-+          out.lo = v + 1;
-+          return true;
-+        case Expression::Kind::kRelLE:
-+          out.hasHi = true;
-+          out.hi = v;
-+          return true;
-+        case Expression::Kind::kRelLT:
-+          // A strict upper bound v must become v-1.
-+          if (v == std::numeric_limits<EdgeRanking>::min()) {
-+            out.impossible = true;
-+            return true;
-+          }
-+          out.hasHi = true;
-+          out.hi = v - 1;
-+          return true;
-+        case Expression::Kind::kRelEQ:
-+          out.hasLo = out.hasHi = true;
-+          out.lo = out.hi = v;
-+          return true;
-+        default:
-+          return false;
-+      }
-+    }
-+    default:
-+      return false;
-+  }
-+}
-+
-+std::optional<RankRange> extractRankRange(const Expression* filter,
-+                                           const std::string& edgeName) {
-+  RankBounds bounds;
-+  if (!extractRankBounds(filter, edgeName, bounds)) {
-+    return std::nullopt;
-+  }
-+  if (!bounds.hasLo && !bounds.hasHi && !bounds.impossible) {
-+    return std::nullopt;
-+  }
-+  RankRange range;
-+  if (bounds.impossible) {
-+    // SingleEdgeNode treats lo > hi as an empty iterator.  Keep the filter
-+    // representable so the caller cannot fall back to an unfiltered scan.
-+    range.lo = std::numeric_limits<EdgeRanking>::max();
-+    range.hi = std::numeric_limits<EdgeRanking>::min();
-+    return range;
-+  }
-+  if (bounds.hasLo) {
-+    range.lo = bounds.lo;
-+  }
-+  if (bounds.hasHi) {
-+    range.hi = bounds.hi;
-+  }
-+  return range;
-+}
-+
 +}  // namespace
 +
  ProcessorCounters kGetDstBySrcCounters;
  
  void GetDstBySrcProcessor::process(const cpp2::GetDstBySrcRequest& req) {
-@@ -49,6 +254,17 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+@@ -49,6 +107,17 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
    this->planContext_ = std::make_unique<PlanContext>(
        this->env_, spaceId_, this->spaceVidLen_, this->isIntId_, req.common_ref());
  
@@ -939,7 +830,7 @@ index 19d13f6..f0004a0 100644
    // check edgetypes exists
    retCode = checkAndBuildContexts(req);
    if (retCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
-@@ -60,15 +276,25 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+@@ -60,15 +129,25 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
    }
  
    dedup_ = req.dedup_ref().value_or(false);
@@ -972,7 +863,7 @@ index 19d13f6..f0004a0 100644
    }
  }
  
-@@ -77,9 +303,17 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
+@@ -77,9 +156,17 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
    contexts_.emplace_back(RuntimeContext(planContext_.get()));
    auto plan = buildPlan(&contexts_.front(), &flatResult_);
    std::unordered_set<PartitionID> failedParts;
@@ -990,7 +881,7 @@ index 19d13f6..f0004a0 100644
        auto vId = src.getStr();
  
        if (!NebulaKeyUtils::isValidVidLen(spaceVidLen_, vId)) {
-@@ -97,6 +331,14 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
+@@ -97,6 +184,14 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
            failedParts.emplace(partId);
            handleErrorCode(ret, spaceId_, partId);
          }
@@ -1005,7 +896,7 @@ index 19d13f6..f0004a0 100644
        }
      }
    }
-@@ -174,6 +416,9 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> GetDstBySrcProces
+@@ -174,6 +269,9 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> GetDstBySrcProces
                          return std::make_pair(nebula::cpp2::ErrorCode::E_STORAGE_MEMORY_EXCEEDED,
                                                partId);
                        }
@@ -1015,20 +906,7 @@ index 19d13f6..f0004a0 100644
                        auto plan = buildPlan(context, result);
                        for (const auto& src : input) {
                          auto& vId = src.getStr();
-@@ -216,16 +461,26 @@ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
-   StoragePlan<VertexID> plan;
-   std::vector<SingleEdgeNode*> edges;
-   for (const auto& ec : edgeContext_.propContexts_) {
-+    std::optional<RankRange> range;
-+    if (filter_ != nullptr) {
-+      range = extractRankRange(filter_, edgeContext_.edgeNames_[ec.first]);
-+    }
-     // Since we only return dst in this processor, some steps would be skipped when iterating
-     // key-values if possible, for example, decoding value
-     auto edge = std::make_unique<SingleEdgeNode>(
--        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true);
-+        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true, std::move(range));
-     edges.emplace_back(edge.get());
+@@ -224,8 +322,14 @@ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
      plan.addNode(std::move(edge));
    }
  
@@ -1045,7 +923,7 @@ index 19d13f6..f0004a0 100644
    for (auto* edge : edges) {
      output->addDependency(edge);
    }
-@@ -244,6 +499,15 @@ nebula::cpp2::ErrorCode GetDstBySrcProcessor::checkAndBuildContexts(
+@@ -244,6 +348,15 @@ nebula::cpp2::ErrorCode GetDstBySrcProcessor::checkAndBuildContexts(
    if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
      return code;
    }
@@ -1061,7 +939,7 @@ index 19d13f6..f0004a0 100644
    return nebula::cpp2::ErrorCode::SUCCEEDED;
  }
  
-@@ -352,6 +616,9 @@ void GetDstBySrcProcessor::onProcessFinished() {
+@@ -352,6 +465,9 @@ void GetDstBySrcProcessor::onProcessFinished() {
    }
    resultDataSet_.rows = std::move(deduped);
    resp_.dsts_ref() = std::move(resultDataSet_);
