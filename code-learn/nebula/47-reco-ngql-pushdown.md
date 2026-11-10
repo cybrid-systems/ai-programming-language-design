@@ -115,7 +115,7 @@ opt，文件 [q1-opt.ngql](bench/reco/pushdown/q1-opt.ngql)：
 GO FROM 2 OVER buy WHERE buy._rank >= 1761436800 - 1800 YIELD buy._dst AS pid, buy._rank AS ts | ORDER BY $-.ts DESC | LIMIT 10
 ```
 
-下推前（optimize 304 µs）：
+下推前（optimize 320 µs）：
 
 ```text
 TopN count=10 factors=ts DESC
@@ -129,7 +129,7 @@ TopN count=10 factors=ts DESC
             Start
 ```
 
-下推后（optimize 90 µs）：
+下推后（optimize 150 µs）：
 
 ```text
 TopN count=10 factors=ts DESC
@@ -145,7 +145,7 @@ graphd 上的 `Filter` 没有了。rank 比较在 `ExpandAll.filter` 里，字�
 
 结果多重集 SHA-256 都是 `58819b84f72b41a1e04a9d1ff3659287fd121d7e5f9f8e94f158055eb419bc20`。前五行与 [buy_manifest.json](bench/reco/out/buy_manifest.json) 的 `q1_user_2` 一致，首行 `(10000019766, 1761436409)`。
 
-server p50 580 → 282 µs。wall p50 704 → 407 µs。
+server p50 493 → 315 µs。wall p50 649 → 461 µs。
 
 ---
 
@@ -163,7 +163,7 @@ opt，文件 [q2-opt.ngql](bench/reco/pushdown/q2-opt.ngql)：
 GO FROM 2 OVER expose YIELD DISTINCT expose._dst AS pid MINUS GO FROM 2 OVER buy YIELD DISTINCT buy._dst AS pid
 ```
 
-下推前（optimize 86 µs）。两侧对称，左边 expose 类型 16，右边 buy 类型 15：
+下推前（optimize 58 µs）。两侧对称，左边 expose 类型 16，右边 buy 类型 15：
 
 ```text
 Minus
@@ -178,7 +178,7 @@ Minus
       ExpandAll ... 同上，另一条边
 ```
 
-下推后（optimize 72 µs）：
+下推后（optimize 50 µs）：
 
 ```text
 Minus
@@ -194,7 +194,7 @@ Minus
 
 两侧都不再解码边 value。`getDstBySrc` 在 storaged 里去重之后，graphd 仍保留 `Dedup`。`MINUS` 仍是 graphd 上的两次结果相减，没有合成一次 storage 调用。
 
-结果 8 行，SHA-256 都是 `7d6a1faae17baef402be4b030792a49c63f56f29a0e156db885ba67f91ea45a6`，与 manifest 里 user 2 的 8 个曝光差集一致。server p50 324 → 270 µs，样本区间重叠。
+结果 8 行，SHA-256 都是 `7d6a1faae17baef402be4b030792a49c63f56f29a0e156db885ba67f91ea45a6`，与 manifest 里 user 2 的 8 个曝光差集一致。server p50 349 → 262 µs，样本区间重叠。
 
 ---
 
@@ -214,7 +214,7 @@ opt，文件 [q3-opt.ngql](bench/reco/pushdown/q3-opt.ngql)：
 LOOKUP ON product WHERE product.type == 1 YIELD id(vertex) AS pid | GO FROM $-.pid OVER buy REVERSELY WHERE buy._rank >= 1761436800 - 7776000 YIELD buy._dst AS uid | YIELD DISTINCT $-.uid AS high_potential_user | LIMIT 5000
 ```
 
-下推前（optimize 657 µs）：
+下推前（optimize 731 µs）：
 
 ```text
 Limit count=5000
@@ -233,7 +233,7 @@ Limit count=5000
                 Argument
 ```
 
-下推后（optimize 266 µs）：
+下推后（optimize 206 µs）：
 
 ```text
 Limit count=5000
@@ -252,7 +252,7 @@ Limit count=5000
 
 索引扫描还在。graphd `Filter` 没有了，90 天比较进了反向 `ExpandAll`。因为 `WHERE` 还在，这条 `GO` 不是简单计划，存储入口仍是 `GetNeighbors`。`LIMIT 5000` 在 `Dedup` 之上，没有进 `ExpandAll`。返回 1801 行，小于 5000，这个 limit 没有截断结果。
 
-SHA-256 都是 `45e59fd185d339542050700fd013ad009249ef0e6de5d0b4110b6ee8995c4dc2`。server p50 13199 → 9440 µs。wall p50 18074 → 14323 µs。
+SHA-256 都是 `45e59fd185d339542050700fd013ad009249ef0e6de5d0b4110b6ee8995c4dc2`。server p50 13180 → 9102 µs。wall p50 17995 → 13787 µs。
 
 ---
 
@@ -345,7 +345,7 @@ opt，文件 [q5-opt.ngql](bench/reco/pushdown/q5-opt.ngql)：
 GO FROM 2 OVER buy YIELD DISTINCT buy._dst AS x | GO FROM $-.x OVER buy REVERSELY YIELD DISTINCT buy._dst AS u2 | GO FROM $-.u2 OVER buy YIELD buy._dst AS y | ORDER BY $-.y | GROUP BY $-.y YIELD $-.y AS rec_item, COUNT(1) AS score | ORDER BY $-.score DESC | LIMIT 20
 ```
 
-下推前（optimize 235 µs）：
+下推前（optimize 288 µs）：
 
 ```text
 TopN count=20 factors=score DESC
@@ -368,7 +368,7 @@ TopN count=20 factors=score DESC
             edgeProps: 全部 buy 属性
 ```
 
-下推后（optimize 177 µs）：
+下推后（optimize 213 µs）：
 
 ```text
 TopN count=20 factors=score DESC
@@ -392,7 +392,7 @@ TopN count=20 factors=score DESC
 
 第一跳、第二跳收成 `Expand`。第三跳仍是 `ExpandAll`，因为 `COUNT(1)` 需要每条边一行；边列从整条边收成 `buy._dst`。两边都有 `Sort`，它来自 `ORDER BY $-.y`，聚合留在 graphd。`TopN 20` 留在 graphd。
 
-20 行相同，SHA-256 `5c0ebd20c7c71f420899f1af3ba0fb3f85a40ebcb7dcfdecadb728b4d346a5c3`。样本前三行 `(10000027663, 8)`、`(10000017204, 6)`、`(10000041658, 5)`。server p50 2414 → 1722 µs。
+20 行相同，SHA-256 `5c0ebd20c7c71f420899f1af3ba0fb3f85a40ebcb7dcfdecadb728b4d346a5c3`。样本前三行 `(10000027663, 8)`、`(10000017204, 6)`、`(10000041658, 5)`。server p50 2402 → 1565 µs。
 
 ---
 
@@ -412,7 +412,7 @@ opt，文件 [q6-opt.ngql](bench/reco/pushdown/q6-opt.ngql)：
 GO FROM 10000031733 OVER buy REVERSELY YIELD DISTINCT buy._dst AS uid | GO FROM $-.uid OVER buy WHERE buy._dst != 10000031733 YIELD buy._dst AS item | ORDER BY $-.item | GROUP BY $-.item YIELD $-.item AS rec_item, COUNT(1) AS score | ORDER BY $-.score DESC | LIMIT 20
 ```
 
-下推前（optimize 511 µs）：
+下推前（optimize 502 µs）：
 
 ```text
 TopN count=20 factors=score DESC
@@ -432,7 +432,7 @@ TopN count=20 factors=score DESC
                 edgeProps: 全部 buy 属性
 ```
 
-下推后（optimize 219 µs）：
+下推后（optimize 276 µs）：
 
 ```text
 TopN count=20 factors=score DESC
@@ -453,7 +453,7 @@ TopN count=20 factors=score DESC
 
 第一跳收成 `Expand`。第二跳的不等谓词在 `ExpandAll.filter` 里，graphd `Filter` 节点没有了，边列只剩 `buy._dst`。`Sort`、`Aggregate`、`TopN` 仍在 graphd。谓词是目的 VID 不等，不是 rank 范围。
 
-20 行相同，SHA-256 `d4500be032c76abe085765c447d86dfd0a6d3f39858d58bdac7f66f8567dc6e3`。样本分数都是 1，首行 `10000042680`。server p50 1338 → 886 µs。
+20 行相同，SHA-256 `d4500be032c76abe085765c447d86dfd0a6d3f39858d58bdac7f66f8567dc6e3`。样本分数都是 1，首行 `10000042680`。server p50 1316 → 893 µs。
 
 ---
 
