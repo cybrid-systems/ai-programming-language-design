@@ -1,2 +1,2 @@
 USE reco;
-UNWIND range(1, 10000) AS uid | GO FROM $-.uid OVER buy YIELD dst(edge) AS pid, $$.product.type AS t | GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy | ORDER BY $-.co_buy DESC | LIMIT 100 | GO FROM $-.pid OVER buy REVERSELY YIELD DISTINCT src(edge) AS ext_user | LIMIT 100000;
+UNWIND range(1, 10000) AS uid | GO FROM $-.uid OVER buy YIELD dst(edge) AS pid | ORDER BY $-.pid | GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy | ORDER BY $-.co_buy DESC | LIMIT 100 | GO FROM $-.pid OVER buy REVERSELY YIELD DISTINCT src(edge) AS ext_user | LIMIT 100000;

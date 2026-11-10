@@ -21,13 +21,13 @@
 | Q1 最近购买 | 时间窗写进 `GO WHERE buy._rank`，投影改成 `buy._dst` / `buy._rank` | `ExpandAll.filter=(buy._rank>=1761435000)`，边列只剩 `_rank`、`_dst`。`ORDER BY ts DESC \| LIMIT 10` 仍是 graphd `TopN` |
 | Q2 曝光减购买 | `dst(edge)` 改成 `expose._dst` / `buy._dst` | 两侧从 `ExpandAll` 收成 `Expand`（`_dst` only）。`MINUS` 仍在 graphd |
 | Q3 美妆高潜用户 | 反向边用 `buy._dst`，90 天窗写进 `GO WHERE buy._rank` | `ExpandAll.filter=(buy._rank>=1753660800)`，边类型 `-15`，边列 `_rank`、`_dst`。`Dedup` 和 `Limit 5000` 仍在 graphd |
-| Q4 种子扩展 | 第一跳只投影 `buy._dst`；`ORDER BY $-.pid` 再 `GROUP BY`；第二跳 `YIELD DISTINCT buy._dst` | 第一跳去掉 `GetVertices`。第二跳从 `ExpandAll` 收成 `Expand`（类型 `-15`，只 `_dst`）。`Aggregate` / `TopN 100` / `Limit 100000` 仍在 graphd |
+| Q4 种子扩展 | 第一跳只投影 `buy._dst`；`ORDER BY $-.pid` 再 `GROUP BY`；第二跳 `YIELD DISTINCT buy._dst` | 第一跳边列从「全部 buy 属性」收成 `buy._dst`。第二跳从 `ExpandAll` 收成 `Expand`（类型 `-15`，只 `_dst`）。`Aggregate` / `TopN 100` / `Limit 100000` 仍在 graphd |
 | Q5 UserCF | 前两跳 `YIELD DISTINCT buy._dst`；第三跳只投影 `buy._dst`，保留重复边再 `COUNT` | 前两跳收成 `Expand`。第三跳 `ExpandAll` 的边列只剩 `buy._dst`。`Aggregate` 和 `TopN 20` 仍在 graphd |
 | Q6 ItemCF | 第一跳 `YIELD DISTINCT buy._dst`；种子排除写进第二跳 `WHERE buy._dst != ...` | 第一跳收成 `Expand`（类型 `-15`）。第二跳 `ExpandAll.filter=(buy._dst!=10000031733)`，边列只剩 `buy._dst`。graphd `Filter` 节点消失 |
 
 `ExpandAll` 是 `GetNeighbors` 那条路径，过滤和列裁剪写在这个节点上。计划里它下面通常还挂着一个只标边类型的 `Expand`，那是 GO 的骨架，存储入口仍是上面的 `ExpandAll`。没有 `ExpandAll`、只剩 `Expand` 且 `edgeProps` 只有 `_dst` 时，走的是简单计划 `getDstBySrc`。
 
-这六条都没有把全局 `LIMIT` 写进 `GO` 的逐步 `LIMIT [n]`。`ExpandAll.limit` 在 JSON 里仍是 `9223372036854775807`。Q4 / Q5 / Q6 在 `GROUP BY` 前的 `ORDER BY` 是为了让本二进制上的聚合读到 VID 键，计划里对应一个 graphd `Sort`，不减少 storage 回传。
+这六条都没有把全局 `LIMIT` 写进 `GO` 的逐步 `LIMIT [n]`。`ExpandAll.limit` 在 JSON 里仍是 `9223372036854775807`。Q4 / Q5 / Q6 在 `GROUP BY` 前的 `ORDER BY` 不是排序语义，是这个二进制上聚合要读到 VID 键的前提：少了它，`GROUP BY $.pid` 只分出一组（实测整条 Q4 返回 0 行，单独跑第一跳聚合返回 1 行）。计划里它对应一个 graphd `Sort`，不减少 storage 回传。
 
 ---
 
@@ -75,27 +75,27 @@
 
 | 查询 | 行数 base / opt | 多重集 | server p50 base | server p50 opt | 比值 | wall p50 base | wall p50 opt |
 |------|-----------------|--------|-----------------|----------------|------|---------------|--------------|
-| Q1 | 10 / 10 | 相同 | 580 | 282 | 2.06 | 704 | 407 |
-| Q2 | 8 / 8 | 相同 | 324 | 270 | 1.20 | 418 | 359 |
-| Q3 | 1801 / 1801 | 相同 | 13199 | 9440 | 1.40 | 18074 | 14323 |
-| Q4 | 669 / 670 | 不同 | 205686 | 73392 | 2.80 | 207843 | 75354 |
-| Q5 | 20 / 20 | 相同 | 2414 | 1722 | 1.40 | 2596 | 1889 |
-| Q6 | 20 / 20 | 相同 | 1338 | 886 | 1.51 | 1530 | 1048 |
+| Q1 | 10 / 10 | 相同 | 493 | 315 | 1.57 | 649 | 461 |
+| Q2 | 8 / 8 | 相同 | 349 | 262 | 1.33 | 463 | 361 |
+| Q3 | 1801 / 1801 | 相同 | 13180 | 9102 | 1.45 | 17995 | 13787 |
+| Q4 | 670 / 670 | 相同 | 139191 | 74859 | 1.86 | 141099 | 76841 |
+| Q5 | 20 / 20 | 相同 | 2402 | 1565 | 1.53 | 2611 | 1729 |
+| Q6 | 20 / 20 | 相同 | 1316 | 893 | 1.47 | 1473 | 1052 |
 
 5 次 server latency 样本：
 
 | 查询 | base | opt |
 |------|------|-----|
-| Q1 | 610, 544, 580, 621, 510 | 280, 282, 288, 319, 255 |
-| Q2 | 325, 291, 366, 324, 288 | 326, 270, 260, 234, 352 |
-| Q3 | 13199, 12587, 13426, 12791, 13298 | 9621, 9645, 9357, 9434, 9440 |
-| Q4 | 212083, 205686, 194454, 206696, 190087 | 75186, 73097, 73392, 73232, 74028 |
-| Q5 | 2505, 2563, 2315, 2414, 2309 | 1722, 1841, 1577, 2038, 1602 |
-| Q6 | 1382, 1568, 1338, 1305, 1290 | 971, 798, 824, 963, 886 |
+| Q1 | 623, 493, 479, 643, 454 | 369, 315, 293, 316, 309 |
+| Q2 | 349, 332, 352, 639, 343 | 331, 247, 229, 262, 341 |
+| Q3 | 12755, 14585, 13610, 12341, 13180 | 9151, 9267, 8882, 8942, 9102 |
+| Q4 | 146296, 151904, 137454, 135568, 139191 | 74859, 74960, 73014, 74069, 76856 |
+| Q5 | 2362, 2506, 2402, 2640, 2371 | 1565, 1711, 1565, 1720, 1528 |
+| Q6 | 1311, 1322, 1316, 1401, 1270 | 893, 807, 896, 819, 948 |
 
-Q1、Q3、Q4、Q5、Q6 的 opt 最大值都低于 base 最小值。Q2 两侧区间重叠（opt 最大 352，base 最小 288），中位数仍从 324 降到 270。Q2 这条在当前数据量上的差距很小。
+Q1、Q3、Q4、Q5、Q6 的 opt 最大值都低于 base 最小值。Q2 两侧区间重叠（opt 最大 341，base 最小 332），中位数仍从 349 降到 262。Q2 这条在当前数据量上的差距很小。
 
-Q4 的行数不同来自 `co_buy=6` 的 Top100 切分，见第 9 节。它的时延差主要来自基线第一跳为了 `$$.product.type` 去拉顶点。
+六条的多重集现在全部相同。Q4 的基线和 opt 只差 `dst(edge)`→`buy._dst` 这一处改写，行数和 SHA-256 都一致（670 行，`51e9d529…`），见第 9 节。它的时延差来自第一跳的边列裁剪：基线把全部 buy 属性拉回 graphd，opt 只取 `buy._dst`。
 
 ---
 
@@ -258,12 +258,12 @@ SHA-256 都是 `45e59fd185d339542050700fd013ad009249ef0e6de5d0b4110b6ee8995c4dc2
 
 ## 9. Q4 种子共买再扩用户
 
-基线第一跳带 `$$.product.type`，聚合才能读到商品 VID；第二跳用 `src(edge)`。opt 第一跳只拿 `buy._dst`，用 `ORDER BY $-.pid` 把行物化后再聚合；第二跳 `YIELD DISTINCT buy._dst`。
+基线和 opt 只差两处：`dst(edge)` → `buy._dst`、`src(edge)` → `buy._dst`。两侧第一跳都在 `GROUP BY` 前带 `| ORDER BY $-.pid`——这不是排序语义，而是这个二进制上聚合要读到 VID 键的前提（见第 12 节）。
 
 基线：
 
 ```ngql
-UNWIND range(1, 10000) AS uid | GO FROM $-.uid OVER buy YIELD dst(edge) AS pid, $$.product.type AS t | GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy | ORDER BY $-.co_buy DESC | LIMIT 100 | GO FROM $-.pid OVER buy REVERSELY YIELD DISTINCT src(edge) AS ext_user | LIMIT 100000
+UNWIND range(1, 10000) AS uid | GO FROM $-.uid OVER buy YIELD dst(edge) AS pid | ORDER BY $-.pid | GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy | ORDER BY $-.co_buy DESC | LIMIT 100 | GO FROM $-.pid OVER buy REVERSELY YIELD DISTINCT src(edge) AS ext_user | LIMIT 100000
 ```
 
 opt，文件 [q4-opt.ngql](bench/reco/pushdown/q4-opt.ngql)：
@@ -272,7 +272,7 @@ opt，文件 [q4-opt.ngql](bench/reco/pushdown/q4-opt.ngql)：
 UNWIND range(1, 10000) AS uid | GO FROM $-.uid OVER buy YIELD buy._dst AS pid | ORDER BY $-.pid | GROUP BY $-.pid YIELD $-.pid AS pid, COUNT(*) AS co_buy | ORDER BY $-.co_buy DESC | LIMIT 100 | GO FROM $-.pid OVER buy REVERSELY YIELD DISTINCT buy._dst AS ext_user | LIMIT 100000
 ```
 
-下推前（optimize 293 µs）：
+下推前（optimize 249 µs）：
 
 ```text
 Limit count=100000
@@ -281,18 +281,15 @@ Limit count=100000
       HashInnerJoin
         TopN count=100 factors=co_buy DESC
           Aggregate groupKeys=$-.pid
-            Project dst(EDGE) AS pid, $__COL_0 AS t
-              HashInnerJoin
-                Unwind
-                  Start
-                HashLeftJoin
+            Sort factors=pid ASC
+              Project dst(EDGE) AS pid
+                HashInnerJoin
+                  Unwind
+                    Start
                   ExpandAll joinInput=true type 15 filter=<empty>
                     edgeProps: 全部 buy 属性
-                    edgeColumns: EDGE AS EDGE, *._dst AS _expandall_dst
+                    edgeColumns: EDGE AS EDGE
                     Expand props=_dst
-                      Argument
-                  Project $$.product.type AS __COL_0
-                    GetVertices dedup=1
                       Argument
         ExpandAll joinInput=true type -15 filter=<empty>
           edgeProps: 全部 buy 属性
@@ -301,7 +298,7 @@ Limit count=100000
             Argument
 ```
 
-下推后（optimize 234 µs）：
+下推后（optimize 229 µs）：
 
 ```text
 Project COLUMN[0]
@@ -322,19 +319,13 @@ Project COLUMN[0]
                       Argument
 ```
 
-第一跳不再 `GetVertices`，边列只剩 `buy._dst`。`Sort` 是 `ORDER BY $-.pid`，在聚合之前。第二跳没有 `ExpandAll`，`Expand` 只带 `_dst`，边类型 `-15`，`joinInput=false`，上面才是 graphd `Dedup` 和 `Limit 100000`。第一跳没有 rank 谓词，所以这条 `ExpandAll` 的 filter 仍是空的。`TopN 100` 仍在 graphd，输入仍是全部共买计数。
+两侧第一跳都不再拉顶点，`GetVertices` 从计划里消失。差别在边列：基线把全部 buy 属性拉回 graphd，opt 的 `ExpandAll` 只回 `buy._dst`。`Sort` 是 `ORDER BY $-.pid`，在聚合之前。第二跳没有 `ExpandAll`，`Expand` 只带 `_dst`，边类型 `-15`，`joinInput=false`，上面才是 graphd `Dedup` 和 `Limit 100000`。第一跳没有 rank 谓词，所以这条 `ExpandAll` 的 filter 仍是空的。`TopN 100` 仍在 graphd，输入仍是全部共买计数。
 
-全语句结果：基线 669 行，SHA-256 `ee84408f614fe76dc665485820f0c083e740ab98dc8079eb3de3c3d8c2aaa48e`。opt 670 行，SHA-256 `51e9d5295d9e5e77ee005c37a60d9f3e73c9ec972fcbe833399325367e1442b5`。
+全语句结果：两侧都是 670 行，SHA-256 都是 `51e9d5295d9e5e77ee005c37a60d9f3e73c9ec972fcbe833399325367e1442b5`。
 
-差在 Top100 的并列切分。测量后又单独跑了第一跳的 `GROUP BY ... LIMIT 100`（各一次，不计入上表）：两边直方图都是 `co_buy` 9 有 2 个、8 有 19 个、7 有 66 个、6 有 13 个。交集 89 个商品，`COUNT` 全部一致。`co_buy>=7` 的 87 个都在交集里。剩下 13 个名额是 `co_buy=6`，其中 2 个商品两边都在，各有 11 个只出现在一边。
+这里要修正本篇早先一版记录里的一个测量缺陷：基线原本多投影了 `$$.product.type`，于是第一跳走 `GetVertices` 把 vid 物化；opt 则用 `| ORDER BY $-.pid` 物化。两条不是同一个查询，`ORDER BY co_buy DESC | LIMIT 100` 在相等键上切哪几个取决于进入 `TopN` 的顺序，于是集合差 1 行，`co_buy=6` 的并列切分被误记成了下推的副作用。把基线也换成 `| ORDER BY $-.pid`、去掉 `$$.product.type` 后，两侧只差 `dst(edge)`/`src(edge)` 到 `_dst` 的改写，逐行一致。
 
-只在基线 Top100：`10000010368`、`10000011250`、`10000011254`、`10000011927`、`10000018969`、`10000020359`、`10000022400`、`10000033659`、`10000035722`、`10000042668`、`10000048627`。
-
-只在 opt Top100：`10000031459`、`10000031660`、`10000032229`、`10000032339`、`10000039895`、`10000039999`、`10000040091`、`10000040159`、`10000040334`、`10000044677`、`10000044931`。
-
-这些商品的 `co_buy` 都是 6。`ORDER BY co_buy DESC | LIMIT 100` 在相等键上切哪 13 个，取决于进入 `TopN` 的顺序。两条语句的最终用户集因此差 1 行。共享商品上的计数没有分叉。
-
-server p50 205686 → 73392 µs。wall p50 207843 → 75354 µs。
+server p50 139191 → 74859 µs。wall p50 141099 → 76841 µs。
 
 ---
 
@@ -472,6 +463,7 @@ TopN count=20 factors=score DESC
 
 - `ORDER BY ... LIMIT` 仍是 graphd `TopN`。`ExpandAll` 不带 order，limit 仍是 int64 最大值。
 - `GROUP BY` / `COUNT` 仍整段在 graphd。Q4 第一跳、Q5 第三跳、Q6 第二跳把计过数的行全部拉回 graphd 再聚合。
+- `GROUP BY` 的分组键要靠 `ORDER BY` 物化。`GO ... YIELD dst(edge) AS pid | GROUP BY $.pid ...` 在这个二进制上只分出一组；先加 `| ORDER BY $-.pid`（或让投影多带一列触发 `GetVertices`）才得到正确的分组数。这是 Q4 / Q5 / Q6 都要带 `ORDER BY` 的原因，也是基线与 opt 必须同形的原因。
 - `MINUS` 仍在 graphd。Q2 仍是 expose、buy 各一次 `getDstBySrc`。
 - Q4 第二跳的 `Dedup + Limit` 没有提前停。这条 `GO` 没有 rank 谓词，`Expand` 上面也还有 `Project`。
 - rank 谓词写进了 `ExpandAll.filter`。本次 EXPLAIN 看不到它变成从 rank 上界往回走的迭代器。
