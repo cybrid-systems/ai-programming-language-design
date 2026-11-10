@@ -1,0 +1,190 @@
+diff --git a/src/graph/context/ast/QueryAstContext.h b/src/graph/context/ast/QueryAstContext.h
+index 36057a0..83f41ab 100644
+--- a/src/graph/context/ast/QueryAstContext.h
++++ b/src/graph/context/ast/QueryAstContext.h
+@@ -82,6 +82,11 @@ struct GoContext final : AstContext {
+   StepClause steps;
+   Over over;
+   Expression* filter{nullptr};
++  // Original edge-only filter expression.  When the filter has been fully
++  // evaluated in storage, storageFilter is the expression sent to storage and
++  // filterFullyPushed is true; graphd does not build a residual Filter node.
++  Expression* storageFilter{nullptr};
++  bool filterFullyPushed{false};
+   YieldColumns* yieldExpr;
+   bool distinct{false};
+   // true: sample, false: limit
+@@ -98,6 +103,9 @@ struct GoContext final : AstContext {
+   bool isSimple{false};
+ 
+   ExpressionProps exprProps;
++  // Properties needed by the returned columns only.  Used to trim filter-only
++  // properties from the storage response when the filter is fully pushed.
++  ExpressionProps yieldProps;
+ 
+   // save dst prop
+   YieldColumns* dstPropsExpr;
+diff --git a/src/graph/planner/ngql/GoPlanner.cpp b/src/graph/planner/ngql/GoPlanner.cpp
+index 3f9b36e..9b47a9c 100644
+--- a/src/graph/planner/ngql/GoPlanner.cpp
++++ b/src/graph/planner/ngql/GoPlanner.cpp
+@@ -33,7 +33,10 @@ std::unique_ptr<GoPlanner::EdgeProps> GoPlanner::buildEdgeProps(bool onlyDst) {
+ }
+ 
+ void GoPlanner::doBuildEdgeProps(std::unique_ptr<EdgeProps>& eProps, bool onlyDst, bool isInEdge) {
+-  const auto& exprProps = goCtx_->exprProps;
++  // When an edge-only WHERE clause is fully evaluated by storage, filter-only
++  // properties must not be requested as response columns.  Storage still adds
++  // them to its filter context from the storage filter expression.
++  const auto& exprProps = goCtx_->filterFullyPushed ? goCtx_->yieldProps : goCtx_->exprProps;
+   for (const auto& e : goCtx_->over.edgeTypes) {
+     EdgeProp ep;
+     if (isInEdge) {
+@@ -261,7 +264,13 @@ SubPlan GoPlanner::doPlan() {
+   }
+ 
+   if (goCtx_->filter != nullptr) {
+-    dep = Filter::make(qctx, dep, goCtx_->filter);
++    if (goCtx_->filterFullyPushed) {
++      // Storage evaluates the complete edge filter; no residual graph Filter
++      // is needed and filter-only properties can stay out of edgeColumns.
++      expandAll->setFilter(goCtx_->storageFilter);
++    } else {
++      dep = Filter::make(qctx, dep, goCtx_->filter);
++    }
+   }
+ 
+   dep = Project::make(qctx, dep, goCtx_->yieldExpr);
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 662d7a5..7d3661c 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -82,6 +82,10 @@ DEFINE_bool(disable_octal_escape_char,
+ DEFINE_bool(enable_experimental_feature, false, "Whether to enable experimental feature");
+ DEFINE_bool(enable_data_balance, true, "Whether to enable data balance feature");
+ 
++DEFINE_bool(enable_filter_only_prop_prune,
++            true,
++            "Do not return edge properties used only by a fully pushed storage filter");
++
+ DEFINE_int32(num_rows_to_check_memory, 1024, "number rows to check memory");
+ DEFINE_int32(max_sessions_per_ip_per_user,
+              300,
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index 8713911..4b65127 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -60,6 +60,7 @@ DECLARE_int64(max_allowed_connections);
+ 
+ DECLARE_bool(enable_experimental_feature);
+ DECLARE_bool(enable_data_balance);
++DECLARE_bool(enable_filter_only_prop_prune);
+ 
+ DECLARE_bool(enable_client_white_list);
+ DECLARE_string(client_white_list);
+diff --git a/src/graph/validator/GoValidator.cpp b/src/graph/validator/GoValidator.cpp
+index 518a017..8fb300a 100644
+--- a/src/graph/validator/GoValidator.cpp
++++ b/src/graph/validator/GoValidator.cpp
+@@ -6,6 +6,7 @@
+ #include "graph/validator/GoValidator.h"
+ 
+ #include "graph/planner/plan/Logic.h"
++#include "graph/service/GraphFlags.h"
+ #include "graph/util/ExpressionUtils.h"
+ #include "graph/util/ValidateUtil.h"
+ #include "graph/visitor/ExtractPropExprVisitor.h"
+@@ -92,6 +93,17 @@ Status GoValidator::validateWhere(WhereClause* where) {
+ 
+   NG_RETURN_IF_ERROR(deduceProps(filter, goCtx_->exprProps, &tagIds_, &goCtx_->over.edgeTypes));
+   goCtx_->filter = filter;
++
++  // A one-step GO filter that only references edge properties can be evaluated
++  // entirely by storage.  Keep the original expression for the storage request
++  // and avoid returning its properties to graphd (unless YIELD also uses them).
++  // Multi-step filters and filters involving input/tag/dst properties keep the
++  // existing graph-side Filter path.
++  if (FLAGS_enable_filter_only_prop_prune && goCtx_->steps.mSteps() == 1 &&
++      goCtx_->steps.nSteps() == 1 && isEdgeOnlyFilter(filter)) {
++    goCtx_->storageFilter = filter->clone();
++    goCtx_->filterFullyPushed = true;
++  }
+   return Status::OK();
+ }
+ 
+@@ -153,6 +165,8 @@ Status GoValidator::validateYield(YieldClause* yield) {
+     auto type = typeStatus.value();
+     outputs_.emplace_back(colName, type);
+     NG_RETURN_IF_ERROR(deduceProps(colExpr, exprProps, &tagIds_, &goCtx_->over.edgeTypes));
++    NG_RETURN_IF_ERROR(
++        deduceProps(colExpr, goCtx_->yieldProps, &tagIds_, &goCtx_->over.edgeTypes));
+   }
+ 
+   const auto& over = goCtx_->over;
+@@ -249,7 +263,7 @@ Status GoValidator::buildColumns() {
+ 
+   std::unordered_set<std::string> uniqueEdgeVertexExpr;
+   auto filter = goCtx_->filter;
+-  if (filter != nullptr) {
++  if (filter != nullptr && !goCtx_->filterFullyPushed) {
+     NG_RETURN_IF_ERROR(extractPropExprs(filter, uniqueEdgeVertexExpr));
+     goCtx_->filter = rewrite2VarProp(filter);
+   }
+@@ -264,6 +278,44 @@ Status GoValidator::buildColumns() {
+   return Status::OK();
+ }
+ 
++bool GoValidator::isEdgeOnlyFilter(const Expression* expr) const {
++  if (expr == nullptr) {
++    return false;
++  }
++  // Filters that need graph-side columns or vertex/tag values cannot be
++  // evaluated by the storage traversal path in this first version.
++  static const std::unordered_set<Expression::Kind> unsupported = {
++      Expression::Kind::kInputProperty,
++      Expression::Kind::kVarProperty,
++      Expression::Kind::kTagProperty,
++      Expression::Kind::kLabelTagProperty,
++      Expression::Kind::kSrcProperty,
++      Expression::Kind::kDstProperty,
++      Expression::Kind::kVertex,
++      Expression::Kind::kEdge,
++      Expression::Kind::kColumn,
++      Expression::Kind::kLabelAttribute,
++      Expression::Kind::kVar,
++      Expression::Kind::kVersionedVar,
++      Expression::Kind::kMatchPathPattern,
++      Expression::Kind::kESQUERY,
++      Expression::Kind::kPathBuild,
++      Expression::Kind::kAggregate,
++      Expression::Kind::kPredicate,
++      Expression::Kind::kListComprehension,
++      Expression::Kind::kReduce};
++  if (ExpressionUtils::hasAny(expr, unsupported)) {
++    return false;
++  }
++  static const std::unordered_set<Expression::Kind> edgeRefs = {
++      Expression::Kind::kEdgeProperty,
++      Expression::Kind::kEdgeRank,
++      Expression::Kind::kEdgeSrc,
++      Expression::Kind::kEdgeDst,
++      Expression::Kind::kEdgeType};
++  return ExpressionUtils::hasAny(expr, edgeRefs);
++}
++
+ bool GoValidator::checkDstPropOrVertexExist(const Expression* expr) {
+   auto filterExprs = ExpressionUtils::collectAll(
+       expr, {Expression::Kind::kVertex, Expression::Kind::kDstProperty});
+diff --git a/src/graph/validator/GoValidator.h b/src/graph/validator/GoValidator.h
+index 5a7a42f..b1e1206 100644
+--- a/src/graph/validator/GoValidator.h
++++ b/src/graph/validator/GoValidator.h
+@@ -44,6 +44,8 @@ class GoValidator final : public Validator {
+ 
+   bool checkDstPropOrVertexExist(const Expression* expr);
+ 
++  bool isEdgeOnlyFilter(const Expression* expr) const;
++
+   bool isSimpleCase();
+ 
+  private:

@@ -1,0 +1,360 @@
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index a86032b..044c1f8 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -114,7 +114,9 @@ StorageRpcRespFuture<cpp2::GetNeighborsResponse> StorageClient::getNeighbors(
+ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     const CommonRequestParam& param,
+     const std::vector<Value>& vertices,
+-    const std::vector<EdgeType>& edgeTypes) {
++    const std::vector<EdgeType>& edgeTypes,
++    bool dedup,
++    int64_t limit) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -137,6 +139,8 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     req.parts_ref() = std::move(c.second);
+     req.edge_types_ref() = edgeTypes;
+     req.common_ref() = common;
++    req.dedup_ref() = dedup;
++    req.limit_ref() = limit;
+   }
+ 
+   return collectResponse(param.evb,
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index f60dc77..c75051f 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -84,7 +84,9 @@ class StorageClient
+   StorageRpcRespFuture<cpp2::GetDstBySrcResponse> getDstBySrc(
+       const CommonRequestParam& param,
+       const std::vector<Value>& vertices,
+-      const std::vector<EdgeType>& edgeTypes);
++      const std::vector<EdgeType>& edgeTypes,
++      bool dedup = false,
++      int64_t limit = -1);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
+index edb388f..79412ea 100644
+--- a/src/graph/executor/query/ExpandExecutor.cpp
++++ b/src/graph/executor/query/ExpandExecutor.cpp
+@@ -76,7 +76,9 @@ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
+                                           qctx_->plan()->isProfileEnabled());
+   std::vector<Value> vids(nextStepVids_.size());
+   std::move(nextStepVids_.begin(), nextStepVids_.end(), vids.begin());
+-  return storageClient->getDstBySrc(param, std::move(vids), expand_->edgeTypes())
++  const bool dedup = expand_->dedup();
++  const int64_t limit = expand_->limitExpr() == nullptr ? -1 : expand_->limit(qctx());
++  return storageClient->getDstBySrc(param, std::move(vids), expand_->edgeTypes(), dedup, limit)
+       .via(runner())
+       .ensure([this, getDstTime]() {
+         SCOPED_TIMER(&execTime_);
+diff --git a/src/graph/optimizer/CMakeLists.txt b/src/graph/optimizer/CMakeLists.txt
+index d5e1fb3..585a674 100644
+--- a/src/graph/optimizer/CMakeLists.txt
++++ b/src/graph/optimizer/CMakeLists.txt
+@@ -26,6 +26,7 @@ nebula_add_library(
+     rule/PushLimitDownFulltextIndexScanRule.cpp
+     rule/PushLimitDownFulltextIndexScanRule2.cpp
+     rule/PushLimitDownExpandAllRule.cpp
++    rule/PushDistinctLimitDownExpandRule.cpp
+     rule/PushStepSampleDownGetNeighborsRule.cpp
+     rule/PushStepLimitDownGetNeighborsRule.cpp
+     rule/TopNRule.cpp
+diff --git a/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp
+new file mode 100644
+index 0000000..07a3ee8
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp
+@@ -0,0 +1,120 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushDistinctLimitDownExpandRule.h"
++
++#include "graph/context/ExecutionContext.h"
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/util/ExpressionUtils.h"
++
++using nebula::graph::Dedup;
++using nebula::graph::Expand;
++using nebula::graph::Limit;
++using nebula::graph::PlanNode;
++using nebula::graph::QueryContext;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushDistinctLimitDownExpandRule::kInstance =
++    std::unique_ptr<PushDistinctLimitDownExpandRule>(new PushDistinctLimitDownExpandRule());
++
++PushDistinctLimitDownExpandRule::PushDistinctLimitDownExpandRule() {
++  RuleSet::QueryRules().addRule(this);
++}
++
++const Pattern &PushDistinctLimitDownExpandRule::pattern() const {
++  static Pattern pattern =
++      Pattern::create(PlanNode::Kind::kLimit,
++                      {Pattern::create(PlanNode::Kind::kDedup,
++                                       {Pattern::create(PlanNode::Kind::kExpand)})});
++  return pattern;
++}
++
++StatusOr<OptRule::TransformResult> PushDistinctLimitDownExpandRule::transform(
++    OptContext *octx, const MatchedResult &matched) const {
++  auto *qctx = octx->qctx();
++  const auto *limitGroupNode = matched.node;
++  const auto *dedupGroupNode = matched.dependencies.front().node;
++  const auto *expandGroupNode = matched.dependencies.front().dependencies.front().node;
++
++  const auto *limit = static_cast<const Limit *>(limitGroupNode->node());
++  const auto *dedup = static_cast<const Dedup *>(dedupGroupNode->node());
++  const auto *expand = static_cast<const Expand *>(expandGroupNode->node());
++
++  if (!graph::ExpressionUtils::isEvaluableExpr(limit->countExpr())) {
++    return TransformResult::noTransform();
++  }
++  if (expand->maxSteps() != 1 || expand->sample() || expand->joinInput()) {
++    return TransformResult::noTransform();
++  }
++  // The storage RPC returns one dst column.  Deduping it is equivalent to
++  // deduping the Expand output only when that output is just `_expand_vid`.
++  if (expand->colNames().size() != 1 || expand->colNames().front() != "_expand_vid") {
++    return TransformResult::noTransform();
++  }
++  // A global LIMIT can be applied per source only when there is one source.
++  auto *ectx = qctx->ectx();
++  if (!ectx->exist(expand->inputVar()) || ectx->getResult(expand->inputVar()).size() != 1) {
++    return TransformResult::noTransform();
++  }
++  const int64_t offset = std::max<int64_t>(limit->offset(), 0);
++  const int64_t count = limit->count(qctx);
++  if (count < 0 || offset > std::numeric_limits<int64_t>::max() - count) {
++    return TransformResult::noTransform();
++  }
++  const int64_t limitRows = offset + count;
++  int64_t oldLimit = -1;
++  if (expand->limitExpr() != nullptr) {
++    if (!graph::ExpressionUtils::isEvaluableExpr(expand->limitExpr())) {
++      return TransformResult::noTransform();
++    }
++    oldLimit = expand->limit(qctx);
++  }
++  if (oldLimit >= 0 && oldLimit <= limitRows) {
++    return TransformResult::noTransform();
++  }
++
++  auto *newLimit = static_cast<Limit *>(limit->clone());
++  auto *newDedup = static_cast<Dedup *>(dedup->clone());
++  auto *newExpand = static_cast<Expand *>(expand->clone());
++  newExpand->setDedup(true);
++  newExpand->setLimit(limitRows);
++  // Keep the original dataflow variable names; the groups are replaced in place.
++  newExpand->setInputVar(expand->inputVar());
++  newExpand->setOutputVar(expand->outputVar());
++  newDedup->setInputVar(expand->outputVar());
++  newDedup->setOutputVar(dedup->outputVar());
++  newLimit->setInputVar(dedup->outputVar());
++  newLimit->setOutputVar(limit->outputVar());
++
++  auto *newExpandGroup = OptGroup::create(octx);
++  auto *newExpandGroupNode = newExpandGroup->makeGroupNode(newExpand);
++  for (auto *dep : expandGroupNode->dependencies()) {
++    newExpandGroupNode->dependsOn(dep);
++  }
++
++  auto *newDedupGroup = OptGroup::create(octx);
++  auto *newDedupGroupNode = newDedupGroup->makeGroupNode(newDedup);
++  newDedupGroupNode->dependsOn(newExpandGroup);
++
++  auto *newLimitGroupNode = OptGroupNode::create(octx, newLimit, limitGroupNode->group());
++  newLimitGroupNode->dependsOn(newDedupGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(newLimitGroupNode);
++  return result;
++}
++
++std::string PushDistinctLimitDownExpandRule::toString() const {
++  return "PushDistinctLimitDownExpandRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+diff --git a/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h
+new file mode 100644
+index 0000000..eb32972
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h
+@@ -0,0 +1,39 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHDISTINCTLIMITDOWNEXPANDRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHDISTINCTLIMITDOWNEXPANDRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Push `LIMIT k` through `Dedup` into a one-step Expand whose input has
++// exactly one source vertex.  The storage getDstBySrc RPC can then dedup
++// destinations while scanning and stop after k distinct destinations.
++//
++//   Limit(k) -> Dedup -> Expand        Limit(k) -> Dedup -> Expand(dedup, limit=k)
++//
++// This is only valid for a single source vertex: for multiple sources a
++// global LIMIT cannot be applied independently to each source.
++class PushDistinctLimitDownExpandRule final : public OptRule {
++ public:
++  const Pattern &pattern() const override;
++
++  StatusOr<OptRule::TransformResult> transform(OptContext *ctx,
++                                               const MatchedResult &matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushDistinctLimitDownExpandRule();
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHDISTINCTLIMITDOWNEXPANDRULE_H_
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index 2a95ba3..49b9b33 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -247,6 +247,12 @@ struct GetDstBySrcRequest {
+         (cpp.template = "std::unordered_map")   parts,
+     3: list<common.EdgeType>                    edge_types,
+     4: optional RequestCommon                   common,
++    // Dedup destination VIDs per source vertex.  The result of this RPC is
++    // one column of dst VIDs, so deduping on dst is equivalent to deduping
++    // on the whole returned row.
++    5: optional bool                            dedup,
++    // Stop after this many distinct dst VIDs for each source vertex.
++    6: optional i64                             limit,
+ }
+ 
+ struct GetDstBySrcResponse {
+diff --git a/src/storage/exec/GetDstBySrcNode.h b/src/storage/exec/GetDstBySrcNode.h
+index 33f841c..c7b5f5d 100644
+--- a/src/storage/exec/GetDstBySrcNode.h
++++ b/src/storage/exec/GetDstBySrcNode.h
+@@ -19,11 +19,13 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+                   const std::vector<SingleEdgeNode*>& edgeNodes,
+                   EdgeContext* edgeContext,
+                   std::deque<Value>* result,
++                  bool dedup,
+                   int64_t limit)
+       : context_(context),
+         edgeNodes_(edgeNodes),
+         edgeContext_(edgeContext),
+         result_(result),
++        dedup_(dedup),
+         limit_(limit) {
+     name_ = "GetDstBySrcNode";
+   }
+@@ -45,13 +47,14 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+     if (iter_->valid()) {
+       setCurrentEdgeInfo(iter_->edgeType());
+     }
+-    return iterateEdges();
++    std::unordered_set<Value> visited;
++    return iterateEdges(visited);
+   }
+ 
+  private:
+-  nebula::cpp2::ErrorCode iterateEdges() {
++  nebula::cpp2::ErrorCode iterateEdges(std::unordered_set<Value>& visited) {
+     int64_t count = 0;
+-    for (; iter_->valid(); iter_->next(), ++count) {
++    for (; iter_->valid(); iter_->next()) {
+       if (count >= limit_) {
+         return nebula::cpp2::ErrorCode::SUCCEEDED;
+       }
+@@ -62,11 +65,17 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+       }
+       auto key = iter_->key();
+       auto dstId = NebulaKeyUtils::getDstId(context_->vIdLen(), key);
++      Value dst;
+       if (context_->isIntId()) {
+-        result_->emplace_back(*reinterpret_cast<const int64_t*>(dstId.data()));
++        dst = *reinterpret_cast<const int64_t*>(dstId.data());
+       } else {
+-        result_->emplace_back(dstId.subpiece(0, dstId.find_first_of('\0')).toString());
++        dst = dstId.subpiece(0, dstId.find_first_of('\0')).toString();
+       }
++      if (dedup_ && !visited.emplace(dst).second) {
++        continue;
++      }
++      result_->emplace_back(std::move(dst));
++      ++count;
+     }
+     return nebula::cpp2::ErrorCode::SUCCEEDED;
+   }
+@@ -93,6 +102,7 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+   EdgeContext* edgeContext_;
+   std::deque<Value>* result_;
+   std::unique_ptr<MultiEdgeIterator> iter_;
++  bool dedup_{false};
+   int64_t limit_;
+ };
+ 
+diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
+index 9c89662..19d13f6 100644
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -59,6 +59,12 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+     return;
+   }
+ 
++  dedup_ = req.dedup_ref().value_or(false);
++  limit_ = req.limit_ref().value_or(FLAGS_max_edge_returned_per_vertex);
++  if (limit_ < 0) {
++    limit_ = FLAGS_max_edge_returned_per_vertex;
++  }
++
+   if (!FLAGS_query_concurrently) {
+     runInSingleThread(req);
+   } else {
+@@ -218,8 +224,8 @@ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
+     plan.addNode(std::move(edge));
+   }
+ 
+-  int64_t limit = FLAGS_max_edge_returned_per_vertex;
+-  auto output = std::make_unique<GetDstBySrcNode>(context, edges, &edgeContext_, result, limit);
++  auto output =
++      std::make_unique<GetDstBySrcNode>(context, edges, &edgeContext_, result, dedup_, limit_);
+   for (auto* edge : edges) {
+     output->addDependency(edge);
+   }
+diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
+index 11e9944..3207501 100644
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -57,6 +57,9 @@ class GetDstBySrcProcessor
+   StoragePlan<VertexID> buildPlan(RuntimeContext* context, std::deque<Value>* result);
+ 
+  private:
++  bool dedup_{false};
++  int64_t limit_{std::numeric_limits<int64_t>::max()};
++
+   std::vector<RuntimeContext> contexts_;
+   // The process result of each part if run concurrently, then merge into resultDataSet_ at last
+   std::vector<std::deque<Value>> partResults_;

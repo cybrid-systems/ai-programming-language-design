@@ -1,0 +1,87 @@
+diff --git a/src/common/expression/AggregateExpression.cpp b/src/common/expression/AggregateExpression.cpp
+index 8a3d9fa..cf0d5d7 100644
+--- a/src/common/expression/AggregateExpression.cpp
++++ b/src/common/expression/AggregateExpression.cpp
+@@ -39,8 +39,8 @@ void AggregateExpression::resetFrom(Decoder& decoder) {
+ const Value& AggregateExpression::eval(ExpressionContext& ctx) {
+   DCHECK(!!aggData_);
+   auto val = arg_->eval(ctx);
+-  auto uniques = aggData_->uniques();
+   if (distinct_) {
++    auto uniques = aggData_->uniques();
+     if (uniques->contains(val)) {
+       return aggData_->result();
+     }
+diff --git a/src/common/function/AggFunctionManager.h b/src/common/function/AggFunctionManager.h
+index dcd7666..5f9ee6f 100644
+--- a/src/common/function/AggFunctionManager.h
++++ b/src/common/function/AggFunctionManager.h
+@@ -23,9 +23,8 @@ class AggData final {
+  public:
+   explicit AggData(Set* uniques = nullptr)
+       : cnt_(0), sum_(0.0), avg_(0.0), deviation_(0.0), result_(Value::kNullValue) {
+-    if (uniques == nullptr) {
+-      uniques_ = std::make_unique<Set>();
+-    } else {
++    // Allocate uniques_ lazily: COUNT/SUM/AVG do not need a Set.
++    if (uniques != nullptr) {
+       uniques_.reset(uniques);
+     }
+   }
+@@ -99,6 +98,9 @@ class AggData final {
+   }
+ 
+   Set* uniques() {
++    if (!uniques_) {
++      uniques_ = std::make_unique<Set>();
++    }
+     return uniques_.get();
+   }
+ 
+diff --git a/src/graph/executor/query/AggregateExecutor.cpp b/src/graph/executor/query/AggregateExecutor.cpp
+index d9f8b5b..3cb83ff 100644
+--- a/src/graph/executor/query/AggregateExecutor.cpp
++++ b/src/graph/executor/query/AggregateExecutor.cpp
+@@ -57,30 +57,32 @@ folly::Future<Status> AggregateExecutor::execute() {
+     }
+   }
+ 
++  // Reuse one key buffer and look the group up exactly once per row.
++  List key;
+   for (; iter->valid(); iter->next()) {
+-    List list;
+-    for (auto* key : groupKeys) {
+-      list.values.emplace_back(key->eval(ctx(iter.get())));
++    key.clear();
++    for (auto* keyExpr : groupKeys) {
++      key.values.emplace_back(keyExpr->eval(ctx(iter.get())));
+     }
+ 
+-    auto it = result.find(list);
+-    if (it == result.end()) {
+-      std::vector<std::unique_ptr<AggData>> cols;
++    auto [it, inserted] = result.try_emplace(key);
++    if (inserted) {
++      it->second.reserve(groupItems.size());
+       for (size_t i = 0; i < groupItems.size(); ++i) {
+-        cols.emplace_back(new AggData());
++        it->second.emplace_back(std::make_unique<AggData>());
+       }
+-      result.emplace(std::make_pair(list, std::move(cols)));
+     } else {
+       DCHECK_EQ(it->second.size(), groupItems.size());
+     }
+ 
+     for (size_t i = 0; i < groupItems.size(); ++i) {
+       auto* item = groupItems[i];
++      auto* aggData = it->second[i].get();
+       if (item->kind() == Expression::Kind::kAggregate) {
+-        static_cast<AggregateExpression*>(item)->setAggData(result[list][i].get());
++        static_cast<AggregateExpression*>(item)->setAggData(aggData);
+         item->eval(ctx(iter.get()));
+       } else {
+-        result[list][i]->setResult(item->eval(ctx(iter.get())));
++        aggData->setResult(item->eval(ctx(iter.get())));
+       }
+     }
+   }

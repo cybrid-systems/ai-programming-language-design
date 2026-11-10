@@ -1,0 +1,319 @@
+diff --git a/src/graph/executor/query/AggregateExecutor.cpp b/src/graph/executor/query/AggregateExecutor.cpp
+index e96ab7f..bccb158 100644
+--- a/src/graph/executor/query/AggregateExecutor.cpp
++++ b/src/graph/executor/query/AggregateExecutor.cpp
+@@ -317,6 +317,63 @@ folly::Future<Status> AggregateExecutor::executeCount(size_t countItem) {
+ 
+   DataSet ds;
+   ds.colNames = agg->colNames();
++  auto addRow = [&](int64_t groupKey, int64_t count) {
++    Row row;
++    row.values.reserve(agg->groupItems().size());
++    for (size_t i = 0; i < agg->groupItems().size(); ++i) {
++      row.values.emplace_back(i == countItem ? Value(count) : Value(groupKey));
++    }
++    ds.rows.emplace_back(std::move(row));
++  };
++  if (agg->hasTopN()) {
++    const int64_t offset = agg->topNOffset();
++    const int64_t count = agg->topNCount();
++    if (count == 0 || static_cast<uint64_t>(offset) >= counts.size()) {
++      return finish(ResultBuilder().value(Value(std::move(ds))).build());
++    }
++    if (offset >= 0 && count >= 0 && offset <= std::numeric_limits<int64_t>::max() - count &&
++        counts.size() > static_cast<uint64_t>(offset + count)) {
++      struct CountGroup {
++        int64_t key;
++        int64_t count;
++      };
++      auto valueAt = [&](const CountGroup& g, size_t col) -> int64_t {
++        return col == countItem ? g.count : g.key;
++      };
++      auto cmp = [&](const CountGroup& lhs, const CountGroup& rhs) {
++        for (const auto& factor : agg->topNFactors()) {
++          auto l = valueAt(lhs, factor.first);
++          auto r = valueAt(rhs, factor.first);
++          if (l != r) {
++            return factor.second == OrderFactor::OrderType::ASCEND ? l < r : l > r;
++          }
++        }
++        return false;
++      };
++      const size_t heapSize = static_cast<size_t>(offset + count);
++      std::vector<CountGroup> heap;
++      heap.reserve(heapSize);
++      for (const auto& kv : counts) {
++        CountGroup g{kv.first, kv.second};
++        if (heap.size() < heapSize) {
++          heap.emplace_back(g);
++          if (heap.size() == heapSize) {
++            std::make_heap(heap.begin(), heap.end(), cmp);
++          }
++        } else if (cmp(g, heap.front())) {
++          std::pop_heap(heap.begin(), heap.end(), cmp);
++          heap.back() = g;
++          std::push_heap(heap.begin(), heap.end(), cmp);
++        }
++      }
++      std::sort_heap(heap.begin(), heap.end(), cmp);
++      ds.rows.reserve(heap.size());
++      for (const auto& g : heap) {
++        addRow(g.key, g.count);
++      }
++      return finish(ResultBuilder().value(Value(std::move(ds))).build());
++    }
++  }
+   ds.rows.reserve(counts.size());
+   for (const auto& kv : counts) {
+     Row row;
+diff --git a/src/graph/optimizer/CMakeLists.txt b/src/graph/optimizer/CMakeLists.txt
+index c1eb342..1f6527d 100644
+--- a/src/graph/optimizer/CMakeLists.txt
++++ b/src/graph/optimizer/CMakeLists.txt
+@@ -29,6 +29,7 @@ nebula_add_library(
+     rule/PushStepSampleDownGetNeighborsRule.cpp
+     rule/PushStepLimitDownGetNeighborsRule.cpp
+     rule/TopNRule.cpp
++    rule/PushTopNIntoAggregateRule.cpp
+     rule/PushEFilterDownRule.cpp
+     rule/PushFilterDownAggregateRule.cpp
+     rule/PushFilterDownProjectRule.cpp
+diff --git a/src/graph/optimizer/rule/PushTopNIntoAggregateRule.cpp b/src/graph/optimizer/rule/PushTopNIntoAggregateRule.cpp
+new file mode 100644
+index 0000000..fa37f34
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushTopNIntoAggregateRule.cpp
+@@ -0,0 +1,93 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushTopNIntoAggregateRule.h"
++
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/service/GraphFlags.h"
++
++using nebula::graph::Aggregate;
++using nebula::graph::PlanNode;
++using nebula::graph::TopN;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushTopNIntoAggregateRule::kInstance =
++    std::unique_ptr<PushTopNIntoAggregateRule>(new PushTopNIntoAggregateRule());
++
++PushTopNIntoAggregateRule::PushTopNIntoAggregateRule() {
++  RuleSet::QueryRules().addRule(this);
++}
++
++const Pattern &PushTopNIntoAggregateRule::pattern() const {
++  static Pattern pattern = Pattern::create(
++      PlanNode::Kind::kTopN,
++      {Pattern::create(PlanNode::Kind::kAggregate)});
++  return pattern;
++}
++
++StatusOr<OptRule::TransformResult> PushTopNIntoAggregateRule::transform(
++    OptContext *ctx, const MatchedResult &matched) const {
++  if (!FLAGS_enable_aggregate_topn_fusion) {
++    return TransformResult::noTransform();
++  }
++
++  const auto *topN = static_cast<const TopN *>(matched.planNode({0}));
++  const auto *agg = static_cast<const Aggregate *>(matched.planNode({0, 0}));
++  if (topN->factors().empty() || topN->count() < 0 || topN->offset() < 0) {
++    return TransformResult::noTransform();
++  }
++  if (agg->hasTopN()) {
++    return TransformResult::noTransform();
++  }
++
++  auto *aggVar = ctx->qctx()->symTable()->getVar(agg->outputVar());
++  if (aggVar == nullptr || aggVar->readBy.size() != 1) {
++    return TransformResult::noTransform();
++  }
++  const auto &aggCols = agg->colNames();
++  for (const auto &factor : topN->factors()) {
++    if (factor.first >= aggCols.size()) {
++      return TransformResult::noTransform();
++    }
++  }
++
++  auto *newAgg = static_cast<Aggregate *>(agg->clone());
++  newAgg->setInputVar(agg->inputVar());
++  newAgg->setOutputVar(agg->outputVar());
++  newAgg->setColNames(agg->colNames());
++  newAgg->setTopN(topN->offset(), topN->count(), topN->factors());
++
++  auto *newTopN = static_cast<TopN *>(topN->clone());
++  newTopN->setInputVar(agg->outputVar());
++  newTopN->setOutputVar(topN->outputVar());
++  newTopN->setColNames(topN->colNames());
++
++  const auto *aggGroupNode = matched.result({0, 0}).node;
++  auto *newAggGroup = OptGroup::create(ctx);
++  auto *newAggGroupNode = newAggGroup->makeGroupNode(newAgg);
++  for (auto *dep : aggGroupNode->dependencies()) {
++    newAggGroupNode->dependsOn(dep);
++  }
++
++  auto *newTopNGroupNode = OptGroupNode::create(ctx, newTopN, matched.node->group());
++  newTopNGroupNode->dependsOn(newAggGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(newTopNGroupNode);
++  return result;
++}
++
++std::string PushTopNIntoAggregateRule::toString() const {
++  return "PushTopNIntoAggregateRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+diff --git a/src/graph/optimizer/rule/PushTopNIntoAggregateRule.h b/src/graph/optimizer/rule/PushTopNIntoAggregateRule.h
+new file mode 100644
+index 0000000..d15f494
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushTopNIntoAggregateRule.h
+@@ -0,0 +1,34 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHTOPNINTOAGGREGATERULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHTOPNINTOAGGREGATERULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Tell a COUNT-only Aggregate which TopN it feeds.  The Aggregate executor can
++// then emit only the top offset+count groups instead of materializing every
++// group row for TopN.  The TopN node is kept for the final ordering.
++class PushTopNIntoAggregateRule final : public OptRule {
++ public:
++  const Pattern &pattern() const override;
++
++  StatusOr<OptRule::TransformResult> transform(OptContext *ctx,
++                                               const MatchedResult &matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushTopNIntoAggregateRule();
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHTOPNINTOAGGREGATERULE_H_
+diff --git a/src/graph/planner/plan/Query.cpp b/src/graph/planner/plan/Query.cpp
+index 9ee98a9..ca8c84f 100644
+--- a/src/graph/planner/plan/Query.cpp
++++ b/src/graph/planner/plan/Query.cpp
+@@ -609,6 +609,10 @@ std::unique_ptr<PlanNodeDescription> Aggregate::explain() const {
+     itemArr.push_back(itemObj);
+   }
+   addDescription("groupItems", folly::toJson(itemArr), desc.get());
++  if (hasTopN_) {
++    addDescription("topNOffset", std::to_string(topNOffset_), desc.get());
++    addDescription("topNCount", std::to_string(topNCount_), desc.get());
++  }
+   return desc;
+ }
+ 
+@@ -635,6 +639,10 @@ void Aggregate::cloneMembers(const Aggregate& agg) {
+   }
+   groupKeys_ = std::move(gKeys);
+   groupItems_ = std::move(gItems);
++  hasTopN_ = agg.hasTopN_;
++  topNOffset_ = agg.topNOffset_;
++  topNCount_ = agg.topNCount_;
++  topNFactors_ = agg.topNFactors_;
+ }
+ 
+ std::unique_ptr<PlanNodeDescription> SwitchSpace::explain() const {
+diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
+index 7c5f96f..80912eb 100644
+--- a/src/graph/planner/plan/Query.h
++++ b/src/graph/planner/plan/Query.h
+@@ -1357,6 +1357,31 @@ class Aggregate final : public SingleInputNode {
+     return groupItems_;
+   }
+ 
++  bool hasTopN() const {
++    return hasTopN_;
++  }
++
++  int64_t topNOffset() const {
++    return topNOffset_;
++  }
++
++  int64_t topNCount() const {
++    return topNCount_;
++  }
++
++  const std::vector<std::pair<size_t, OrderFactor::OrderType>>& topNFactors() const {
++    return topNFactors_;
++  }
++
++  void setTopN(int64_t offset,
++               int64_t count,
++               std::vector<std::pair<size_t, OrderFactor::OrderType>> factors) {
++    hasTopN_ = true;
++    topNOffset_ = offset;
++    topNCount_ = count;
++    topNFactors_ = std::move(factors);
++  }
++
+   PlanNode* clone() const override;
+   std::unique_ptr<PlanNodeDescription> explain() const override;
+ 
+@@ -1374,6 +1399,10 @@ class Aggregate final : public SingleInputNode {
+  private:
+   std::vector<Expression*> groupKeys_;
+   std::vector<Expression*> groupItems_;
++  bool hasTopN_{false};
++  int64_t topNOffset_{0};
++  int64_t topNCount_{0};
++  std::vector<std::pair<size_t, OrderFactor::OrderType>> topNFactors_;
+ };
+ 
+ // Change the space that specified for current session.
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 90d163a..0b78b2d 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -99,6 +99,10 @@ DEFINE_bool(optimize_appendvertices, false, "if true, return directly without go
+ 
+ DEFINE_uint32(num_path_thread, 10, "number of threads to build path");
+ 
++DEFINE_bool(enable_aggregate_topn_fusion,
++            true,
++            "Let an Aggregate keep only the rows needed by a directly following TopN");
++
+ // Sanity-checking Flag Values
+ static bool ValidateSessIdleTimeout(const char* flagname, int32_t value) {
+   // The max timeout is 604800 seconds(a week)
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index bb25d18..5bced73 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -55,6 +55,7 @@ DECLARE_uint32(password_lock_time_in_secs);
+ DECLARE_bool(enable_optimizer);
+ DECLARE_bool(optimize_appendvertice);
+ DECLARE_uint32(num_path_thread);
++DECLARE_bool(enable_aggregate_topn_fusion);
+ 
+ DECLARE_int64(max_allowed_connections);
+ DECLARE_bool(enable_parallel_aggregate);

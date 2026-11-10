@@ -1,0 +1,267 @@
+diff --git a/src/storage/exec/EdgeNode.h b/src/storage/exec/EdgeNode.h
+index dc96e55..4d51ad4 100644
+--- a/src/storage/exec/EdgeNode.h
++++ b/src/storage/exec/EdgeNode.h
+@@ -6,13 +6,51 @@
+ #ifndef STORAGE_EXEC_EDGENODE_H_
+ #define STORAGE_EXEC_EDGENODE_H_
+ 
++#include <optional>
++#include <utility>
++
+ #include "common/base/Base.h"
++#include "common/utils/NebulaKeyUtils.h"
++#include "kvstore/KVIterator.h"
+ #include "storage/exec/RelNode.h"
+ #include "storage/exec/StorageIterator.h"
+ 
+ namespace nebula {
+ namespace storage {
+ 
++// Inclusive rank bounds for a single source vertex and edge type.
++struct RankRange {
++  std::optional<EdgeRanking> lo;
++  std::optional<EdgeRanking> hi;
++};
++
++// Wraps a prefix iterator and stops once the edge rank exceeds `hi`.
++class RankBoundedKVIterator final : public kvstore::KVIterator {
++ public:
++  RankBoundedKVIterator(std::unique_ptr<kvstore::KVIterator> iter,
++                        size_t vIdLen,
++                        EdgeRanking hi)
++      : iter_(std::move(iter)), vIdLen_(vIdLen), hi_(hi) {}
++
++  bool valid() const override {
++    return iter_ && iter_->valid() &&
++           NebulaKeyUtils::getRank(vIdLen_, iter_->key()) <= hi_;
++  }
++
++  void next() override { iter_->next(); }
++
++  void prev() override { iter_->prev(); }
++
++  folly::StringPiece key() const override { return iter_->key(); }
++
++  folly::StringPiece val() const override { return iter_->val(); }
++
++ private:
++  std::unique_ptr<kvstore::KVIterator> iter_;
++  size_t vIdLen_;
++  EdgeRanking hi_;
++};
++
+ // EdgeNode will return a StorageIterator which iterates over the specified
+ // edgeType of given vertexId
+ template <typename T>
+@@ -187,8 +225,10 @@ class SingleEdgeNode final : public EdgeNode<VertexID> {
+                  const std::vector<PropContext>* props,
+                  StorageExpressionContext* expCtx = nullptr,
+                  Expression* exp = nullptr,
+-                 bool maySkipDecode = false)
+-      : EdgeNode(context, edgeContext, edgeType, props, expCtx, exp, maySkipDecode) {
++                 bool maySkipDecode = false,
++                 std::optional<RankRange> range = std::nullopt)
++      : EdgeNode(context, edgeContext, edgeType, props, expCtx, exp, maySkipDecode),
++        range_(std::move(range)) {
+     name_ = "SingleEdgeNode";
+   }
+ 
+@@ -226,8 +266,22 @@ class SingleEdgeNode final : public EdgeNode<VertexID> {
+             << ", prop size " << props_->size();
+     std::unique_ptr<kvstore::KVIterator> iter;
+     prefix_ = NebulaKeyUtils::edgePrefix(context_->vIdLen(), partId, vId, edgeType_);
+-    ret = context_->env()->kvstore_->prefix(context_->spaceId(), partId, prefix_, &iter);
++    if (range_ && range_->lo && range_->hi && *range_->lo > *range_->hi) {
++      iter_.reset();
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    if (range_ && range_->lo) {
++      const auto start = prefix_ + NebulaKeyUtils::encodeRank(*range_->lo);
++      ret = context_->env()->kvstore_->rangeWithPrefix(
++          context_->spaceId(), partId, start, prefix_, &iter);
++    } else {
++      ret = context_->env()->kvstore_->prefix(context_->spaceId(), partId, prefix_, &iter);
++    }
+     if (ret == nebula::cpp2::ErrorCode::SUCCEEDED && iter && iter->valid()) {
++      if (range_ && range_->hi) {
++        iter = std::make_unique<RankBoundedKVIterator>(
++            std::move(iter), context_->vIdLen(), *range_->hi);
++      }
+       if (!skipDecode_) {
+         iter_.reset(new SingleEdgeIterator(context_, std::move(iter), edgeType_, schemas_, &ttl_));
+       } else {
+@@ -242,6 +296,7 @@ class SingleEdgeNode final : public EdgeNode<VertexID> {
+  private:
+   std::unique_ptr<SingleEdgeIterator> iter_;
+   std::string prefix_;
++  std::optional<RankRange> range_;
+ };
+ 
+ }  // namespace storage
+diff --git a/src/storage/query/GetNeighborsProcessor.cpp b/src/storage/query/GetNeighborsProcessor.cpp
+index a5a4a64..69541b9 100644
+--- a/src/storage/query/GetNeighborsProcessor.cpp
++++ b/src/storage/query/GetNeighborsProcessor.cpp
+@@ -5,6 +5,13 @@
+ 
+ #include "storage/query/GetNeighborsProcessor.h"
+ 
++#include <optional>
++#include <utility>
++
++#include "common/expression/ConstantExpression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/expression/RelationalExpression.h"
+ #include "common/memory/MemoryTracker.h"
+ #include "storage/StorageFlags.h"
+ #include "storage/exec/AggregateNode.h"
+@@ -20,6 +27,136 @@ namespace storage {
+ 
+ ProcessorCounters kGetNeighborsCounters;
+ 
++namespace {
++
++struct RankBounds {
++  bool hasLo{false};
++  bool hasHi{false};
++  EdgeRanking lo{0};
++  EdgeRanking hi{0};
++};
++
++void intersectRankBounds(RankBounds& dst, const RankBounds& src) {
++  if (src.hasLo) {
++    if (!dst.hasLo || src.lo > dst.lo) {
++      dst.lo = src.lo;
++      dst.hasLo = true;
++    }
++  }
++  if (src.hasHi) {
++    if (!dst.hasHi || src.hi < dst.hi) {
++      dst.hi = src.hi;
++      dst.hasHi = true;
++    }
++  }
++}
++
++bool extractRankBounds(const Expression* expr,
++                       const std::string& edgeName,
++                       RankBounds& out) {
++  if (expr == nullptr) {
++    return false;
++  }
++  switch (expr->kind()) {
++    case Expression::Kind::kLogicalAnd: {
++      const auto* logic = static_cast<const LogicalExpression*>(expr);
++      bool any = false;
++      for (auto* operand : logic->operands()) {
++        RankBounds sub;
++        if (extractRankBounds(operand, edgeName, sub)) {
++          intersectRankBounds(out, sub);
++          any = true;
++        }
++      }
++      return any;
++    }
++    case Expression::Kind::kLogicalOr:
++      // Do not derive a range from OR; only AND is a safe superset.
++      return false;
++    case Expression::Kind::kRelEQ:
++    case Expression::Kind::kRelLT:
++    case Expression::Kind::kRelLE:
++    case Expression::Kind::kRelGT:
++    case Expression::Kind::kRelGE: {
++      const auto* rel = static_cast<const RelationalExpression*>(expr);
++      const Expression* left = rel->left();
++      const Expression* right = rel->right();
++      bool swapped = false;
++      if (left->kind() == Expression::Kind::kConstant &&
++          right->kind() == Expression::Kind::kEdgeProperty) {
++        std::swap(left, right);
++        swapped = true;
++      }
++      if (left->kind() != Expression::Kind::kEdgeProperty ||
++          right->kind() != Expression::Kind::kConstant) {
++        return false;
++      }
++      const auto* prop = static_cast<const EdgePropertyExpression*>(left);
++      if (prop->prop() != "_rank" || prop->sym() != edgeName) {
++        return false;
++      }
++      const auto* constant = static_cast<const ConstantExpression*>(right);
++      if (!constant->value().isInt()) {
++        return false;
++      }
++      const EdgeRanking v = constant->value().getInt();
++      auto kind = expr->kind();
++      if (swapped) {
++        switch (kind) {
++          case Expression::Kind::kRelLT: kind = Expression::Kind::kRelGT; break;
++          case Expression::Kind::kRelLE: kind = Expression::Kind::kRelGE; break;
++          case Expression::Kind::kRelGT: kind = Expression::Kind::kRelLT; break;
++          case Expression::Kind::kRelGE: kind = Expression::Kind::kRelLE; break;
++          default: break;
++        }
++      }
++      // GT/LT use the endpoint itself: the residual filter still runs,
++      // so the range only needs to be a superset (also avoids overflow).
++      switch (kind) {
++        case Expression::Kind::kRelGE:
++        case Expression::Kind::kRelGT:
++          out.hasLo = true;
++          out.lo = v;
++          return true;
++        case Expression::Kind::kRelLE:
++        case Expression::Kind::kRelLT:
++          out.hasHi = true;
++          out.hi = v;
++          return true;
++        case Expression::Kind::kRelEQ:
++          out.hasLo = out.hasHi = true;
++          out.lo = out.hi = v;
++          return true;
++        default:
++          return false;
++      }
++    }
++    default:
++      return false;
++  }
++}
++
++std::optional<RankRange> extractRankRange(const Expression* filter,
++                                          const std::string& edgeName) {
++  RankBounds bounds;
++  if (!extractRankBounds(filter, edgeName, bounds)) {
++    return std::nullopt;
++  }
++  if (!bounds.hasLo && !bounds.hasHi) {
++    return std::nullopt;
++  }
++  RankRange range;
++  if (bounds.hasLo) {
++    range.lo = bounds.lo;
++  }
++  if (bounds.hasHi) {
++    range.hi = bounds.hi;
++  }
++  return range;
++}
++
++}  // namespace
++
+ void GetNeighborsProcessor::process(const cpp2::GetNeighborsRequest& req) {
+   if (executor_ != nullptr) {
+     executor_->add(
+@@ -249,7 +386,9 @@ StoragePlan<VertexID> GetNeighborsProcessor::buildPlan(RuntimeContext* context,
+   }
+   std::vector<SingleEdgeNode*> edges;
+   for (const auto& ec : edgeContext_.propContexts_) {
+-    auto edge = std::make_unique<SingleEdgeNode>(context, &edgeContext_, ec.first, &ec.second);
++    auto range = extractRankRange(filter_, edgeContext_.edgeNames_[ec.first]);
++    auto edge = std::make_unique<SingleEdgeNode>(
++        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, false, std::move(range));
+     edges.emplace_back(edge.get());
+     plan.addNode(std::move(edge));
+   }

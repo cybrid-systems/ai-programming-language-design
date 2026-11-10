@@ -1,0 +1,221 @@
+diff --git a/src/graph/executor/query/AggregateExecutor.cpp b/src/graph/executor/query/AggregateExecutor.cpp
+index 2080c95..e96ab7f 100644
+--- a/src/graph/executor/query/AggregateExecutor.cpp
++++ b/src/graph/executor/query/AggregateExecutor.cpp
+@@ -5,6 +5,12 @@
+ #include "graph/executor/query/AggregateExecutor.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <limits>
++#include <thread>
++
++#include <folly/ScopeGuard.h>
++#include <robin_hood.h>
+ 
+ #include "graph/planner/plan/Query.h"
+ #include "graph/service/GraphFlags.h"
+@@ -53,6 +58,23 @@ folly::Future<Status> AggregateExecutor::execute() {
+       }
+     }
+     if (eligible) {
++      if (aggCount == 1) {
++        size_t countItem = static_cast<size_t>(-1);
++        for (size_t i = 0; i < groupItems.size(); ++i) {
++          if (groupItems[i]->kind() == Expression::Kind::kAggregate) {
++            countItem = i;
++            break;
++          }
++        }
++        std::string countText = groupItems[countItem]->toString();
++        std::transform(countText.begin(), countText.end(), countText.begin(), ::toupper);
++        if (countText == "COUNT(*)" || countText == "COUNT(1)") {
++          const auto* keyExpr = static_cast<const PropertyExpression*>(groupKeys[0]);
++          if (iter->getColumnIndex(keyExpr->prop()).ok()) {
++            return executeCount(countItem);
++          }
++        }
++      }
+       struct FastGroup {
+         std::vector<AggData> aggs;
+       };
+@@ -174,5 +196,138 @@ folly::Future<Status> AggregateExecutor::execute() {
+   return finish(ResultBuilder().value(Value(std::move(ds))).build());
+ }
+ 
++
++folly::Future<Status> AggregateExecutor::executeCount(size_t countItem) {
++  memory::MemoryCheckGuard guard;
++  auto* agg = asNode<Aggregate>(node());
++  auto iter = ectx_->getResult(agg->inputVar()).iter();
++  const auto* key = static_cast<const PropertyExpression*>(agg->groupKeys().front());
++  auto keyIndex = iter->getColumnIndex(key->prop());
++  if (!keyIndex.ok()) {
++    return Status::Error("aggregate key column is not materialized");
++  }
++
++  using Counts = robin_hood::unordered_flat_map<int64_t, int64_t>;
++  struct Shard {
++    std::unique_ptr<Iterator> iter;
++    size_t size{0};
++    bool bounded{true};
++    Counts counts;
++    bool allInt{true};
++    std::exception_ptr exception;
++  };
++  const bool sizeIsRowCount = iter->isSequentialIter() || iter->isPropIter();
++  const size_t rowCount = sizeIsRowCount ? iter->size() : 0;
++  const unsigned hw = std::max(1U, std::thread::hardware_concurrency());
++  const size_t workerCount = FLAGS_enable_parallel_aggregate && iter->isSequentialIter() &&
++                                     rowCount >= (1U << 20) && hw > 1
++                                 ? std::min<size_t>(8, hw)
++                                 : 1;
++  std::vector<Shard> shards(workerCount);
++  size_t begin = 0;
++  for (size_t i = 0; i < workerCount; ++i) {
++    auto& shard = shards[i];
++    shard.iter = iter->copy();
++    shard.bounded = sizeIsRowCount;
++    shard.size = rowCount / workerCount + (i < rowCount % workerCount ? 1 : 0);
++    if (begin != 0) {
++      shard.iter->reset(begin);
++    }
++    begin += shard.size;
++  }
++
++  std::atomic<bool> stop{false};
++  auto countRows = [&](size_t i) {
++    try {
++      memory::MemoryCheckGuard workerGuard;
++      auto& shard = shards[i];
++      for (size_t row = 0; shard.iter->valid() && (!shard.bounded || row < shard.size);
++           ++row, shard.iter->next()) {
++        if ((row & 1023) == 0) {
++          if (stop.load(std::memory_order_relaxed)) {
++            return;
++          }
++          if (qctx_->isKilled()) {
++            throw std::runtime_error("Execution had been killed");
++          }
++          auto status = checkMemoryWatermark();
++          if (!status.ok()) {
++            throw std::runtime_error(status.toString());
++          }
++        }
++        const auto& value = shard.iter->getColumn(keyIndex.value());
++        if (!value.isInt()) {
++          shard.allInt = false;
++          stop.store(true, std::memory_order_relaxed);
++          return;
++        }
++        auto& count = shard.counts[value.getInt()];
++        if (UNLIKELY(count == std::numeric_limits<int64_t>::max())) {
++          throw std::overflow_error("COUNT overflow");
++        }
++        ++count;
++      }
++    } catch (...) {
++      shards[i].exception = std::current_exception();
++      stop.store(true, std::memory_order_relaxed);
++    }
++  };
++
++  std::vector<std::thread> workers;
++  workers.reserve(workerCount > 0 ? workerCount - 1 : 0);
++  {
++    auto joinWorkers = folly::makeGuard([&] {
++      for (auto& worker : workers) {
++        worker.join();
++      }
++    });
++    try {
++      for (size_t i = 1; i < workerCount; ++i) {
++        workers.emplace_back(countRows, i);
++      }
++      countRows(0);
++    } catch (...) {
++      stop.store(true, std::memory_order_relaxed);
++      throw;
++    }
++  }
++  if (qctx_->isKilled()) {
++    return Status::Error("Execution had been killed");
++  }
++  for (const auto& shard : shards) {
++    if (shard.exception) {
++      std::rethrow_exception(shard.exception);
++    }
++  }
++  if (std::any_of(shards.begin(), shards.end(), [](const Shard& shard) { return !shard.allInt; })) {
++    return Status::Error("COUNT group key is not entirely INT64");
++  }
++
++  auto& counts = shards.front().counts;
++  for (size_t i = 1; i < shards.size(); ++i) {
++    for (const auto& kv : shards[i].counts) {
++      auto& count = counts[kv.first];
++      if (UNLIKELY(count > std::numeric_limits<int64_t>::max() - kv.second)) {
++        return Status::Error("COUNT overflow");
++      }
++      count += kv.second;
++    }
++    Counts().swap(shards[i].counts);
++  }
++
++  DataSet ds;
++  ds.colNames = agg->colNames();
++  ds.rows.reserve(counts.size());
++  for (const auto& kv : counts) {
++    Row row;
++    row.values.reserve(agg->groupItems().size());
++    for (size_t i = 0; i < agg->groupItems().size(); ++i) {
++      row.values.emplace_back(i == countItem ? Value(kv.second) : Value(kv.first));
++    }
++    ds.rows.emplace_back(std::move(row));
++  }
++  return finish(ResultBuilder().value(Value(std::move(ds))).build());
++}
++
+ }  // namespace graph
+ }  // namespace nebula
+diff --git a/src/graph/executor/query/AggregateExecutor.h b/src/graph/executor/query/AggregateExecutor.h
+index b256d1f..5ca5b1e 100644
+--- a/src/graph/executor/query/AggregateExecutor.h
++++ b/src/graph/executor/query/AggregateExecutor.h
+@@ -17,6 +17,9 @@ class AggregateExecutor final : public Executor {
+       : Executor("AggregateExecutor", node, qctx) {}
+ 
+   folly::Future<Status> execute() override;
++
++ private:
++  folly::Future<Status> executeCount(size_t countItem);
+ };
+ 
+ }  // namespace graph
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 3182d86..90d163a 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -87,6 +87,10 @@ DEFINE_bool(enable_experimental_feature, false, "Whether to enable experimental
+ DEFINE_bool(enable_data_balance, true, "Whether to enable data balance feature");
+ 
+ DEFINE_int32(num_rows_to_check_memory, 1024, "number rows to check memory");
++
++DEFINE_bool(enable_parallel_aggregate,
++            true,
++            "Count large integer-key aggregates in input partitions with bounded worker count");
+ DEFINE_int32(max_sessions_per_ip_per_user,
+              300,
+              "Maximum number of sessions that can be created per IP and per user");
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index e2127b9..bb25d18 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -57,6 +57,7 @@ DECLARE_bool(optimize_appendvertice);
+ DECLARE_uint32(num_path_thread);
+ 
+ DECLARE_int64(max_allowed_connections);
++DECLARE_bool(enable_parallel_aggregate);
+ 
+ DECLARE_bool(enable_experimental_feature);
+ DECLARE_bool(enable_aggregate_fast_path);

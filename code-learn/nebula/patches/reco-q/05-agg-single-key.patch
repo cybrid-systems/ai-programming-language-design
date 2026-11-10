@@ -1,0 +1,122 @@
+diff --git a/src/graph/executor/query/AggregateExecutor.cpp b/src/graph/executor/query/AggregateExecutor.cpp
+index d9f8b5b..2080c95 100644
+--- a/src/graph/executor/query/AggregateExecutor.cpp
++++ b/src/graph/executor/query/AggregateExecutor.cpp
+@@ -4,7 +4,10 @@
+ 
+ #include "graph/executor/query/AggregateExecutor.h"
+ 
++#include <algorithm>
++
+ #include "graph/planner/plan/Query.h"
++#include "graph/service/GraphFlags.h"
+ 
+ namespace nebula {
+ namespace graph {
+@@ -30,6 +33,79 @@ folly::Future<Status> AggregateExecutor::execute() {
+     }
+   }
+ 
++  // Single-column GROUP BY k YIELD k, <agg>.  The key is evaluated once and
++  // stored as a Value, not a one-element List.  Queries that do not match
++  // fall through to the generic table below.
++  if (FLAGS_enable_aggregate_fast_path && groupKeys.size() == 1 && !groupItems.empty() &&
++      iter->valid() &&
++      (groupKeys[0]->kind() == Expression::Kind::kInputProperty ||
++       groupKeys[0]->kind() == Expression::Kind::kVarProperty)) {
++    std::vector<size_t> aggPositions(groupItems.size(), size_t(-1));
++    size_t aggCount = 0;
++    bool eligible = true;
++    for (size_t i = 0; i < groupItems.size(); ++i) {
++      auto* item = groupItems[i];
++      if (item->kind() == Expression::Kind::kAggregate) {
++        aggPositions[i] = aggCount++;
++      } else if (!(*item == *groupKeys[0])) {
++        eligible = false;
++        break;
++      }
++    }
++    if (eligible) {
++      struct FastGroup {
++        std::vector<AggData> aggs;
++      };
++      std::unordered_map<Value, FastGroup> fastResult;
++      fastResult.reserve(std::min<size_t>(iter->size(), static_cast<size_t>(1024)));
++      size_t checkedRows = 0;
++      for (; iter->valid(); iter->next()) {
++        if (UNLIKELY((checkedRows++ & 1023) == 0)) {
++          if (qctx_->isKilled()) {
++            return Status::Error("Execution had been killed");
++          }
++          auto status = checkMemoryWatermark();
++          if (!status.ok()) {
++            return status;
++          }
++        }
++        Value keyVal = groupKeys[0]->eval(ctx(iter.get()));
++        auto [it, inserted] = fastResult.try_emplace(std::move(keyVal));
++        if (inserted) {
++          it->second.aggs.reserve(aggCount);
++          for (size_t i = 0; i < aggCount; ++i) {
++            it->second.aggs.emplace_back();
++          }
++        }
++        for (size_t i = 0; i < groupItems.size(); ++i) {
++          auto* item = groupItems[i];
++          if (item->kind() != Expression::Kind::kAggregate) {
++            continue;
++          }
++          auto* aggData = &it->second.aggs[aggPositions[i]];
++          static_cast<AggregateExpression*>(item)->setAggData(aggData);
++          item->eval(ctx(iter.get()));
++        }
++      }
++      DataSet ds;
++      ds.colNames = agg->colNames();
++      ds.rows.reserve(fastResult.size());
++      for (auto& kv : fastResult) {
++        Row row;
++        row.values.reserve(groupItems.size());
++        for (size_t i = 0; i < groupItems.size(); ++i) {
++          if (groupItems[i]->kind() == Expression::Kind::kAggregate) {
++            row.values.emplace_back(kv.second.aggs[aggPositions[i]].result());
++          } else {
++            row.values.emplace_back(kv.first);
++          }
++        }
++        ds.rows.emplace_back(std::move(row));
++      }
++      return finish(ResultBuilder().value(Value(std::move(ds))).build());
++    }
++  }
++
+   std::unordered_map<List, std::vector<std::unique_ptr<AggData>>, std::hash<nebula::List>> result;
+ 
+   // generate default result when input dataset is empty
+diff --git a/src/graph/service/GraphFlags.cpp b/src/graph/service/GraphFlags.cpp
+index 662d7a5..3182d86 100644
+--- a/src/graph/service/GraphFlags.cpp
++++ b/src/graph/service/GraphFlags.cpp
+@@ -74,6 +74,10 @@ DEFINE_string(client_white_list,
+ 
+ DEFINE_bool(accept_partial_success, false, "Whether to accept partial success, default false");
+ 
++DEFINE_bool(enable_aggregate_fast_path,
++            true,
++            "Use a single-column group table when every non-aggregate output is that key");
++
+ DEFINE_bool(disable_octal_escape_char,
+             false,
+             "Octal escape character will be disabled"
+diff --git a/src/graph/service/GraphFlags.h b/src/graph/service/GraphFlags.h
+index 8713911..e2127b9 100644
+--- a/src/graph/service/GraphFlags.h
++++ b/src/graph/service/GraphFlags.h
+@@ -59,6 +59,7 @@ DECLARE_uint32(num_path_thread);
+ DECLARE_int64(max_allowed_connections);
+ 
+ DECLARE_bool(enable_experimental_feature);
++DECLARE_bool(enable_aggregate_fast_path);
+ DECLARE_bool(enable_data_balance);
+ 
+ DECLARE_bool(enable_client_white_list);

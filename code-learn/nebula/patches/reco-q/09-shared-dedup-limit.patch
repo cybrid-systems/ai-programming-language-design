@@ -1,0 +1,1087 @@
+diff --git a/src/clients/storage/StorageClient.cpp b/src/clients/storage/StorageClient.cpp
+index 044c1f8..0c2a95f 100644
+--- a/src/clients/storage/StorageClient.cpp
++++ b/src/clients/storage/StorageClient.cpp
+@@ -116,7 +116,9 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     const std::vector<Value>& vertices,
+     const std::vector<EdgeType>& edgeTypes,
+     bool dedup,
+-    int64_t limit) {
++    int64_t limit,
++    bool sharedDedupLimit,
++    const Expression* filter) {
+   auto cbStatus = getIdFromValue(param.space);
+   if (!cbStatus.ok()) {
+     return folly::makeFuture<StorageRpcResponse<cpp2::GetDstBySrcResponse>>(
+@@ -141,6 +143,10 @@ StorageRpcRespFuture<cpp2::GetDstBySrcResponse> StorageClient::getDstBySrc(
+     req.common_ref() = common;
+     req.dedup_ref() = dedup;
+     req.limit_ref() = limit;
++    req.shared_dedup_limit_ref() = sharedDedupLimit;
++    if (filter != nullptr) {
++      req.filter_ref() = filter->encode();
++    }
+   }
+ 
+   return collectResponse(param.evb,
+diff --git a/src/clients/storage/StorageClient.h b/src/clients/storage/StorageClient.h
+index c75051f..5c6d77b 100644
+--- a/src/clients/storage/StorageClient.h
++++ b/src/clients/storage/StorageClient.h
+@@ -86,7 +86,9 @@ class StorageClient
+       const std::vector<Value>& vertices,
+       const std::vector<EdgeType>& edgeTypes,
+       bool dedup = false,
+-      int64_t limit = -1);
++      int64_t limit = -1,
++      bool sharedDedupLimit = false,
++      const Expression* filter = nullptr);
+ 
+   StorageRpcRespFuture<cpp2::GetPropResponse> getProps(
+       const CommonRequestParam& param,
+diff --git a/src/graph/executor/query/ExpandExecutor.cpp b/src/graph/executor/query/ExpandExecutor.cpp
+index 79412ea..3094023 100644
+--- a/src/graph/executor/query/ExpandExecutor.cpp
++++ b/src/graph/executor/query/ExpandExecutor.cpp
+@@ -78,7 +78,14 @@ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
+   std::move(nextStepVids_.begin(), nextStepVids_.end(), vids.begin());
+   const bool dedup = expand_->dedup();
+   const int64_t limit = expand_->limitExpr() == nullptr ? -1 : expand_->limit(qctx());
+-  return storageClient->getDstBySrc(param, std::move(vids), expand_->edgeTypes(), dedup, limit)
++  return storageClient
++      ->getDstBySrc(param,
++                    std::move(vids),
++                    expand_->edgeTypes(),
++                    dedup,
++                    limit,
++                    expand_->sharedDedupLimit(),
++                    expand_->filter())
+       .via(runner())
+       .ensure([this, getDstTime]() {
+         SCOPED_TIMER(&execTime_);
+@@ -103,6 +110,15 @@ folly::Future<Status> ExpandExecutor::GetDstBySrc() {
+           return folly::makeFuture<Status>(result.status());
+         }
+         auto& responses = resps.responses();
++        if (expand_->sharedDedupLimit() || expand_->filter() != nullptr) {
++          for (const auto& resp : responses) {
++            if (!resp.shared_dedup_limit_supported_ref().value_or(false)) {
++              return folly::makeFuture<Status>(Status::Error(
++                  "storaged does not support shared dedup/filter semantics; "
++                  "graphd and storaged versions must match"));
++            }
++          }
++        }
+         if (currentStep_ < maxSteps_) {
+           for (auto& resp : responses) {
+             auto* dataset = resp.get_dsts();
+diff --git a/src/graph/optimizer/CMakeLists.txt b/src/graph/optimizer/CMakeLists.txt
+index abde945..6ad7579 100644
+--- a/src/graph/optimizer/CMakeLists.txt
++++ b/src/graph/optimizer/CMakeLists.txt
+@@ -27,6 +27,7 @@ nebula_add_library(
+     rule/PushLimitDownFulltextIndexScanRule2.cpp
+     rule/PushLimitDownExpandAllRule.cpp
+     rule/PushDistinctLimitDownExpandRule.cpp
++    rule/PushDistinctLimitDownJoinExpandRule.cpp
+     rule/PushStepSampleDownGetNeighborsRule.cpp
+     rule/PushStepLimitDownGetNeighborsRule.cpp
+     rule/TopNRule.cpp
+diff --git a/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp
+index 07a3ee8..330ee23 100644
+--- a/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp
++++ b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.cpp
+@@ -58,11 +58,6 @@ StatusOr<OptRule::TransformResult> PushDistinctLimitDownExpandRule::transform(
+   if (expand->colNames().size() != 1 || expand->colNames().front() != "_expand_vid") {
+     return TransformResult::noTransform();
+   }
+-  // A global LIMIT can be applied per source only when there is one source.
+-  auto *ectx = qctx->ectx();
+-  if (!ectx->exist(expand->inputVar()) || ectx->getResult(expand->inputVar()).size() != 1) {
+-    return TransformResult::noTransform();
+-  }
+   const int64_t offset = std::max<int64_t>(limit->offset(), 0);
+   const int64_t count = limit->count(qctx);
+   if (count < 0 || offset > std::numeric_limits<int64_t>::max() - count) {
+@@ -84,6 +79,10 @@ StatusOr<OptRule::TransformResult> PushDistinctLimitDownExpandRule::transform(
+   auto *newDedup = static_cast<Dedup *>(dedup->clone());
+   auto *newExpand = static_cast<Expand *>(expand->clone());
+   newExpand->setDedup(true);
++  // D can have multiple source items.  The storage side applies one shared
++  // visited set and one request-level limit; graphd still dedups and limits
++  // the merged response.
++  newExpand->setSharedDedupLimit(true);
+   newExpand->setLimit(limitRows);
+   // Keep the original dataflow variable names; the groups are replaced in place.
+   newExpand->setInputVar(expand->inputVar());
+diff --git a/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h
+index eb32972..ab69d46 100644
+--- a/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h
++++ b/src/graph/optimizer/rule/PushDistinctLimitDownExpandRule.h
+@@ -11,14 +11,17 @@
+ namespace nebula {
+ namespace opt {
+ 
+-// Push `LIMIT k` through `Dedup` into a one-step Expand whose input has
+-// exactly one source vertex.  The storage getDstBySrc RPC can then dedup
+-// destinations while scanning and stop after k distinct destinations.
++// Push `LIMIT k` through `Dedup` into a one-step Expand.  The storage
++// getDstBySrc RPC shares one visited set across all source vertices and
++// partitions in a storaged request, stops after k distinct destinations, and
++// graphd still dedups and applies the global limit after merging storaged
++// responses.
+ //
+ //   Limit(k) -> Dedup -> Expand        Limit(k) -> Dedup -> Expand(dedup, limit=k)
+ //
+-// This is only valid for a single source vertex: for multiple sources a
+-// global LIMIT cannot be applied independently to each source.
++// The input may contain multiple source vertices.  This is valid without an
++// ORDER BY because the query result is an arbitrary set of distinct
++// destinations; each storaged contributes at most k candidates.
+ class PushDistinctLimitDownExpandRule final : public OptRule {
+  public:
+   const Pattern &pattern() const override;
+diff --git a/src/graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.cpp b/src/graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.cpp
+new file mode 100644
+index 0000000..d816fe0
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.cpp
+@@ -0,0 +1,314 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.h"
++
++#include <algorithm>
++
++#include "common/expression/ConstantExpression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/expression/RelationalExpression.h"
++#include "graph/context/QueryContext.h"
++#include "graph/context/Symbols.h"
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/Logic.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++#include "graph/util/ExpressionUtils.h"
++#include "common/meta/SchemaManager.h"
++
++using nebula::graph::Dedup;
++using nebula::graph::Expand;
++using nebula::graph::ExpandAll;
++using nebula::graph::HashInnerJoin;
++using nebula::graph::Limit;
++using nebula::graph::PlanNode;
++using nebula::graph::QueryContext;
++
++namespace nebula {
++namespace opt {
++
++namespace {
++
++bool isRankProperty(const Expression* expr, const std::string& edgeName) {
++  if (expr == nullptr ||
++      (expr->kind() != Expression::Kind::kEdgeRank &&
++       expr->kind() != Expression::Kind::kEdgeProperty)) {
++    return false;
++  }
++  const auto* prop = static_cast<const PropertyExpression*>(expr);
++  return prop->prop() == "_rank" && prop->sym() == edgeName;
++}
++
++bool isRankComparison(const Expression* expr, const std::string& edgeName) {
++  if (expr == nullptr) {
++    return false;
++  }
++  if (expr->kind() != Expression::Kind::kRelEQ && expr->kind() != Expression::Kind::kRelLT &&
++      expr->kind() != Expression::Kind::kRelLE && expr->kind() != Expression::Kind::kRelGT &&
++      expr->kind() != Expression::Kind::kRelGE) {
++    return false;
++  }
++  const auto* rel = static_cast<const RelationalExpression*>(expr);
++  const Expression* left = rel->left();
++  const Expression* right = rel->right();
++  if (left->kind() == Expression::Kind::kConstant) {
++    std::swap(left, right);
++  }
++  if (!isRankProperty(left, edgeName) || right->kind() != Expression::Kind::kConstant) {
++    return false;
++  }
++  return static_cast<const ConstantExpression*>(right)->value().isInt();
++}
++
++bool isRankOnlyFilter(const Expression* expr, const std::string& edgeName) {
++  if (expr == nullptr) {
++    return false;
++  }
++  if (expr->kind() == Expression::Kind::kLogicalAnd) {
++    const auto* logic = static_cast<const LogicalExpression*>(expr);
++    if (logic->operands().empty()) {
++      return false;
++    }
++    for (const auto* operand : logic->operands()) {
++      if (!isRankOnlyFilter(operand, edgeName)) {
++        return false;
++      }
++    }
++    return true;
++  }
++  return isRankComparison(expr, edgeName);
++}
++
++bool isDstExpression(const Expression* expr) {
++  if (expr == nullptr) {
++    return false;
++  }
++  if (expr->kind() == Expression::Kind::kEdgeDst) {
++    return true;
++  }
++  if (expr->kind() != Expression::Kind::kEdgeProperty) {
++    return false;
++  }
++  const auto* prop = static_cast<const PropertyExpression*>(expr);
++  return prop->prop() == "_dst";
++}
++
++bool isInputColumn(const Expression* expr, const std::string& column) {
++  if (expr == nullptr ||
++      (expr->kind() != Expression::Kind::kInputProperty &&
++       expr->kind() != Expression::Kind::kVarProperty)) {
++    return false;
++  }
++  const auto* prop = static_cast<const PropertyExpression*>(expr);
++  return prop->prop() == column;
++}
++
++bool isExpandVidKey(const Expression* expr, const std::string& expandVar) {
++  if (expr == nullptr ||
++      (expr->kind() != Expression::Kind::kVarProperty &&
++       expr->kind() != Expression::Kind::kInputProperty)) {
++    return false;
++  }
++  const auto* prop = static_cast<const PropertyExpression*>(expr);
++  if (prop->prop() != "_expand_vid") {
++    return false;
++  }
++  return prop->kind() == Expression::Kind::kInputProperty ||
++         prop->sym() == expandVar || prop->sym().empty();
++}
++
++const graph::PlanNode* writerOf(const std::string& var, QueryContext* qctx) {
++  auto* variable = qctx->symTable()->getVar(var);
++  if (variable == nullptr || variable->writtenBy.size() != 1) {
++    return nullptr;
++  }
++  return *variable->writtenBy.begin();
++}
++
++bool rightInputComesFrom(const ExpandAll* expandAll,
++                         const std::string& leftInputVar,
++                         const std::string& leftColumn,
++                         QueryContext* qctx) {
++  std::string var = expandAll->inputVar();
++  for (int depth = 0; depth < 5 && !var.empty(); ++depth) {
++    const auto* writer = writerOf(var, qctx);
++    if (writer == nullptr) {
++      return false;
++    }
++    if (writer->inputVar() == leftInputVar) {
++      return true;
++    }
++    // Argument nodes are materialized from a named column and may not have
++    // inputVar populated at optimization time; its alias is the source column.
++    if (writer->kind() == PlanNode::Kind::kArgument) {
++      const auto* arg = static_cast<const graph::Argument*>(writer);
++      if (arg->getAlias() == leftColumn) {
++        return true;
++      }
++    }
++    var = writer->inputVar();
++  }
++  return false;
++}
++
++}  // namespace
++
++std::unique_ptr<OptRule> PushDistinctLimitDownJoinExpandRule::kInstance =
++    std::unique_ptr<PushDistinctLimitDownJoinExpandRule>(
++        new PushDistinctLimitDownJoinExpandRule());
++
++PushDistinctLimitDownJoinExpandRule::PushDistinctLimitDownJoinExpandRule() {
++  RuleSet::QueryRules().addRule(this);
++}
++
++const Pattern& PushDistinctLimitDownJoinExpandRule::pattern() const {
++  static Pattern pattern = Pattern::create(
++      PlanNode::Kind::kLimit,
++      {Pattern::create(
++          PlanNode::Kind::kDedup,
++          {Pattern::create(
++              PlanNode::Kind::kHashInnerJoin,
++              {Pattern::create(PlanNode::Kind::kUnknown),
++               Pattern::create(PlanNode::Kind::kUnknown)})})});
++  return pattern;
++}
++
++StatusOr<OptRule::TransformResult> PushDistinctLimitDownJoinExpandRule::transform(
++    OptContext* octx, const MatchedResult& matched) const {
++  auto* qctx = octx->qctx();
++  const auto* limitGroupNode = matched.node;
++  const auto* dedupGroupNode = matched.dependencies.front().node;
++  const auto* joinGroupNode = matched.dependencies.front().dependencies.front().node;
++  const auto* limit = static_cast<const Limit*>(limitGroupNode->node());
++  const auto* dedup = static_cast<const Dedup*>(dedupGroupNode->node());
++  const auto* join = static_cast<const HashInnerJoin*>(joinGroupNode->node());
++  const auto* rightNode = matched.planNode({0, 0, 0, 1});
++  if (rightNode->kind() != PlanNode::Kind::kExpandAll) {
++    return TransformResult::noTransform();
++  }
++  const auto* expandAll = static_cast<const ExpandAll*>(rightNode);
++
++  // The join output must be exactly one projected edge dst column, must be
++  // the sole consumer of the join, and its hash/probe keys must tie the left
++  // input VIDs to the right ExpandAll's _expand_vid.  A one-column check alone
++  // would also accept YIELD DISTINCT edge._rank AS r.
++  if (join->colNames().size() != 1 || !join->hasOutputColumns() ||
++      join->outputColumns().size() != 1 || dedup->inputVar() != join->outputVar() ||
++      limit->inputVar() != dedup->outputVar() || join->outputVar().empty() ||
++      expandAll->edgeColumns() == nullptr || join->hashKeys().size() != 1 ||
++      join->probeKeys().size() != 1) {
++    return TransformResult::noTransform();
++  }
++  auto* joinVar = qctx->symTable()->getVar(join->outputVar());
++  if (joinVar == nullptr || joinVar->readBy.size() != 1) {
++    return TransformResult::noTransform();
++  }
++  const auto* leftVar = qctx->symTable()->getVar(join->leftInputVar());
++  if (leftVar == nullptr || leftVar->colNames.size() != 1 ||
++      !isInputColumn(join->hashKeys().front(), leftVar->colNames.front()) ||
++      !isExpandVidKey(join->probeKeys().front(), expandAll->outputVar()) ||
++      !rightInputComesFrom(expandAll, join->leftInputVar(), leftVar->colNames.front(), qctx)) {
++    std::string hk = join->hashKeys().empty() ? "none" : join->hashKeys().front()->toString();
++    std::string pk = join->probeKeys().empty() ? "none" : join->probeKeys().front()->toString();
++    return TransformResult::noTransform();
++  }
++  const auto& outputColumn = join->outputColumns().front();
++  if (outputColumn.alias != join->colNames().front()) {
++    return TransformResult::noTransform();
++  }
++  const Expression* projectedExpr = nullptr;
++  for (const auto* column : expandAll->edgeColumns()->columns()) {
++    if (column != nullptr && column->alias() == outputColumn.source) {
++      projectedExpr = column->expr();
++      break;
++    }
++  }
++  if (!isDstExpression(projectedExpr)) {
++    return TransformResult::noTransform();
++  }
++
++  // This is the GO FROM <variable> shape: the right side preserves the source
++  // association and is joined back to the input VIDs.  Only a one-step,
++  // one-edge-type, rank-filtered expansion can be converted to GetDstBySrc.
++  // For joinInput plans GoPlanner may leave edgeTypes empty and encode the
++  // direction in edgeProps instead, so recover it before matching.
++  std::vector<EdgeType> edgeTypes = expandAll->edgeTypes();
++  if (edgeTypes.empty() && expandAll->edgeProps() != nullptr) {
++    for (const auto& prop : *expandAll->edgeProps()) {
++      if (std::find(edgeTypes.begin(), edgeTypes.end(), prop.get_type()) == edgeTypes.end()) {
++        edgeTypes.emplace_back(prop.get_type());
++      }
++    }
++  }
++  if (expandAll->maxSteps() != 1 || expandAll->sample() || !expandAll->joinInput() ||
++      !expandAll->stepLimits().empty() || edgeTypes.size() != 1 ||
++      expandAll->filter() == nullptr || join->hashKeys().size() != 1 ||
++      join->probeKeys().size() != 1) {
++    return TransformResult::noTransform();
++  }
++
++  const auto edgeType = edgeTypes.front();
++  const auto edgeName = qctx->schemaMng()->toEdgeName(
++      expandAll->space(), edgeType < 0 ? -edgeType : edgeType);
++  if (!edgeName.ok() || !isRankOnlyFilter(expandAll->filter(), edgeName.value())) {
++    return TransformResult::noTransform();
++  }
++
++  if (!graph::ExpressionUtils::isEvaluableExpr(limit->countExpr())) {
++    return TransformResult::noTransform();
++  }
++  const int64_t offset = std::max<int64_t>(limit->offset(), 0);
++  const int64_t count = limit->count(qctx);
++  if (count < 0 || offset > std::numeric_limits<int64_t>::max() - count) {
++    return TransformResult::noTransform();
++  }
++  const int64_t limitRows = offset + count;
++  auto* newExpand = Expand::make(qctx, nullptr, expandAll->space(), false, 1);
++  newExpand->setInputVar(join->leftInputVar());
++  newExpand->setOutputVar(join->outputVar());
++  newExpand->setColNames(join->colNames());
++  newExpand->setEdgeTypes({edgeType});
++  newExpand->setFilter(expandAll->filter()->clone());
++  newExpand->setDedup(true);
++  newExpand->setSharedDedupLimit(true);
++  newExpand->setLimit(limitRows);
++
++  auto* newDedup = static_cast<Dedup*>(dedup->clone());
++  auto* newLimit = static_cast<Limit*>(limit->clone());
++  newDedup->setInputVar(newExpand->outputVar());
++  newDedup->setOutputVar(dedup->outputVar());
++  newLimit->setInputVar(dedup->outputVar());
++  newLimit->setOutputVar(limit->outputVar());
++
++  // The left side is the source VID table.  The right-side ExpandAll and the
++  // join are no longer needed: the new Expand reads the same left variable and
++  // performs the storage-side dedup/filter.
++  auto* leftGroup = const_cast<OptGroup*>(matched.result({0, 0, 0, 0}).node->group());
++  auto* expandGroup = OptGroup::create(octx);
++  auto* expandGroupNode = expandGroup->makeGroupNode(newExpand);
++  expandGroupNode->dependsOn(leftGroup);
++
++  auto* dedupGroup = OptGroup::create(octx);
++  auto* newDedupGroupNode = dedupGroup->makeGroupNode(newDedup);
++  newDedupGroupNode->dependsOn(expandGroup);
++
++  auto* newLimitGroupNode = OptGroupNode::create(octx, newLimit, limitGroupNode->group());
++  newLimitGroupNode->dependsOn(dedupGroup);
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(newLimitGroupNode);
++  return result;
++}
++
++std::string PushDistinctLimitDownJoinExpandRule::toString() const {
++  return "PushDistinctLimitDownJoinExpandRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+diff --git a/src/graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.h b/src/graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.h
+new file mode 100644
+index 0000000..03cac2e
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushDistinctLimitDownJoinExpandRule.h
+@@ -0,0 +1,49 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHDISTINCTLIMITDOWNJOINEXPANDRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHDISTINCTLIMITDOWNJOINEXPANDRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Collapse the multi-source input-join shape used by a second GO:
++//
++//   Limit(k) -> Dedup -> HashInnerJoin
++//                    (left: source VIDs, right: ExpandAll(joinInput, filter))
++//
++// into a single storage-backed expand:
++//
++//   Limit(k) -> Dedup -> Expand(dedup, sharedDedupLimit, limit=k, filter)
++//
++// All source VIDs are routed to their owning storaged in one request.  The
++// storage side shares one visited set across sources/partitions, applies the
++// rank filter before inserting a dst, and stops after k distinct dsts.  The
++// graph side still performs the final global Dedup and Limit.
++//
++// The rewrite is only safe when the join output is just the projected dst
++// column, the right side is a one-step ExpandAll with joinInput=true, and the
++// filter is a rank-only conjunction (e.g. C's Q4 window).
++class PushDistinctLimitDownJoinExpandRule final : public OptRule {
++ public:
++  const Pattern &pattern() const override;
++
++  StatusOr<OptRule::TransformResult> transform(OptContext *ctx,
++                                               const MatchedResult &matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushDistinctLimitDownJoinExpandRule();
++
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHDISTINCTLIMITDOWNJOINEXPANDRULE_H_
+diff --git a/src/graph/planner/plan/Query.cpp b/src/graph/planner/plan/Query.cpp
+index 9ee98a9..a61106d 100644
+--- a/src/graph/planner/plan/Query.cpp
++++ b/src/graph/planner/plan/Query.cpp
+@@ -111,6 +111,7 @@ std::unique_ptr<PlanNodeDescription> Expand::explain() const {
+   auto desc = Explore::explain();
+   addDescription("sample", folly::toJson(util::toJson(sample_)), desc.get());
+   addDescription("joinInput", folly::toJson(util::toJson(joinInput_)), desc.get());
++  addDescription("sharedDedupLimit", folly::toJson(util::toJson(sharedDedupLimit_)), desc.get());
+   addDescription("maxSteps", folly::to<std::string>(maxSteps_), desc.get());
+   addDescription(
+       "edgeProps", edgeProps_ ? folly::toJson(util::toJson(*edgeProps_)) : "", desc.get());
+@@ -139,6 +140,7 @@ void Expand::cloneMembers(const Expand& expand) {
+   }
+   stepLimits_ = expand.stepLimits();
+   joinInput_ = expand.joinInput();
++  sharedDedupLimit_ = expand.sharedDedupLimit();
+   edgeTypes_ = expand.edgeTypes();
+ }
+ 
+diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
+index 7c5f96f..d16ff10 100644
+--- a/src/graph/planner/plan/Query.h
++++ b/src/graph/planner/plan/Query.h
+@@ -312,6 +312,14 @@ class Expand : public Explore {
+     joinInput_ = joinInput;
+   }
+ 
++  bool sharedDedupLimit() const {
++    return sharedDedupLimit_;
++  }
++
++  void setSharedDedupLimit(bool sharedDedupLimit) {
++    sharedDedupLimit_ = sharedDedupLimit;
++  }
++
+   size_t maxSteps() const {
+     return maxSteps_;
+   }
+@@ -342,6 +350,7 @@ class Expand : public Explore {
+   std::unique_ptr<std::vector<EdgeProp>> edgeProps_{nullptr};
+   std::vector<int64_t> stepLimits_;
+   bool joinInput_{false};
++  bool sharedDedupLimit_{false};
+   std::vector<EdgeType> edgeTypes_;
+ };
+ 
+diff --git a/src/interface/storage.thrift b/src/interface/storage.thrift
+index 49b9b33..81797fb 100644
+--- a/src/interface/storage.thrift
++++ b/src/interface/storage.thrift
+@@ -253,12 +253,26 @@ struct GetDstBySrcRequest {
+     5: optional bool                            dedup,
+     // Stop after this many distinct dst VIDs for each source vertex.
+     6: optional i64                             limit,
++    // If true, dedup and limit apply to the whole request instead of each
++    // source vertex independently.  All source vertices and partitions in this
++    // request share one visited set, and scanning stops after `limit` distinct
++    // destinations.  The caller must still dedup results from different
++    // storaged nodes and apply the global limit.
++    7: optional bool                            shared_dedup_limit,
++    // Optional encoded edge filter.  The current implementation supports a
++    // conjunction of comparisons on the edge rank (e.g. the Q4 rank range).
++    8: optional binary                          filter,
+ }
+ 
+ struct GetDstBySrcResponse {
+     1: required ResponseCommon                  result,
+     // Only one dst column, each row is a dst
+     2: optional common.DataSet                  dsts,
++    // Set by storaged implementations that understand filter and
++    // shared_dedup_limit.  A graphd must not trust a rewritten C plan when this
++    // capability is absent: old storaged nodes silently skip the new optional
++    // request fields.
++    3: optional bool                            shared_dedup_limit_supported,
+ }
+ 
+ 
+diff --git a/src/storage/exec/GetDstBySrcNode.h b/src/storage/exec/GetDstBySrcNode.h
+index c7b5f5d..490fc47 100644
+--- a/src/storage/exec/GetDstBySrcNode.h
++++ b/src/storage/exec/GetDstBySrcNode.h
+@@ -20,23 +20,36 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+                   EdgeContext* edgeContext,
+                   std::deque<Value>* result,
+                   bool dedup,
+-                  int64_t limit)
++                  int64_t limit,
++                  int64_t scanLimit,
++                  bool sharedDedupLimit)
+       : context_(context),
+         edgeNodes_(edgeNodes),
+         edgeContext_(edgeContext),
+         result_(result),
+         dedup_(dedup),
+-        limit_(limit) {
++        sharedDedupLimit_(sharedDedupLimit),
++        limit_(limit),
++        scanLimit_(scanLimit) {
+     name_ = "GetDstBySrcNode";
+   }
+ 
+   // need to override doExecute because the return format of GetNeighborsNode and
+   // GetDstBySrcNode are different
+   nebula::cpp2::ErrorCode doExecute(PartitionID partId, const VertexID& vId) override {
++    if (context_->isPlanKilled()) {
++      return nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED;
++    }
++    if (sharedDedupLimit_ && sharedCount_ >= limit_) {
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
+     auto ret = RelNode::doExecute(partId, vId);
+     if (ret != nebula::cpp2::ErrorCode::SUCCEEDED) {
+       return ret;
+     }
++    if (context_->isPlanKilled()) {
++      return nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED;
++    }
+ 
+     std::vector<SingleEdgeIterator*> iters;
+     iters.reserve(edgeNodes_.size());
+@@ -47,17 +60,34 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+     if (iter_->valid()) {
+       setCurrentEdgeInfo(iter_->edgeType());
+     }
++    if (sharedDedupLimit_) {
++      // The plan is reused for every source in this request, so the visited
++      // set and count intentionally survive across source vertices and parts.
++      return iterateEdges(sharedVisited_, sharedCount_);
++    }
+     std::unordered_set<Value> visited;
+-    return iterateEdges(visited);
++    int64_t count = 0;
++    return iterateEdges(visited, count);
+   }
+ 
+  private:
+-  nebula::cpp2::ErrorCode iterateEdges(std::unordered_set<Value>& visited) {
+-    int64_t count = 0;
++  nebula::cpp2::ErrorCode iterateEdges(std::unordered_set<Value>& visited, int64_t& count) {
++    if (limit_ <= 0 || scanLimit_ <= 0) {
++      return nebula::cpp2::ErrorCode::SUCCEEDED;
++    }
++    int64_t scanned = 0;
+     for (; iter_->valid(); iter_->next()) {
+-      if (count >= limit_) {
++      if (context_->isPlanKilled()) {
++        return nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED;
++      }
++      // Keep the historical max_edge_returned_per_vertex cap on raw edges as
++      // well as on distinct output.  Deduping before applying the cap would
++      // let a duplicate-rich source return more distinct values than the old
++      // storage path, changing query results under a small cap.
++      if (scanned >= scanLimit_ || count >= limit_) {
+         return nebula::cpp2::ErrorCode::SUCCEEDED;
+       }
++      ++scanned;
+       EdgeType type = iter_->edgeType();
+       if (type != context_->edgeType_) {
+         // update info when edgeType changes while iterating over different edge types
+@@ -76,6 +106,9 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+       }
+       result_->emplace_back(std::move(dst));
+       ++count;
++      if (sharedDedupLimit_ && count >= limit_) {
++        return nebula::cpp2::ErrorCode::SUCCEEDED;
++      }
+     }
+     return nebula::cpp2::ErrorCode::SUCCEEDED;
+   }
+@@ -103,7 +136,11 @@ class GetDstBySrcNode : public QueryNode<VertexID> {
+   std::deque<Value>* result_;
+   std::unique_ptr<MultiEdgeIterator> iter_;
+   bool dedup_{false};
++  bool sharedDedupLimit_{false};
+   int64_t limit_;
++  int64_t scanLimit_;
++  std::unordered_set<Value> sharedVisited_;
++  int64_t sharedCount_{0};
+ };
+ 
+ }  // namespace storage
+diff --git a/src/storage/query/GetDstBySrcProcessor.cpp b/src/storage/query/GetDstBySrcProcessor.cpp
+index 19d13f6..f0004a0 100644
+--- a/src/storage/query/GetDstBySrcProcessor.cpp
++++ b/src/storage/query/GetDstBySrcProcessor.cpp
+@@ -7,6 +7,10 @@
+ 
+ #include <robin_hood.h>
+ 
++#include "common/expression/ConstantExpression.h"
++#include "common/expression/LogicalExpression.h"
++#include "common/expression/PropertyExpression.h"
++#include "common/expression/RelationalExpression.h"
+ #include "common/memory/MemoryTracker.h"
+ #include "common/thread/GenericThreadPool.h"
+ #include "storage/StorageFlags.h"
+@@ -19,6 +23,207 @@ DEFINE_uint64(max_dedup_threads, 6, "max dedup threads");
+ namespace nebula {
+ namespace storage {
+ 
++namespace {
++
++struct RankBounds {
++  bool hasLo{false};
++  bool hasHi{false};
++  bool impossible{false};
++  EdgeRanking lo{0};
++  EdgeRanking hi{0};
++};
++
++void intersectRankBounds(RankBounds& dst, const RankBounds& src) {
++  if (dst.impossible || src.impossible) {
++    dst.impossible = true;
++    return;
++  }
++  if (src.hasLo) {
++    if (!dst.hasLo || src.lo > dst.lo) {
++      dst.lo = src.lo;
++      dst.hasLo = true;
++    }
++  }
++  if (src.hasHi) {
++    if (!dst.hasHi || src.hi < dst.hi) {
++      dst.hi = src.hi;
++      dst.hasHi = true;
++    }
++  }
++  if (dst.hasLo && dst.hasHi && dst.lo > dst.hi) {
++    dst.impossible = true;
++  }
++}
++
++bool isRankProperty(const Expression* expr, const std::string& edgeName) {
++  if (expr == nullptr ||
++      (expr->kind() != Expression::Kind::kEdgeRank &&
++       expr->kind() != Expression::Kind::kEdgeProperty)) {
++    return false;
++  }
++  const auto* prop = static_cast<const PropertyExpression*>(expr);
++  return prop->prop() == "_rank" && prop->sym() == edgeName;
++}
++
++bool isRankComparison(const Expression* expr, const std::string& edgeName) {
++  if (expr == nullptr) {
++    return false;
++  }
++  if (expr->kind() != Expression::Kind::kRelEQ && expr->kind() != Expression::Kind::kRelLT &&
++      expr->kind() != Expression::Kind::kRelLE && expr->kind() != Expression::Kind::kRelGT &&
++      expr->kind() != Expression::Kind::kRelGE) {
++    return false;
++  }
++  const auto* rel = static_cast<const RelationalExpression*>(expr);
++  const Expression* left = rel->left();
++  const Expression* right = rel->right();
++  if (left->kind() == Expression::Kind::kConstant) {
++    std::swap(left, right);
++  }
++  if (!isRankProperty(left, edgeName) || right->kind() != Expression::Kind::kConstant) {
++    return false;
++  }
++  return static_cast<const ConstantExpression*>(right)->value().isInt();
++}
++
++bool isRankOnlyFilter(const Expression* expr, const std::string& edgeName) {
++  if (expr == nullptr) {
++    return false;
++  }
++  if (expr->kind() == Expression::Kind::kLogicalAnd) {
++    const auto* logic = static_cast<const LogicalExpression*>(expr);
++    if (logic->operands().empty()) {
++      return false;
++    }
++    for (const auto* operand : logic->operands()) {
++      if (!isRankOnlyFilter(operand, edgeName)) {
++        return false;
++      }
++    }
++    return true;
++  }
++  return isRankComparison(expr, edgeName);
++}
++
++bool extractRankBounds(const Expression* expr,
++                       const std::string& edgeName,
++                       RankBounds& out) {
++  if (expr == nullptr) {
++    return false;
++  }
++  switch (expr->kind()) {
++    case Expression::Kind::kLogicalAnd: {
++      const auto* logic = static_cast<const LogicalExpression*>(expr);
++      bool any = false;
++      for (const auto* operand : logic->operands()) {
++        RankBounds sub;
++        if (extractRankBounds(operand, edgeName, sub)) {
++          intersectRankBounds(out, sub);
++          any = true;
++        }
++      }
++      return any;
++    }
++    case Expression::Kind::kRelEQ:
++    case Expression::Kind::kRelLT:
++    case Expression::Kind::kRelLE:
++    case Expression::Kind::kRelGT:
++    case Expression::Kind::kRelGE: {
++      const auto* rel = static_cast<const RelationalExpression*>(expr);
++      const Expression* left = rel->left();
++      const Expression* right = rel->right();
++      bool swapped = false;
++      if (left->kind() == Expression::Kind::kConstant && isRankProperty(right, edgeName)) {
++        std::swap(left, right);
++        swapped = true;
++      }
++      if (!isRankProperty(left, edgeName) || right->kind() != Expression::Kind::kConstant) {
++        return false;
++      }
++      const auto* constant = static_cast<const ConstantExpression*>(right);
++      if (!constant->value().isInt()) {
++        return false;
++      }
++      const EdgeRanking v = constant->value().getInt();
++      auto kind = expr->kind();
++      if (swapped) {
++        switch (kind) {
++          case Expression::Kind::kRelLT: kind = Expression::Kind::kRelGT; break;
++          case Expression::Kind::kRelLE: kind = Expression::Kind::kRelGE; break;
++          case Expression::Kind::kRelGT: kind = Expression::Kind::kRelLT; break;
++          case Expression::Kind::kRelGE: kind = Expression::Kind::kRelLE; break;
++          default: break;
++        }
++      }
++      switch (kind) {
++        case Expression::Kind::kRelGE:
++          out.hasLo = true;
++          out.lo = v;
++          return true;
++        case Expression::Kind::kRelGT:
++          // RankRange is inclusive.  A strict lower bound v must become v+1;
++          // v == INT64_MAX therefore describes an empty range.
++          if (v == std::numeric_limits<EdgeRanking>::max()) {
++            out.impossible = true;
++            return true;
++          }
++          out.hasLo = true;
++          out.lo = v + 1;
++          return true;
++        case Expression::Kind::kRelLE:
++          out.hasHi = true;
++          out.hi = v;
++          return true;
++        case Expression::Kind::kRelLT:
++          // A strict upper bound v must become v-1.
++          if (v == std::numeric_limits<EdgeRanking>::min()) {
++            out.impossible = true;
++            return true;
++          }
++          out.hasHi = true;
++          out.hi = v - 1;
++          return true;
++        case Expression::Kind::kRelEQ:
++          out.hasLo = out.hasHi = true;
++          out.lo = out.hi = v;
++          return true;
++        default:
++          return false;
++      }
++    }
++    default:
++      return false;
++  }
++}
++
++std::optional<RankRange> extractRankRange(const Expression* filter,
++                                           const std::string& edgeName) {
++  RankBounds bounds;
++  if (!extractRankBounds(filter, edgeName, bounds)) {
++    return std::nullopt;
++  }
++  if (!bounds.hasLo && !bounds.hasHi && !bounds.impossible) {
++    return std::nullopt;
++  }
++  RankRange range;
++  if (bounds.impossible) {
++    // SingleEdgeNode treats lo > hi as an empty iterator.  Keep the filter
++    // representable so the caller cannot fall back to an unfiltered scan.
++    range.lo = std::numeric_limits<EdgeRanking>::max();
++    range.hi = std::numeric_limits<EdgeRanking>::min();
++    return range;
++  }
++  if (bounds.hasLo) {
++    range.lo = bounds.lo;
++  }
++  if (bounds.hasHi) {
++    range.hi = bounds.hi;
++  }
++  return range;
++}
++
++}  // namespace
++
+ ProcessorCounters kGetDstBySrcCounters;
+ 
+ void GetDstBySrcProcessor::process(const cpp2::GetDstBySrcRequest& req) {
+@@ -49,6 +254,17 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+   this->planContext_ = std::make_unique<PlanContext>(
+       this->env_, spaceId_, this->spaceVidLen_, this->isIntId_, req.common_ref());
+ 
++  if (req.filter_ref().has_value() && !req.filter_ref()->empty()) {
++    filter_ = Expression::decode(&planContext_->objPool_, *req.filter_ref());
++    if (filter_ == nullptr) {
++      for (auto& p : req.get_parts()) {
++        pushResultCode(nebula::cpp2::ErrorCode::E_INVALID_FILTER, p.first);
++      }
++      onFinished();
++      return;
++    }
++  }
++
+   // check edgetypes exists
+   retCode = checkAndBuildContexts(req);
+   if (retCode != nebula::cpp2::ErrorCode::SUCCEEDED) {
+@@ -60,15 +276,25 @@ void GetDstBySrcProcessor::doProcess(const cpp2::GetDstBySrcRequest& req) {
+   }
+ 
+   dedup_ = req.dedup_ref().value_or(false);
+-  limit_ = req.limit_ref().value_or(FLAGS_max_edge_returned_per_vertex);
+-  if (limit_ < 0) {
+-    limit_ = FLAGS_max_edge_returned_per_vertex;
+-  }
+-
+-  if (!FLAGS_query_concurrently) {
++  sharedDedupLimit_ = req.shared_dedup_limit_ref().value_or(false);
++  const int64_t cap = std::max<int64_t>(0, FLAGS_max_edge_returned_per_vertex);
++  scanLimit_ = sharedDedupLimit_ ? std::numeric_limits<int64_t>::max() : cap;
++  const int64_t requested = req.limit_ref().value_or(cap);
++  if (sharedDedupLimit_) {
++    // The request-level limit is the requested distinct count.  Shared mode
++    // must scan all legal input when it cannot reach K; cancellation and
++    // memory tracking remain the resource guards.
++    limit_ = requested < 0 ? cap : requested;
++    // A shared visited set cannot be maintained independently by the
++    // concurrent per-partition plans.  Run the request as one ordered scan.
+     runInSingleThread(req);
+   } else {
+-    runInMultipleThread(req);
++    limit_ = requested < 0 ? cap : std::min<int64_t>(requested, cap);
++    if (!FLAGS_query_concurrently) {
++      runInSingleThread(req);
++    } else {
++      runInMultipleThread(req);
++    }
+   }
+ }
+ 
+@@ -77,9 +303,17 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
+   contexts_.emplace_back(RuntimeContext(planContext_.get()));
+   auto plan = buildPlan(&contexts_.front(), &flatResult_);
+   std::unordered_set<PartitionID> failedParts;
++  bool reachedLimit = false;
+   for (const auto& partEntry : req.get_parts()) {
++    if (reachedLimit) {
++      break;
++    }
+     auto partId = partEntry.first;
+     for (const auto& src : partEntry.second) {
++      if (sharedDedupLimit_ && static_cast<int64_t>(flatResult_.size()) >= limit_) {
++        reachedLimit = true;
++        break;
++      }
+       auto vId = src.getStr();
+ 
+       if (!NebulaKeyUtils::isValidVidLen(spaceVidLen_, vId)) {
+@@ -97,6 +331,14 @@ void GetDstBySrcProcessor::runInSingleThread(const cpp2::GetDstBySrcRequest& req
+           failedParts.emplace(partId);
+           handleErrorCode(ret, spaceId_, partId);
+         }
++        if (ret == nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED) {
++          reachedLimit = true;
++          break;
++        }
++      }
++      if (sharedDedupLimit_ && static_cast<int64_t>(flatResult_.size()) >= limit_) {
++        reachedLimit = true;
++        break;
+       }
+     }
+   }
+@@ -174,6 +416,9 @@ folly::Future<std::pair<nebula::cpp2::ErrorCode, PartitionID>> GetDstBySrcProces
+                         return std::make_pair(nebula::cpp2::ErrorCode::E_STORAGE_MEMORY_EXCEEDED,
+                                               partId);
+                       }
++                      if (context->isPlanKilled()) {
++                        return std::make_pair(nebula::cpp2::ErrorCode::E_PLAN_IS_KILLED, partId);
++                      }
+                       auto plan = buildPlan(context, result);
+                       for (const auto& src : input) {
+                         auto& vId = src.getStr();
+@@ -216,16 +461,26 @@ StoragePlan<VertexID> GetDstBySrcProcessor::buildPlan(RuntimeContext* context,
+   StoragePlan<VertexID> plan;
+   std::vector<SingleEdgeNode*> edges;
+   for (const auto& ec : edgeContext_.propContexts_) {
++    std::optional<RankRange> range;
++    if (filter_ != nullptr) {
++      range = extractRankRange(filter_, edgeContext_.edgeNames_[ec.first]);
++    }
+     // Since we only return dst in this processor, some steps would be skipped when iterating
+     // key-values if possible, for example, decoding value
+     auto edge = std::make_unique<SingleEdgeNode>(
+-        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true);
++        context, &edgeContext_, ec.first, &ec.second, nullptr, nullptr, true, std::move(range));
+     edges.emplace_back(edge.get());
+     plan.addNode(std::move(edge));
+   }
+ 
+-  auto output =
+-      std::make_unique<GetDstBySrcNode>(context, edges, &edgeContext_, result, dedup_, limit_);
++  auto output = std::make_unique<GetDstBySrcNode>(context,
++                                                  edges,
++                                                  &edgeContext_,
++                                                  result,
++                                                  dedup_,
++                                                  limit_,
++                                                  scanLimit_,
++                                                  sharedDedupLimit_);
+   for (auto* edge : edges) {
+     output->addDependency(edge);
+   }
+@@ -244,6 +499,15 @@ nebula::cpp2::ErrorCode GetDstBySrcProcessor::checkAndBuildContexts(
+   if (code != nebula::cpp2::ErrorCode::SUCCEEDED) {
+     return code;
+   }
++  if (filter_ != nullptr) {
++    if (edgeContext_.propContexts_.size() != 1) {
++      return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++    }
++    const auto edgeName = edgeContext_.edgeNames_[edgeContext_.propContexts_.front().first];
++    if (!isRankOnlyFilter(filter_, edgeName)) {
++      return nebula::cpp2::ErrorCode::E_INVALID_FILTER;
++    }
++  }
+   return nebula::cpp2::ErrorCode::SUCCEEDED;
+ }
+ 
+@@ -352,6 +616,9 @@ void GetDstBySrcProcessor::onProcessFinished() {
+   }
+   resultDataSet_.rows = std::move(deduped);
+   resp_.dsts_ref() = std::move(resultDataSet_);
++  // Explicit capability marker for graphd: old storaged nodes do not set this
++  // and would otherwise silently ignore filter/shared_dedup_limit.
++  resp_.shared_dedup_limit_supported_ref() = true;
+ 
+   if (profileDetailFlag_) {
+     profileDetail("GetDstBySrcProcessorDedup", dedupDuration_.elapsedInUSec());
+diff --git a/src/storage/query/GetDstBySrcProcessor.h b/src/storage/query/GetDstBySrcProcessor.h
+index 3207501..322bef7 100644
+--- a/src/storage/query/GetDstBySrcProcessor.h
++++ b/src/storage/query/GetDstBySrcProcessor.h
+@@ -58,7 +58,9 @@ class GetDstBySrcProcessor
+ 
+  private:
+   bool dedup_{false};
++  bool sharedDedupLimit_{false};
+   int64_t limit_{std::numeric_limits<int64_t>::max()};
++  int64_t scanLimit_{std::numeric_limits<int64_t>::max()};
+ 
+   std::vector<RuntimeContext> contexts_;
+   // The process result of each part if run concurrently, then merge into resultDataSet_ at last

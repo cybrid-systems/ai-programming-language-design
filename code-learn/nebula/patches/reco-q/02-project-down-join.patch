@@ -1,0 +1,381 @@
+diff --git a/src/graph/executor/query/JoinExecutor.cpp b/src/graph/executor/query/JoinExecutor.cpp
+index 5610ae5..bdcafa8 100644
+--- a/src/graph/executor/query/JoinExecutor.cpp
++++ b/src/graph/executor/query/JoinExecutor.cpp
+@@ -13,6 +13,8 @@ Status JoinExecutor::checkInputDataSets() {
+   // Since the executors might reuse in loops, so manually clear the table here.
+   hashTable_.clear();
+   listHashTable_.clear();
++  projection_.clear();
++  rhsOutputColIdxs_.reset();
+   auto* join = asNode<Join>(node());
+   lhsIter_ = ectx_->getVersionedResult(join->leftVar().first, join->leftVar().second).iter();
+   DCHECK(!!lhsIter_);
+@@ -33,6 +35,8 @@ Status JoinExecutor::checkInputDataSets() {
+ }
+ 
+ Status JoinExecutor::checkBiInputDataSets() {
++  projection_.clear();
++  rhsOutputColIdxs_.reset();
+   auto* join = asNode<HashJoin>(node());
+   lhsIter_ = ectx_->getResult(join->leftInputVar()).iter();
+   DCHECK(!!lhsIter_);
+@@ -58,6 +62,40 @@ Status JoinExecutor::checkBiInputDataSets() {
+   auto& rhsColNames = rhsResult.valuePtr()->getDataSet().colNames;
+   auto rhsColSize = rhsColNames.size();
+ 
++  if (join->hasOutputColumns()) {
++    // Resolve the Project's source names against the join's natural output
++    // layout: all left columns first, then non-duplicate right columns.
++    std::vector<ProjectedColumn> naturalColumns;
++    std::vector<std::string> naturalNames;
++    naturalColumns.reserve(lhsColSize + rhsColSize);
++    naturalNames.reserve(lhsColSize + rhsColSize);
++    for (size_t i = 0; i < lhsColSize; ++i) {
++      naturalColumns.push_back(ProjectedColumn{true, i});
++      naturalNames.emplace_back(lhsColNames[i]);
++    }
++    for (size_t i = 0; i < rhsColSize; ++i) {
++      if (std::find(lhsColNames.begin(), lhsColNames.end(), rhsColNames[i]) ==
++          lhsColNames.end()) {
++        naturalColumns.push_back(ProjectedColumn{false, i});
++        naturalNames.emplace_back(rhsColNames[i]);
++      }
++    }
++
++    projection_.reserve(join->outputColumns().size());
++    for (const auto& output : join->outputColumns()) {
++      auto it = std::find(naturalNames.begin(), naturalNames.end(), output.source);
++      if (it == naturalNames.end()) {
++        std::stringstream ss;
++        ss << "Projected join column `" << output.source << "' is not in the join output";
++        return Status::Error(ss.str());
++      }
++      auto idx = std::distance(naturalNames.begin(), it);
++      projection_.push_back(naturalColumns[idx]);
++    }
++    colSize_ = projection_.size();
++    return Status::OK();
++  }
++
+   DCHECK_LE(colSize_, lhsColSize + rhsColSize);
+   if (colSize_ < lhsColSize + rhsColSize) {
+     rhsOutputColIdxs_ = std::vector<size_t>();
+@@ -104,6 +142,17 @@ void JoinExecutor::buildSingleKeyHashTable(
+ }
+ 
+ Row JoinExecutor::newRow(Row left, Row right) const {
++  if (!projection_.empty()) {
++    Row row;
++    row.values.reserve(projection_.size());
++    for (const auto& col : projection_) {
++      const auto& source = col.fromLeft ? left : right;
++      DCHECK_LT(col.index, source.values.size());
++      row.values.emplace_back(source.values[col.index]);
++    }
++    return row;
++  }
++
+   Row row;
+   row.reserve(left.size() + right.size());
+   row.values.insert(row.values.end(),
+diff --git a/src/graph/executor/query/JoinExecutor.h b/src/graph/executor/query/JoinExecutor.h
+index 0e1cfca..de74f53 100644
+--- a/src/graph/executor/query/JoinExecutor.h
++++ b/src/graph/executor/query/JoinExecutor.h
+@@ -16,6 +16,11 @@ class JoinExecutor : public Executor {
+       : Executor(name, node, qctx) {}
+ 
+  protected:
++  struct ProjectedColumn {
++    bool fromLeft;
++    size_t index;
++  };
++
+   Status checkInputDataSets();
+ 
+   Status checkBiInputDataSets();
+@@ -42,6 +47,8 @@ class JoinExecutor : public Executor {
+   std::optional<std::vector<size_t>> rhsOutputColIdxs_;
+   std::unordered_map<Value, std::vector<const Row*>> hashTable_;
+   std::unordered_map<List, std::vector<const Row*>> listHashTable_;
++  // Resolved join output projection, empty for a natural join.
++  std::vector<ProjectedColumn> projection_;
+ };
+ }  // namespace graph
+ }  // namespace nebula
+diff --git a/src/graph/optimizer/CMakeLists.txt b/src/graph/optimizer/CMakeLists.txt
+index c1eb342..d5e1fb3 100644
+--- a/src/graph/optimizer/CMakeLists.txt
++++ b/src/graph/optimizer/CMakeLists.txt
+@@ -35,6 +35,7 @@ nebula_add_library(
+     rule/PushFilterDownExpandAllRule.cpp
+     rule/PushFilterDownAllPathsRule.cpp
+     rule/PushFilterDownHashInnerJoinRule.cpp
++    rule/PushProjectDownHashInnerJoinRule.cpp
+     rule/PushFilterDownHashLeftJoinRule.cpp
+     rule/PushFilterDownInnerJoinRule.cpp
+     rule/PushFilterDownNodeRule.cpp
+diff --git a/src/graph/optimizer/rule/PushProjectDownHashInnerJoinRule.cpp b/src/graph/optimizer/rule/PushProjectDownHashInnerJoinRule.cpp
+new file mode 100644
+index 0000000..a18bf3f
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushProjectDownHashInnerJoinRule.cpp
+@@ -0,0 +1,141 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#include "graph/optimizer/rule/PushProjectDownHashInnerJoinRule.h"
++
++#include <algorithm>
++#include <iterator>
++#include <unordered_set>
++
++#include "common/expression/PropertyExpression.h"
++#include "graph/optimizer/OptContext.h"
++#include "graph/optimizer/OptGroup.h"
++#include "graph/planner/plan/PlanNode.h"
++#include "graph/planner/plan/Query.h"
++
++using nebula::graph::HashInnerJoin;
++using nebula::graph::PlanNode;
++using nebula::graph::Project;
++
++namespace nebula {
++namespace opt {
++
++std::unique_ptr<OptRule> PushProjectDownHashInnerJoinRule::kInstance =
++    std::unique_ptr<OptRule>(new PushProjectDownHashInnerJoinRule());
++
++PushProjectDownHashInnerJoinRule::PushProjectDownHashInnerJoinRule() {
++  RuleSet::QueryRules().addRule(this);
++}
++
++const Pattern& PushProjectDownHashInnerJoinRule::pattern() const {
++  static Pattern pattern = Pattern::create(
++      PlanNode::Kind::kProject,
++      {Pattern::create(
++          PlanNode::Kind::kHashInnerJoin,
++          {Pattern::create(PlanNode::Kind::kUnknown), Pattern::create(PlanNode::Kind::kUnknown)})});
++  return pattern;
++}
++
++StatusOr<OptRule::TransformResult> PushProjectDownHashInnerJoinRule::transform(
++    OptContext* octx, const MatchedResult& matched) const {
++  const auto* projectNode = matched.planNode({0});
++  DCHECK_EQ(projectNode->kind(), PlanNode::Kind::kProject);
++  const auto* project = static_cast<const Project*>(projectNode);
++
++  const auto* joinNode = matched.planNode({0, 0});
++  DCHECK_EQ(joinNode->kind(), PlanNode::Kind::kHashInnerJoin);
++  const auto* join = static_cast<const HashInnerJoin*>(joinNode);
++
++  // The join output is consumed only by this Project.  Otherwise changing the
++  // join's output shape would break another reader.
++  auto* joinVar = octx->qctx()->symTable()->getVar(join->outputVar());
++  if (joinVar == nullptr || joinVar->readBy.size() != 1) {
++    return TransformResult::noTransform();
++  }
++
++  const auto* columns = project->columns();
++  if (columns == nullptr || columns->columns().empty()) {
++    return TransformResult::noTransform();
++  }
++  const auto& outNames = project->colNames();
++  if (outNames.size() != columns->columns().size()) {
++    return TransformResult::noTransform();
++  }
++
++  const auto& joinColNames = join->colNames();
++  // Ambiguous source names would make the projection mapping depend on which
++  // duplicate the iterator happens to resolve; leave those plans untouched.
++  std::unordered_set<std::string> uniqueJoinCols;
++  for (const auto& colName : joinColNames) {
++    if (!uniqueJoinCols.emplace(colName).second) {
++      return TransformResult::noTransform();
++    }
++  }
++
++  const auto* leftVar = octx->qctx()->symTable()->getVar(join->leftInputVar());
++  const auto* rightVar = octx->qctx()->symTable()->getVar(join->rightInputVar());
++  if (leftVar == nullptr || rightVar == nullptr) {
++    return TransformResult::noTransform();
++  }
++  std::unordered_set<std::string> naturalCols;
++  for (const auto& colName : leftVar->colNames) {
++    naturalCols.emplace(colName);
++  }
++  for (const auto& colName : rightVar->colNames) {
++    if (std::find(leftVar->colNames.begin(), leftVar->colNames.end(), colName) ==
++        leftVar->colNames.end()) {
++      naturalCols.emplace(colName);
++    }
++  }
++
++  std::vector<graph::JoinOutputColumn> outputs;
++  outputs.reserve(columns->columns().size());
++  for (size_t i = 0; i < columns->columns().size(); ++i) {
++    const auto* expr = columns->columns()[i]->expr();
++    // `$-.col` is normally an InputProperty, but GoValidator may rewrite a
++    // pipe column to an anonymous VarProperty (empty sym).  A real `$var.col`
++    // reference could name a column belonging to a different variable with
++    // the same visible name, so keep those on a real Project.
++    if (expr == nullptr) {
++      return TransformResult::noTransform();
++    }
++    if (expr->kind() != Expression::Kind::kInputProperty &&
++        expr->kind() != Expression::Kind::kVarProperty) {
++      return TransformResult::noTransform();
++    }
++    const auto* propExpr = static_cast<const PropertyExpression*>(expr);
++    if (expr->kind() == Expression::Kind::kVarProperty && !propExpr->sym().empty()) {
++      return TransformResult::noTransform();
++    }
++    if (std::find(joinColNames.begin(), joinColNames.end(), propExpr->prop()) ==
++            joinColNames.end() ||
++        naturalCols.count(propExpr->prop()) == 0) {
++      return TransformResult::noTransform();
++    }
++    outputs.emplace_back(graph::JoinOutputColumn{propExpr->prop(), outNames[i]});
++  }
++
++  const auto* joinGroupNode = matched.result({0, 0}).node;
++  auto* newJoin = static_cast<HashInnerJoin*>(join->clone());
++  newJoin->setOutputColumns(std::move(outputs));
++  newJoin->setColNames(project->colNames());
++  newJoin->setOutputVar(project->outputVar());
++
++  auto* newGroupNode =
++      OptGroupNode::create(octx, newJoin, const_cast<OptGroup*>(matched.node->group()));
++  newGroupNode->setDeps(joinGroupNode->dependencies());
++
++  TransformResult result;
++  result.eraseAll = true;
++  result.newGroupNodes.emplace_back(newGroupNode);
++  return result;
++}
++
++std::string PushProjectDownHashInnerJoinRule::toString() const {
++  return "PushProjectDownHashInnerJoinRule";
++}
++
++}  // namespace opt
++}  // namespace nebula
+diff --git a/src/graph/optimizer/rule/PushProjectDownHashInnerJoinRule.h b/src/graph/optimizer/rule/PushProjectDownHashInnerJoinRule.h
+new file mode 100644
+index 0000000..0ce7b51
+--- /dev/null
++++ b/src/graph/optimizer/rule/PushProjectDownHashInnerJoinRule.h
+@@ -0,0 +1,42 @@
++/* Copyright (c) 2024 vesoft inc. All rights reserved.
++ *
++ * This source code is licensed under Apache 2.0 License.
++ */
++
++#ifndef GRAPH_OPTIMIZER_RULE_PUSHPROJECTDOWNHASHINNERJOINRULE_H_
++#define GRAPH_OPTIMIZER_RULE_PUSHPROJECTDOWNHASHINNERJOINRULE_H_
++
++#include "graph/optimizer/OptRule.h"
++
++namespace nebula {
++namespace opt {
++
++// Push a simple Project into a HashInnerJoin.
++//
++// Before:
++//   Project($-.__COL_2 AS user_id)
++//     HashInnerJoin
++//
++// After:
++//   HashInnerJoin(outputColumns = [__COL_2 AS user_id])
++//
++// Only direct input-column references are handled; computed expressions keep
++// the Project node.
++class PushProjectDownHashInnerJoinRule final : public OptRule {
++ public:
++  const Pattern& pattern() const override;
++
++  StatusOr<OptRule::TransformResult> transform(OptContext* octx,
++                                               const MatchedResult& matched) const override;
++
++  std::string toString() const override;
++
++ private:
++  PushProjectDownHashInnerJoinRule();
++  static std::unique_ptr<OptRule> kInstance;
++};
++
++}  // namespace opt
++}  // namespace nebula
++
++#endif  // GRAPH_OPTIMIZER_RULE_PUSHPROJECTDOWNHASHINNERJOINRULE_H_
+diff --git a/src/graph/planner/plan/Query.cpp b/src/graph/planner/plan/Query.cpp
+index 9ee98a9..8902fe6 100644
+--- a/src/graph/planner/plan/Query.cpp
++++ b/src/graph/planner/plan/Query.cpp
+@@ -893,6 +893,13 @@ std::unique_ptr<PlanNodeDescription> HashJoin::explain() const {
+   auto desc = BinaryInputNode::explain();
+   addDescription("hashKeys", folly::toJson(util::toJson(hashKeys_)), desc.get());
+   addDescription("probeKeys", folly::toJson(util::toJson(probeKeys_)), desc.get());
++  if (!outputColumns_.empty()) {
++    folly::dynamic output = folly::dynamic::array();
++    for (const auto& col : outputColumns_) {
++      output.push_back(folly::dynamic::object("source", col.source)("alias", col.alias));
++    }
++    addDescription("outputColumns", folly::toJson(output), desc.get());
++  }
+   return desc;
+ }
+ 
+@@ -914,6 +921,7 @@ void HashJoin::cloneMembers(const HashJoin& j) {
+     pKeys.emplace_back(item->clone());
+   }
+   probeKeys_ = std::move(pKeys);
++  outputColumns_ = j.outputColumns();
+ }
+ 
+ HashJoin::HashJoin(QueryContext* qctx,
+diff --git a/src/graph/planner/plan/Query.h b/src/graph/planner/plan/Query.h
+index 7c5f96f..e792f74 100644
+--- a/src/graph/planner/plan/Query.h
++++ b/src/graph/planner/plan/Query.h
+@@ -1842,9 +1842,28 @@ class AppendVertices final : public GetVertices {
+   bool trackPrevPath_{true};
+ };
+ 
++// A projected output column of a HashJoin.  `source` names a column in the
++// join's natural left+right output, `alias` is the name exposed downstream.
++struct JoinOutputColumn {
++  std::string source;
++  std::string alias;
++};
++
+ // Binary Join that joins two results from two inputs.
+ class HashJoin : public BinaryInputNode {
+  public:
++  const std::vector<JoinOutputColumn>& outputColumns() const {
++    return outputColumns_;
++  }
++
++  void setOutputColumns(std::vector<JoinOutputColumn> outputColumns) {
++    outputColumns_ = std::move(outputColumns);
++  }
++
++  bool hasOutputColumns() const {
++    return !outputColumns_.empty();
++  }
++
+   const std::vector<Expression*>& hashKeys() const {
+     return hashKeys_;
+   }
+@@ -1878,6 +1897,8 @@ class HashJoin : public BinaryInputNode {
+  protected:
+   std::vector<Expression*> hashKeys_;
+   std::vector<Expression*> probeKeys_;
++  // If non-empty, only these columns are materialized by the join executor.
++  std::vector<JoinOutputColumn> outputColumns_;
+ };
+ 
+ // Left join
